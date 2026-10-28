@@ -341,7 +341,9 @@ def fuse_pointwise(graph: Graph) -> Graph:
             consumers.setdefault(value_id, []).append(index)
 
     pointwise = {
-        index for index, op in enumerate(graph.ops) if op.op in POINTWISE_OPS
+        index
+        for index, op in enumerate(graph.ops)
+        if _is_pointwise_fusion_candidate(graph, op)
     }
     roots: list[int] = []
     for index in pointwise:
@@ -415,6 +417,14 @@ def fuse_pointwise(graph: Graph) -> Graph:
             rewritten.append(op)
 
     return graph.replace_ops(tuple(rewritten))
+
+
+def _is_pointwise_fusion_candidate(graph: Graph, op: Operation) -> bool:
+    if op.op not in POINTWISE_OPS:
+        return False
+    dtypes = [graph.value(op.outputs[0]).type.dtype]
+    dtypes.extend(graph.value(value_id).type.dtype for value_id in op.inputs)
+    return all(dtype not in {DType.I32, DType.I64} for dtype in dtypes)
 
 
 def eliminate_common_subexpressions(graph: Graph) -> Graph:

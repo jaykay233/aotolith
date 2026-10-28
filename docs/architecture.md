@@ -89,6 +89,7 @@
 | `aten.where.self` | `where` |
 | `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
 | `aten.scalar_tensor.default` | `scalar_tensor`，标量值和输出 dtype 进入 IR |
+| `aten.arange.default`、`aten.arange.start`、`aten.arange.start_step` | `arange`，参数规范化为 `start/end/step` attributes |
 | `aten.zeros.default`、`aten.ones.default`、`aten.full.default`、`aten.new_zeros.default`、`aten.new_ones.default`、`aten.new_full.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default` | `zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like`、`full_like`，shape/dtype 来自输出 metadata，填充值进入 IR |
 | `aten.cat.default` | `cat`，tensor 输入序列和拼接轴进入 IR |
 | `aten.stack.default` | 在前端展开为多个 `unsqueeze` 后接一个 `cat` |
@@ -115,7 +116,7 @@
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute。`scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 都是无 tensor 输入的 pointwise 常量节点：值和输出 dtype 分别来自 IR attribute 与节点 metadata。`new_*` 和 `*_like` 的模板 tensor 只参与 FX 捕获，不进入 op 的运行时输入。它们可以单独生成 Metal kernel，也可以与相邻 pointwise op 融合；CSE 的 key 包含输出 shape/dtype，因此同一模板上的不同 dtype 覆盖不会被错误合并。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute。`scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 都是无 tensor 输入的常量节点：值和输出 dtype 分别来自 IR attribute 与节点 metadata。`new_*` 和 `*_like` 的模板 tensor 只参与 FX 捕获，不进入 op 的运行时输入。浮点/bool 常量可以单独生成 Metal kernel，也可以与相邻 pointwise op 融合；I32/I64 常量走独立的整数 kernel。CSE 的 key 包含输出 shape/dtype，因此同一模板上的不同 dtype 覆盖或不同整数宽度不会被错误合并。`arange` 的三个 ATen target 统一规范化为 `(start, end, step)` attributes，当前只接受整数参数和 I32/I64 输出。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
@@ -153,13 +154,13 @@ Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention
 
 `fuse_pointwise` 找出图的融合区域：
 
-1. 把支持的一元和二元运算标记为 pointwise op。
+1. 把支持的一元和二元运算标记为 pointwise op；含 I32/I64 输入或输出的 op 不参与融合。
 2. 找出 region root：输出被 graph output 或非 pointwise consumer 观察的 pointwise op。
 3. 从每个 root 开始迭代式反向闭包，只有 producer 没有被 graph output 观察、且它的全部 consumer 都已经在 region 内时才纳入 producer。
 4. region 至少包含两个 op 才替换成 `fused_elementwise`。
 5. `fused_elementwise` 的 `attrs["body"]` 保存原始 pointwise op 序列。
 
-只有单个 pointwise op 时不做 IR fusion，但 Apple backend 仍会为它生成一个独立 Metal kernel。
+只有单个 pointwise op 时不做 IR fusion，但 Apple backend 仍会为它生成一个独立 Metal kernel。当前 pointwise emitter 使用 float 中间值，因此整数 op 被排除在融合之外，避免超过 `2**53` 的 I64 值发生静默舍入；普通整数算术目前仍不支持。
 
 闭包规则允许共享 producer 的 DAG 进入同一个 region。例如 `s = sigmoid(x); (s + s) * s` 中，`sigmoid` 的三个 consumer 都在 region 内，因此整条链只需一个 kernel。仍然被 graph output 观察的中间值不会从图中删除；backend 按 region 内 value ID 做局部 CSE，让同一表达式只生成一次代码。
 
@@ -232,6 +233,8 @@ input_offset = (elem % 3) * 1
 `maximum`/`minimum` 在比较相等时选择左操作数，以匹配 PyTorch 对 signed zero 的行为，并显式传播任一操作数的 NaN。`logaddexp` 使用 `max(a, b) + log1p(exp(-abs(a - b)))`，避免两个同号大数直接相加后溢出；任一输入为 NaN 时返回 NaN，最大值为正无穷时返回正无穷，两个 `-inf` 返回 `-inf`。`exp2` 直接生成 `metal::exp2`。
 
 Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异，因此 `tsc_atan2` 显式处理 NaN、`x == ±0`、`y == ±0`、`x`/`y` 为无穷以及 `(-inf, -inf)` 等象限边界，其余有限值回退到系统 `atan2`。这些规则与 `torch.atan2` 的参数顺序一致。
+
+整数常量和 `arange` 不经过这条 float pointwise 路径。Backend 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。`arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。当前不 lowering 浮点 `arange`，因为 PyTorch 使用 double 语义，而 Metal 没有稳定可用的 GPU double 路径。
 
 ## 8. Metal softmax reduction
 
@@ -386,7 +389,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 ## 14. 已知边界
 
 - 只支持静态、非空 shape
-- 不支持动态 shape、控制流和 list/dict 输出；常量生成支持 `scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 的 float/bool 输出，尚不支持整数常量
+- 不支持动态 shape、控制流和 list/dict 输出；常量生成支持 `scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 的 float/bool/I32/I64 输出
+- `arange` 目前只支持整数 start/end/step 和 I32/I64 输出；浮点 `arange` 尚未实现
 - bool tensor 只支持比较、logical、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；整数 tensor 可用于 embedding/index_select/gather/scatter indices，但不支持一般整数算术和 bitwise 运算
 - scatter 只支持默认写入语义，不支持 `reduce`、`scatter_add` 或 `scatter_reduce`
 - softmax 支持任意单轴，但不支持一次对多个轴做 softmax

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Callable, Sequence
+from math import isfinite
 from typing import Any
 
 from .ir import DType, Graph, Operation, TensorType, Value
@@ -114,6 +115,9 @@ _SUPPORTED_OPS = {
     "aten.logaddexp.default": "logaddexp",
     "aten.atan2.default": "atan2",
     "aten.scalar_tensor.default": "scalar_tensor",
+    "aten.arange.default": "arange",
+    "aten.arange.start": "arange",
+    "aten.arange.start_step": "arange",
     "aten.zeros.default": "zeros",
     "aten.ones.default": "ones",
     "aten.full.default": "full",
@@ -1389,6 +1393,27 @@ def _operation_inputs(
             raise ValueError(f"scalar_tensor value must be scalar, got {value!r}")
         return (), {"value": value}
 
+    if op == "arange":
+        if len(args) not in {1, 2, 3}:
+            raise ValueError(
+                f"arange expects one to three arguments, got {len(args)}"
+            )
+        start = 0 if len(args) == 1 else args[0]
+        end = args[0] if len(args) == 1 else args[1]
+        step = 1 if len(args) < 3 else args[2]
+        for name, value in (("start", start), ("end", end), ("step", step)):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(
+                    f"arange.{name} must be a scalar number, got {value!r}"
+                )
+            if not isfinite(value):
+                raise ValueError(
+                    f"arange.{name} must be finite, got {value!r}"
+                )
+        if step == 0:
+            raise ValueError("arange.step must be nonzero")
+        return (), {"start": start, "end": end, "step": step}
+
     if op in {"zeros", "ones", "full", "new_zeros", "new_ones", "new_full"}:
         has_template = op.startswith("new_")
         base_op = op.removeprefix("new_")
@@ -1813,6 +1838,7 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         )
     if op in {
         "scalar_tensor",
+        "arange",
         "zeros",
         "ones",
         "full",
@@ -1847,6 +1873,7 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
     if op in {
         "cast",
         "scalar_tensor",
+        "arange",
         "zeros",
         "ones",
         "full",

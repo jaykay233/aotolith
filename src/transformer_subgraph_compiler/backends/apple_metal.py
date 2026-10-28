@@ -3,7 +3,7 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass
 from functools import lru_cache
-from math import ceil, isinf, isnan, prod
+from math import ceil, isfinite, isinf, isnan, prod
 from typing import Any
 
 import mlx.core as mx
@@ -41,6 +41,7 @@ _CONSTANT_POINTWISE_OPS = {
     "ones_like",
     "full_like",
 }
+_INTEGRAL_DTYPES = {DType.I32, DType.I64}
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
@@ -322,6 +323,13 @@ class AppleMetalBackend:
                 compiled = self._compile_elementwise(
                     graph, op.inputs, body, op.outputs[0], index, "fused_elementwise"
                 )
+            elif op.op == "arange":
+                compiled = self._compile_arange(graph, op, index)
+            elif (
+                op.op in _CONSTANT_POINTWISE_OPS
+                and graph.value(op.outputs[0]).type.dtype in _INTEGRAL_DTYPES
+            ):
+                compiled = self._compile_integer_constant(graph, op, index)
             elif op.op in POINTWISE_OPS:
                 compiled = self._compile_elementwise(
                     graph, op.inputs, (op,), op.outputs[0], index, op.op
@@ -436,6 +444,59 @@ class AppleMetalBackend:
             output_id=output_id,
             tensor_type=output_type,
             kind=kind,
+        )
+        return artifact, runtime
+
+    def _compile_integer_constant(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        _validate_integer_constant(graph, op)
+        output_type = graph.value(op.outputs[0]).type
+        source = _emit_integer_constant_source(op, output_type)
+        return self._compile_zero_input_kernel(op, index, source, output_type)
+
+    def _compile_arange(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        _validate_arange(graph, op)
+        output_type = graph.value(op.outputs[0]).type
+        source = _emit_arange_source(op, output_type)
+        return self._compile_zero_input_kernel(op, index, source, output_type)
+
+    def _compile_zero_input_kernel(
+        self,
+        op: Operation,
+        index: int,
+        source: str,
+        output_type: TensorType,
+    ) -> tuple[KernelArtifact, Any]:
+        name = f"{op.op}_{index}"
+        kernel = _metal_kernel(name, (), ("out",), source, _MSL_HEADER)
+
+        element_count = prod(output_type.shape)
+        grid = (ceil(element_count / _ELEMENTS_PER_THREAD), 1, 1)
+        threadgroup = (min(256, grid[0]), 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime() -> mx.array:
+            outputs = kernel(
+                inputs=[],
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header=_MSL_HEADER,
+            input_ids=(),
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind=op.op,
         )
         return artifact, runtime
 
@@ -2063,6 +2124,120 @@ def _validate_pointwise_region(
             | _CONSTANT_POINTWISE_OPS
         ):
             raise ValueError("boolean pointwise region has an unsupported root op")
+
+
+def _validate_integer_constant(graph: Graph, op: Operation) -> None:
+    if op.inputs:
+        raise ValueError(f"{op.op} must not have tensor inputs")
+    output_type = graph.value(op.outputs[0]).type
+    if output_type.dtype not in _INTEGRAL_DTYPES:
+        raise ValueError(f"{op.op} is not an integer constant")
+    _integer_constant_value(op, output_type.dtype)
+
+
+def _integer_constant_value(op: Operation, dtype: DType) -> int:
+    value = op.attrs.get("value")
+    if not isinstance(value, (bool, int, float)):
+        raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError(f"{op.op}.value cannot be converted to an integer")
+
+    converted = int(value)
+    bits = 32 if dtype == DType.I32 else 64
+    lower = -(1 << (bits - 1))
+    upper = (1 << (bits - 1)) - 1
+    if not lower <= converted <= upper:
+        raise ValueError(
+            f"{op.op}.value {value!r} overflows {dtype.value}"
+        )
+    return converted
+
+
+def _emit_integer_constant_source(op: Operation, output_type: TensorType) -> str:
+    value = _integer_constant_value(op, output_type.dtype)
+    return _emit_zero_input_expression(
+        _msl_integer_literal(value, output_type.dtype), output_type.shape
+    )
+
+
+def _validate_arange(graph: Graph, op: Operation) -> None:
+    if op.inputs:
+        raise ValueError("arange must not have tensor inputs")
+    output_type = graph.value(op.outputs[0]).type
+    if output_type.dtype not in _INTEGRAL_DTYPES:
+        raise NotImplementedError(
+            "arange currently supports int32 and int64 outputs only"
+        )
+    if len(output_type.shape) != 1:
+        raise ValueError(f"arange must produce a rank-1 tensor, got {output_type.shape}")
+
+    values: list[int] = []
+    for name in ("start", "end", "step"):
+        value = op.attrs.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise NotImplementedError(
+                "arange currently requires integer start, end and step values"
+            )
+        if not -(1 << 63) <= value < (1 << 63):
+            raise ValueError(f"arange.{name} {value} exceeds signed int64")
+        values.append(value)
+    start, end, step = values
+    if step == 0:
+        raise ValueError("arange.step must be nonzero")
+
+    expected_length = _arange_length(start, end, step)
+    if output_type.shape[0] != expected_length:
+        raise ValueError(
+            f"arange output shape {output_type.shape} does not match expected "
+            f"length {expected_length}"
+        )
+
+
+def _arange_length(start: int, end: int, step: int) -> int:
+    if step > 0:
+        if start >= end:
+            return 0
+        return (end - start + step - 1) // step
+    if start <= end:
+        return 0
+    stride = -step
+    return (start - end + stride - 1) // stride
+
+
+def _emit_arange_source(op: Operation, output_type: TensorType) -> str:
+    start = _msl_integer_literal(int(op.attrs["start"]), DType.I64)
+    step = _msl_integer_literal(int(op.attrs["step"]), DType.I64)
+    expression = f"(long)({start}) + (long)elem * (long)({step})"
+    return _emit_zero_input_expression(expression, output_type.shape)
+
+
+def _emit_zero_input_expression(
+    expression: str, output_shape: tuple[int, ...]
+) -> str:
+    element_count = prod(output_shape)
+    lines = [
+        "uint base = thread_position_in_grid.x * 4u;",
+        "for (uint lane = 0u; lane < 4u; ++lane) {",
+        "    uint elem = base + lane;",
+        f"    if (elem >= {element_count}) {{",
+        "        break;",
+        "    }",
+        f"    out[elem] = (T)({expression});",
+        "}",
+    ]
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _msl_integer_literal(value: int, dtype: DType) -> str:
+    if dtype == DType.I64:
+        if value == -(1 << 63):
+            return "(-9223372036854775807LL - 1LL)"
+        return f"{value}LL"
+    if dtype == DType.I32:
+        if value == -(1 << 31):
+            return "(-2147483647 - 1)"
+        return str(value)
+    raise ValueError(f"{dtype.value} is not an integer dtype")
 
 
 def _emit_pointwise_source(

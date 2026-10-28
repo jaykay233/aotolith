@@ -27,7 +27,8 @@ _MLX_DTYPES = {
 
 
 def _torch_to_mlx(value: torch.Tensor) -> mx.array:
-    return mx.array(value.float().numpy()).astype(_MLX_DTYPES[value.dtype])
+    source = value.float().numpy() if value.is_floating_point() else value.numpy()
+    return mx.array(source).astype(_MLX_DTYPES[value.dtype])
 
 
 def _manual_gate_graph(dtype: DType = DType.F32) -> Graph:
@@ -3579,21 +3580,238 @@ def test_static_size_fill_supports_boolean_outputs() -> None:
     assert bool(mx.all(actual[2]).item())
 
 
-def test_full_like_rejects_integer_outputs() -> None:
+def test_static_size_fill_supports_integer_outputs() -> None:
+    def fn():
+        return (
+            torch.zeros((2, 3), dtype=torch.int32),
+            torch.ones((2, 3), dtype=torch.int64),
+            torch.full((2, 3), 2**53 + 1, dtype=torch.int64),
+            torch.full((2, 3), -2.9, dtype=torch.int32),
+        )
+
+    result = compile_callable(fn, ())
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "zeros",
+        "ones",
+        "full",
+        "full",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "zeros",
+        "ones",
+        "full",
+        "full",
+    ]
+
+    actual = result.plan()
+    expected = tuple(_torch_to_mlx(output) for output in fn())
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert actual_value.dtype == expected_value.dtype
+        assert mx.array_equal(actual_value, expected_value)
+
+
+def test_like_and_new_fill_support_integer_outputs() -> None:
     template = torch.zeros(3, dtype=torch.int32)
-    with pytest.raises(ValueError, match="full_like does not support integer outputs"):
-        compile_callable(lambda value: torch.full_like(value, 7), (template,))
+
+    def fn(value):
+        return (
+            torch.full_like(value, -2.9),
+            torch.ones_like(value, dtype=torch.int64),
+            value.new_full((2,), 2**53 + 1, dtype=torch.int64),
+        )
+
+    result = compile_callable(fn, (template,))
+    assert all(not op.inputs for op in result.lowered_graph.ops)
+    actual = result.plan(_torch_to_mlx(template))
+    expected = tuple(_torch_to_mlx(output) for output in fn(template))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert actual_value.dtype == expected_value.dtype
+        assert mx.array_equal(actual_value, expected_value)
 
 
-def test_static_size_fill_rejects_integer_outputs() -> None:
-    with pytest.raises(ValueError, match="zeros does not support integer outputs"):
-        compile_callable(lambda: torch.zeros((3,), dtype=torch.int32), ())
+@pytest.mark.parametrize("value", [-(2**63), 2**63 - 1])
+def test_integer_scalar_constant_preserves_int64_precision(value: int) -> None:
+    result = compile_callable(
+        lambda: torch.scalar_tensor(value, dtype=torch.int64), ()
+    )
+
+    actual = result.plan()[0]
+    mx.eval(actual)
+    assert actual.dtype == mx.int64
+    assert actual.item() == value
 
 
-def test_new_full_rejects_integer_outputs() -> None:
-    template = torch.zeros(3, dtype=torch.int64)
-    with pytest.raises(ValueError, match="new_full does not support integer outputs"):
-        compile_callable(lambda value: value.new_full((2,), 7), (template,))
+def test_integer_pointwise_ops_are_not_fused() -> None:
+    tensor_type = TensorType((4,), DType.I32)
+    graph = Graph(
+        ("x",),
+        {
+            "x": Value("x", tensor_type),
+            "sum": Value("sum", tensor_type),
+            "out": Value("out", tensor_type),
+        },
+        (
+            Operation(
+                "add",
+                ("x",),
+                ("sum",),
+                {"scalar": 1.0, "scalar_position": "rhs"},
+            ),
+            Operation(
+                "mul",
+                ("sum",),
+                ("out",),
+                {"scalar": 2.0, "scalar_position": "rhs"},
+            ),
+        ),
+        ("out",),
+    )
+
+    assert [op.op for op in fuse_pointwise(graph).ops] == ["add", "mul"]
+
+
+def test_integer_constants_are_common_subexpressions() -> None:
+    def fn():
+        return (
+            torch.full((4,), 7, dtype=torch.int64),
+            torch.full((4,), 7, dtype=torch.int64),
+        )
+
+    result = compile_callable(fn, ())
+    assert [op.op for op in result.input_graph.ops] == ["full", "full"]
+    assert [op.op for op in result.lowered_graph.ops] == ["full"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["full"]
+
+
+def test_arange_forms_generate_integer_constants() -> None:
+    def fn():
+        return (
+            torch.arange(8),
+            torch.arange(2, 8),
+            torch.arange(2, 8, 2),
+            torch.arange(8, 2, -2),
+            torch.arange(8, dtype=torch.int32),
+        )
+
+    result = compile_callable(fn, ())
+    assert [op.op for op in result.input_graph.ops] == ["arange"] * 5
+    assert [op.op for op in result.lowered_graph.ops] == ["arange"] * 5
+    assert [kernel.kind for kernel in result.plan.kernels] == ["arange"] * 5
+
+    actual = result.plan()
+    expected = tuple(_torch_to_mlx(output) for output in fn())
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert actual_value.dtype == expected_value.dtype
+        assert mx.array_equal(actual_value, expected_value)
+
+
+def test_arange_large_int64_values_do_not_round_through_float() -> None:
+    start = 2**53
+    result = compile_callable(lambda: torch.arange(start, start + 5), ())
+
+    actual = result.plan()[0]
+    expected = _torch_to_mlx(torch.arange(start, start + 5))
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.int64
+    assert mx.array_equal(actual, expected)
+
+
+def test_arange_is_common_subexpression() -> None:
+    def fn():
+        return torch.arange(8), torch.arange(8)
+
+    result = compile_callable(fn, ())
+    assert [op.op for op in result.input_graph.ops] == ["arange", "arange"]
+    assert [op.op for op in result.lowered_graph.ops] == ["arange"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["arange"]
+
+
+def test_arange_rejects_zero_step() -> None:
+    output_type = TensorType((3,), DType.I64)
+    graph = Graph(
+        (),
+        {"out": Value("out", output_type)},
+        (
+            Operation(
+                "arange",
+                (),
+                ("out",),
+                {"start": 0, "end": 3, "step": 0},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(ValueError, match="arange.step must be nonzero"):
+        compile_graph(graph)
+
+
+def test_arange_rejects_non_rank_one_output() -> None:
+    output_type = TensorType((2, 2), DType.I64)
+    graph = Graph(
+        (),
+        {"out": Value("out", output_type)},
+        (
+            Operation(
+                "arange",
+                (),
+                ("out",),
+                {"start": 0, "end": 4, "step": 1},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(ValueError, match="rank-1 tensor"):
+        compile_graph(graph)
+
+
+def test_arange_rejects_output_length_mismatch() -> None:
+    output_type = TensorType((4,), DType.I64)
+    graph = Graph(
+        (),
+        {"out": Value("out", output_type)},
+        (
+            Operation(
+                "arange",
+                (),
+                ("out",),
+                {"start": 0, "end": 3, "step": 1},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(ValueError, match="expected length 3"):
+        compile_graph(graph)
+
+
+def test_integer_constant_rejects_i64_overflow() -> None:
+    output_type = TensorType((2,), DType.I64)
+    graph = Graph(
+        (),
+        {"out": Value("out", output_type)},
+        (
+            Operation(
+                "full",
+                (),
+                ("out",),
+                {"value": 2**63},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(ValueError, match="overflows int64"):
+        compile_graph(graph)
+
+
+def test_arange_rejects_floating_point_outputs() -> None:
+    with pytest.raises(NotImplementedError, match="int32 and int64"):
+        compile_callable(lambda: torch.arange(8, dtype=torch.float32), ())
 
 
 def test_metal_matmul_uses_shared_memory_tiles() -> None:
