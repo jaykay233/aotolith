@@ -9,6 +9,8 @@ from .compiler import (
 )
 from .frontend import capture_fx
 from .ir import DType, Graph, Operation, TensorType, Value
+from .planning import BufferSlot, StoragePlan, ValueLifetime, plan_storage
+from .selection import KernelSelection
 from .passes import (
     canonicalize_batched_matmul,
     eliminate_common_subexpressions,
@@ -21,8 +23,12 @@ from .passes import (
 __all__ = [
     "CompilationResult",
     "CompiledModulePlan",
+    "BufferSlot",
+    "StoragePlan",
+    "ValueLifetime",
     "DType",
     "Graph",
+    "KernelSelection",
     "Operation",
     "TensorType",
     "Value",
@@ -35,5 +41,6 @@ __all__ = [
     "fuse_attention",
     "fuse_pointwise",
     "fold_matmul_input_layouts",
+    "plan_storage",
     "simplify_layouts",
 ]

@@ -1,6 +1,6 @@
 # Transformer Subgraph Compiler
 
-一个面向 Transformer 模型的实验性编译器。项目把 PyTorch FX 图转换成带类型和 shape 的 SSA IR，再逐步经过合法化、布局简化、融合、CSE 和内存规划，最终 lower 成 Metal Shading Language kernel 与可直接执行的编译计划。当前以 Apple Silicon 为第一目标，MLX 用作执行计划和回退算子的验证底座。
+一个面向 Transformer 模型的实验性编译器。项目把 PyTorch FX 图转换成带类型和 shape 的 SSA IR，再经过合法化、布局简化、融合、CSE、liveness/buffer planning 和 kernel selection，最终 lower 成 Metal Shading Language kernel 与可直接执行的编译计划。当前以 Apple Silicon 为第一目标，MLX 用作执行计划和回退算子的验证底座。
 
 ## 项目目标
 
@@ -16,7 +16,15 @@
 6. 产出包含 manifest、IR、权重布局、kernel 和 ABI 版本的编译产物，并支持保存、重载和跨进程 kernel cache。
 7. 用 PyTorch 参考结果验证数值语义，并记录编译期选择、内存计划和 autotune 结果。
 
-当前交付物仍是进程内的 `CompiledPlan`。真实 tiny Llama/Qwen 风格的模型级编译和 logits 对齐已经打通；序列化产物、稳定 ABI、liveness/buffer planning、backend capability table、autotune 和跨进程重载尚未完成。
+当前交付物仍是进程内的 `CompiledPlan`。模型级编译、logits 对齐、liveness/buffer plan 和逐算子 kernel selection 已接入执行计划；编译产物序列化、稳定 ABI、物理 arena 绑定、autotune 和跨进程重载尚未完成。
+
+| 模块 | 当前状态 |
+|---|---|
+| 模型前端与执行 | 支持静态 shape 的 `nn.Module`/callable；参数和 buffer 绑定后可脱离原模块执行 |
+| IR 与图优化 | 支持类型/shape 校验、legalization、布局折叠、融合和 CSE |
+| 存储规划 | 已生成 lifetime、释放点和逻辑 buffer slot；执行器会释放死亡中间值，尚未绑定物理 arena |
+| Kernel 选择 | 已记录每个 lowered op 的原生 kernel 或 MLX fallback；尚无 autotune 和持久化选择记录 |
+| 编译产物 | 目前只在进程内可用；版本化 manifest、kernel artifact 和跨进程重载仍在开发 |
 
 目标按以下三个验收门推进：
 
@@ -36,6 +44,8 @@ KV Cache 在项目里是图输入、图输出和内存布局契约。编译器�
 PyTorch FX
   -> SSA IR
   -> layout simplification / matmul layout folding and canonicalization / attention and pointwise fusion / CSE
+  -> liveness analysis / storage plan
+  -> kernel selection / fallback planning
   -> Metal Shading Language + MLX fallback lowering
   -> mx.fast.metal_kernel
   -> CompiledPlan
@@ -70,6 +80,8 @@ PyTorch FX
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
 - `compile_module` 通过 `torch.func.functional_call` 绑定参数和 buffer，把模块状态转成执行计划的私有输入；返回计划不持有原始 `nn.Module`
 - 支持 `aten.t`、`aten.cumsum`、`aten.index.Tensor`，并对可证明无别名观察者的 `aten.add_` 做 SSA legalization
+- 生成每个 value 的 live interval、峰值活跃字节数、释放点和保守 buffer slot plan；执行器在最后一次使用后移除中间 tensor 引用
+- 为每个 lowered op 记录 `metal_kernel` 或 MLX fallback、生成时对应的 kernel artifact 和选择原因
 - 已用端到端测试验证两层 decoder-only Transformer forward：token embedding、RoPE、causal GQA attention、预归一化 residual、SwiGLU MLP、最终 RMSNorm 和 LM head 可以一起编译到 Metal，并在 FP32 下与 PyTorch CPU 对齐
 - 已验证固定容量静态 KV Cache 的 prefill/decode 图接口：prefill 把 prompt 的 K/V 右对齐写入 cache，decode 接收并返回每层更新后的 K/V；单请求和左侧 padding 的双请求 batch 都连续生成三步，并逐请求与完整序列 forward 的 logits、贪心 token 对齐
 - 构建带 dtype/shape 校验的 SSA IR
@@ -211,6 +223,14 @@ result = compile_callable(fn, example_inputs, codegen_matmul=True)
 inputs = tuple(mx.array(value.numpy()) for value in example_inputs)
 output = result.plan(*inputs)[0]
 mx.eval(output)
+
+print("peak live bytes:", result.plan.storage_plan.peak_live_bytes)
+for selection in result.plan.selections:
+    print(
+        selection.op,
+        selection.implementation,
+        selection.reason,
+    )
 ```
 
 模型级编译使用 `compile_module`：
@@ -242,6 +262,8 @@ mx.eval(logits)
 ```
 
 `compile_module` 在编译期把 `named_parameters()` 和 `named_buffers()` 复制为 MLX array，作为图的私有输入。释放原始 module 后计划仍可执行，但当前同名参数会被去重为同一个状态项；需要保留共享参数的别名关系时应在后续状态布局阶段显式建模。
+
+`storage_plan.lifetimes` 记录每个 value 的活跃区间和字节数，`release_after_op` 已经用于执行器释放中间引用。`storage_plan.slots` 只描述可复用中间值按生命周期归并后的逻辑 slot，不包含输入、输出和模型状态，也尚未把 MLX tensor 绑定到物理 arena；因此 `arena_size_bytes` 是这份中间值计划的保守容量，不是整个模型的显存占用。`selections` 是逐算子的编译期选择记录，不包含运行时计时或 autotune 结果。
 
 编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以用固定最大 batch、左侧 padding 和逐请求 mask 执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此这个例子只验证 cache 的图 ABI 和生成正确性，不代表编译器要提供 cache allocator 或生成引擎。编译器和执行计划目前还不支持动态 shape、控制流、跨进程 kernel 产物以及训练。分页 cache、请求动态进出 batch、采样策略和 serving 由外部推理系统负责，不属于本项目目标。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 

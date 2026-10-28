@@ -9,6 +9,8 @@ from typing import Any
 import mlx.core as mx
 
 from ..ir import DType, Graph, Operation, TensorType
+from ..planning import StoragePlan, plan_storage
+from ..selection import KernelSelection
 from ..passes import LAYOUT_OPS, POINTWISE_OPS
 
 _MLX_DTYPES = {
@@ -289,7 +291,9 @@ def _check_advanced_index_indices(indices: mx.array, upper_bound: int) -> None:
 class CompiledPlan:
     graph: Graph
     kernels: tuple[KernelArtifact, ...]
+    selections: tuple[KernelSelection, ...]
     _callables: dict[str, Any]
+    storage_plan: StoragePlan
 
     def __call__(self, *inputs: Any) -> tuple[mx.array, ...]:
         if len(inputs) != len(self.graph.inputs):
@@ -311,10 +315,12 @@ class CompiledPlan:
                 )
             env[value_id] = array
 
-        for op in self.graph.ops:
+        for op_index, op in enumerate(self.graph.ops):
             runtime = self._callables.get(op.outputs[0])
             if runtime is not None:
                 env[op.outputs[0]] = runtime(*(env[value_id] for value_id in op.inputs))
+                for value_id in self.storage_plan.release_after_op[op_index]:
+                    env.pop(value_id, None)
                 continue
 
             if op.op == "attention":
@@ -408,6 +414,8 @@ class CompiledPlan:
                 env[op.outputs[0]] = _evaluate_pointwise_mlx(
                     op, env, self.graph.value(op.outputs[0]).type
                 )
+            for value_id in self.storage_plan.release_after_op[op_index]:
+                env.pop(value_id, None)
 
         return tuple(env[value_id] for value_id in self.graph.outputs)
 
@@ -429,6 +437,7 @@ class AppleMetalBackend:
             raise RuntimeError("Apple Metal is unavailable in this process")
 
         kernels: list[KernelArtifact] = []
+        selections: list[KernelSelection] = []
         callables: dict[str, Any] = {}
         for index, op in enumerate(graph.ops):
             compiled: tuple[KernelArtifact, Any] | None = None
@@ -510,8 +519,51 @@ class AppleMetalBackend:
                 artifact, runtime = compiled
                 kernels.append(artifact)
                 callables[artifact.output_id] = runtime
+                selections.append(
+                    KernelSelection(
+                        op_index=index,
+                        op=op.op,
+                        output_id=op.outputs[0],
+                        implementation="metal_kernel",
+                        kind=artifact.kind,
+                        reason="native Metal kernel selected",
+                        artifact_name=artifact.name,
+                    )
+                )
+            else:
+                selections.append(
+                    KernelSelection(
+                        op_index=index,
+                        op=op.op,
+                        output_id=op.outputs[0],
+                        implementation="mlx",
+                        kind=op.op,
+                        reason=self._fallback_reason(graph, op),
+                    )
+                )
 
-        return CompiledPlan(graph, tuple(kernels), callables)
+        return CompiledPlan(
+            graph,
+            tuple(kernels),
+            tuple(selections),
+            callables,
+            plan_storage(graph),
+        )
+
+    def _fallback_reason(self, graph: Graph, op: Operation) -> str:
+        if op.op == "attention" and not self.codegen_attention:
+            return "codegen_attention disabled; using MLX scaled dot-product attention"
+        if op.op == "attention":
+            return "attention shape or mask is outside native Metal constraints"
+        if op.op in {"matmul", "addmm"} and not self.codegen_matmul:
+            return "codegen_matmul disabled; using MLX matrix multiplication"
+        if op.op in {"matmul", "addmm"}:
+            return "matmul shape is outside native Metal constraints"
+        if op.op == "cast":
+            return "dtype conversion uses MLX astype"
+        if op.op in LAYOUT_OPS:
+            return "layout operation uses an MLX view or materialization"
+        return "operation uses the MLX runtime implementation"
 
     def _compile_elementwise(
         self,
