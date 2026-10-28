@@ -109,9 +109,18 @@ class CompiledPlan:
                     self.graph, op, env[op.inputs[0]]
                 )
             elif op.op == "matmul":
-                env[op.outputs[0]] = mx.matmul(env[op.inputs[0]], env[op.inputs[1]])
+                left, right = (env[value_id] for value_id in op.inputs)
+                if op.attrs.get("transpose_a", False):
+                    left = mx.swapaxes(left, -1, -2)
+                if op.attrs.get("transpose_b", False):
+                    right = mx.swapaxes(right, -1, -2)
+                env[op.outputs[0]] = mx.matmul(left, right)
             elif op.op == "addmm":
                 bias, left, right = (env[value_id] for value_id in op.inputs)
+                if op.attrs.get("transpose_a", False):
+                    left = mx.swapaxes(left, -1, -2)
+                if op.attrs.get("transpose_b", False):
+                    right = mx.swapaxes(right, -1, -2)
                 alpha = float(op.attrs.get("alpha", 1.0))
                 beta = float(op.attrs.get("beta", 1.0))
                 env[op.outputs[0]] = beta * bias + alpha * mx.matmul(left, right)
@@ -1326,8 +1335,12 @@ class AppleMetalBackend:
         if len(output_type.shape) != 2:
             raise NotImplementedError("Metal matmul currently produces rank-2 tensors")
 
-        rows, reduction = left_type.shape
-        right_reduction, columns = right_type.shape
+        transpose_left = _matmul_transpose_attribute(op, "transpose_a")
+        transpose_right = _matmul_transpose_attribute(op, "transpose_b")
+        logical_left = left_type.shape[::-1] if transpose_left else left_type.shape
+        logical_right = right_type.shape[::-1] if transpose_right else right_type.shape
+        rows, reduction = logical_left
+        right_reduction, columns = logical_right
         if reduction != right_reduction:
             raise ValueError(
                 f"matmul reduction dimensions differ: {reduction} and {right_reduction}"
@@ -1359,6 +1372,8 @@ class AppleMetalBackend:
                 columns,
                 graph,
                 output_type.dtype,
+                transpose_left,
+                transpose_right,
             )
             threads = 256
             name = (
@@ -1376,6 +1391,8 @@ class AppleMetalBackend:
                 micro_rows,
                 micro_columns,
                 graph,
+                transpose_left,
+                transpose_right,
             )
             threads = (
                 (_MATMUL_BLOCK_ROWS // micro_rows)
@@ -1818,6 +1835,13 @@ def _supports_simdgroup_matmul(rows: int, columns: int, dtype: DType) -> bool:
     )
 
 
+def _matmul_transpose_attribute(op: Operation, name: str) -> bool:
+    value = op.attrs.get(name, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"matmul {name} must be a boolean")
+    return value
+
+
 def _emit_simdgroup_matmul_source(
     op: Operation,
     rows: int,
@@ -1825,6 +1849,8 @@ def _emit_simdgroup_matmul_source(
     columns: int,
     graph: Graph,
     dtype: DType,
+    transpose_left: bool,
+    transpose_right: bool,
 ) -> str:
     if rows % _MATMUL_BLOCK_ROWS != 0 or columns % _MATMUL_BLOCK_COLUMNS != 0:
         raise ValueError("simdgroup matmul requires complete 64x64 output blocks")
@@ -1857,6 +1883,8 @@ def _emit_simdgroup_matmul_source(
         exact_reduction
         and reduction % load_vector_width == 0
         and columns % load_vector_width == 0
+        and not transpose_left
+        and not transpose_right
     )
     tile_alignment = "alignas(16) " if vector_loads else ""
     simdgroup_type = {
@@ -1930,10 +1958,15 @@ def _emit_simdgroup_matmul_source(
                 f"        uint local_k = index % {block_reduction}u;",
             ]
         )
-        load_a = (
-            f"in_{left_position}[(row_base + local_row) * {reduction}u "
-            f"+ k_base + local_k]"
-        )
+        if transpose_left:
+            left_index = (
+                f"(k_base + local_k) * {rows}u + row_base + local_row"
+            )
+        else:
+            left_index = (
+                f"(row_base + local_row) * {reduction}u + k_base + local_k"
+            )
+        load_a = f"in_{left_position}[{left_index}]"
         if not exact_reduction:
             load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
         lines.extend(
@@ -1947,10 +1980,15 @@ def _emit_simdgroup_matmul_source(
                 f"        uint local_column = index % {block_columns}u;",
             ]
         )
-        load_b = (
-            f"in_{right_position}[(k_base + local_k) * {columns}u "
-            f"+ col_base + local_column]"
-        )
+        if transpose_right:
+            right_index = (
+                f"(col_base + local_column) * {reduction}u + k_base + local_k"
+            )
+        else:
+            right_index = (
+                f"(k_base + local_k) * {columns}u + col_base + local_column"
+            )
+        load_b = f"in_{right_position}[{right_index}]"
         if not exact_reduction:
             load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
         lines.extend(
@@ -2037,6 +2075,8 @@ def _emit_tiled_matmul_source(
     micro_rows: int,
     micro_columns: int,
     graph: Graph,
+    transpose_left: bool,
+    transpose_right: bool,
 ) -> str:
     if op.op == "addmm":
         bias_id, _, _ = op.inputs
@@ -2091,10 +2131,11 @@ def _emit_tiled_matmul_source(
     )
     lines.append(f"        uint local_row = index / {block_reduction}u;")
     lines.append(f"        uint local_k = index % {block_reduction}u;")
-    load_a = (
-        f"float(in_{left_position}[(row_base + local_row) * {reduction}u "
-        f"+ k_base + local_k])"
-    )
+    if transpose_left:
+        left_index = f"(k_base + local_k) * {rows}u + row_base + local_row"
+    else:
+        left_index = f"(row_base + local_row) * {reduction}u + k_base + local_k"
+    load_a = f"float(in_{left_position}[{left_index}])"
     a_guards = []
     if not exact_rows:
         a_guards.append(f"row_base + local_row < {rows}u")
@@ -2111,10 +2152,13 @@ def _emit_tiled_matmul_source(
     )
     lines.append(f"        uint local_k = index / {block_columns}u;")
     lines.append(f"        uint local_column = index % {block_columns}u;")
-    load_b = (
-        f"float(in_{right_position}[(k_base + local_k) * {columns}u "
-        f"+ col_base + local_column])"
-    )
+    if transpose_right:
+        right_index = (
+            f"(col_base + local_column) * {reduction}u + k_base + local_k"
+        )
+    else:
+        right_index = f"(k_base + local_k) * {columns}u + col_base + local_column"
+    load_b = f"float(in_{right_position}[{right_index}])"
     b_guards = []
     if not exact_columns:
         b_guards.append(f"col_base + local_column < {columns}u")

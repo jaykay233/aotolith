@@ -12,6 +12,7 @@ from .passes import (
     eliminate_common_subexpressions,
     fuse_attention,
     fuse_pointwise,
+    fold_matmul_input_layouts,
     simplify_layouts,
 )
 
@@ -36,6 +37,7 @@ def compile_graph(
     lowered = simplify_layouts(graph)
     lowered = canonicalize_batched_matmul(lowered)
     lowered = fuse_attention(lowered)
+    lowered = fold_matmul_input_layouts(lowered)
     lowered = fuse_pointwise(lowered)
     lowered = eliminate_common_subexpressions(lowered)
     plan = AppleMetalBackend(

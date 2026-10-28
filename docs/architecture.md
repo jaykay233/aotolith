@@ -48,7 +48,7 @@
 
 每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
 
-Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
+除已折叠到矩阵乘的转置外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
 `addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
@@ -70,11 +70,13 @@ IR 定义在 `ir.py`：
 
 这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
 
-## 3. Layout 简化、matmul 规范化与 attention 融合
+## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
 
 `simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。
 
 `canonicalize_batched_matmul` 识别 PyTorch 为 rank-N matmul 生成的折叠模式：输入先 reshape 成二维 batch，执行 `bmm`，输出再 reshape 回原始 batch shape。匹配成功后替换成一个 `matmul`，避免后续 attention pattern 只看到低秩 `bmm`。
+
+`fold_matmul_input_layouts` 处理单个 consumer 的最后一维转置。若 `matmul/addmm` 的操作数来自 `transpose` 或交换最后两维的 `permute`，pass 会把该 op 收进矩阵乘的 `transpose_a`/`transpose_b` attribute。Runtime 在 MLX matmul 前执行等价 swapaxes；项目生成的 rank-2 Metal kernel 则使用转置后的线性地址取数。只要转置结果还被 graph output 或其他节点使用，pass 就保留原 layout op，避免破坏可观察的中间 value。该 pass 在 `fuse_attention` 之后运行，不改变 attention pattern 对 `K^T` 的匹配。
 
 `fuse_attention` 从 PV matmul 反向匹配 `QK^T -> optional scale -> optional additive mask -> softmax -> PV`。它也能恢复 PyTorch 把 batch-head 拍平后执行的 `reshape -> mm -> reshape`。只有内部 value 都只有单个 consumer，且没有被 graph output 观察时才会替换成 `attention`。`scale`、`has_mask`、`causal` 和 `safe_softmax` 存在 operation attribute 中，Q/K/V 保持原 graph 中的 rank-3 或 rank-4 形式。softmax probability 被其他节点使用时不会融合，因为替换会丢掉该中间结果。
 
@@ -277,7 +279,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 `CompiledPlan` 按 SSA 顺序执行 IR：
 
 - 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
-- 默认模式下的 `matmul`、`addmm`：调用 MLX
+- 默认模式下的 `matmul`、`addmm`：调用 MLX，并按 `transpose_a`/`transpose_b` 执行对应的 swapaxes
 - attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
 - cast：调用 MLX `astype`，保留源和目标 dtype、shape
@@ -301,10 +303,10 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
-- kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
+- kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
 - matmul 的 SIMD matrix 只覆盖 FP16/BF16 完整输出块；完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
-- layout op 已做恒等与逆变换消除，但还没有布局传播
+- layout 优化已覆盖恒等、逆变换和矩阵乘输入转置折叠，但还不支持跨 reshape、broadcast 等边界的一般布局传播
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
@@ -312,4 +314,4 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进布局传播与跨进程 kernel cache。
+下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进更一般的布局传播、batched matmul codegen 与跨进程 kernel cache。

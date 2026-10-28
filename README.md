@@ -5,7 +5,7 @@
 ```text
 PyTorch FX
   -> SSA IR
-  -> layout simplification / matmul canonicalization / attention and pointwise fusion / CSE
+  -> layout simplification / matmul layout folding and canonicalization / attention and pointwise fusion / CSE
   -> Metal Shading Language + MLX runtime lowering
   -> mx.fast.metal_kernel
   -> Apple GPU
@@ -34,13 +34,14 @@ PyTorch FX
 - 构建带 dtype/shape 校验的 SSA IR
 - 消除恒等 layout、连续逆 `transpose/permute` 和 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
+- 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
 - 识别 PyTorch 分解图中 `repeat_kv` 产生的 `unsqueeze -> expand -> reshape`，融合后不再物化复制后的 K/V
 - 把相邻 pointwise op 融合成一个 DAG region
 - 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式，并保持 graph output alias
-- 在 schedule 前校验静态视图和布局变换，Runtime 通过 MLX 执行 view 语义
+- 在 schedule 前校验静态视图和布局变换；未折叠的 layout op 由 Runtime 执行 MLX view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
@@ -148,7 +149,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout op 已具备静态校验、恒等与逆变换消除和 MLX lowering，但还没有布局传播。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout 优化已覆盖恒等、逆变换和 matmul 输入转置折叠；`reshape` 跨转置、广播布局等更一般的传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见形式会使用生成的 MSL attention kernel，其余形式回退到 MLX。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 

@@ -82,6 +82,81 @@ def canonicalize_batched_matmul(graph: Graph) -> Graph:
     return simplify_layouts(result)
 
 
+def fold_matmul_input_layouts(graph: Graph) -> Graph:
+    """Fold a single-use last-two-dimension transpose into matmul operands."""
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    removed: set[int] = set()
+    replacements: dict[int, Operation] = {}
+
+    for index, op in enumerate(graph.ops):
+        if op.op not in {"matmul", "addmm"}:
+            continue
+
+        positions = ((1, "transpose_a"), (2, "transpose_b")) if op.op == "addmm" else (
+            (0, "transpose_a"),
+            (1, "transpose_b"),
+        )
+        inputs = list(op.inputs)
+        attrs = dict(op.attrs)
+        changed = False
+        for position, attribute in positions:
+            operand_id = inputs[position]
+            producer_index = producers.get(operand_id)
+            if producer_index is None:
+                continue
+            if (
+                producer_index in removed
+                or operand_id in output_set
+                or len(consumers.get(operand_id, [])) != 1
+            ):
+                continue
+
+            producer = graph.ops[producer_index]
+            operand_type = graph.value(operand_id).type
+            source_type = graph.value(producer.inputs[0]).type
+            if not _is_last_two_transpose(producer, len(operand_type.shape)):
+                continue
+            if producer.op not in {"transpose", "permute"}:
+                continue
+            if producer.outputs != (operand_id,):
+                continue
+            if operand_type.dtype != source_type.dtype:
+                continue
+            expected_shape = source_type.shape[:-2] + (
+                source_type.shape[-1],
+                source_type.shape[-2],
+            )
+            if operand_type.shape != expected_shape:
+                continue
+
+            current = attrs.get(attribute, False)
+            if not isinstance(current, bool):
+                raise ValueError(f"matmul {attribute} must be a boolean")
+            inputs[position] = producer.inputs[0]
+            attrs[attribute] = not current
+            removed.add(producer_index)
+            changed = True
+
+        if changed:
+            replacements[index] = Operation(op.op, tuple(inputs), op.outputs, attrs)
+
+    if not removed:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = replacements.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in removed:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
 def fuse_attention(graph: Graph) -> Graph:
     """Fold QK^T, scale/mask, softmax and PV into one attention operation."""
 

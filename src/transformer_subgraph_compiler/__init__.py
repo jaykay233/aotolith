@@ -8,6 +8,7 @@ from .passes import (
     eliminate_common_subexpressions,
     fuse_attention,
     fuse_pointwise,
+    fold_matmul_input_layouts,
     simplify_layouts,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "eliminate_common_subexpressions",
     "fuse_attention",
     "fuse_pointwise",
+    "fold_matmul_input_layouts",
     "simplify_layouts",
 ]

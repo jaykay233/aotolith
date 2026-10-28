@@ -367,13 +367,42 @@ def test_folded_batched_matmul_is_restored_to_rank_four() -> None:
     query = torch.randn(2, 4, 6, 8)
     key = torch.randn(2, 4, 3, 8)
     result = compile_callable(fn, (query, key))
-    assert [op.op for op in result.lowered_graph.ops] == ["transpose", "matmul"]
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    assert result.lowered_graph.ops[0].attrs == {"transpose_b": True}
 
     inputs = (mx.array(query.numpy()), mx.array(key.numpy()))
     actual = result.plan(*inputs)[0]
     expected = mx.matmul(inputs[0], mx.swapaxes(inputs[1], -1, -2))
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_matmul_input_transpose_folds_into_left_operand() -> None:
+    left = torch.randn(8, 3)
+    right = torch.randn(8, 5)
+    result = compile_callable(lambda lhs, rhs: lhs.T @ rhs, (left, right))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    assert result.lowered_graph.ops[0].attrs == {"transpose_a": True}
+
+    inputs = (mx.array(left.numpy()), mx.array(right.numpy()))
+    actual = result.plan(*inputs)[0]
+    expected = mx.matmul(mx.swapaxes(inputs[0], -1, -2), inputs[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
+def test_matmul_input_transpose_is_kept_when_shared() -> None:
+    left = torch.randn(3, 8)
+    right = torch.randn(3, 5)
+
+    def fn(lhs, rhs):
+        transposed = lhs.T
+        return transposed @ rhs, transposed
+
+    result = compile_callable(fn, (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["permute", "matmul"]
+    assert "transpose_a" not in result.lowered_graph.ops[1].attrs
 
 
 def test_direct_scaled_dot_product_attention_with_mask() -> None:
@@ -1550,6 +1579,49 @@ def test_metal_matmul_simdgroup_vectorizes_complete_tiles(dtype) -> None:
     expected = _torch_to_mlx(inputs[0] @ inputs[1])
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_metal_matmul_codegen_folds_transposed_operand() -> None:
+    torch.manual_seed(34)
+    inputs = (
+        torch.randn(64, 64, dtype=torch.float16),
+        torch.randn(64, 64, dtype=torch.float16),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right.T,
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert result.lowered_graph.ops[0].attrs == {"transpose_b": True}
+    source = result.plan.kernels[0].source
+    assert "(col_base + local_column) * 64u + k_base + local_k" in source
+    assert "vec<T, 8>" not in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(inputs[0] @ inputs[1].T)
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_metal_addmm_codegen_folds_transposed_operand() -> None:
+    torch.manual_seed(35)
+    inputs = (
+        torch.randn(5),
+        torch.randn(4, 3),
+        torch.randn(4, 5),
+    )
+
+    def addmm(bias, left, right):
+        return torch.addmm(bias, left.T, right, alpha=0.75, beta=1.25)
+
+    result = compile_callable(addmm, inputs, codegen_matmul=True)
+    assert result.lowered_graph.ops[0].attrs["transpose_a"] is True
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(addmm(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 def test_simdgroup_addmm_applies_broadcast_bias() -> None:
