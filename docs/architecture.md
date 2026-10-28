@@ -95,7 +95,7 @@ IR 定义在 `ir.py`：
 
 GQA/MQA 有两种入口。直接调用 `F.scaled_dot_product_attention(..., enable_gqa=True)` 时，前端直接生成 `attention`；显式 `repeat_kv` 的分解图则通过 `unsqueeze -> expand -> reshape` 识别出原始 K/V。后一种模式会去掉物化复制，把 K/V head 数低于 Q head 数的 `attention` 交给 MLX。rank-4 下要求 Q head 数是 K/V head 数的整数倍；MQA 是 K/V head 数为 1 的特例。
 
-Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。显式 mask 可以是与 Q/K/V 同 dtype 的 additive mask，也可以是 bool mask；bool mask 中 `True` 表示允许该 key 参与 attention。当 `safe_softmax=True` 且存在显式 mask 时，MLX lowering 会把整行都被 mask 的输出显式置零：additive mask 判断整行是否为 `-inf`，bool mask 判断整行是否为 `False`，避免 fused SDPA 产生 NaN 或错误结果。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 additive-mask attention 会改为执行下面描述的生成 kernel；直接 bool mask 或不满足条件的形状仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
+Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。显式 mask 可以是与 Q/K/V 同 dtype 的 additive mask，也可以是 bool mask；bool mask 中 `True` 表示允许该 key 参与 attention。当 `safe_softmax=True` 且存在显式 mask 时，MLX lowering 会把整行都被 mask 的输出显式置零：additive mask 判断整行是否为 `-inf`，bool mask 判断整行是否为 `False`，避免 fused SDPA 产生 NaN 或错误结果。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 additive-mask 或 bool-mask attention 会改为执行下面描述的生成 kernel；不满足条件的形状仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
 
 ## 4. Pointwise 融合
 
@@ -287,7 +287,7 @@ kernel 的执行方式：
 - key tile 之间只重标定 running sum 和 V accumulator，不物化完整 attention matrix
 - query tile 和 key tile 的尾部用 `-INFINITY` score 或零 probability 补齐，最后一个 tile 不越界读写
 - GQA/MQA 通过静态的 `kv_head = query_head / group_size` 寻址，不展开 K/V head
-- rank-4 additive mask 按 `(batch, head, query, key)` 生成静态 offset，支持 batch/head/query/key 维广播
+- rank-4 additive/bool mask 按 `(batch, head, query, key)` 生成静态 offset，支持 batch/head/query/key 维广播；bool mask 的 `True` 保留对应 score，`False` 将其置为 `-inf`
 - causal mask 在 score 写入 softmax 状态前应用
 
 score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概率与 V fragment，最后写回 FP16、BF16 或 FP32。当前 M5 Pro 上交替启动进程，每项各运行 5 次、每次取 21 轮中位数：
@@ -298,7 +298,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 | `1×8×1024×128` | 1.720 ms | 1.314 ms | 23.6% |
 | `1×8×2048×128` | 6.211 ms | 4.612 ms | 25.7% |
 
-数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256、直接传入 bool mask，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
+数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
 ## 13. Runtime
 

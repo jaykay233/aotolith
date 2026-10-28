@@ -298,8 +298,7 @@ class AppleMetalBackend:
         has_mask = bool(op.attrs.get("has_mask"))
         mask_type = graph.value(op.inputs[3]).type if has_mask else None
         mask_shape = mask_type.shape if mask_type is not None else None
-        if mask_type is not None and mask_type.dtype == DType.BOOL:
-            return None
+        mask_is_boolean = mask_type is not None and mask_type.dtype == DType.BOOL
         if has_mask and not _native_attention_mask_supported(rank, mask_shape):
             return None
 
@@ -462,7 +461,12 @@ class AppleMetalBackend:
         score_expression = f"dot * {float(op.attrs['scale'])!r}"
         if has_mask:
             mask_offset = _attention_mask_offset_expression(rank, mask_shape)
-            score_expression += f" + float(in_3[{mask_offset}])"
+            if mask_is_boolean:
+                score_expression = (
+                    f"in_3[{mask_offset}] ? ({score_expression}) : -INFINITY"
+                )
+            else:
+                score_expression += f" + float(in_3[{mask_offset}])"
         if op.attrs.get("causal"):
             score_expression = (
                 f"key > query_pos ? -INFINITY : ({score_expression})"

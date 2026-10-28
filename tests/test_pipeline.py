@@ -1089,6 +1089,55 @@ def test_native_attention_limits_query_tile_by_shared_memory(
     assert expected_kernel in result.plan.kernels[0].name
 
 
+def test_native_attention_long_sequence_boolean_mask_uses_64_key_tile() -> None:
+    dtype = DType.F16
+    values = {
+        "query": Value("query", TensorType((1, 769, 16), dtype)),
+        "key": Value("key", TensorType((1, 64, 16), dtype)),
+        "value": Value("value", TensorType((1, 64, 16), dtype)),
+        "mask": Value("mask", TensorType((769, 64), DType.BOOL)),
+        "output": Value("output", TensorType((1, 769, 16), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {"scale": 16**-0.5, "has_mask": True, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    kernel = result.plan.kernels[0]
+    assert "metal_attention_flash_24x64_768" in kernel.name
+    assert "float score0 = -INFINITY" in kernel.source
+    assert "float score1 = -INFINITY" in kernel.source
+
+    torch.manual_seed(77)
+    mask = torch.rand(769, 64) > 0.25
+    mask[1, :] = False
+    inputs = (
+        torch.randn(1, 769, 16, dtype=torch.float16),
+        torch.randn(1, 64, 16, dtype=torch.float16),
+        torch.randn(1, 64, 16, dtype=torch.float16),
+        mask,
+    )
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(
+        torch.nn.functional.scaled_dot_product_attention(
+            inputs[0], inputs[1], inputs[2], attn_mask=inputs[3]
+        ).numpy()
+    )
+    empty_row = mx.zeros((1, 16), dtype=mx.float16)
+    mx.eval(actual, expected, empty_row)
+    assert mx.array_equal(actual[:, 1, :], empty_row)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_native_attention_long_sequence_partial_value_chunk() -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(
@@ -1176,7 +1225,7 @@ def test_native_attention_all_masked_row_is_zero() -> None:
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
-def test_boolean_attention_mask_falls_back_to_mlx_and_zeroes_empty_rows() -> None:
+def test_native_attention_boolean_mask_and_zeroes_empty_rows() -> None:
     dtype = DType.F32
     values = {
         "query": Value("query", TensorType((2, 2, 3, 8), dtype)),
@@ -1204,7 +1253,7 @@ def test_boolean_attention_mask_falls_back_to_mlx_and_zeroes_empty_rows() -> Non
         ("output",),
     )
     result = compile_graph(graph, codegen_attention=True)
-    assert result.plan.kernels == ()
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
 
     torch.manual_seed(68)
     mask = torch.rand(1, 1, 3, 4) > 0.25
@@ -1393,6 +1442,53 @@ def test_native_attention_rank3_direct_ir_supports_broadcast_masks(mask_shape) -
     )
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_native_attention_rank3_boolean_mask_on_simd_path() -> None:
+    dtype = DType.F16
+    values = {
+        "query": Value("query", TensorType((2, 5, 16), dtype)),
+        "key": Value("key", TensorType((2, 7, 16), dtype)),
+        "value": Value("value", TensorType((2, 7, 16), dtype)),
+        "mask": Value("mask", TensorType((5, 7), DType.BOOL)),
+        "output": Value("output", TensorType((2, 5, 16), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {"scale": 16**-0.5, "has_mask": True, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+    assert "tile_probabilities_low" in result.plan.kernels[0].source
+
+    torch.manual_seed(76)
+    mask = torch.rand(5, 7) > 0.25
+    mask[1, :] = False
+    inputs = (
+        torch.randn(2, 5, 16, dtype=torch.float16),
+        torch.randn(2, 7, 16, dtype=torch.float16),
+        torch.randn(2, 7, 16, dtype=torch.float16),
+        mask,
+    )
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(
+        torch.nn.functional.scaled_dot_product_attention(
+            inputs[0], inputs[1], inputs[2], attn_mask=inputs[3]
+        ).numpy()
+    )
+    empty_row = mx.zeros((2, 16), dtype=mx.float16)
+    mx.eval(actual, expected, empty_row)
+    assert mx.array_equal(actual[:, 1, :], empty_row)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 def test_native_attention_falls_back_above_threadgroup_limit() -> None:
