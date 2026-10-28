@@ -1842,6 +1842,24 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"metal::tanh({arguments[0]})"
     if op.op == "relu":
         return f"metal::max(0.0f, {arguments[0]})"
+    if op.op == "leaky_relu":
+        value = arguments[0]
+        slope = repr(float(op.attrs.get("negative_slope", 0.01)))
+        return f"(({value}) >= 0.0f ? ({value}) : {slope} * ({value}))"
+    if op.op == "elu":
+        value = arguments[0]
+        alpha = repr(float(op.attrs.get("alpha", 1.0)))
+        return (
+            f"(({value}) >= 0.0f ? ({value}) : "
+            f"{alpha} * (metal::exp({value}) - 1.0f))"
+        )
+    if op.op == "hardswish":
+        value = arguments[0]
+        body = (
+            f"({value}) * metal::min(metal::max(({value}) + 3.0f, 0.0f), 6.0f) "
+            "/ 6.0f"
+        )
+        return f"(metal::isnan({value}) ? NAN : {body})"
     if op.op == "exp":
         return f"metal::exp({arguments[0]})"
     if op.op == "erf":
@@ -1852,7 +1870,7 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"metal::rsqrt({arguments[0]})"
     if op.op == "reciprocal":
         return f"1.0f / {arguments[0]}"
-    if op.op == "clamp":
+    if op.op in {"clamp", "clamp_min", "clamp_max"}:
         value = arguments[0]
         lower = _clamp_bound_expression(op, arguments, "min")
         upper = _clamp_bound_expression(op, arguments, "max")
@@ -2495,6 +2513,18 @@ def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
         return mx.tanh(arguments[0])
     if op.op == "relu":
         return mx.maximum(arguments[0], 0.0)
+    if op.op == "leaky_relu":
+        value = arguments[0]
+        slope = float(op.attrs.get("negative_slope", 0.01))
+        return mx.where(value >= 0.0, value, slope * value)
+    if op.op == "elu":
+        value = arguments[0]
+        alpha = float(op.attrs.get("alpha", 1.0))
+        return mx.where(value >= 0.0, value, alpha * (mx.exp(value) - 1.0))
+    if op.op == "hardswish":
+        value = arguments[0]
+        body = value * mx.minimum(mx.maximum(value + 3.0, 0.0), 6.0) / 6.0
+        return mx.where(mx.isnan(value), float("nan"), body)
     if op.op == "exp":
         return mx.exp(arguments[0])
     if op.op == "erf":
@@ -2505,7 +2535,7 @@ def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
         return 1.0 / mx.sqrt(arguments[0])
     if op.op == "reciprocal":
         return 1.0 / arguments[0]
-    if op.op == "clamp":
+    if op.op in {"clamp", "clamp_min", "clamp_max"}:
         value = arguments[0]
         lower: mx.array | float = -float("inf")
         upper: mx.array | float = float("inf")

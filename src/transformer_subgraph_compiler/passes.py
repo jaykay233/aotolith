@@ -24,6 +24,11 @@ POINTWISE_OPS = {
     "rsqrt",
     "reciprocal",
     "clamp",
+    "clamp_min",
+    "clamp_max",
+    "leaky_relu",
+    "elu",
+    "hardswish",
 }
 
 LAYOUT_OPS = {

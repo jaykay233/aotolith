@@ -51,7 +51,14 @@ _SUPPORTED_OPS = {
     "aten.reciprocal.default": "reciprocal",
     "aten.clamp.default": "clamp",
     "aten.clamp.Tensor": "clamp",
+    "aten.clamp_min.default": "clamp_min",
+    "aten.clamp_min.Tensor": "clamp_min",
+    "aten.clamp_max.default": "clamp_max",
+    "aten.clamp_max.Tensor": "clamp_max",
     "aten.hardtanh.default": "clamp",
+    "aten.leaky_relu.default": "leaky_relu",
+    "aten.elu.default": "elu",
+    "aten.hardswish.default": "hardswish",
 }
 
 _TORCH_DTYPES = {
@@ -65,6 +72,8 @@ _NUMERIC_ATTRS = {
     "add": {"alpha": 1.0},
     "sub": {"alpha": 1.0},
     "rsub": {"alpha": 1.0},
+    "leaky_relu": {"negative_slope": 0.01},
+    "elu": {"alpha": 1.0},
 }
 
 _BINARY_OPS = {"mul", "add", "sub", "rsub", "div", "pow"}
@@ -720,6 +729,35 @@ def _operation_inputs(
                 attrs[f"{name}_input"] = len(inputs)
                 inputs.append(bound_id)
         return tuple(inputs), attrs
+
+    if op in {"clamp_min", "clamp_max"}:
+        if len(args) != 2:
+            raise ValueError(f"{op} expects two arguments, got {len(args)}")
+        inputs = [_argument_ids(args[0], node_ids)]
+        attrs: dict[str, object] = {}
+        bound = args[1]
+        name = "min" if op == "clamp_min" else "max"
+        try:
+            bound_id = _argument_ids(bound, node_ids)
+        except ValueError:
+            if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+                raise ValueError(
+                    f"unsupported {op} {name}: {bound!r}"
+                ) from None
+            attrs[name] = float(bound)
+        else:
+            attrs[f"{name}_input"] = len(inputs)
+            inputs.append(bound_id)
+        return tuple(inputs), attrs
+
+    if op in {"leaky_relu", "elu"}:
+        if len(args) != 2:
+            raise ValueError(f"{op} expects two arguments, got {len(args)}")
+        argument = args[1]
+        if not isinstance(argument, (int, float)) or isinstance(argument, bool):
+            raise ValueError(f"{op} scalar must be a number, got {argument!r}")
+        name = "negative_slope" if op == "leaky_relu" else "alpha"
+        return ((_argument_ids(args[0], node_ids),), {name: float(argument)})
 
     if op in _REDUCTION_OPS:
         if len(args) == 1:

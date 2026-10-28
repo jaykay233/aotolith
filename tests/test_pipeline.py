@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 import pytest
 import torch
@@ -1604,6 +1606,126 @@ def test_clamp_supports_low_precision(dtype) -> None:
         torch.clamp(x.float(), min=-0.5, max=0.5).numpy(),
         dtype=mlx_dtype,
     )
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("activation", ["leaky_relu", "elu", "hardswish"])
+def test_additional_activations_match_pytorch(activation) -> None:
+    torch.manual_seed(28)
+    x = torch.randn(2, 3, 31)
+    if activation == "leaky_relu":
+        fn = lambda value: torch.nn.functional.leaky_relu(value, 0.17)
+    elif activation == "elu":
+        fn = lambda value: torch.nn.functional.elu(value, 1.3)
+    else:
+        fn = lambda value: torch.nn.functional.hardswish(value)
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [activation]
+    assert [kernel.kind for kernel in result.plan.kernels] == [activation]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_additional_activations_fuse_with_surrounding_pointwise_ops() -> None:
+    def fn(value):
+        activated = torch.nn.functional.leaky_relu(value, 0.2)
+        activated = torch.nn.functional.elu(activated, 0.7)
+        return torch.nn.functional.hardswish(activated) + value
+
+    torch.manual_seed(29)
+    x = torch.randn(2, 3, 17)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    body = result.lowered_graph.ops[0].attrs["body"]
+    assert [op.op for op in body] == ["leaky_relu", "elu", "hardswish", "add"]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("activation", ["leaky_relu", "elu", "hardswish"])
+def test_additional_activations_preserve_signed_zero(activation) -> None:
+    inputs = torch.tensor([-0.0, 0.0, float("nan"), float("inf"), float("-inf")])
+    functions = {
+        "leaky_relu": lambda value: torch.nn.functional.leaky_relu(value, 0.25),
+        "elu": lambda value: torch.nn.functional.elu(value, 1.5),
+        "hardswish": lambda value: torch.nn.functional.hardswish(value),
+    }
+    fn = functions[activation]
+    result = compile_callable(fn, (inputs,))
+    actual = result.plan(mx.array(inputs.numpy()))[0]
+    expected = mx.array(fn(inputs).numpy())
+    mx.eval(actual, expected)
+    actual_values = actual.tolist()
+    expected_values = expected.tolist()
+    for actual_value, expected_value in zip(
+        actual_values[:2], expected_values[:2], strict=True
+    ):
+        assert math.copysign(1.0, actual_value) == math.copysign(
+            1.0, expected_value
+        )
+    assert math.isnan(actual_values[2]) == math.isnan(expected_values[2])
+    finite = mx.isfinite(actual) & mx.isfinite(expected)
+    assert mx.allclose(
+        mx.where(finite, actual, 0.0),
+        mx.where(finite, expected, 0.0),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("operation", ["clamp_min", "clamp_max"])
+@pytest.mark.parametrize("tensor_bound", [False, True])
+def test_one_sided_clamp_variants_match_pytorch(operation, tensor_bound) -> None:
+    torch.manual_seed(30)
+    x = torch.randn(2, 3, 7)
+    reduce = torch.clamp_min if operation == "clamp_min" else torch.clamp_max
+    if tensor_bound:
+        bound = torch.randn(1, 3, 1) * 0.5
+        fn = lambda value, limit: reduce(value * limit, limit)
+        inputs = (x, bound)
+    else:
+        fn = lambda value: reduce(value, 0.25 if operation == "clamp_min" else -0.25)
+        inputs = (x,)
+
+    result = compile_callable(fn, inputs)
+    if tensor_bound:
+        assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+        body = result.lowered_graph.ops[0].attrs["body"]
+        assert body[-1].op == operation
+        key = "min_input" if operation == "clamp_min" else "max_input"
+        assert body[-1].attrs[key] == 1
+    else:
+        assert [op.op for op in result.lowered_graph.ops] == [operation]
+        assert [kernel.kind for kernel in result.plan.kernels] == [operation]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_extended_activations_support_low_precision(dtype) -> None:
+    torch.manual_seed(31)
+    x = torch.randn(2, 3, 13, dtype=dtype)
+
+    def fn(value):
+        value = torch.nn.functional.leaky_relu(value, 0.2)
+        value = torch.nn.functional.elu(value, 0.7)
+        return torch.nn.functional.hardswish(value)
+
+    result = compile_callable(fn, (x,))
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
+    expected = mx.array(fn(x.float()).numpy(), dtype=mlx_dtype)
     mx.eval(actual, expected)
     assert actual.dtype == expected.dtype
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
