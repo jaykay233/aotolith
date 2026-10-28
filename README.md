@@ -18,7 +18,7 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
-| 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
+| 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量拼接 | `aten.cat.default`，校验非拼接轴 shape 和 dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
 | 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
@@ -39,6 +39,7 @@ PyTorch FX
 - 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
 - 消除仍能由 matmul batch broadcast 恢复语义的单消费者 `expand`，避免为广播输入生成额外拷贝
 - 支持沿正负轴拼接 tensor，可用于 RoPE 的 `rotate_half`、QKV 拼接等常见结构；`cat` 本身由 MLX runtime 执行，前后 pointwise 子图仍分别融合
+- 把静态 `split`、`chunk` 和 `unbind` 展开为已有的 `slice`/`squeeze` op；Q/K/V 投影结果拆开后仍可共享 layout、CSE 和 pointwise 融合
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive/bool mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
@@ -154,7 +155,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask 可以是同 dtype 的 additive mask 或 bool mask。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见 additive-mask 或 bool-mask 形式会使用生成的 MSL attention kernel。bool mask 的 `True` 表示允许该 key 参与 attention，整行都为 `False` 时输出为零。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 

@@ -1667,6 +1667,72 @@ def test_rotary_embedding_rotate_half_compiles_and_runs() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_chunk_lowering_fuses_qkv_pointwise_region() -> None:
+    def qkv_gate(x):
+        query, key, value = torch.chunk(x, 3, dim=-1)
+        return torch.nn.functional.silu(query) * value + key
+
+    torch.manual_seed(80)
+    x = torch.randn(2, 3, 12)
+    result = compile_callable(qkv_gate, (x,))
+
+    assert [op.op for op in result.input_graph.ops].count("slice") == 3
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "slice",
+        "slice",
+        "slice",
+        "fused_elementwise",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(qkv_gate(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_split_with_sizes_supports_uneven_parts() -> None:
+    def split_uneven(x):
+        first, middle, last = torch.split(x, [1, 3, 2], dim=-1)
+        return torch.cat((first + 1.0, middle * 2.0, last - 3.0), dim=-1)
+
+    torch.manual_seed(81)
+    x = torch.randn(2, 6)
+    result = compile_callable(split_uneven, (x,))
+
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert lowered_ops.count("slice") == 3
+    assert "cat" in lowered_ops
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(split_uneven(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_unbind_lowering_returns_each_squeezed_tensor() -> None:
+    def unbind_heads(x):
+        return torch.unbind(x, dim=1)
+
+    torch.manual_seed(82)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(unbind_heads, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "slice",
+        "squeeze",
+        "slice",
+        "squeeze",
+        "slice",
+        "squeeze",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in unbind_heads(x))
+    mx.eval(*actual, *expected)
+    assert len(actual) == len(expected) == 3
+    assert all(mx.allclose(a, e) for a, e in zip(actual, expected, strict=True))
+
+
 def test_transformer_decoder_block_compiles_and_runs() -> None:
     def decoder_block(
         x,

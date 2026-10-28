@@ -59,10 +59,14 @@
 | `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
 | `aten.scalar_tensor.default` | `scalar_tensor`，标量值和输出 dtype 进入 IR |
 | `aten.cat.default` | `cat`，tensor 输入序列和拼接轴进入 IR |
+| `aten.split.Tensor`、`aten.split_with_sizes.default` | 在前端展开为多个 `slice` |
+| `aten.unbind.int` | 在前端展开为多个 `slice + squeeze` |
 
 每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。IR 的数值 dtype 包括 FP16、BF16 和 FP32，另外支持 `DType.BOOL` 表示谓词、logical op、bool mask 和 bool 输出。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
 
 `cat` 保留所有 tensor 输入，并把归一化前的轴写入 `dim` attribute。Backend 要求输入 rank、非拼接轴 shape 和非拼接轴目标 shape 完全一致，且所有输入与输出 dtype 相同；拼接轴长度必须等于各输入该轴长度之和。Runtime 用 `mx.concatenate` 执行，不生成 Metal kernel。
+
+`split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 

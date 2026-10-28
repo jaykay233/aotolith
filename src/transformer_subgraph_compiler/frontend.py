@@ -133,6 +133,12 @@ _TUPLE_ATTENTION_TARGETS = {
     "aten._scaled_dot_product_efficient_attention.default",
 }
 
+_SEQUENCE_VIEW_TARGETS = {
+    "aten.split.Tensor",
+    "aten.split_with_sizes.default",
+    "aten.unbind.int",
+}
+
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     """Capture a supported callable with make_fx and build the compiler IR."""
@@ -160,6 +166,13 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
         elif node.op == "call_function":
             if node in node_ids:
                 continue
+            target = str(node.target)
+            if target in _SEQUENCE_VIEW_TARGETS:
+                sequence_ops = _sequence_view_operations(node, node_ids, len(ops))
+                for operation, value in sequence_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                continue
             rms_norm = _rms_norm_operation(node, node_ids)
             if rms_norm is not None:
                 inputs, attrs, output_type, folded_nodes = rms_norm
@@ -169,7 +182,6 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 for folded_node in folded_nodes:
                     node_ids[folded_node] = output_id
                 continue
-            target = str(node.target)
             if target in _DIRECT_ATTENTION_TARGETS:
                 inputs, attrs, output_node = _attention_operation(
                     node, node_ids
@@ -242,8 +254,14 @@ def _reject_unsupported_attention_dropout(graph: object) -> None:
 def _node_type(node: object) -> TensorType:
     meta = getattr(node, "meta", {})
     tensor = meta.get("val")
-    if tensor is None or not hasattr(tensor, "shape") or not hasattr(tensor, "dtype"):
+    if tensor is None:
         raise ValueError(f"missing concrete shape/dtype metadata for FX node: {node}")
+    return _tensor_type(tensor, f"FX node {node}")
+
+
+def _tensor_type(tensor: object, context: str) -> TensorType:
+    if not hasattr(tensor, "shape") or not hasattr(tensor, "dtype"):
+        raise ValueError(f"missing concrete shape/dtype metadata for {context}")
 
     dtype = _TORCH_DTYPES.get(str(tensor.dtype))
     if dtype is None:
@@ -251,6 +269,130 @@ def _node_type(node: object) -> TensorType:
     if any(dim <= 0 for dim in tensor.shape):
         raise ValueError(f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}")
     return TensorType(tuple(int(dim) for dim in tensor.shape), dtype)
+
+
+def _sequence_view_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[Operation, Value], ...]:
+    """Expand split/chunk/unbind into single-output slice or squeeze ops."""
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if kwargs:
+        raise ValueError(f"{target} received unsupported keyword arguments: {kwargs!r}")
+
+    if target in {"aten.split.Tensor", "aten.split_with_sizes.default"}:
+        if len(args) != 3:
+            raise ValueError(f"{target} expects three arguments, got {len(args)}")
+        input_node, _, dim = args
+    else:
+        if len(args) != 2:
+            raise ValueError(f"{target} expects two arguments, got {len(args)}")
+        input_node, dim = args
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+    axis = dim + rank if dim < 0 else dim
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+
+    metadata = getattr(node, "meta", {}).get("val")
+    if not isinstance(metadata, (tuple, list)) or not metadata:
+        raise ValueError(f"missing concrete split output metadata for FX node: {node}")
+    output_types = tuple(
+        _tensor_type(tensor, f"output {index} of FX node {node}")
+        for index, tensor in enumerate(metadata)
+    )
+    if target == "aten.unbind.int":
+        expected_shape = input_type.shape[:axis] + input_type.shape[axis + 1 :]
+        if any(output_type.shape != expected_shape for output_type in output_types):
+            raise ValueError(
+                f"unbind output shapes must all be {expected_shape}, got "
+                f"{[output_type.shape for output_type in output_types]}"
+            )
+    else:
+        if sum(output_type.shape[axis] for output_type in output_types) != input_type.shape[axis]:
+            raise ValueError(
+                f"split output lengths do not preserve input axis {axis} of shape "
+                f"{input_type.shape}"
+            )
+        for output_type in output_types:
+            if (
+                output_type.shape[:axis] != input_type.shape[:axis]
+                or output_type.shape[axis + 1 :] != input_type.shape[axis + 1 :]
+            ):
+                raise ValueError(
+                    f"split output shape {output_type.shape} is incompatible with "
+                    f"input shape {input_type.shape} on axis {axis}"
+                )
+
+    input_id = _argument_ids(input_node, node_ids)
+    operations: list[tuple[Operation, Value]] = []
+    output_ids: list[str] = []
+    start = 0
+    next_op_index = first_op_index
+    for output_type in output_types:
+        if target == "aten.unbind.int":
+            sliced_id = f"v{next_op_index}"
+            next_op_index += 1
+            sliced_shape = (
+                input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
+            )
+            operations.append(
+                (
+                    Operation(
+                        "slice",
+                        (input_id,),
+                        (sliced_id,),
+                        {
+                            "dim": axis,
+                            "start": start,
+                            "end": start + 1,
+                            "step": 1,
+                        },
+                    ),
+                    Value(sliced_id, TensorType(sliced_shape, input_type.dtype)),
+                )
+            )
+            start += 1
+            output_id = f"v{next_op_index}"
+            next_op_index += 1
+            operation = Operation(
+                "squeeze", (sliced_id,), (output_id,), {"dim": axis}
+            )
+        else:
+            output_id = f"v{next_op_index}"
+            next_op_index += 1
+            end = start + output_type.shape[axis]
+            operation = Operation(
+                "slice",
+                (input_id,),
+                (output_id,),
+                {"dim": axis, "start": start, "end": end, "step": 1},
+            )
+            start = end
+        output_ids.append(output_id)
+        operations.append((operation, Value(output_id, output_type)))
+
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{target} outputs must be selected with getitem")
+        user_args = getattr(user, "args", ())
+        if len(user_args) != 2 or not isinstance(user_args[1], int):
+            raise ValueError(f"malformed sequence output selection: {user!r}")
+        index = user_args[1]
+        if index < 0 or index >= len(output_ids):
+            raise ValueError(f"{target} output index {index} is out of range")
+        node_ids[user] = output_ids[index]
+
+    return tuple(operations)
 
 
 def _attention_operation(
