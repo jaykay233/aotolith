@@ -756,6 +756,26 @@ def test_roll_lowers_to_mlx_layout_without_a_kernel(roll) -> None:
     assert mx.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize(("op_name", "diagonal"), [("triu", 1), ("tril", -1)])
+def test_triangular_ops_use_mlx_without_a_kernel(op_name, diagonal) -> None:
+    operation = getattr(torch, op_name)
+
+    def fn(value):
+        return operation(value, diagonal=diagonal)
+
+    torch.manual_seed(48)
+    value = torch.randn(2, 3, 4, 5)
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert result.lowered_graph.ops[0].attrs["diagonal"] == diagonal
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
 def test_inverse_flip_and_roll_layouts_are_eliminated() -> None:
     def fn(x):
         flipped = torch.flip(torch.flip(x, dims=[1, -1]), dims=[-1, 1])

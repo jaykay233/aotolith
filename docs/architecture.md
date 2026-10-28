@@ -22,6 +22,7 @@
 | `aten.slice.Tensor` | `slice` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
+| `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |
 | `aten.unsqueeze.default` | `unsqueeze` |
 | `aten.squeeze.dim` | `squeeze` |
 | `aten.clone.default`、`aten.alias.default` | `contiguous`、`alias` |

@@ -20,6 +20,8 @@ _SUPPORTED_OPS = {
     "aten.slice.Tensor": "slice",
     "aten.flip.default": "flip",
     "aten.roll.default": "roll",
+    "aten.triu.default": "triu",
+    "aten.tril.default": "tril",
     "aten.unsqueeze.default": "unsqueeze",
     "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
@@ -1143,6 +1145,16 @@ def _operation_inputs(
             {"shifts": normalized_shifts, "dims": normalized_dims},
         )
 
+    if op in {"triu", "tril"}:
+        if len(args) not in {1, 2}:
+            raise ValueError(f"{op} expects one or two arguments, got {len(args)}")
+        diagonal = args[1] if len(args) == 2 else kwargs.get("diagonal", 0)
+        if len(args) == 2 and "diagonal" in kwargs:
+            raise ValueError(f"{op} received duplicate diagonal arguments")
+        if not isinstance(diagonal, int) or isinstance(diagonal, bool):
+            raise ValueError(f"{op}.diagonal must be an integer, got {diagonal!r}")
+        return ((_argument_ids(args[0], node_ids),), {"diagonal": diagonal})
+
     if op == "unsqueeze":
         if len(args) != 2:
             raise ValueError(f"unsqueeze expects two arguments, got {len(args)}")
@@ -1325,10 +1337,12 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("dims")
     if op == "roll":
         allowed.update({"shifts", "dims"})
+    if op in {"triu", "tril"}:
+        allowed.add("diagonal")
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
-    if op in {"cast", "scalar_tensor", "cat", "flip", "roll"}:
+    if op in {"cast", "scalar_tensor", "cat", "flip", "roll", "triu", "tril"}:
         return {}
 
     attrs: dict[str, object] = {}

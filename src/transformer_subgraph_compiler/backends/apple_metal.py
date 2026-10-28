@@ -118,6 +118,10 @@ class CompiledPlan:
             elif op.op == "embedding":
                 weight, indices = (env[value_id] for value_id in op.inputs)
                 env[op.outputs[0]] = mx.take(weight, indices, axis=0)
+            elif op.op in {"triu", "tril"}:
+                diagonal = int(op.attrs["diagonal"])
+                operation = mx.triu if op.op == "triu" else mx.tril
+                env[op.outputs[0]] = operation(env[op.inputs[0]], diagonal)
             elif op.op == "cat":
                 rank = len(env[op.inputs[0]].shape)
                 axis = int(op.attrs["dim"]) % rank
@@ -203,6 +207,8 @@ class AppleMetalBackend:
                 _validate_cat_op(graph, op)
             elif op.op == "embedding":
                 _validate_embedding_op(graph, op)
+            elif op.op in {"triu", "tril"}:
+                _validate_triangular_op(graph, op)
             elif op.op == "cast":
                 _validate_cast_op(graph, op)
                 output_type = graph.value(op.outputs[0]).type
@@ -3027,6 +3033,20 @@ def _validate_embedding_op(graph: Graph, op: Operation) -> None:
     for name in ("scale_grad_by_freq", "sparse"):
         if not isinstance(op.attrs.get(name, False), bool):
             raise ValueError(f"embedding.{name} must be a boolean")
+
+
+def _validate_triangular_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    if len(input_type.shape) < 2:
+        raise NotImplementedError(f"{op.op} requires a tensor with rank >= 2")
+    if input_type != output_type:
+        raise ValueError(f"{op.op} must preserve the input tensor type")
+    diagonal = op.attrs.get("diagonal")
+    if not isinstance(diagonal, int) or isinstance(diagonal, bool):
+        raise ValueError(f"{op.op}.diagonal must be an integer, got {diagonal!r}")
 
 
 def _validate_cast_op(graph: Graph, op: Operation) -> None:
