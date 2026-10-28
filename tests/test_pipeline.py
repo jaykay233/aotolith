@@ -2473,6 +2473,7 @@ def test_trigonometric_ops_are_generated_as_metal_kernels(op_name) -> None:
         ("log10", (0.125, 0.5, 1.0, 2.0, 7.5), "metal::log10("),
         ("log1p", (0.125, 0.5, 1.0, 2.0, 7.5), "log1p("),
         ("expm1", (-2.0, -0.5, -0.001, 0.0, 0.001, 0.5, 2.0), "tsc_expm1("),
+        ("exp2", (-2.0, -0.5, -0.0, 0.0, 0.5, 2.0), "metal::exp2("),
         ("floor", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::floor("),
         ("ceil", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::ceil("),
         ("round", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::rint("),
@@ -2529,8 +2530,20 @@ def test_additional_unary_ops_are_generated_as_metal_kernels(
             "tsc_logsigmoid(",
             {},
         ),
+        (
+            "hardsigmoid",
+            lambda value: torch.nn.functional.hardsigmoid(value),
+            "metal::min(metal::max(",
+            {},
+        ),
     ],
-    ids=["softplus-default", "softplus-custom", "mish", "logsigmoid"],
+    ids=[
+        "softplus-default",
+        "softplus-custom",
+        "mish",
+        "logsigmoid",
+        "hardsigmoid",
+    ],
 )
 def test_smooth_activations_are_generated_as_stable_metal_kernels(
     op_name, fn, source_expression, expected_attrs
@@ -2586,8 +2599,9 @@ def test_smooth_activations_fuse_with_surrounding_pointwise_ops() -> None:
         lambda value: torch.nn.functional.softplus(value),
         lambda value: torch.nn.functional.mish(value),
         lambda value: torch.nn.functional.logsigmoid(value),
+        lambda value: torch.nn.functional.hardsigmoid(value),
     ],
-    ids=["softplus", "mish", "logsigmoid"],
+    ids=["softplus", "mish", "logsigmoid", "hardsigmoid"],
 )
 def test_smooth_activations_preserve_nonfinite_values(fn) -> None:
     value = torch.tensor(
@@ -2621,6 +2635,223 @@ def test_smooth_activations_support_low_precision(dtype) -> None:
     mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
     actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
     expected = mx.array(fn(x.float()).numpy(), dtype=mlx_dtype)
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def _numerical_pointwise_chain(left, right):
+    upper = torch.maximum(left, right)
+    lower = torch.minimum(left, right)
+    stable_sum = torch.logaddexp(upper, lower)
+    angle = torch.atan2(lower, upper)
+    gate = torch.nn.functional.hardsigmoid(upper - lower)
+    active = torch.nn.functional.threshold(gate, 0.25, -1.0)
+    return torch.exp2(active) + stable_sum + angle
+
+
+@pytest.mark.parametrize("op_name", ["maximum", "minimum"])
+def test_maximum_and_minimum_preserve_signed_zero_and_nan(op_name) -> None:
+    operation = getattr(torch, op_name)
+    left = torch.tensor([-0.0, 0.0, -0.0, 1.0, float("nan")])
+    right = torch.tensor([0.0, -0.0, -0.0, 2.0, 3.0])
+    result = compile_callable(lambda lhs, rhs: operation(lhs, rhs), (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert [kernel.kind for kernel in result.plan.kernels] == [op_name]
+    assert "metal::isnan(" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(left.numpy()), mx.array(right.numpy()))[0]
+    expected = operation(left, right)
+    mx.eval(actual)
+    for actual_value, expected_value in zip(
+        actual.tolist(), expected.tolist(), strict=True
+    ):
+        if math.isnan(expected_value):
+            assert math.isnan(actual_value)
+            continue
+        assert actual_value == expected_value
+        if expected_value == 0.0:
+            assert math.copysign(1.0, actual_value) == math.copysign(
+                1.0, expected_value
+            )
+
+
+def test_logaddexp_preserves_nonfinite_values() -> None:
+    left = torch.tensor(
+        [
+            -float("inf"),
+            float("inf"),
+            -float("inf"),
+            float("inf"),
+            0.0,
+            float("nan"),
+        ]
+    )
+    right = torch.tensor(
+        [
+            -float("inf"),
+            float("inf"),
+            float("inf"),
+            -float("inf"),
+            -float("inf"),
+            1.0,
+        ]
+    )
+    result = compile_callable(torch.logaddexp, (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["logaddexp"]
+    assert "tsc_logaddexp(" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(left.numpy()), mx.array(right.numpy()))[0]
+    expected = torch.logaddexp(left, right)
+    mx.eval(actual)
+    for actual_value, expected_value in zip(
+        actual.tolist(), expected.tolist(), strict=True
+    ):
+        if math.isnan(expected_value):
+            assert math.isnan(actual_value)
+        else:
+            assert actual_value == expected_value
+
+
+def test_atan2_preserves_signed_zero_and_infinite_quadrants() -> None:
+    left = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            float("inf"),
+            -float("inf"),
+            float("inf"),
+            -float("inf"),
+            3.0,
+        ]
+    )
+    right = torch.tensor(
+        [
+            0.0,
+            0.0,
+            -0.0,
+            -0.0,
+            -0.0,
+            -0.0,
+            float("inf"),
+            float("inf"),
+            -float("inf"),
+            -float("inf"),
+            4.0,
+        ]
+    )
+    result = compile_callable(torch.atan2, (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["atan2"]
+    assert "tsc_atan2(" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(left.numpy()), mx.array(right.numpy()))[0]
+    expected = torch.atan2(left, right)
+    mx.eval(actual)
+    for actual_value, expected_value in zip(
+        actual.tolist(), expected.tolist(), strict=True
+    ):
+        if math.isnan(expected_value):
+            assert math.isnan(actual_value)
+            continue
+        assert actual_value == pytest.approx(expected_value, abs=1e-6)
+        if expected_value == 0.0:
+            assert math.copysign(1.0, actual_value) == math.copysign(
+                1.0, expected_value
+            )
+
+
+@pytest.mark.parametrize("keyword_arguments", [False, True], ids=["positional", "keyword"])
+def test_threshold_matches_pytorch_arguments_and_boundaries(
+    keyword_arguments,
+) -> None:
+    def fn(value):
+        if keyword_arguments:
+            return torch.ops.aten.threshold.default(
+                value, threshold=0.25, value=-2.0
+            )
+        return torch.ops.aten.threshold.default(value, 0.25, -2.0)
+
+    value = torch.tensor(
+        [-float("inf"), -0.1, 0.25, 0.2501, float("inf"), float("nan")]
+    )
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["threshold"]
+    assert result.lowered_graph.ops[0].attrs == {
+        "threshold": 0.25,
+        "value": -2.0,
+    }
+    assert "> 0.25 ?" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = fn(value)
+    mx.eval(actual)
+    for actual_value, expected_value in zip(
+        actual.tolist(), expected.tolist(), strict=True
+    ):
+        if math.isnan(expected_value):
+            assert math.isnan(actual_value)
+        else:
+            assert actual_value == expected_value
+
+
+def test_numerical_pointwise_ops_fuse_into_one_metal_kernel() -> None:
+    torch.manual_seed(34)
+    inputs = (torch.randn(2, 3, 17), torch.randn(2, 3, 17) * 0.5)
+    result = compile_callable(_numerical_pointwise_chain, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    body = result.lowered_graph.ops[0].attrs["body"]
+    assert [op.op for op in body] == [
+        "maximum",
+        "minimum",
+        "logaddexp",
+        "atan2",
+        "sub",
+        "hardsigmoid",
+        "threshold",
+        "exp2",
+        "add",
+        "add",
+    ]
+    source = result.plan.kernels[0].source
+    for expression in (
+        "tsc_logaddexp(",
+        "tsc_atan2(",
+        "metal::exp2(",
+        "metal::isnan(",
+    ):
+        assert expression in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(_numerical_pointwise_chain(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_numerical_pointwise_ops_support_low_precision(dtype) -> None:
+    torch.manual_seed(35)
+    inputs = (
+        torch.randn(2, 3, 13, dtype=dtype),
+        torch.randn(2, 3, 13, dtype=dtype) * 0.5,
+    )
+    result = compile_callable(_numerical_pointwise_chain, inputs)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        *(mx.array(value.float().numpy(), dtype=mlx_dtype) for value in inputs)
+    )[0]
+    expected = mx.array(
+        _numerical_pointwise_chain(
+            *(value.float() for value in inputs)
+        ).numpy(),
+        dtype=mlx_dtype,
+    )
     mx.eval(actual, expected)
     assert actual.dtype == expected.dtype
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)

@@ -48,6 +48,9 @@
 | `aten.rsub.Scalar` | `rsub` |
 | `aten.div.Tensor` | `div` |
 | `aten.pow.Tensor_Tensor`、`aten.pow.Tensor_Scalar`、`aten.pow.Scalar` | `pow` |
+| `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
+| `aten.logaddexp.default` | `logaddexp` |
+| `aten.atan2.default` | `atan2` |
 | `aten.neg.default` | `neg` |
 | `aten.abs.default` | `abs` |
 | `aten.sigmoid.default` | `sigmoid` |
@@ -56,8 +59,11 @@
 | `aten.leaky_relu.default` | `leaky_relu` |
 | `aten.elu.default` | `elu` |
 | `aten.hardswish.default` | `hardswish` |
+| `aten.hardsigmoid.default` | `hardsigmoid` |
+| `aten.threshold.default` | `threshold`，保留 `threshold` 和 `value` |
 | `aten.exp.default` | `exp` |
 | `aten.expm1.default` | `expm1` |
+| `aten.exp2.default` | `exp2` |
 | `aten.log.default` | `log` |
 | `aten.log2.default` | `log2` |
 | `aten.log10.default` | `log10` |
@@ -108,7 +114,7 @@
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute；`scalar_tensor` 是无 tensor 输入的 pointwise 常量节点，值和输出 dtype 分别来自 operation attribute 与节点 metadata。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute；`scalar_tensor` 是无 tensor 输入的 pointwise 常量节点，值和输出 dtype 分别来自 operation attribute 与节点 metadata。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
@@ -220,7 +226,11 @@ input_offset = (elem % 3) * 1
 
 `round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
 
-`softplus` 使用 threshold 分段公式：`beta * x > threshold` 时直接返回 `x`，否则计算 `log1p(exp(beta * x)) / beta`。`logsigmoid` 使用 `min(x, 0) - log1p(exp(-abs(x)))`，避免正输入时直接计算 `log(sigmoid(x))` 溢出。`mish` 计算 `x * tanh(softplus(x, 1, 20))`，在 `x > 20` 时直接返回 `x`。这些路径都复用 `_MSL_HEADER` 中的 helper，并能与其他 pointwise op 融合。
+`softplus` 使用 threshold 分段公式：`beta * x > threshold` 时直接返回 `x`，否则计算 `log1p(exp(beta * x)) / beta`。`logsigmoid` 使用 `min(x, 0) - log1p(exp(-abs(x)))`，避免正输入时直接计算 `log(sigmoid(x))` 溢出。`mish` 计算 `x * tanh(softplus(x, 1, 20))`，在 `x > 20` 时直接返回 `x`。`hardsigmoid` 计算 `min(max(x + 3, 0), 6) / 6`；`threshold` 仅在 `x > threshold` 时保留输入，否则返回 `value`，两者都显式传播 NaN。这些路径都复用 `_MSL_HEADER` 中的 helper，并能与其他 pointwise op 融合。
+
+`maximum`/`minimum` 在比较相等时选择左操作数，以匹配 PyTorch 对 signed zero 的行为，并显式传播任一操作数的 NaN。`logaddexp` 使用 `max(a, b) + log1p(exp(-abs(a - b)))`，避免两个同号大数直接相加后溢出；任一输入为 NaN 时返回 NaN，最大值为正无穷时返回正无穷，两个 `-inf` 返回 `-inf`。`exp2` 直接生成 `metal::exp2`。
+
+Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异，因此 `tsc_atan2` 显式处理 NaN、`x == ±0`、`y == ±0`、`x`/`y` 为无穷以及 `(-inf, -inf)` 等象限边界，其余有限值回退到系统 `atan2`。这些规则与 `torch.atan2` 的参数顺序一致。
 
 ## 8. Metal softmax reduction
 

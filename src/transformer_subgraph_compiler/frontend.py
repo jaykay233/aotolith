@@ -53,6 +53,7 @@ _SUPPORTED_OPS = {
     "aten.relu.default": "relu",
     "aten.exp.default": "exp",
     "aten.expm1.default": "expm1",
+    "aten.exp2.default": "exp2",
     "aten.log.default": "log",
     "aten.log2.default": "log2",
     "aten.log10.default": "log10",
@@ -79,6 +80,8 @@ _SUPPORTED_OPS = {
     "aten.leaky_relu.default": "leaky_relu",
     "aten.elu.default": "elu",
     "aten.hardswish.default": "hardswish",
+    "aten.hardsigmoid.default": "hardsigmoid",
+    "aten.threshold.default": "threshold",
     "aten.eq.Tensor": "eq",
     "aten.eq.Scalar": "eq",
     "aten.ne.Tensor": "ne",
@@ -106,6 +109,10 @@ _SUPPORTED_OPS = {
     "aten.isnan.default": "isnan",
     "aten.isinf.default": "isinf",
     "aten.masked_fill.Scalar": "masked_fill",
+    "aten.maximum.default": "maximum",
+    "aten.minimum.default": "minimum",
+    "aten.logaddexp.default": "logaddexp",
+    "aten.atan2.default": "atan2",
     "aten.scalar_tensor.default": "scalar_tensor",
     "aten.cat.default": "cat",
     "aten.embedding.default": "embedding",
@@ -132,6 +139,7 @@ _NUMERIC_ATTRS = {
     "leaky_relu": {"negative_slope": 0.01},
     "elu": {"alpha": 1.0},
     "softplus": {"beta": 1.0, "threshold": 20.0},
+    "threshold": {"threshold": 0.0, "value": 0.0},
 }
 
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
@@ -143,6 +151,10 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "rsub",
     "div",
     "pow",
+    "maximum",
+    "minimum",
+    "logaddexp",
+    "atan2",
     "logical_and",
     "logical_or",
     "logical_xor",
@@ -1394,6 +1406,27 @@ def _operation_inputs(
         return (
             (_argument_ids(args[0], node_ids),),
             {"beta": float(beta), "threshold": float(threshold)},
+        )
+
+    if op == "threshold":
+        if len(args) not in {1, 2, 3}:
+            raise ValueError(
+                f"threshold expects one to three arguments, got {len(args)}"
+            )
+        if len(args) >= 2 and "threshold" in kwargs:
+            raise ValueError("threshold received duplicate threshold arguments")
+        if len(args) >= 3 and "value" in kwargs:
+            raise ValueError("threshold received duplicate value arguments")
+        threshold = args[1] if len(args) >= 2 else kwargs.get("threshold", 0.0)
+        fill_value = args[2] if len(args) >= 3 else kwargs.get("value", 0.0)
+        for name, value in (("threshold", threshold), ("value", fill_value)):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(
+                    f"threshold.{name} must be a scalar number, got {value!r}"
+                )
+        return (
+            (_argument_ids(args[0], node_ids),),
+            {"threshold": float(threshold), "value": float(fill_value)},
         )
 
     if op == "cast":

@@ -75,6 +75,46 @@ inline float tsc_logsigmoid(float value) {
         - log1p(metal::exp(-metal::abs(value)));
 }
 
+inline float tsc_logaddexp(float left, float right) {
+    if (metal::isnan(left) || metal::isnan(right)) {
+        return NAN;
+    }
+    float maximum = left < right ? right : left;
+    if (metal::isinf(maximum)) {
+        return maximum;
+    }
+    return maximum + log1p(metal::exp(-metal::abs(left - right)));
+}
+
+inline float tsc_atan2(float y, float x) {
+    constexpr float pi = 3.14159265358979323846f;
+    if (metal::isnan(y) || metal::isnan(x)) {
+        return NAN;
+    }
+    bool x_negative = (as_type<uint>(x) & 0x80000000u) != 0u;
+    if (metal::isinf(y)) {
+        if (metal::isinf(x)) {
+            float magnitude = x_negative ? 0.75f * pi : 0.25f * pi;
+            return metal::copysign(magnitude, y);
+        }
+        return metal::copysign(0.5f * pi, y);
+    }
+    if (metal::isinf(x)) {
+        return x_negative
+            ? metal::copysign(pi, y)
+            : metal::copysign(0.0f, y);
+    }
+    if (x == 0.0f) {
+        if (y == 0.0f) {
+            return x_negative
+                ? metal::copysign(pi, y)
+                : metal::copysign(0.0f, y);
+        }
+        return metal::copysign(0.5f * pi, y);
+    }
+    return atan2(y, x);
+}
+
 inline float tsc_mish(float value) {
     return value > 20.0f
         ? value
@@ -2176,6 +2216,20 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
     if op.op == "pow":
         left, right = _binary_operands(op, arguments)
         return f"metal::pow({left}, {right})"
+    if op.op in {"maximum", "minimum"}:
+        left, right = _binary_operands(op, arguments)
+        comparison = "<" if op.op == "maximum" else ">"
+        selected = f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
+        return (
+            f"((metal::isnan({left}) || metal::isnan({right})) "
+            f"? NAN : {selected})"
+        )
+    if op.op == "logaddexp":
+        left, right = _binary_operands(op, arguments)
+        return f"tsc_logaddexp({left}, {right})"
+    if op.op == "atan2":
+        left, right = _binary_operands(op, arguments)
+        return f"tsc_atan2({left}, {right})"
     if op.op in {"add", "sub", "rsub"}:
         left, right = _binary_operands(op, arguments)
         operator = "+" if op.op == "add" else "-"
@@ -2209,10 +2263,27 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
             "/ 6.0f"
         )
         return f"(metal::isnan({value}) ? NAN : {body})"
+    if op.op == "hardsigmoid":
+        value = arguments[0]
+        body = (
+            "metal::min(metal::max("
+            f"({value}) + 3.0f, 0.0f), 6.0f) / 6.0f"
+        )
+        return f"(metal::isnan({value}) ? NAN : {body})"
+    if op.op == "threshold":
+        value = arguments[0]
+        threshold = _msl_float_literal(float(op.attrs["threshold"]))
+        fill_value = _msl_float_literal(float(op.attrs["value"]))
+        return (
+            f"(metal::isnan({value}) ? {value} : "
+            f"(({value}) > {threshold} ? ({value}) : {fill_value}))"
+        )
     if op.op == "exp":
         return f"metal::exp({arguments[0]})"
     if op.op == "expm1":
         return f"tsc_expm1({arguments[0]})"
+    if op.op == "exp2":
+        return f"metal::exp2({arguments[0]})"
     if op.op == "log":
         return f"metal::log({arguments[0]})"
     if op.op == "log2":
@@ -2958,6 +3029,20 @@ def _evaluate_pointwise_mlx(
         if op.op == "add":
             return left + alpha * right
         return left - alpha * right
+    if op.op in {"maximum", "minimum"}:
+        left, right = _binary_mx_operands(op, arguments)
+        comparison = left < right if op.op == "maximum" else left > right
+        selected = mx.where(comparison, right, left)
+        return mx.where(mx.isnan(left) | mx.isnan(right), float("nan"), selected)
+    if op.op == "logaddexp":
+        left, right = _binary_mx_operands(op, arguments)
+        maximum = mx.where(left < right, right, left)
+        body = maximum + mx.log1p(mx.exp(-mx.abs(left - right)))
+        body = mx.where(mx.isinf(maximum), maximum, body)
+        return mx.where(mx.isnan(left) | mx.isnan(right), float("nan"), body)
+    if op.op == "atan2":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.arctan2(left, right)
     if op.op == "neg":
         return -arguments[0]
     if op.op == "abs":
@@ -2980,10 +3065,25 @@ def _evaluate_pointwise_mlx(
         value = arguments[0]
         body = value * mx.minimum(mx.maximum(value + 3.0, 0.0), 6.0) / 6.0
         return mx.where(mx.isnan(value), float("nan"), body)
+    if op.op == "hardsigmoid":
+        value = arguments[0]
+        body = mx.minimum(mx.maximum(value + 3.0, 0.0), 6.0) / 6.0
+        return mx.where(mx.isnan(value), float("nan"), body)
+    if op.op == "threshold":
+        value = arguments[0]
+        threshold = float(op.attrs["threshold"])
+        fill_value = float(op.attrs["value"])
+        return mx.where(
+            mx.isnan(value),
+            value,
+            mx.where(value > threshold, value, fill_value),
+        )
     if op.op == "exp":
         return mx.exp(arguments[0])
     if op.op == "expm1":
         return mx.expm1(arguments[0])
+    if op.op == "exp2":
+        return mx.exp2(arguments[0])
     if op.op == "log":
         return mx.log(arguments[0])
     if op.op == "log2":

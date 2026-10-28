@@ -24,6 +24,7 @@ POINTWISE_OPS = {
     "relu",
     "exp",
     "expm1",
+    "exp2",
     "log",
     "log2",
     "log10",
@@ -46,6 +47,8 @@ POINTWISE_OPS = {
     "leaky_relu",
     "elu",
     "hardswish",
+    "hardsigmoid",
+    "threshold",
     "eq",
     "ne",
     "lt",
@@ -60,6 +63,10 @@ POINTWISE_OPS = {
     "isinf",
     "where",
     "masked_fill",
+    "maximum",
+    "minimum",
+    "logaddexp",
+    "atan2",
     "scalar_tensor",
 }
 
