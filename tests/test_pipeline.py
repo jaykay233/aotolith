@@ -663,7 +663,7 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
     assert "simdgroup_float8x8 qk_accumulator" in source
     assert f"simdgroup_{simdgroup_type}8x8 qk_frag_q" in source
     assert "simdgroup_load(qk_frag_k" in source
-    assert f"tile_k + warp * 8u * 64u" in source
+    assert "key_fragment * 8u * 64u" in source
     assert "threadgroup T tile_probabilities_low[256]" in source
     assert "threadgroup float tile_pv[512]" in source
     assert "simdgroup_float8x8 pv_accumulator" in source
@@ -677,6 +677,52 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
     mx.eval(actual, expected)
     tolerance = 2e-2 if dtype == torch.bfloat16 else 5e-3
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
+)
+def test_native_attention_reuses_query_tile_across_simd_groups(
+    dtype, tolerance
+) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    torch.manual_seed(66)
+    inputs = (
+        torch.randn(1, 2, 17, 64, dtype=dtype),
+        torch.randn(1, 2, 40, 64, dtype=dtype),
+        torch.randn(1, 2, 40, 64, dtype=dtype),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    kernel = result.plan.kernels[0]
+    source = kernel.source
+
+    assert "metal_attention_flash_16x32_512" in kernel.name
+    assert "threadgroup T tile_q[1024]" in source
+    assert "threadgroup float tile_scores[512]" in source
+    assert "threadgroup T tile_probabilities_low[512]" in source
+    assert "if (warp < 8u)" in source
+    assert "uint query_fragment = warp / 4u" in source
+    assert "uint key_fragment = warp % 4u" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+def test_native_attention_limits_query_tile_by_shared_memory() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    inputs = tuple(torch.randn(1, 1, 16, 256, dtype=torch.float16) for _ in range(3))
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    source = result.plan.kernels[0].source
+
+    assert "metal_attention_flash_8x32_256" in result.plan.kernels[0].name
+    assert "threadgroup T tile_q[2048]" in source
 
 
 @pytest.mark.parametrize(

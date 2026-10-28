@@ -25,6 +25,7 @@ _MATMUL_BLOCK_ROWS = 64
 _MATMUL_BLOCK_COLUMNS = 64
 _MATMUL_BLOCK_REDUCTION = 32
 _METAL_KERNEL_CACHE_SIZE = 256
+_ATTENTION_MAX_SHARED_BYTES = 30 * 1024
 
 _MSL_HEADER = """
 inline float tsc_erf(float value) {
@@ -278,9 +279,28 @@ class AppleMetalBackend:
         query_heads = query_shape[-3] if rank == 4 else 1
         key_value_heads = key_shape[-3] if rank == 4 else 1
         group_size = query_heads // key_value_heads
-        query_tile = 8
         key_tile = 32
-        threads = query_tile * key_tile
+        low_precision_attention = output_type.dtype in {DType.F16, DType.BF16}
+        use_simdgroup_qk = low_precision_attention and query_head_dim % 8 == 0
+        use_simdgroup_pv = low_precision_attention and value_head_dim % 8 == 0
+        query_tile = 8
+        if (
+            use_simdgroup_qk
+            and use_simdgroup_pv
+            and query_length > query_tile
+        ):
+            candidate_query_tile = 16
+            element_bytes = 2
+            shared_bytes = (
+                candidate_query_tile * query_head_dim * element_bytes
+                + key_tile * max(query_head_dim, value_head_dim) * element_bytes
+                + candidate_query_tile * key_tile * 4
+                + candidate_query_tile * key_tile * element_bytes
+                + candidate_query_tile * value_head_dim * 4
+            )
+            if shared_bytes <= _ATTENTION_MAX_SHARED_BYTES:
+                query_tile = candidate_query_tile
+        threads = query_tile * 32
         query_blocks = ceil(query_length / query_tile)
         query_count = batch * query_heads * query_blocks
 
@@ -302,33 +322,37 @@ class AppleMetalBackend:
                 f"key > query_pos ? -INFINITY : ({score_expression})"
             )
 
-        use_simdgroup_qk = (
-            output_type.dtype in {DType.F16, DType.BF16}
-            and query_head_dim % 8 == 0
-        )
         if use_simdgroup_qk:
             simdgroup_type = {
                 DType.F16: "half",
                 DType.BF16: "bfloat",
             }[output_type.dtype]
+            query_fragments = query_tile // 8
+            qk_group_count = query_fragments * 4
             qk_steps = "\n".join(
-                f"""                simdgroup_load(qk_frag_q, tile_q + {dimension}u,
+                f"""                simdgroup_load(qk_frag_q, tile_q
+                    + query_fragment * 8u * {query_head_dim}u + {dimension}u,
                     {query_head_dim}, 0, false);
-                simdgroup_load(qk_frag_k, tile_k + warp * 8u * {query_head_dim}u
-                    + {dimension}u, {query_head_dim}, 0, true);
+                simdgroup_load(qk_frag_k, tile_k
+                    + key_fragment * 8u * {query_head_dim}u + {dimension}u,
+                    {query_head_dim}, 0, true);
                 simdgroup_multiply_accumulate(
                     qk_accumulator, qk_frag_q, qk_frag_k, qk_accumulator);"""
                 for dimension in range(0, query_head_dim, 8)
             )
             qk_score_source = f"""
-            if (warp < 4u) {{
+            if (warp < {qk_group_count}u) {{
+                uint query_fragment = warp / 4u;
+                uint key_fragment = warp % 4u;
                 simdgroup_float8x8 qk_accumulator =
                     make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 simdgroup_{simdgroup_type}8x8 qk_frag_q;
                 simdgroup_{simdgroup_type}8x8 qk_frag_k;
 {qk_steps}
-                simdgroup_store(
-                    qk_accumulator, tile_scores + warp * 8u, {key_tile}, 0, false);
+                simdgroup_store(qk_accumulator,
+                    tile_scores + query_fragment * 8u * {key_tile}u
+                        + key_fragment * 8u,
+                    {key_tile}, 0, false);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -353,20 +377,21 @@ class AppleMetalBackend:
                 score = {score_expression};
             }}
 """
-        use_simdgroup_pv = (
-            output_type.dtype in {DType.F16, DType.BF16}
-            and value_head_dim % 8 == 0
-        )
         if use_simdgroup_pv:
             simdgroup_type = {
                 DType.F16: "half",
                 DType.BF16: "bfloat",
             }[output_type.dtype]
+            query_fragments = query_tile // 8
+            value_fragments = value_head_dim // 8
+            pv_fragment_count = query_fragments * value_fragments
             pv_steps = "\n".join(
                 f"""                simdgroup_load(pv_frag_probability,
-                    tile_probabilities_low + {tile_key}u, {key_tile}, 0, false);
+                    tile_probabilities_low + output_row_fragment * 8u
+                        * {key_tile}u + {tile_key}u, {key_tile}, 0, false);
                 simdgroup_load(pv_frag_value, tile_k
-                    + {tile_key * value_head_dim}u + output_fragment * 8u,
+                    + {tile_key * value_head_dim}u
+                    + output_column_fragment * 8u,
                     {value_head_dim}, 0, false);
                 simdgroup_multiply_accumulate(
                     pv_accumulator, pv_frag_probability, pv_frag_value,
@@ -393,15 +418,19 @@ class AppleMetalBackend:
 """
             pv_accumulation_source = f"""
             for (uint output_fragment = warp;
-                 output_fragment * 8u < {value_head_dim}u;
-                 output_fragment += 8u) {{
+                 output_fragment < {pv_fragment_count}u;
+                 output_fragment += {query_tile}u) {{
+                uint output_row_fragment = output_fragment / {value_fragments}u;
+                uint output_column_fragment = output_fragment % {value_fragments}u;
                 simdgroup_float8x8 pv_accumulator =
                     make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 simdgroup_{simdgroup_type}8x8 pv_frag_probability;
                 simdgroup_{simdgroup_type}8x8 pv_frag_value;
 {pv_steps}
                 simdgroup_store(pv_accumulator,
-                    tile_pv + output_fragment * 8u, {value_head_dim}, 0, false);
+                    tile_pv + output_row_fragment * 8u * {value_head_dim}u
+                        + output_column_fragment * 8u,
+                    {value_head_dim}, 0, false);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 

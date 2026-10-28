@@ -69,7 +69,7 @@ matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 6
 result = compile_callable(fn, example_inputs, codegen_attention=True)
 ```
 
-kernel 每个 threadgroup 处理 8 个 query 和 32 个 key，一个 warp 负责一个 query。Q/K/V tile 先协作加载到 threadgroup memory；FP16/BF16 下由 4 个 SIMD group 用 `simdgroup_multiply_accumulate` 一次算出完整的 `8×32` QK score tile，warp 内用 `simd_max`/`simd_sum` 做 online softmax，再由 8 个 SIMD group 计算 `8×32 @ 32×D` 的 PV tile。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
+kernel 每个 threadgroup 处理 32 个 key，以及 8 或 16 个 query。FP16/BF16 且 QK/PV 都满足 SIMD matrix 条件时，shared memory 预算允许就选 `16×32` tile、512 个 thread；否则使用 `8×32` tile、256 个 thread。Q/K/V tile 先协作加载到 threadgroup memory；QK 按 `8×8` fragment 并行计算 score tile，warp 内用 `simd_max`/`simd_sum` 做 online softmax，PV 再把 query/value 的 `8×8` fragment 分给 SIMD group。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
 
 ## 为什么没有直接改 Triton
 
