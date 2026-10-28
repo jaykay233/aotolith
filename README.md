@@ -48,7 +48,7 @@ PyTorch FX
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
 - 可选的 fused Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
-- matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
+- matmul shared-memory tiling：`64×64×32` threadgroup block，小 K 用 4×4、大 K 用 8×4 每线程 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
@@ -61,7 +61,7 @@ PyTorch FX
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
 ```
 
-matmul kernel 现在使用寄存器 tiling：每个 thread 一次计算多个输出，复用 A/B 的加载，用 float 做 FMA 累加。K 小于 1024 时使用 4×4 microtile，K 较大时使用 8×4；完整 tile 走无边界检查快路径，尾部 shape 才生成 predicate。它仍没有 shared memory、SIMD matrix 或 autotune，实测比旧的一线程一输出版本快，但仍慢于 MLX，所以默认开关保持关闭。
+matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 64×32 和 B 的 32×64 片段协作加载到 threadgroup memory，再由每个 thread 的寄存器 microtile 复用。K 小于 1024 时使用 4×4 microtile，K 较大时使用 8×4；完整 tile 走无边界检查快路径，尾部 shape 才生成 predicate。当前仍没有 vectorized load、SIMD matrix、split-K 或 autotune，实测仍慢于 MLX，所以默认开关保持关闭。
 
 传入 `codegen_attention=True` 会为满足条件的 attention 生成原生 MSL kernel：
 

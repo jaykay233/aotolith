@@ -21,6 +21,9 @@ _ELEMENTS_PER_THREAD = 4
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
+_MATMUL_BLOCK_ROWS = 64
+_MATMUL_BLOCK_COLUMNS = 64
+_MATMUL_BLOCK_REDUCTION = 32
 _METAL_KERNEL_CACHE_SIZE = 256
 
 _MSL_HEADER = """
@@ -953,7 +956,7 @@ class AppleMetalBackend:
             raise NotImplementedError("Metal matmul requires identical input/output dtypes")
 
         micro_rows, micro_columns = _select_matmul_microtile(reduction)
-        source = _emit_register_matmul_source(
+        source = _emit_tiled_matmul_source(
             op,
             rows,
             reduction,
@@ -962,7 +965,17 @@ class AppleMetalBackend:
             micro_columns,
             graph,
         )
-        name = f"metal_{op.op}_{micro_rows}x{micro_columns}_{index}"
+        threads = (
+            (_MATMUL_BLOCK_ROWS // micro_rows)
+            * (_MATMUL_BLOCK_COLUMNS // micro_columns)
+        )
+        row_blocks = ceil(rows / _MATMUL_BLOCK_ROWS)
+        column_blocks = ceil(columns / _MATMUL_BLOCK_COLUMNS)
+        name = (
+            f"metal_{op.op}_tiled_"
+            f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
+            f"{_MATMUL_BLOCK_REDUCTION}_{micro_rows}x{micro_columns}_{index}"
+        )
         kernel = _metal_kernel(
             name,
             tuple(f"in_{position}" for position in range(len(op.inputs))),
@@ -971,11 +984,11 @@ class AppleMetalBackend:
             "",
         )
         grid = (
-            ceil(columns / micro_columns),
-            ceil(rows / micro_rows),
+            row_blocks * column_blocks * threads,
+            1,
             1,
         )
-        threadgroup = (min(32, grid[0]), min(8, grid[1]), 1)
+        threadgroup = (threads, 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
         def runtime(*inputs: mx.array) -> mx.array:
@@ -1387,7 +1400,7 @@ def _select_matmul_microtile(reduction: int) -> tuple[int, int]:
     return _MATMUL_MICROTILE
 
 
-def _emit_register_matmul_source(
+def _emit_tiled_matmul_source(
     op: Operation,
     rows: int,
     reduction: int,
@@ -1413,52 +1426,110 @@ def _emit_register_matmul_source(
         left_position = 0
         right_position = 1
 
-    exact_tiles = rows % micro_rows == 0 and columns % micro_columns == 0
+    block_rows = _MATMUL_BLOCK_ROWS
+    block_columns = _MATMUL_BLOCK_COLUMNS
+    block_reduction = _MATMUL_BLOCK_REDUCTION
+    micro_rows_per_block = block_rows // micro_rows
+    micro_columns_per_block = block_columns // micro_columns
+    threads = micro_rows_per_block * micro_columns_per_block
+    column_blocks = ceil(columns / block_columns)
+    exact_rows = rows % block_rows == 0
+    exact_columns = columns % block_columns == 0
+    exact_reduction = reduction % block_reduction == 0
     lines = [
-        f"uint row_base = thread_position_in_grid.y * {micro_rows}u;",
-        f"uint col_base = thread_position_in_grid.x * {micro_columns}u;",
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+        f"uint block_row = threadgroup_index / {column_blocks}u;",
+        f"uint block_column = threadgroup_index % {column_blocks}u;",
+        f"uint row_base = block_row * {block_rows}u;",
+        f"uint col_base = block_column * {block_columns}u;",
+        f"uint micro_row = tid / {micro_columns_per_block}u;",
+        f"uint micro_column = tid % {micro_columns_per_block}u;",
+        f"threadgroup float tile_a[{block_rows * block_reduction}];",
+        f"threadgroup float tile_b[{block_reduction * block_columns}];",
     ]
-    if not exact_tiles:
-        lines.extend(
-            [
-                f"if (row_base >= {rows}u || col_base >= {columns}u) {{",
-                "    return;",
-                "}",
-            ]
-        )
-        for row in range(micro_rows):
-            lines.append(f"bool row_ok_{row} = row_base + {row}u < {rows}u;")
-        for column in range(micro_columns):
-            lines.append(f"bool col_ok_{column} = col_base + {column}u < {columns}u;")
-
     for row in range(micro_rows):
         for column in range(micro_columns):
             lines.append(f"float acc_{row}_{column} = 0.0f;")
+    lines.append(
+        f"for (uint k_base = 0u; k_base < {reduction}u; "
+        f"k_base += {block_reduction}u) {{"
+    )
 
-    lines.append(f"for (uint k = 0u; k < {reduction}u; ++k) {{")
+    lines.append(
+        f"    for (uint index = tid; index < {block_rows * block_reduction}u; "
+        f"index += {threads}u) {{"
+    )
+    lines.append(f"        uint local_row = index / {block_reduction}u;")
+    lines.append(f"        uint local_k = index % {block_reduction}u;")
+    load_a = (
+        f"float(in_{left_position}[(row_base + local_row) * {reduction}u "
+        f"+ k_base + local_k])"
+    )
+    a_guards = []
+    if not exact_rows:
+        a_guards.append(f"row_base + local_row < {rows}u")
+    if not exact_reduction:
+        a_guards.append(f"k_base + local_k < {reduction}u")
+    if a_guards:
+        load_a = f"{' && '.join(a_guards)} ? {load_a} : 0.0f"
+    lines.append(f"        tile_a[index] = {load_a};")
+    lines.append("    }")
+
+    lines.append(
+        f"    for (uint index = tid; index < {block_reduction * block_columns}u; "
+        f"index += {threads}u) {{"
+    )
+    lines.append(f"        uint local_k = index / {block_columns}u;")
+    lines.append(f"        uint local_column = index % {block_columns}u;")
+    load_b = (
+        f"float(in_{right_position}[(k_base + local_k) * {columns}u "
+        f"+ col_base + local_column])"
+    )
+    b_guards = []
+    if not exact_columns:
+        b_guards.append(f"col_base + local_column < {columns}u")
+    if not exact_reduction:
+        b_guards.append(f"k_base + local_k < {reduction}u")
+    if b_guards:
+        load_b = f"{' && '.join(b_guards)} ? {load_b} : 0.0f"
+    lines.append(f"        tile_b[index] = {load_b};")
+    lines.append("    }")
+    lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+    lines.append(f"    for (uint local_k = 0u; local_k < {block_reduction}u; ++local_k) {{")
     for row in range(micro_rows):
-        load = (
-            f"float(in_{left_position}["
-            f"(row_base + {row}u) * {reduction}u + k])"
+        lines.append(
+            f"        float av_{row} = tile_a[(micro_row * {micro_rows}u + {row}u) "
+            f"* {block_reduction}u + local_k];"
         )
-        if not exact_tiles:
-            load = f"row_ok_{row} ? {load} : 0.0f"
-        lines.append(f"    float av_{row} = {load};")
     for column in range(micro_columns):
-        load = (
-            f"float(in_{right_position}["
-            f"k * {columns}u + col_base + {column}u])"
+        lines.append(
+            f"        float bv_{column} = tile_b[local_k * {block_columns}u "
+            f"+ micro_column * {micro_columns}u + {column}u];"
         )
-        if not exact_tiles:
-            load = f"col_ok_{column} ? {load} : 0.0f"
-        lines.append(f"    float bv_{column} = {load};")
     for row in range(micro_rows):
         for column in range(micro_columns):
             lines.append(
-                f"    acc_{row}_{column} = fma("
+                f"        acc_{row}_{column} = fma("
                 f"av_{row}, bv_{column}, acc_{row}_{column});"
             )
+    lines.append("    }")
+    lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
     lines.append("}")
+
+    exact_tiles = exact_rows and exact_columns
+    if not exact_tiles:
+        for row in range(micro_rows):
+            lines.append(
+                f"bool row_ok_{row} = "
+                f"row_base + micro_row * {micro_rows}u + {row}u < {rows}u;"
+            )
+        for column in range(micro_columns):
+            lines.append(
+                f"bool col_ok_{column} = "
+                f"col_base + micro_column * {micro_columns}u + {column}u < {columns}u;"
+            )
 
     for row in range(micro_rows):
         for column in range(micro_columns):
@@ -1467,8 +1538,9 @@ def _emit_register_matmul_source(
                 lines.append(f"if (row_ok_{row} && col_ok_{column}) {{")
             indent = "    " if not exact_tiles else ""
             lines.append(
-                f"{indent}uint {linear} = (row_base + {row}u) * {columns}u "
-                f"+ col_base + {column}u;"
+                f"{indent}uint {linear} = "
+                f"(row_base + micro_row * {micro_rows}u + {row}u) * {columns}u "
+                f"+ col_base + micro_column * {micro_columns}u + {column}u;"
             )
             accumulator = f"acc_{row}_{column}"
             if bias_id is not None:

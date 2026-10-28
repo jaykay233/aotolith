@@ -31,7 +31,8 @@ def main() -> None:
     fallback = compile_callable(matmul, torch_inputs)
     kernel = compiled.plan.kernels[0]
     print("custom kernel:", kernel.name)
-    print("register tiling:", "8x4" if "8x4" in kernel.name else "4x4")
+    print("shared-memory tile: 64x64x32")
+    print("register microtile:", "8x4" if "8x4" in kernel.name else "4x4")
 
     inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)
     actual = compiled.plan(*inputs)[0]
@@ -42,7 +43,7 @@ def main() -> None:
 
     custom_ms = benchmark(lambda: compiled.plan(*inputs)[0])
     mlx_ms = benchmark(lambda: fallback.plan(*inputs)[0])
-    print(f"custom register-tiled: {custom_ms:.3f} ms")
+    print(f"custom tiled:          {custom_ms:.3f} ms")
     print(f"MLX matmul:            {mlx_ms:.3f} ms")
     print(f"custom / MLX:          {custom_ms / mlx_ms:.2f}x")
 

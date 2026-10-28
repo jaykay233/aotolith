@@ -1284,14 +1284,16 @@ def test_scalar_pointwise_ops_are_fused() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_metal_matmul_uses_register_microtile() -> None:
+def test_metal_matmul_uses_shared_memory_tiles() -> None:
     torch.manual_seed(23)
     inputs = (torch.randn(11, 7), torch.randn(7, 13))
     result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
     kernel = result.plan.kernels[0]
 
-    assert kernel.name == "metal_matmul_4x4_0"
-    assert "threadgroup float" not in kernel.source
+    assert kernel.name == "metal_matmul_tiled_64x64x32_4x4_0"
+    assert "threadgroup float tile_a[2048]" in kernel.source
+    assert "threadgroup float tile_b[2048]" in kernel.source
+    assert "threadgroup_barrier(mem_flags::mem_threadgroup)" in kernel.source
     assert "fma(av_0, bv_0, acc_0_0)" in kernel.source
     assert "acc_3_3" in kernel.source
 
@@ -1306,8 +1308,21 @@ def test_large_k_matmul_uses_8x4_microtile() -> None:
     result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
     kernel = result.plan.kernels[0]
 
-    assert kernel.name == "metal_matmul_8x4_0"
+    assert kernel.name == "metal_matmul_tiled_64x64x32_8x4_0"
     assert "acc_7_3" in kernel.source
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array((inputs[0] @ inputs[1]).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_handles_reduction_tail() -> None:
+    torch.manual_seed(27)
+    inputs = (torch.randn(67, 35), torch.randn(35, 71))
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    kernel = result.plan.kernels[0]
+
+    assert "k_base + local_k < 35u" in kernel.source
     actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
     expected = mx.array((inputs[0] @ inputs[1]).numpy())
     mx.eval(actual, expected)
@@ -1353,7 +1368,7 @@ def test_addmm_codegen_broadcasts_bias(bias_shape) -> None:
 
 
 def test_exact_matmul_tiles_skip_boundary_predicates() -> None:
-    inputs = (torch.randn(8, 8), torch.randn(8, 8))
+    inputs = (torch.randn(64, 32), torch.randn(32, 64))
     result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
     source = result.plan.kernels[0].source
 

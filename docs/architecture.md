@@ -213,18 +213,18 @@ beta * bias + alpha * (A @ B)
 
 bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 的静态 broadcast 规则。FP16/BF16 输入用 float 累加，最后 cast 回输出 dtype。
 
-### 寄存器 tiling
+### Shared-memory tiling
 
-每个 thread 计算一个 microtile，而不是只计算一个输出：
+每个 threadgroup 计算输出矩阵的一个 `64×64` block，并沿 reduction 维按 `32` 分块：
 
-- 默认使用 4×4 microtile，即每个 thread 持有 16 个 float accumulator
-- reduction 维达到 1024 时使用 8×4 microtile，增加大 K 下的指令级并行
-- grid 是 `ceil(columns / micro_columns) × ceil(rows / micro_rows)`
-- K 循环里加载 microtile 对应的 A/B 行和列，用 `fma` 更新所有 accumulator
-- row/column 能被 microtile 整除时，step 直接生成无 predicate 的加载和写回
-- 只有尾部 tile 才生成边界检查，避免常见整除 shape 在 K 循环里付分支成本
+- 每个 K step 由 block 内线程协作加载 `A[64×32]` 和 `B[32×64]` 到 threadgroup memory
+- barrier 后，每个 thread 从共享片段读取数据并用寄存器 microtile 计算多个输出
+- reduction 小于 1024 时使用 4×4 microtile，共 256 个 thread；较大的 reduction 使用 8×4 microtile，共 128 个 thread
+- 每次 K step 结束时再次 barrier，避免下一轮加载覆盖仍在使用的共享数据
+- row/column 能被 `64` 整除时跳过写回 predicate，reduction 能整除 `32` 时跳过 tail load predicate
+- 尾部 block 用零填充越界的 A/B 元素，不执行越界读取
 
-该实现没有 threadgroup memory、vectorized load、SIMD matrix 或 split-K。它在同一台机器上比旧的一线程一输出 kernel 快约 2–4 倍，但仍明显慢于 MLX，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
+该实现还没有 vectorized load、SIMD matrix、split-K 或 autotune，在当前 Apple Silicon 测试中比 MLX 慢约 1.8–5.6 倍，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
 
 ## 12. Metal attention codegen
 
@@ -272,7 +272,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
-- matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
+- matmul 还没有 vectorized load、SIMD matrix、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout op 已做恒等与逆变换消除，但还没有布局传播
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
