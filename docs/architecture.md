@@ -13,6 +13,8 @@
 | `aten.mm.default` | `matmul` |
 | `aten.addmm.default` | `addmm` |
 | `aten._softmax.default` | `softmax` |
+| `aten.sum.dim_IntList` | `sum` |
+| `aten.mean.dim` | `mean` |
 | `aten.native_layer_norm.default` | `layer_norm`，仅第 0 个输出 |
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
@@ -35,7 +37,7 @@
 
 每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate` 和 softmax 的 `dim` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
@@ -132,7 +134,19 @@ grid 大小是 `rows * threads`，每个 threadgroup 的大小固定为 `threads
 
 非最后一维的 softmax 会在 backend 编译阶段抛 `NotImplementedError`，不会静默退化成 MLX。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
 
-## 7. Metal LayerNorm 和 RMSNorm lowering
+## 7. Metal sum/mean reduction
+
+sum/mean 接受一个或多个 reduction 维，但当前要求这些维合并后位于输入的最后一段连续区域。backend 把未参与 reduction 的维度展平为 `rows`，把 reduction 维展平为连续的 `columns`：
+
+- 每个 threadgroup 处理一行
+- threadgroup 线程数复用 softmax 的选择规则，最多 256 个线程
+- 每个线程跨步累加局部结果，再在 threadgroup memory 中做树形加法
+- sum 直接写回归约值；mean 在 float 中除以 `columns` 后写回
+- 只有 `tid == 0` 写一个输出元素，`keepdim` 只影响输出 shape，不影响行数和写入位置
+
+输入输出必须保持相同 dtype。显式传入不同的 reduction dtype 会在前端被拒绝。非连续尾维会由 backend 抛出 `NotImplementedError`，不会静默调用 MLX。
+
+## 8. Metal LayerNorm 和 RMSNorm lowering
 
 两种归一化都按 normalized shape 的最后一组维度处理。backend 把 normalized shape 之前的维度展平为 `rows`，把 normalized shape 展平为连续的 `columns`：
 
@@ -147,7 +161,7 @@ RMSNorm 只做一遍平方和 reduction，得到 `mean(x^2)` 后用 `rsqrt(mean(
 
 两者都支持 normalized shape 占满最后一维、多个连续尾维，或整个 tensor。若 normalized shape 不是连续尾维，PyTorch 不会产生对应的归一化 FX 结构。
 
-## 8. Metal matmul/addmm codegen
+## 9. Metal matmul/addmm codegen
 
 `codegen_matmul=True` 时，backend 为 rank-2 `matmul` 和 `addmm` 生成独立 Metal kernel：
 
@@ -176,7 +190,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 
 该实现没有 threadgroup memory、vectorized load、SIMD matrix 或 split-K。它在同一台机器上比旧的一线程一输出 kernel 快约 2–4 倍，但仍明显慢于 MLX，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
 
-## 9. Runtime
+## 10. Runtime
 
 `CompiledPlan` 按 SSA 顺序执行 IR：
 
@@ -184,17 +198,20 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
 - softmax：调用生成的 last-dim reduction kernel
+- sum/mean：调用生成的尾维 reduction kernel
 - layer_norm：调用生成的两遍 mean/variance reduction kernel
 - rms_norm：调用生成的平方和 reduction kernel
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 
-## 10. 已知边界
+## 11. 已知边界
 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
-- softmax 只支持最后一维；LayerNorm/RMSNorm 只支持连续尾维 reduction
+- softmax 只支持最后一维
+- sum/mean 只支持连续尾维，且不支持 reduction dtype override
+- LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - 没有 kernel cache、autotune、layout propagation
@@ -202,4 +219,4 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是通用 reduction lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是非连续轴 reduction、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

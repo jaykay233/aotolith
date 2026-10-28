@@ -120,6 +120,8 @@ class AppleMetalBackend:
                 )
             elif op.op == "softmax":
                 compiled = self._compile_softmax(graph, op, index)
+            elif op.op in {"sum", "mean"}:
+                compiled = self._compile_reduction(graph, op, index)
             elif op.op == "layer_norm":
                 compiled = self._compile_layer_norm(graph, op, index)
             elif op.op == "rms_norm":
@@ -302,6 +304,116 @@ class AppleMetalBackend:
             output_id=op.outputs[0],
             tensor_type=output_type,
             kind="softmax",
+        )
+        return artifact, runtime
+
+    def _compile_reduction(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        if len(op.inputs) != 1:
+            raise ValueError(f"{op.op} expects one input")
+
+        input_type = graph.value(op.inputs[0]).type
+        output_type = graph.value(op.outputs[0]).type
+        if input_type.dtype != output_type.dtype:
+            raise NotImplementedError(
+                f"Metal {op.op} currently requires identical input/output dtypes"
+            )
+        if not input_type.shape:
+            raise NotImplementedError(f"Metal {op.op} requires a ranked tensor")
+
+        rank = len(input_type.shape)
+        dims = op.attrs.get("dims")
+        if not isinstance(dims, tuple) or not dims:
+            raise ValueError(f"{op.op}.dims must be a non-empty tuple")
+        normalized_dims: list[int] = []
+        for dim in dims:
+            if not isinstance(dim, int) or isinstance(dim, bool):
+                raise ValueError(f"{op.op}.dims must contain integers")
+            axis = dim % rank
+            if axis in normalized_dims:
+                raise ValueError(f"{op.op}.dims must not contain duplicates")
+            normalized_dims.append(axis)
+        normalized_dims.sort()
+        if normalized_dims != list(range(rank - len(normalized_dims), rank)):
+            raise NotImplementedError(
+                f"Metal {op.op} currently supports contiguous tail dimensions"
+            )
+
+        keepdim = op.attrs.get("keepdim")
+        if not isinstance(keepdim, bool):
+            raise ValueError(f"{op.op}.keepdim must be a boolean")
+        reduced_rank = len(normalized_dims)
+        columns = prod(input_type.shape[axis] for axis in normalized_dims)
+        prefix_shape = input_type.shape[: rank - reduced_rank]
+        expected_output_shape = prefix_shape
+        if keepdim:
+            expected_output_shape += (1,) * reduced_rank
+        if output_type.shape != expected_output_shape:
+            raise ValueError(
+                f"{op.op} output shape {output_type.shape} "
+                f"!= {expected_output_shape}"
+            )
+
+        rows = prod(prefix_shape) or 1
+        threads = _reduction_thread_count(columns)
+        reduction_stride = threads // 2
+        result_expression = "scratch[0]"
+        if op.op == "mean":
+            result_expression = f"scratch[0] / {columns}.0f"
+        source = f"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint offset = row * {columns}u;
+        threadgroup float scratch[{threads}];
+
+        float local_value = 0.0f;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            local_value += float(in_0[offset + col]);
+        }}
+        scratch[tid] = local_value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        if (tid == 0u) {{
+            out[row] = (T)({result_expression});
+        }}
+        """
+        name = f"metal_{op.op}_{threads}_{index}"
+        kernel = mx.fast.metal_kernel(
+            name=name,
+            input_names=["in_0"],
+            output_names=["out"],
+            source=source,
+        )
+        grid = (rows * threads, 1, 1)
+        threadgroup = (threads, 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header="",
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind=op.op,
         )
         return artifact, runtime
 

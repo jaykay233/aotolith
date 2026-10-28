@@ -667,3 +667,102 @@ def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
         ValueError, match="unsupported FX target: aten.pow.Tensor_Scalar"
     ):
         compile_callable(fn, (x,))
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_sum_last_dim_supports_keepdim(keepdim) -> None:
+    torch.manual_seed(83)
+    x = torch.randn(2, 3, 300)
+
+    def fn(value):
+        return torch.sum(value, dim=-1, keepdim=keepdim)
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.input_graph.ops] == ["sum"]
+    assert result.input_graph.ops[0].attrs == {
+        "dims": (-1,),
+        "keepdim": keepdim,
+    }
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_sum_256_0"
+    assert "threadgroup float scratch[256]" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_mean_reduces_multiple_tail_dimensions() -> None:
+    torch.manual_seed(89)
+    x = torch.randn(2, 3, 4, 5)
+
+    def fn(value):
+        return torch.mean(value, dim=(-2, -1), keepdim=True)
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.input_graph.ops] == ["mean"]
+    assert result.plan.kernels[0].name == "metal_mean_32_0"
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 3, 1, 1)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mean_supports_low_precision(dtype) -> None:
+    torch.manual_seed(97)
+    x = torch.randn(2, 3, 300, dtype=dtype)
+
+    def fn(value):
+        return torch.mean(value, dim=-1)
+
+    result = compile_callable(fn, (x,))
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        mx.array(x.float().numpy(), dtype=mlx_dtype)
+    )[0]
+    expected = mx.array(torch.mean(x.float(), dim=-1).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_mean_composes_with_matmul() -> None:
+    torch.manual_seed(101)
+    inputs = (torch.randn(2, 4), torch.randn(4, 8))
+
+    def fn(value, weight):
+        return torch.mean(value @ weight, dim=-1)
+
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.input_graph.ops] == ["matmul", "mean"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["mean"]
+
+    mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
+    actual = result.plan(*mlx_inputs)[0]
+    expected = mx.mean(mx.matmul(mlx_inputs[0], mlx_inputs[1]), axis=-1)
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_reduction_rejects_non_tail_dimensions() -> None:
+    x = torch.randn(3, 5)
+    with pytest.raises(
+        NotImplementedError,
+        match="currently supports contiguous tail dimensions",
+    ):
+        compile_callable(lambda value: torch.mean(value, dim=0), (x,))
+
+
+def test_reduction_rejects_explicit_dtype_override() -> None:
+    x = torch.randn(3, 5)
+    with pytest.raises(
+        NotImplementedError,
+        match="currently requires the input dtype",
+    ):
+        compile_callable(
+            lambda value: torch.sum(value, dim=-1, dtype=torch.float32),
+            (x,),
+        )

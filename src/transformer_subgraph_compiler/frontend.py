@@ -10,6 +10,8 @@ _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
     "aten.addmm.default": "addmm",
     "aten._softmax.default": "softmax",
+    "aten.sum.dim_IntList": "sum",
+    "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
     "aten.gelu.default": "gelu",
     "aten.mul.Tensor": "mul",
@@ -43,6 +45,7 @@ _NUMERIC_ATTRS = {
 }
 
 _BINARY_OPS = {"mul", "add", "sub", "rsub", "div"}
+_REDUCTION_OPS = {"sum", "mean"}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -378,6 +381,31 @@ def _operation_inputs(
             )
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
+    if op in _REDUCTION_OPS:
+        if len(args) not in {2, 3}:
+            raise ValueError(
+                f"{op} expects two or three positional arguments, got {len(args)}"
+            )
+        input_id = args[0]
+        dims = args[1]
+        keepdim = args[2] if len(args) == 3 else False
+        if isinstance(dims, int) and not isinstance(dims, bool):
+            normalized_dims = (dims,)
+        elif isinstance(dims, (tuple, list)) and all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            normalized_dims = tuple(dims)
+        else:
+            raise ValueError(f"{op}.dim must contain integers, got {dims!r}")
+        if not normalized_dims:
+            raise ValueError(f"{op}.dim must not be empty")
+        if not isinstance(keepdim, bool):
+            raise ValueError(f"{op}.keepdim must be a boolean, got {keepdim!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"dims": normalized_dims, "keepdim": keepdim},
+        )
+
     if op not in _BINARY_OPS:
         return tuple(_argument_ids(arg, node_ids) for arg in args), {}
 
@@ -418,6 +446,12 @@ def _operation_inputs(
 def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
     numeric_attrs = _NUMERIC_ATTRS.get(op, {})
     allowed = set(numeric_attrs)
+    if op in _REDUCTION_OPS:
+        allowed.add("dtype")
+        if kwargs.get("dtype") is not None:
+            raise NotImplementedError(
+                f"Metal {op} currently requires the input dtype"
+            )
     if op == "gelu":
         allowed.add("approximate")
     unknown = set(kwargs) - allowed
