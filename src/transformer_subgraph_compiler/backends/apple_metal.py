@@ -320,6 +320,118 @@ class AppleMetalBackend:
             query_batch_head = "batch"
             key_value_batch_head = "batch"
 
+        if use_simdgroup_qk and use_simdgroup_pv and key_tile == 64:
+            tile_alignment = "alignas(32) "
+            load_vector_width = (
+                16
+                if query_head_dim % 16 == 0 and value_head_dim % 16 == 0
+                else 8
+            )
+            query_load_source = f"""
+        for (uint vector_index = tid;
+             vector_index < {query_tile * query_head_dim // load_vector_width}u;
+             vector_index += {threads}u) {{
+            uint index = vector_index * {load_vector_width}u;
+            uint query_row = index / {query_head_dim}u;
+            uint dimension = index % {query_head_dim}u;
+            uint position = query_block * {query_tile}u + query_row;
+            threadgroup vec<T, {load_vector_width}>* destination =
+                reinterpret_cast<threadgroup vec<T, {load_vector_width}>*>(
+                    tile_q + index);
+            if (position < {query_length}u) {{
+                const device vec<T, {load_vector_width}>* source =
+                    reinterpret_cast<const device vec<T, {load_vector_width}>*>(
+                        in_0 + ({query_batch_head} * {query_length}u + position)
+                            * {query_head_dim}u + dimension);
+                *destination = *source;
+            }} else {{
+                *destination = vec<T, {load_vector_width}>(T(0));
+            }}
+        }}
+"""
+            key_load_source = f"""
+            for (uint vector_index = tid;
+                 vector_index < {key_tile * query_head_dim // load_vector_width}u;
+                 vector_index += {threads}u) {{
+                uint index = vector_index * {load_vector_width}u;
+                uint key_row = index / {query_head_dim}u;
+                uint dimension = index % {query_head_dim}u;
+                uint key = key_base + key_row;
+                threadgroup vec<T, {load_vector_width}>* destination =
+                    reinterpret_cast<threadgroup vec<T, {load_vector_width}>*>(
+                        tile_k + index);
+                if (key < {key_length}u) {{
+                    const device vec<T, {load_vector_width}>* source =
+                        reinterpret_cast<const device vec<T, {load_vector_width}>*>(
+                            in_1 + ({key_value_batch_head} * {key_length}u + key)
+                                * {query_head_dim}u + dimension);
+                    *destination = *source;
+                }} else {{
+                    *destination = vec<T, {load_vector_width}>(T(0));
+                }}
+            }}
+"""
+            value_load_source = f"""
+            for (uint vector_index = tid;
+                 vector_index < {key_tile * value_head_dim // load_vector_width}u;
+                 vector_index += {threads}u) {{
+                uint index = vector_index * {load_vector_width}u;
+                uint key_row = index / {value_head_dim}u;
+                uint dimension = index % {value_head_dim}u;
+                uint global_key = key_base + key_row;
+                threadgroup vec<T, {load_vector_width}>* destination =
+                    reinterpret_cast<threadgroup vec<T, {load_vector_width}>*>(
+                        tile_k + index);
+                if (global_key < {key_length}u) {{
+                    const device vec<T, {load_vector_width}>* source =
+                        reinterpret_cast<const device vec<T, {load_vector_width}>*>(
+                            in_2 + ({key_value_batch_head} * {key_length}u
+                                + global_key) * {value_head_dim}u + dimension);
+                    *destination = *source;
+                }} else {{
+                    *destination = vec<T, {load_vector_width}>(T(0));
+                }}
+            }}
+"""
+        else:
+            tile_alignment = ""
+            query_load_source = f"""
+        for (uint index = tid; index < {query_tile * query_head_dim}u;
+             index += {threads}u) {{
+            uint query_row = index / {query_head_dim}u;
+            uint dimension = index % {query_head_dim}u;
+            uint position = query_block * {query_tile}u + query_row;
+            tile_q[index] = position < {query_length}u
+                ? in_0[({query_batch_head} * {query_length}u + position)
+                    * {query_head_dim}u + dimension]
+                : T(0);
+        }}
+"""
+            key_load_source = f"""
+            for (uint index = tid; index < {key_tile * query_head_dim}u;
+                 index += {threads}u) {{
+                uint key_row = index / {query_head_dim}u;
+                uint dimension = index % {query_head_dim}u;
+                uint key = key_base + key_row;
+                tile_k[index] = key < {key_length}u
+                    ? in_1[({key_value_batch_head} * {key_length}u + key)
+                        * {query_head_dim}u + dimension]
+                    : T(0);
+            }}
+"""
+            value_load_source = f"""
+            for (uint index = tid; index < {key_tile * value_head_dim}u;
+                 index += {threads}u) {{
+                uint key_row = index / {value_head_dim}u;
+                uint dimension = index % {value_head_dim}u;
+                uint global_key = key_base + key_row;
+                tile_k[index] = global_key < {key_length}u
+                    ? in_2[({key_value_batch_head} * {key_length}u + global_key)
+                        * {value_head_dim}u + dimension]
+                    : T(0);
+            }}
+"""
+
         score_expression = f"dot * {float(op.attrs['scale'])!r}"
         if has_mask:
             mask_offset = _attention_mask_offset_expression(rank, mask_shape)
@@ -429,18 +541,7 @@ class AppleMetalBackend:
         threadgroup float tile_pv[{query_tile * pv_value_tile}];"""
                 pv_probability_store = f"""
             tile_probabilities_low[warp * {key_tile}u + lane] = (T)probability;"""
-            pv_preload_source = f"""
-            for (uint index = tid; index < {key_tile * value_head_dim}u;
-                 index += {threads}u) {{
-                uint key_row = index / {value_head_dim}u;
-                uint dimension = index % {value_head_dim}u;
-                uint global_key = key_base + key_row;
-                tile_k[index] = global_key < {key_length}u
-                    ? in_2[({key_value_batch_head} * {key_length}u + global_key)
-                        * {value_head_dim}u + dimension]
-                    : T(0);
-            }}
-"""
+            pv_preload_source = value_load_source
             if key_tile == 64:
                 value_fragments_per_chunk = pv_value_tile // 8
                 pv_steps = "\n".join(
@@ -642,20 +743,11 @@ class AppleMetalBackend:
         uint head = query_remainder / {query_blocks}u;
         uint query_block = query_remainder % {query_blocks}u;
         uint query_pos = query_block * {query_tile}u + warp;
-        threadgroup T tile_q[{query_tile * query_head_dim}];
-        threadgroup T tile_k[{key_tile * max(query_head_dim, value_head_dim)}];
+        {tile_alignment}threadgroup T tile_q[{query_tile * query_head_dim}];
+        {tile_alignment}threadgroup T tile_k[{key_tile * max(query_head_dim, value_head_dim)}];
         {score_storage_declaration}{pv_probability_declaration}{pv_shared_declaration}
 
-        for (uint index = tid; index < {query_tile * query_head_dim}u;
-             index += {threads}u) {{
-            uint query_row = index / {query_head_dim}u;
-            uint dimension = index % {query_head_dim}u;
-            uint position = query_block * {query_tile}u + query_row;
-            tile_q[index] = position < {query_length}u
-                ? in_0[({query_batch_head} * {query_length}u + position)
-                    * {query_head_dim}u + dimension]
-                : T(0);
-        }}
+{query_load_source}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float accumulator[{ceil(value_head_dim / 32)}] = {{0.0f}};
@@ -664,16 +756,7 @@ class AppleMetalBackend:
 
         for (uint key_base = 0u; key_base < {key_length}u;
              key_base += {key_tile}u) {{
-            for (uint index = tid; index < {key_tile * query_head_dim}u;
-                 index += {threads}u) {{
-                uint key_row = index / {query_head_dim}u;
-                uint dimension = index % {query_head_dim}u;
-                uint key = key_base + key_row;
-                tile_k[index] = key < {key_length}u
-                    ? in_1[({key_value_batch_head} * {key_length}u + key)
-                        * {query_head_dim}u + dimension]
-                    : T(0);
-            }}
+{key_load_source}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 {qk_score_source}{pv_preload_source}
 {softmax_source}

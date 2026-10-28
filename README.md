@@ -69,7 +69,7 @@ matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 6
 result = compile_callable(fn, example_inputs, codegen_attention=True)
 ```
 
-kernel 每个 threadgroup 处理 8、16 或 24 个 query。短序列使用 32-key tile；query sequence 达到 768 后，FP16/BF16 且 QK/PV 都满足 SIMD matrix 条件时优先尝试 `24×64` tile、768 个 thread，再依次回退到 `16×64`、`24×32` 和 `16×32`。64-key 路径用 16 或 24 个 SIMD group 并行计算 QK，并在 shared memory 中复用 score 与 probability workspace；PV 按 64 个 value 维度分块，避免超过 31 KiB。Q/K/V tile 先协作加载到 threadgroup memory，warp 内用 `simd_max`/`simd_sum` 做 online softmax。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有运行时 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
+kernel 每个 threadgroup 处理 8、16 或 24 个 query。短序列使用 32-key tile；query sequence 达到 768 后，FP16/BF16 且 QK/PV 都满足 SIMD matrix 条件时优先尝试 `24×64` tile、768 个 thread，再依次回退到 `16×64`、`24×32` 和 `16×32`。64-key 路径用 16 或 24 个 SIMD group 并行计算 QK，并在 shared memory 中复用 score 与 probability workspace；PV 按 64 个 value 维度分块，避免超过 31 KiB。Q/K/V tile 先协作加载到 32-byte 对齐的 threadgroup memory；head dim 都能被 16 整除时使用 16 元素向量加载，否则使用 8 元素向量加载。warp 内用 `simd_max`/`simd_sum` 做 online softmax。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有运行时 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
 
 ## 为什么没有直接改 Triton
 

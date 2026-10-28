@@ -660,6 +660,7 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
 
     assert "threadgroup float tile_scores[256]" in source
     assert "if (warp < 4u)" in source
+    assert "vec<T," not in source
     assert "simdgroup_float8x8 qk_accumulator" in source
     assert f"simdgroup_{simdgroup_type}8x8 qk_frag_q" in source
     assert "simdgroup_load(qk_frag_k" in source
@@ -736,11 +737,13 @@ def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> Non
 
     assert "metal_attention_flash_24x64_768" in kernel.name
     assert "threadgroup T tile_q[3072]" in source
+    assert "alignas(32) threadgroup T tile_q[3072]" in source
     assert "threadgroup float tile_workspace[2304]" in source
     assert "threadgroup T* tile_probabilities_low" in source
     assert "float score1 = -INFINITY" in source
     assert "value_chunk_base" in source
     assert "if (warp < 24u)" in source
+    assert "vec<T, 16>" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))
@@ -786,6 +789,7 @@ def test_native_attention_long_sequence_partial_value_chunk() -> None:
 
     assert "metal_attention_flash_24x64_768" in kernel.name
     assert "value_chunk_fragments" in kernel.source
+    assert "vec<T, 8>" in kernel.source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))

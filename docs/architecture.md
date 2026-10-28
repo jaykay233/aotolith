@@ -244,7 +244,7 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 
 kernel 的执行方式：
 
-- Q tile 和当前 K tile 由 threadgroup 协作加载到 shared memory；FP16/BF16 下，32-key tile 为每个 query fragment 分配 4 个 SIMD group，64-key tile 分配 8 个。`24×64` 正好使用全部 24 个 warp。FP32 或非 8 对齐的 head dim 回退到 lane 串行点积
+- Q tile 和当前 K tile 由 threadgroup 协作加载到 shared memory；FP16/BF16 下，32-key tile 为每个 query fragment 分配 4 个 SIMD group，64-key tile 分配 8 个。`24×64` 正好使用全部 24 个 warp。64-key 路径的 shared tile 按 32-byte 对齐，head dim 都能被 16 整除时用 `vec<T, 16>` 搬运 Q/K/V，否则用 `vec<T, 8>`；短序列的 32-key 路径继续逐元素加载，避免小工作集产生额外开销。FP32 或非 8 对齐的 head dim 回退到 lane 串行点积
 - 32-key 路径中，每个 lane 持有一个 score；64-key 路径中，每个 lane 持有相隔 32 的两个 score。`simd_max` 和 `simd_sum` 在 warp 内得到 block max 与 block sum，再与 running max、denominator 合并成 online softmax 状态
 - 64-key 路径的 shared-memory workspace 先存放 float QK score，所有 warp 读完 score 后，再把前半段复用于 FP16/BF16 probability，后半段作为 PV 输出 tile。V tile 在 QK 完成后加载，并与 probability 写入共用一次同步
 - PV 按 64 个 value 维度分块，再按 query/value 的 `8×8` fragment 分配 SIMD group，计算 `query_tile×64 @ 64×value_chunk` 的 PV tile，并把结果合并回每个 query 的 online accumulator
@@ -256,13 +256,13 @@ kernel 的执行方式：
 
 score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概率与 V fragment，最后写回 FP16、BF16 或 FP32。当前 M5 Pro 上交替启动进程，每项各运行 5 次、每次取 21 轮中位数：
 
-| 输入 | `24×32` | `24×64` | 降幅 |
+| 输入 | `24×64` scalar load | `24×64` vector load | 降幅 |
 | --- | ---: | ---: | ---: |
-| `1×8×768×128` | 1.169 ms | 1.103 ms | 5.6% |
-| `1×8×1024×128` | 1.868 ms | 1.743 ms | 6.7% |
-| `1×8×2048×128` | 6.694 ms | 6.201 ms | 7.4% |
+| `1×8×768×128` | 1.086 ms | 0.833 ms | 23.3% |
+| `1×8×1024×128` | 1.720 ms | 1.314 ms | 23.6% |
+| `1×8×2048×128` | 6.211 ms | 4.612 ms | 25.7% |
 
-该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
+数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
 ## 13. Runtime
 
@@ -300,7 +300,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
-- 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；不满足条件的单个阶段回退到标量路径
+- 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；64-key tile 仅在同样条件成立时使用 8/16 元素向量加载，不满足条件的单个阶段回退到标量路径
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune
 - NVIDIA Triton/CUDA backend 尚未实现
 
