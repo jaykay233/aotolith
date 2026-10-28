@@ -47,16 +47,16 @@ PyTorch FX
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出
-- 可选的 Metal matmul/addmm codegen
+- 可选的 Metal matmul/addmm codegen，支持 rank-2 以及 batch shape 一致的 rank-3/4
 - 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
-- matmul shared-memory tiling：`64×64×32` threadgroup block；FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
+- matmul shared-memory tiling：`64×64×32` threadgroup block；rank-N batch 映射到 grid 的 y 维，FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
-默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘和 bias 会生成自定义 Metal kernel：
+默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘以及 batch shape 一致的 rank-3/4 矩阵乘会生成自定义 Metal kernel；尚不直接处理任意 batch broadcast：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)

@@ -201,10 +201,10 @@ RMSNorm 只做一遍平方和 reduction，得到 `mean(x^2)` 后用 `rsqrt(mean(
 
 ## 11. Metal matmul/addmm codegen
 
-`codegen_matmul=True` 时，backend 为 rank-2 `matmul` 和 `addmm` 生成独立 Metal kernel：
+`codegen_matmul=True` 时，backend 为 `matmul` 和 `addmm` 生成独立 Metal kernel。rank-2 使用单个矩阵，rank-3/4 使用相同的最后两维作为矩阵维度，并把前面的维度展平为 batch：
 
 ```text
-C[row, col] = sum_k A[row, k] * B[k, col]
+C[batch, row, col] = sum_k A[batch, row, k] * B[batch, k, col]
 ```
 
 `addmm` 在同一 kernel 中计算：
@@ -215,6 +215,14 @@ beta * bias + alpha * (A @ B)
 
 bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 的静态 broadcast 规则。FP16/BF16 输入用 float 累加，最后 cast 回输出 dtype。
 
+### Batched layout
+
+rank-N matmul 保持 `A`、`B`、`C` 的 batch 前缀完全一致，backend 直接把展平后的 batch 索引映射到 `threadgroup_position_in_grid.y`。grid 的 x 维仍然负责输出 tile，因此同一个 kernel 可以并发处理多个 batch。
+
+每个 batch 内的地址按操作数自己的逻辑布局计算：A 的 batch stride 是 `rows * reduction`，B 是 `reduction * columns`，输出是 `rows * columns`。如果 `transpose_a` 或 `transpose_b` 已从 layout node 折叠进 matmul，取数仍先加 batch stride，再按转置后的 `(k, row)` 或 `(column, k)` 线性寻址。
+
+当前只直接编译 batch 前缀相同的输入。PyTorch 做 batch broadcast 时，前端通常会先产生 `expand`，这类显式复制仍由 MLX runtime 执行，随后 matmul 可以进入 batched kernel；没有显式展开的任意 broadcast matmul 会回退到 MLX。
+
 ### Shared-memory tiling
 
 每个 threadgroup 计算输出矩阵的一个 `64×64` block，并沿 reduction 维按 `32` 分块：
@@ -223,6 +231,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - barrier 后，每个 thread 从共享片段读取数据并用寄存器 microtile 计算多个输出
 - reduction 小于 1024 时使用 4×4 microtile，共 256 个 thread；较大的 reduction 使用 8×4 microtile，共 128 个 thread
 - 每次 K step 结束时再次 barrier，避免下一轮加载覆盖仍在使用的共享数据
+- 每个 threadgroup 的 y 坐标选择 batch，所有 A/B/C 访问都加上对应的 batch stride
 - row/column 能被 `64` 整除时跳过写回 predicate，reduction 能整除 `32` 时跳过 tail load predicate
 - 尾部 block 用零填充越界的 A/B 元素，不执行越界读取
 
@@ -234,7 +243,7 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 
 - 每个 SIMD group 负责 `16×32` 输出，使用 2 个 A fragment 和 4 个 B fragment 覆盖一次 `16×8 × 8×32` MMA
 - A/B 仍先协作加载到 threadgroup memory，尾 K 用零填充，避免 `simdgroup_load` 越界
-- reduction 能整除 `32` 且输出列能整除 `8` 时，A/B shared tile 按 16-byte 对齐，并用 `vec<T, 8>` 一次搬运 8 个 FP16/BF16 元素；尾 K 继续使用逐元素加载和边界判断
+- reduction 能整除 `32` 且输出列能整除 `8` 时，A/B shared tile 按 16-byte 对齐，并用 `vec<T, 8>` 一次搬运 8 个 FP16/BF16 元素；batched kernel 会在向量地址中加入 batch stride，尾 K 继续使用逐元素加载和边界判断
 - accumulator 保持 `simdgroup_float8x8`，只在最终写回时转换到 FP16/BF16
 - 输出先存入 `threadgroup float` tile，再统一执行 alpha/beta 和 bias broadcast epilogue
 - FP32 SIMD matrix 在当前 Apple GPU 上观察到精度降级，因此不启用；带尾行或尾列的低精度输出也回退到标量 tiled 路径
@@ -304,7 +313,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
-- matmul 的 SIMD matrix 只覆盖 FP16/BF16 完整输出块；完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
+- matmul codegen 支持 rank-2 和 batch 前缀一致的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout 优化已覆盖恒等、逆变换和矩阵乘输入转置折叠，但还不支持跨 reshape、broadcast 等边界的一般布局传播
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
@@ -314,4 +323,4 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进更一般的布局传播、batched matmul codegen 与跨进程 kernel cache。
+下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 batch broadcast、split-K 与 shape autotune；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进更一般的布局传播与跨进程 kernel cache。

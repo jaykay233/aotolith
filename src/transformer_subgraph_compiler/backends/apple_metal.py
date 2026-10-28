@@ -191,7 +191,12 @@ class AppleMetalBackend:
                 right_position = 2 if op.op == "addmm" else 1
                 left_type = graph.value(op.inputs[left_position]).type
                 right_type = graph.value(op.inputs[right_position]).type
-                if len(left_type.shape) == 2 and len(right_type.shape) == 2:
+                output_type = graph.value(op.outputs[0]).type
+                if (
+                    len(left_type.shape) >= 2
+                    and left_type.shape[:-2] == right_type.shape[:-2]
+                    and len(output_type.shape) == len(left_type.shape)
+                ):
                     compiled = self._compile_matmul(graph, op, index)
 
             if compiled is not None:
@@ -1330,25 +1335,34 @@ class AppleMetalBackend:
         left_type = graph.value(left_id).type
         right_type = graph.value(right_id).type
         output_type = graph.value(op.outputs[0]).type
-        if len(left_type.shape) != 2 or len(right_type.shape) != 2:
-            raise NotImplementedError("Metal matmul currently requires rank-2 tensors")
-        if len(output_type.shape) != 2:
-            raise NotImplementedError("Metal matmul currently produces rank-2 tensors")
+        if len(left_type.shape) < 2 or len(right_type.shape) < 2:
+            raise NotImplementedError("Metal matmul requires tensors with rank >= 2")
+        if left_type.shape[:-2] != right_type.shape[:-2]:
+            raise NotImplementedError(
+                "Metal matmul requires identical batch dimensions"
+            )
 
         transpose_left = _matmul_transpose_attribute(op, "transpose_a")
         transpose_right = _matmul_transpose_attribute(op, "transpose_b")
-        logical_left = left_type.shape[::-1] if transpose_left else left_type.shape
-        logical_right = right_type.shape[::-1] if transpose_right else right_type.shape
-        rows, reduction = logical_left
-        right_reduction, columns = logical_right
+        logical_left = left_type.shape
+        logical_right = right_type.shape
+        if transpose_left:
+            logical_left = logical_left[:-2] + logical_left[-2:][::-1]
+        if transpose_right:
+            logical_right = logical_right[:-2] + logical_right[-2:][::-1]
+        batch_shape = left_type.shape[:-2]
+        rows, reduction = logical_left[-2:]
+        right_reduction, columns = logical_right[-2:]
         if reduction != right_reduction:
             raise ValueError(
                 f"matmul reduction dimensions differ: {reduction} and {right_reduction}"
             )
-        if output_type.shape != (rows, columns):
+        expected_output = batch_shape + (rows, columns)
+        if output_type.shape != expected_output:
             raise ValueError(
-                f"matmul output shape {output_type.shape} != {(rows, columns)}"
+                f"matmul output shape {output_type.shape} != {expected_output}"
             )
+        batch_count = prod(batch_shape)
 
         dtypes = {left_type.dtype, right_type.dtype, output_type.dtype}
         if bias_id is not None:
@@ -1374,12 +1388,14 @@ class AppleMetalBackend:
                 output_type.dtype,
                 transpose_left,
                 transpose_right,
+                batch_count,
             )
             threads = 256
+            batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
             name = (
                 f"metal_{op.op}_simdgroup_"
                 f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
-                f"{_MATMUL_BLOCK_REDUCTION}_{index}"
+                f"{_MATMUL_BLOCK_REDUCTION}{batch_suffix}_{index}"
             )
         else:
             micro_rows, micro_columns = _select_matmul_microtile(reduction)
@@ -1393,15 +1409,18 @@ class AppleMetalBackend:
                 graph,
                 transpose_left,
                 transpose_right,
+                batch_count,
             )
             threads = (
                 (_MATMUL_BLOCK_ROWS // micro_rows)
                 * (_MATMUL_BLOCK_COLUMNS // micro_columns)
             )
+            batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
             name = (
                 f"metal_{op.op}_tiled_"
                 f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
-                f"{_MATMUL_BLOCK_REDUCTION}_{micro_rows}x{micro_columns}_{index}"
+                f"{_MATMUL_BLOCK_REDUCTION}_{micro_rows}x{micro_columns}"
+                f"{batch_suffix}_{index}"
             )
         kernel = _metal_kernel(
             name,
@@ -1412,7 +1431,7 @@ class AppleMetalBackend:
         )
         grid = (
             row_blocks * column_blocks * threads,
-            1,
+            batch_count,
             1,
         )
         threadgroup = (threads, 1, 1)
@@ -1851,6 +1870,7 @@ def _emit_simdgroup_matmul_source(
     dtype: DType,
     transpose_left: bool,
     transpose_right: bool,
+    batch_count: int,
 ) -> str:
     if rows % _MATMUL_BLOCK_ROWS != 0 or columns % _MATMUL_BLOCK_COLUMNS != 0:
         raise ValueError("simdgroup matmul requires complete 64x64 output blocks")
@@ -1878,6 +1898,15 @@ def _emit_simdgroup_matmul_source(
     threads = 256
     column_blocks = columns // block_columns
     exact_reduction = reduction % block_reduction == 0
+    left_batch_offset = (
+        f"batch * {rows * reduction}u + " if batch_count > 1 else ""
+    )
+    right_batch_offset = (
+        f"batch * {reduction * columns}u + " if batch_count > 1 else ""
+    )
+    output_batch_offset = (
+        f"batch * {rows * columns}u + " if batch_count > 1 else ""
+    )
     load_vector_width = 8
     vector_loads = (
         exact_reduction
@@ -1897,22 +1926,28 @@ def _emit_simdgroup_matmul_source(
         "uint warp_row = warp / 2u;",
         "uint warp_column = warp % 2u;",
         "uint threadgroup_index = threadgroup_position_in_grid.x;",
-        f"uint block_row = threadgroup_index / {column_blocks}u;",
-        f"uint block_column = threadgroup_index % {column_blocks}u;",
-        f"uint row_base = block_row * {block_rows}u;",
-        f"uint col_base = block_column * {block_columns}u;",
-        f"{tile_alignment}threadgroup T tile_a[{block_rows * block_reduction}];",
-        f"{tile_alignment}threadgroup T tile_b[{block_reduction * block_columns}];",
-        f"threadgroup float tile_c[{block_rows * block_columns}];",
-        "simdgroup_float8x8 acc[8];",
-        f"simdgroup_{simdgroup_type}8x8 frag_a[2];",
-        f"simdgroup_{simdgroup_type}8x8 frag_b[4];",
-        "for (uint i = 0u; i < 8u; ++i) {",
-        "    acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);",
-        "}",
-        f"for (uint k_base = 0u; k_base < {reduction}u; "
-        f"k_base += {block_reduction}u) {{",
     ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    lines.extend(
+        [
+            f"uint block_row = threadgroup_index / {column_blocks}u;",
+            f"uint block_column = threadgroup_index % {column_blocks}u;",
+            f"uint row_base = block_row * {block_rows}u;",
+            f"uint col_base = block_column * {block_columns}u;",
+            f"{tile_alignment}threadgroup T tile_a[{block_rows * block_reduction}];",
+            f"{tile_alignment}threadgroup T tile_b[{block_reduction * block_columns}];",
+            f"threadgroup float tile_c[{block_rows * block_columns}];",
+            "simdgroup_float8x8 acc[8];",
+            f"simdgroup_{simdgroup_type}8x8 frag_a[2];",
+            f"simdgroup_{simdgroup_type}8x8 frag_b[4];",
+            "for (uint i = 0u; i < 8u; ++i) {",
+            "    acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);",
+            "}",
+            f"for (uint k_base = 0u; k_base < {reduction}u; "
+            f"k_base += {block_reduction}u) {{",
+        ]
+    )
     if vector_loads:
         lines.extend(
             [
@@ -1927,7 +1962,8 @@ def _emit_simdgroup_matmul_source(
                 "                tile_a + index);",
                 f"        const device vec<T, {load_vector_width}>* source =",
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
-                f"                in_{left_position} + (row_base + local_row) * {reduction}u",
+                f"                in_{left_position} + {left_batch_offset}"
+                f"(row_base + local_row) * {reduction}u",
                 f"                    + k_base + local_k);",
                 "        *destination = *source;",
                 "    }",
@@ -1942,7 +1978,8 @@ def _emit_simdgroup_matmul_source(
                 "                tile_b + index);",
                 f"        const device vec<T, {load_vector_width}>* source =",
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
-                f"                in_{right_position} + (k_base + local_k) * {columns}u",
+                f"                in_{right_position} + {right_batch_offset}"
+                f"(k_base + local_k) * {columns}u",
                 f"                    + col_base + local_column);",
                 "        *destination = *source;",
                 "    }",
@@ -1966,6 +2003,8 @@ def _emit_simdgroup_matmul_source(
             left_index = (
                 f"(row_base + local_row) * {reduction}u + k_base + local_k"
             )
+        if batch_count > 1:
+            left_index = f"batch * {rows * reduction}u + {left_index}"
         load_a = f"in_{left_position}[{left_index}]"
         if not exact_reduction:
             load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
@@ -1988,6 +2027,8 @@ def _emit_simdgroup_matmul_source(
             right_index = (
                 f"(k_base + local_k) * {columns}u + col_base + local_column"
             )
+        if batch_count > 1:
+            right_index = f"batch * {reduction * columns}u + {right_index}"
         load_b = f"in_{right_position}[{right_index}]"
         if not exact_reduction:
             load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
@@ -2046,7 +2087,7 @@ def _emit_simdgroup_matmul_source(
             f"index += {threads}u) {{",
             f"    uint local_row = index / {block_columns}u;",
             f"    uint local_column = index % {block_columns}u;",
-            f"    uint linear = (row_base + local_row) * {columns}u "
+            f"    uint linear = {output_batch_offset}(row_base + local_row) * {columns}u "
             "+ col_base + local_column;",
         ]
     )
@@ -2077,6 +2118,7 @@ def _emit_tiled_matmul_source(
     graph: Graph,
     transpose_left: bool,
     transpose_right: bool,
+    batch_count: int,
 ) -> str:
     if op.op == "addmm":
         bias_id, _, _ = op.inputs
@@ -2108,15 +2150,21 @@ def _emit_tiled_matmul_source(
     lines = [
         "uint tid = thread_position_in_threadgroup.x;",
         "uint threadgroup_index = threadgroup_position_in_grid.x;",
-        f"uint block_row = threadgroup_index / {column_blocks}u;",
-        f"uint block_column = threadgroup_index % {column_blocks}u;",
-        f"uint row_base = block_row * {block_rows}u;",
-        f"uint col_base = block_column * {block_columns}u;",
-        f"uint micro_row = tid / {micro_columns_per_block}u;",
-        f"uint micro_column = tid % {micro_columns_per_block}u;",
-        f"threadgroup float tile_a[{block_rows * block_reduction}];",
-        f"threadgroup float tile_b[{block_reduction * block_columns}];",
     ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    lines.extend(
+        [
+            f"uint block_row = threadgroup_index / {column_blocks}u;",
+            f"uint block_column = threadgroup_index % {column_blocks}u;",
+            f"uint row_base = block_row * {block_rows}u;",
+            f"uint col_base = block_column * {block_columns}u;",
+            f"uint micro_row = tid / {micro_columns_per_block}u;",
+            f"uint micro_column = tid % {micro_columns_per_block}u;",
+            f"threadgroup float tile_a[{block_rows * block_reduction}];",
+            f"threadgroup float tile_b[{block_reduction * block_columns}];",
+        ]
+    )
     for row in range(micro_rows):
         for column in range(micro_columns):
             lines.append(f"float acc_{row}_{column} = 0.0f;")
@@ -2135,6 +2183,8 @@ def _emit_tiled_matmul_source(
         left_index = f"(k_base + local_k) * {rows}u + row_base + local_row"
     else:
         left_index = f"(row_base + local_row) * {reduction}u + k_base + local_k"
+    if batch_count > 1:
+        left_index = f"batch * {rows * reduction}u + {left_index}"
     load_a = f"float(in_{left_position}[{left_index}])"
     a_guards = []
     if not exact_rows:
@@ -2158,6 +2208,8 @@ def _emit_tiled_matmul_source(
         )
     else:
         right_index = f"(k_base + local_k) * {columns}u + col_base + local_column"
+    if batch_count > 1:
+        right_index = f"batch * {reduction * columns}u + {right_index}"
     load_b = f"float(in_{right_position}[{right_index}])"
     b_guards = []
     if not exact_columns:
@@ -2210,8 +2262,12 @@ def _emit_tiled_matmul_source(
             if not exact_tiles:
                 lines.append(f"if (row_ok_{row} && col_ok_{column}) {{")
             indent = "    " if not exact_tiles else ""
+            batch_offset = (
+                f"batch * {rows * columns}u + " if batch_count > 1 else ""
+            )
             lines.append(
                 f"{indent}uint {linear} = "
+                f"{batch_offset}"
                 f"(row_base + micro_row * {micro_rows}u + {row}u) * {columns}u "
                 f"+ col_base + micro_column * {micro_columns}u + {column}u;"
             )

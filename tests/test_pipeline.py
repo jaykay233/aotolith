@@ -1581,6 +1581,91 @@ def test_metal_matmul_simdgroup_vectorizes_complete_tiles(dtype) -> None:
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize(
+    ("batch_shape", "batch_count"),
+    [((2,), 2), ((2, 3), 6)],
+)
+def test_metal_batched_matmul_codegen_supports_rank_three_and_four(
+    batch_shape, batch_count
+) -> None:
+    torch.manual_seed(43)
+    inputs = (
+        torch.randn(*batch_shape, 5, 7),
+        torch.randn(*batch_shape, 7, 4),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+    kernel = result.plan.kernels[0]
+
+    assert kernel.name == f"metal_matmul_tiled_64x64x32_4x4_batch{batch_count}_0"
+    assert "threadgroup_position_in_grid.y" in kernel.source
+    assert "batch * 35u" in kernel.source
+    assert "batch * 28u" in kernel.source
+    assert "batch * 20u" in kernel.source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(torch.matmul(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_batched_simdgroup_matmul_vectorizes_batch_inputs() -> None:
+    torch.manual_seed(44)
+    inputs = (
+        torch.randn(2, 3, 64, 32, dtype=torch.float16),
+        torch.randn(2, 3, 32, 64, dtype=torch.float16),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+    kernel = result.plan.kernels[0]
+
+    assert kernel.name == "metal_matmul_simdgroup_64x64x32_batch6_0"
+    assert "vec<T, 8>" in kernel.source
+    assert "in_0 + batch * 2048u" in kernel.source
+    assert "in_1 + batch * 2048u" in kernel.source
+    assert "batch * 4096u" in kernel.source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(torch.matmul(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_metal_batched_matmul_combines_transposes_with_batch_strides() -> None:
+    torch.manual_seed(45)
+    inputs = (
+        torch.randn(2, 8, 4),
+        torch.randn(2, 5, 8),
+    )
+    result = compile_callable(
+        lambda left, right: left.transpose(-2, -1) @ right.transpose(-2, -1),
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert result.lowered_graph.ops[0].attrs == {
+        "transpose_a": True,
+        "transpose_b": True,
+    }
+    source = result.plan.kernels[0].source
+    assert "batch * 32u + (k_base + local_k) * 4u" in source
+    assert "batch * 40u + (col_base + local_column) * 8u" in source
+    assert "batch * 20u" in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(
+        torch.matmul(inputs[0].transpose(-2, -1), inputs[1].transpose(-2, -1)).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_metal_matmul_codegen_folds_transposed_operand() -> None:
     torch.manual_seed(34)
     inputs = (
