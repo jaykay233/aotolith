@@ -2500,6 +2500,140 @@ def test_additional_unary_ops_are_generated_as_metal_kernels(
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("op_name", "fn", "source_expression", "expected_attrs"),
+    [
+        (
+            "softplus",
+            lambda value: torch.nn.functional.softplus(value),
+            "tsc_softplus(",
+            {"beta": 1.0, "threshold": 20.0},
+        ),
+        (
+            "softplus",
+            lambda value: torch.nn.functional.softplus(
+                value, beta=2.0, threshold=10.0
+            ),
+            "tsc_softplus(",
+            {"beta": 2.0, "threshold": 10.0},
+        ),
+        (
+            "mish",
+            lambda value: torch.nn.functional.mish(value),
+            "tsc_mish(",
+            {},
+        ),
+        (
+            "logsigmoid",
+            lambda value: torch.nn.functional.logsigmoid(value),
+            "tsc_logsigmoid(",
+            {},
+        ),
+    ],
+    ids=["softplus-default", "softplus-custom", "mish", "logsigmoid"],
+)
+def test_smooth_activations_are_generated_as_stable_metal_kernels(
+    op_name, fn, source_expression, expected_attrs
+) -> None:
+    value = torch.tensor(
+        [-100.0, -20.0, -1.0, -0.0, 0.0, 1.0, 20.0, 100.0],
+        dtype=torch.float32,
+    )
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert result.lowered_graph.ops[0].attrs == expected_attrs
+    assert [kernel.kind for kernel in result.plan.kernels] == [op_name]
+    assert source_expression in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_smooth_activations_fuse_with_surrounding_pointwise_ops() -> None:
+    def fn(value):
+        mish = torch.nn.functional.mish(value)
+        softplus = torch.nn.functional.softplus(value, beta=0.75, threshold=5.0)
+        return mish + softplus + torch.nn.functional.logsigmoid(value)
+
+    torch.manual_seed(32)
+    x = torch.randn(2, 3, 17)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    body = result.lowered_graph.ops[0].attrs["body"]
+    assert [op.op for op in body] == [
+        "mish",
+        "softplus",
+        "add",
+        "logsigmoid",
+        "add",
+    ]
+    source = result.plan.kernels[0].source
+    assert "tsc_softplus(" in source
+    assert "tsc_logsigmoid(" in source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda value: torch.nn.functional.softplus(value),
+        lambda value: torch.nn.functional.mish(value),
+        lambda value: torch.nn.functional.logsigmoid(value),
+    ],
+    ids=["softplus", "mish", "logsigmoid"],
+)
+def test_smooth_activations_preserve_nonfinite_values(fn) -> None:
+    value = torch.tensor(
+        [-float("inf"), float("inf"), float("nan")], dtype=torch.float32
+    )
+    result = compile_callable(fn, (value,))
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    for actual_value, expected_value in zip(
+        actual.tolist(), expected.tolist(), strict=True
+    ):
+        if math.isnan(expected_value):
+            assert math.isnan(actual_value)
+        else:
+            assert actual_value == expected_value
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_smooth_activations_support_low_precision(dtype) -> None:
+    torch.manual_seed(33)
+    x = torch.randn(2, 3, 13, dtype=dtype)
+
+    def fn(value):
+        return torch.nn.functional.mish(
+            torch.nn.functional.softplus(value, beta=0.75, threshold=5.0)
+        ) + torch.nn.functional.logsigmoid(value)
+
+    result = compile_callable(fn, (x,))
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
+    expected = mx.array(fn(x.float()).numpy(), dtype=mlx_dtype)
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_logsigmoid_rejects_backward_buffer_output() -> None:
+    def fn(value):
+        return torch.ops.aten.log_sigmoid_forward.default(value)
+
+    with pytest.raises(NotImplementedError, match="backward buffer"):
+        compile_callable(fn, (torch.randn(5),))
+
+
 def test_square_ir_op_is_generated_as_a_metal_kernel() -> None:
     tensor_type = TensorType((5,), DType.F32)
     graph = Graph(

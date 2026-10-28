@@ -35,6 +35,8 @@ _SUPPORTED_OPS = {
     "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
     "aten.gelu.default": "gelu",
+    "aten.softplus.default": "softplus",
+    "aten.mish.default": "mish",
     "aten.mul.Tensor": "mul",
     "aten.mul.Scalar": "mul",
     "aten.add.Tensor": "add",
@@ -129,6 +131,7 @@ _NUMERIC_ATTRS = {
     "rsub": {"alpha": 1.0},
     "leaky_relu": {"negative_slope": 0.01},
     "elu": {"alpha": 1.0},
+    "softplus": {"beta": 1.0, "threshold": 20.0},
 }
 
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
@@ -167,6 +170,7 @@ _SEQUENCE_VIEW_TARGETS = {
 _SELECT_TARGET = "aten.select.int"
 _STACK_TARGET = "aten.stack.default"
 _SCATTER_TARGETS = {"aten.scatter.src", "aten.scatter.value"}
+_LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -282,6 +286,15 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 values[output_id] = Value(output_id, output_type)
                 for user in node.users:
                     node_ids[user] = output_id
+                continue
+            if target == _LOGSIGMOID_TARGET:
+                output_id = f"v{len(ops)}"
+                inputs, attrs, output_node = _logsigmoid_operation(node, node_ids)
+                ops.append(Operation("logsigmoid", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                for user in node.users:
+                    node_ids[user] = output_id
+                values[output_id] = Value(output_id, _node_type(output_node))
                 continue
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
@@ -1112,6 +1125,46 @@ def _layer_norm_operation(
     return tuple(inputs), attrs, _node_type(output_node)
 
 
+def _logsigmoid_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], object]:
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) != 1 or kwargs:
+        raise ValueError(
+            "log_sigmoid_forward expects one positional argument without keywords"
+        )
+
+    output_node = None
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise NotImplementedError(
+                "log_sigmoid_forward outputs must be selected with getitem"
+            )
+        if (
+            len(user.args) != 2
+            or not isinstance(user.args[1], int)
+            or isinstance(user.args[1], bool)
+        ):
+            raise ValueError(f"malformed logsigmoid output selection: {user!r}")
+        index = user.args[1]
+        if index == 0:
+            output_node = user
+        elif index == 1 and user.users:
+            raise NotImplementedError(
+                "log_sigmoid_forward backward buffer is not supported"
+            )
+        elif index not in {0, 1}:
+            raise ValueError(
+                f"log_sigmoid_forward output index must be 0 or 1, got {index}"
+            )
+
+    if output_node is None:
+        raise ValueError("log_sigmoid_forward result is not used")
+    return (_argument_ids(args[0], node_ids),), {}, output_node
+
+
 def _rms_norm_operation(
     node: object,
     node_ids: dict[object, str],
@@ -1314,6 +1367,34 @@ def _operation_inputs(
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"scalar_tensor value must be scalar, got {value!r}")
         return (), {"value": value}
+
+    if op == "softplus":
+        if len(args) not in {1, 2, 3}:
+            raise ValueError(
+                f"softplus expects one to three arguments, got {len(args)}"
+            )
+        if len(args) >= 2 and "beta" in kwargs:
+            raise ValueError("softplus received duplicate beta arguments")
+        if len(args) >= 3 and "threshold" in kwargs:
+            raise ValueError("softplus received duplicate threshold arguments")
+        beta = args[1] if len(args) >= 2 else kwargs.get("beta", 1.0)
+        threshold = args[2] if len(args) >= 3 else kwargs.get("threshold", 20.0)
+        if (
+            not isinstance(beta, (int, float))
+            or isinstance(beta, bool)
+            or beta <= 0
+        ):
+            raise ValueError(f"softplus.beta must be positive, got {beta!r}")
+        if not isinstance(threshold, (int, float)) or isinstance(
+            threshold, bool
+        ):
+            raise ValueError(
+                f"softplus.threshold must be a scalar number, got {threshold!r}"
+            )
+        return (
+            (_argument_ids(args[0], node_ids),),
+            {"beta": float(beta), "threshold": float(threshold)},
+        )
 
     if op == "cast":
         if len(args) != 1:

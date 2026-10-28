@@ -59,6 +59,27 @@ inline float tsc_expm1(float value) {
     }
     return metal::exp(value) - 1.0f;
 }
+
+inline float tsc_softplus(float value, float beta, float threshold) {
+    float scaled = beta * value;
+    return scaled > threshold
+        ? value
+        : log1p(metal::exp(scaled)) / beta;
+}
+
+inline float tsc_logsigmoid(float value) {
+    if (value != value) {
+        return value;
+    }
+    return metal::min(value, 0.0f)
+        - log1p(metal::exp(-metal::abs(value)));
+}
+
+inline float tsc_mish(float value) {
+    return value > 20.0f
+        ? value
+        : value * metal::tanh(tsc_softplus(value, 1.0f, 20.0f));
+}
 """
 
 
@@ -2140,6 +2161,14 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
             f"0.5f * {value} * (1.0f + tsc_erf("
             f"{value} * 0.7071067811865476f))"
         )
+    if op.op == "softplus":
+        beta = _msl_float_literal(float(op.attrs["beta"]))
+        threshold = _msl_float_literal(float(op.attrs["threshold"]))
+        return f"tsc_softplus({arguments[0]}, {beta}, {threshold})"
+    if op.op == "mish":
+        return f"tsc_mish({arguments[0]})"
+    if op.op == "logsigmoid":
+        return f"tsc_logsigmoid({arguments[0]})"
     if op.op in {"mul", "div"}:
         left, right = _binary_operands(op, arguments)
         operator = "*" if op.op == "mul" else "/"
@@ -2895,6 +2924,28 @@ def _evaluate_pointwise_mlx(
             )
             return 0.5 * value * (1.0 + mx.tanh(inner))
         return 0.5 * value * (1.0 + mx.erf(value * 0.7071067811865476))
+    if op.op == "softplus":
+        value = arguments[0]
+        beta = float(op.attrs["beta"])
+        threshold = float(op.attrs["threshold"])
+        scaled = beta * value
+        return mx.where(
+            scaled > threshold,
+            value,
+            mx.log1p(mx.exp(scaled)) / beta,
+        )
+    if op.op == "mish":
+        value = arguments[0]
+        softplus = mx.where(
+            value > 20.0,
+            value,
+            mx.log1p(mx.exp(value)),
+        )
+        return value * mx.tanh(softplus)
+    if op.op == "logsigmoid":
+        value = arguments[0]
+        body = mx.minimum(value, 0.0) - mx.log1p(mx.exp(-mx.abs(value)))
+        return mx.where(mx.isnan(value), value, body)
     if op.op in {"mul", "div", "add", "sub", "rsub", "pow"}:
         left, right = _binary_mx_operands(op, arguments)
         if op.op == "mul":

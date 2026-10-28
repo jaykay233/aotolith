@@ -39,6 +39,9 @@
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
 | `aten.gelu.default` | `gelu` |
+| `aten.softplus.default` | `softplus`，保留 `beta` 和 `threshold` |
+| `aten.mish.default` | `mish` |
+| `aten.log_sigmoid_forward.default` | `logsigmoid`，仅第 0 个输出 |
 | `aten.mul.Tensor`、`aten.mul.Scalar` | `mul` |
 | `aten.add.Tensor` | `add` |
 | `aten.sub.Tensor` | `sub` |
@@ -216,6 +219,8 @@ input_offset = (elem % 3) * 1
 精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
 
 `round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
+
+`softplus` 使用 threshold 分段公式：`beta * x > threshold` 时直接返回 `x`，否则计算 `log1p(exp(beta * x)) / beta`。`logsigmoid` 使用 `min(x, 0) - log1p(exp(-abs(x)))`，避免正输入时直接计算 `log(sigmoid(x))` 溢出。`mish` 计算 `x * tanh(softplus(x, 1, 20))`，在 `x > 20` 时直接返回 `x`。这些路径都复用 `_MSL_HEADER` 中的 helper，并能与其他 pointwise op 融合。
 
 ## 8. Metal softmax reduction
 

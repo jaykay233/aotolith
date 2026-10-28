@@ -8,6 +8,9 @@ from .ir import DType, Graph, Operation
 POINTWISE_OPS = {
     "silu",
     "gelu",
+    "softplus",
+    "mish",
+    "logsigmoid",
     "mul",
     "add",
     "sub",

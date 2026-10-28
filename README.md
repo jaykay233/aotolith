@@ -21,7 +21,7 @@ PyTorch FX
 | 索引读写 | `aten.embedding.default`、`aten.index_select.default`、`aten.gather.default`、`aten.scatter.src`、`aten.scatter.value`，支持 `int32/int64` indices，并由 MLX gather/scatter 执行 |
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`select`、`flip`、`roll`、`triu`、`tril`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
-| 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
+| 激活与边界 | `silu`、`gelu`、`softplus`、`mish`、`logsigmoid`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
 | 一元运算与谓词 | `neg`、`abs`、`exp`、`expm1`、`log`、`log2`、`log10`、`log1p`、`erf`、`sin`、`cos`、`floor`、`ceil`、`round`、`trunc`、`sign`、`square`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
 | 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
@@ -56,6 +56,7 @@ PyTorch FX
 - 在 schedule 前校验静态视图和布局变换；未折叠的 layout op 由 Runtime 执行 MLX view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，`clamp`/`clamp_min`/`clamp_max` 支持标量和可广播 tensor 边界，并与新增的一元数学算子、`leaky_relu`、`elu`、`hardswish` 一起参与 pointwise 融合
+- 支持 `softplus`、`mish` 和 `logsigmoid` 的稳定 Metal lowering；`softplus` 保留 `beta`/`threshold`，`log_sigmoid_forward` 只接受第 0 个输出，消费 backward buffer 会明确报错
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 支持 `torch.bool` IR value、比较/logical/NaN/Inf 谓词、`where`、`masked_fill`、标量常量生成，并允许 bool predicate/condition 与 FP16/BF16/FP32 数值分支融合在同一个 kernel
 - 生成每个 thread 处理 4 个元素的 Metal kernel
