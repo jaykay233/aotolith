@@ -68,6 +68,9 @@ POINTWISE_OPS = {
     "logaddexp",
     "atan2",
     "scalar_tensor",
+    "zeros_like",
+    "ones_like",
+    "full_like",
 }
 
 LAYOUT_OPS = {

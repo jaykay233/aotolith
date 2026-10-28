@@ -3306,6 +3306,133 @@ def test_scalar_pointwise_ops_are_fused() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_like_fill_ops_generate_static_constants(dtype) -> None:
+    value = torch.zeros(2, 3, 5, dtype=dtype)
+
+    def fn(template):
+        return (
+            torch.zeros_like(template),
+            torch.ones_like(
+                template,
+                dtype=torch.float32,
+                memory_format=torch.contiguous_format,
+            ),
+            torch.full_like(template, 2.5),
+        )
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.input_graph.ops] == [
+        "zeros_like",
+        "ones_like",
+        "full_like",
+    ]
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "zeros_like",
+        "ones_like",
+        "full_like",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "zeros_like",
+        "ones_like",
+        "full_like",
+    ]
+
+    actual = result.plan(_torch_to_mlx(value))
+    expected = tuple(_torch_to_mlx(output) for output in fn(value))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert actual_value.dtype == expected_value.dtype
+        assert actual_value.shape == expected_value.shape
+        assert mx.array_equal(actual_value, expected_value)
+
+
+def test_full_like_fuses_into_pointwise_region() -> None:
+    def fn(value):
+        return torch.full_like(value, 2.5) + value
+
+    torch.manual_seed(47)
+    value = torch.randn(3, 7)
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.input_graph.ops] == ["full_like", "add"]
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert len(result.plan.kernels) == 1
+    assert "2.5" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_like_fill_cse_ignores_template_and_preserves_output_type() -> None:
+    def fn(left, right):
+        return (
+            torch.ones_like(left),
+            torch.ones_like(right),
+            torch.ones_like(left, dtype=torch.float16),
+        )
+
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.input_graph.ops] == ["ones_like"] * 3
+    assert [op.op for op in result.lowered_graph.ops] == ["ones_like"] * 2
+    assert len(result.plan.kernels) == 2
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    mx.eval(*actual)
+    assert mx.array_equal(actual[0], actual[1])
+    assert actual[0].dtype == mx.float32
+    assert actual[2].dtype == mx.float16
+    assert mx.array_equal(actual[0], mx.ones((2, 3), dtype=mx.float32))
+    assert mx.array_equal(actual[2], mx.ones((2, 3), dtype=mx.float16))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_full_like_preserves_signed_zero_and_nonfinite_values(dtype) -> None:
+    template = torch.empty(7, dtype=dtype)
+    values = (-0.0, float("nan"), float("inf"), -float("inf"))
+
+    def fn(value):
+        return tuple(torch.full_like(value, fill) for fill in values)
+
+    result = compile_callable(fn, (template,))
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(mx.array(template.float().numpy(), dtype=mlx_dtype))
+    mx.eval(*actual)
+
+    assert all(value.dtype == mlx_dtype for value in actual)
+    assert math.copysign(1.0, actual[0][0].item()) < 0.0
+    assert bool(mx.all(mx.isnan(actual[1])).item())
+    assert bool(mx.all(mx.isinf(actual[2]) & (actual[2] > 0)).item())
+    assert bool(mx.all(mx.isinf(actual[3]) & (actual[3] < 0)).item())
+
+
+def test_like_fill_supports_boolean_outputs() -> None:
+    template = torch.zeros(11, dtype=torch.bool)
+
+    def fn(value):
+        return (
+            torch.zeros_like(value),
+            torch.ones_like(value),
+            torch.full_like(value, 2),
+        )
+
+    result = compile_callable(fn, (template,))
+    actual = result.plan(_torch_to_mlx(template))
+    mx.eval(*actual)
+    assert all(value.dtype == mx.bool_ for value in actual)
+    assert not bool(mx.any(actual[0]).item())
+    assert bool(mx.all(actual[1]).item())
+    assert bool(mx.all(actual[2]).item())
+
+
+def test_full_like_rejects_integer_outputs() -> None:
+    template = torch.zeros(3, dtype=torch.int32)
+    with pytest.raises(ValueError, match="full_like does not support integer outputs"):
+        compile_callable(lambda value: torch.full_like(value, 7), (template,))
+
+
 def test_metal_matmul_uses_shared_memory_tiles() -> None:
     torch.manual_seed(23)
     inputs = (torch.randn(11, 7), torch.randn(7, 13))

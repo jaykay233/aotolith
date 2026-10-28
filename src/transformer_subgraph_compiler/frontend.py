@@ -114,6 +114,9 @@ _SUPPORTED_OPS = {
     "aten.logaddexp.default": "logaddexp",
     "aten.atan2.default": "atan2",
     "aten.scalar_tensor.default": "scalar_tensor",
+    "aten.zeros_like.default": "zeros_like",
+    "aten.ones_like.default": "ones_like",
+    "aten.full_like.default": "full_like",
     "aten.cat.default": "cat",
     "aten.embedding.default": "embedding",
     "aten.index_select.default": "index_select",
@@ -1380,6 +1383,22 @@ def _operation_inputs(
             raise ValueError(f"scalar_tensor value must be scalar, got {value!r}")
         return (), {"value": value}
 
+    if op in {"zeros_like", "ones_like", "full_like"}:
+        expected_args = 2 if op == "full_like" else 1
+        if len(args) != expected_args:
+            raise ValueError(
+                f"{op} expects {expected_args} positional arguments, got {len(args)}"
+            )
+        _argument_ids(args[0], node_ids)
+        value = (
+            args[1]
+            if op == "full_like"
+            else (0.0 if op == "zeros_like" else 1.0)
+        )
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"{op} fill value must be scalar, got {value!r}")
+        return (), {"value": value}
+
     if op == "softplus":
         if len(args) not in {1, 2, 3}:
             raise ValueError(
@@ -1756,9 +1775,16 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update(
             {"dtype", "layout", "device", "pin_memory", "non_blocking", "memory_format"}
         )
-    if op == "scalar_tensor":
+    if op in {"scalar_tensor", "zeros_like", "ones_like", "full_like"}:
         allowed.update(
-            {"dtype", "layout", "device", "pin_memory", "requires_grad"}
+            {
+                "dtype",
+                "layout",
+                "device",
+                "pin_memory",
+                "requires_grad",
+                "memory_format",
+            }
         )
     if op == "cat":
         allowed.add("dim")
@@ -1771,7 +1797,18 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
-    if op in {"cast", "scalar_tensor", "cat", "flip", "roll", "triu", "tril"}:
+    if op in {
+        "cast",
+        "scalar_tensor",
+        "zeros_like",
+        "ones_like",
+        "full_like",
+        "cat",
+        "flip",
+        "roll",
+        "triu",
+        "tril",
+    }:
         return {}
 
     attrs: dict[str, object] = {}

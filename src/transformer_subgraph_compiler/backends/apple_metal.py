@@ -29,6 +29,12 @@ _LOGICAL_POINTWISE_OPS = {
     "logical_not",
 }
 _NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf"}
+_CONSTANT_POINTWISE_OPS = {
+    "scalar_tensor",
+    "zeros_like",
+    "ones_like",
+    "full_like",
+}
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
@@ -1964,16 +1970,14 @@ def _validate_pointwise_region(
         output_type = graph.value(op.outputs[0]).type
         input_types = tuple(graph.value(value_id).type for value_id in op.inputs)
 
-        if op.op == "scalar_tensor":
+        if op.op in _CONSTANT_POINTWISE_OPS:
             if op.inputs:
-                raise ValueError("scalar_tensor must not have tensor inputs")
+                raise ValueError(f"{op.op} must not have tensor inputs")
             if output_type.dtype in {DType.I32, DType.I64}:
-                raise ValueError("scalar_tensor does not support integer outputs")
+                raise ValueError(f"{op.op} does not support integer outputs")
             value = op.attrs.get("value")
             if not isinstance(value, (bool, int, float)):
-                raise ValueError(
-                    f"scalar_tensor.value must be scalar, got {value!r}"
-                )
+                raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
             continue
 
         if op.op in _COMPARISON_POINTWISE_OPS:
@@ -2049,7 +2053,8 @@ def _validate_pointwise_region(
             _COMPARISON_POINTWISE_OPS
             | _LOGICAL_POINTWISE_OPS
             | _NUMERIC_PREDICATE_POINTWISE_OPS
-            | {"where", "masked_fill", "scalar_tensor"}
+            | {"where", "masked_fill"}
+            | _CONSTANT_POINTWISE_OPS
         ):
             raise ValueError("boolean pointwise region has an unsupported root op")
 
@@ -2144,13 +2149,13 @@ def _msl_float_literal(value: float) -> str:
 
 
 def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
-    if op.op == "scalar_tensor":
+    if op.op in _CONSTANT_POINTWISE_OPS:
         value = op.attrs.get("value")
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, (int, float)):
             return _msl_float_literal(float(value))
-        raise ValueError(f"scalar_tensor.value must be scalar, got {value!r}")
+        raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
     if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
         left, right = _binary_operands(op, arguments)
         operator = {
@@ -2951,6 +2956,12 @@ def _evaluate_pointwise_mlx(
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"scalar_tensor.value must be scalar, got {value!r}")
         return mx.array(value, dtype=_MLX_DTYPES[output_type.dtype])
+    if op.op in {"zeros_like", "ones_like", "full_like"}:
+        value = op.attrs.get("value")
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
+        fill = mx.array(value, dtype=_MLX_DTYPES[output_type.dtype])
+        return mx.full(output_type.shape, fill)
     if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
         left, right = _binary_mx_operands(op, arguments)
         if op.op == "eq":
