@@ -1524,6 +1524,27 @@ def test_metal_matmul_uses_simdgroup_for_complete_blocks(
     assert "simdgroup_float8x8 acc[8]" in kernel.source
     assert "simdgroup_multiply_accumulate" in kernel.source
     assert "k_base + local_k < 35u" in kernel.source
+    assert "vec<T," not in kernel.source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(inputs[0] @ inputs[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_matmul_simdgroup_vectorizes_complete_tiles(dtype) -> None:
+    torch.manual_seed(33)
+    inputs = (
+        torch.randn(64, 64, dtype=dtype),
+        torch.randn(64, 64, dtype=dtype),
+    )
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    source = result.plan.kernels[0].source
+
+    assert "alignas(16) threadgroup T tile_a[2048]" in source
+    assert "alignas(16) threadgroup T tile_b[2048]" in source
+    assert "vec<T, 8>" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(inputs[0] @ inputs[1])

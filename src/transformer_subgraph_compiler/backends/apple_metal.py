@@ -1852,6 +1852,13 @@ def _emit_simdgroup_matmul_source(
     threads = 256
     column_blocks = columns // block_columns
     exact_reduction = reduction % block_reduction == 0
+    load_vector_width = 8
+    vector_loads = (
+        exact_reduction
+        and reduction % load_vector_width == 0
+        and columns % load_vector_width == 0
+    )
+    tile_alignment = "alignas(16) " if vector_loads else ""
     simdgroup_type = {
         DType.F16: "half",
         DType.BF16: "bfloat",
@@ -1866,8 +1873,8 @@ def _emit_simdgroup_matmul_source(
         f"uint block_column = threadgroup_index % {column_blocks}u;",
         f"uint row_base = block_row * {block_rows}u;",
         f"uint col_base = block_column * {block_columns}u;",
-        f"threadgroup T tile_a[{block_rows * block_reduction}];",
-        f"threadgroup T tile_b[{block_reduction * block_columns}];",
+        f"{tile_alignment}threadgroup T tile_a[{block_rows * block_reduction}];",
+        f"{tile_alignment}threadgroup T tile_b[{block_reduction * block_columns}];",
         f"threadgroup float tile_c[{block_rows * block_columns}];",
         "simdgroup_float8x8 acc[8];",
         f"simdgroup_{simdgroup_type}8x8 frag_a[2];",
@@ -1877,41 +1884,82 @@ def _emit_simdgroup_matmul_source(
         "}",
         f"for (uint k_base = 0u; k_base < {reduction}u; "
         f"k_base += {block_reduction}u) {{",
-        f"    for (uint index = tid; index < {block_rows * block_reduction}u; "
-        f"index += {threads}u) {{",
-        f"        uint local_row = index / {block_reduction}u;",
-        f"        uint local_k = index % {block_reduction}u;",
     ]
-    load_a = (
-        f"in_{left_position}[(row_base + local_row) * {reduction}u "
-        f"+ k_base + local_k]"
-    )
-    if not exact_reduction:
-        load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
-    lines.append(f"        tile_a[index] = {load_a};")
-    lines.extend(
-        [
-            "    }",
-            f"    for (uint index = tid; "
-            f"index < {block_reduction * block_columns}u; "
-            f"index += {threads}u) {{",
-            f"        uint local_k = index / {block_columns}u;",
-            f"        uint local_column = index % {block_columns}u;",
-        ]
-    )
-    load_b = (
-        f"in_{right_position}[(k_base + local_k) * {columns}u "
-        f"+ col_base + local_column]"
-    )
-    if not exact_reduction:
-        load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
-    lines.extend(
-        [
-            f"        tile_b[index] = {load_b};",
-            "    }",
-            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-        ]
-    )
+    if vector_loads:
+        lines.extend(
+            [
+                f"    for (uint vector_index = tid; "
+                f"vector_index < {block_rows * block_reduction // load_vector_width}u; "
+                f"vector_index += {threads}u) {{",
+                f"        uint index = vector_index * {load_vector_width}u;",
+                f"        uint local_row = index / {block_reduction}u;",
+                f"        uint local_k = index % {block_reduction}u;",
+                f"        threadgroup vec<T, {load_vector_width}>* destination =",
+                f"            reinterpret_cast<threadgroup vec<T, {load_vector_width}>*>(",
+                "                tile_a + index);",
+                f"        const device vec<T, {load_vector_width}>* source =",
+                f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
+                f"                in_{left_position} + (row_base + local_row) * {reduction}u",
+                f"                    + k_base + local_k);",
+                "        *destination = *source;",
+                "    }",
+                f"    for (uint vector_index = tid; "
+                f"vector_index < {block_reduction * block_columns // load_vector_width}u; "
+                f"vector_index += {threads}u) {{",
+                f"        uint index = vector_index * {load_vector_width}u;",
+                f"        uint local_k = index / {block_columns}u;",
+                f"        uint local_column = index % {block_columns}u;",
+                f"        threadgroup vec<T, {load_vector_width}>* destination =",
+                f"            reinterpret_cast<threadgroup vec<T, {load_vector_width}>*>(",
+                "                tile_b + index);",
+                f"        const device vec<T, {load_vector_width}>* source =",
+                f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
+                f"                in_{right_position} + (k_base + local_k) * {columns}u",
+                f"                    + col_base + local_column);",
+                "        *destination = *source;",
+                "    }",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"    for (uint index = tid; "
+                f"index < {block_rows * block_reduction}u; "
+                f"index += {threads}u) {{",
+                f"        uint local_row = index / {block_reduction}u;",
+                f"        uint local_k = index % {block_reduction}u;",
+            ]
+        )
+        load_a = (
+            f"in_{left_position}[(row_base + local_row) * {reduction}u "
+            f"+ k_base + local_k]"
+        )
+        if not exact_reduction:
+            load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
+        lines.extend(
+            [
+                f"        tile_a[index] = {load_a};",
+                "    }",
+                f"    for (uint index = tid; "
+                f"index < {block_reduction * block_columns}u; "
+                f"index += {threads}u) {{",
+                f"        uint local_k = index / {block_columns}u;",
+                f"        uint local_column = index % {block_columns}u;",
+            ]
+        )
+        load_b = (
+            f"in_{right_position}[(k_base + local_k) * {columns}u "
+            f"+ col_base + local_column]"
+        )
+        if not exact_reduction:
+            load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
+        lines.extend(
+            [
+                f"        tile_b[index] = {load_b};",
+                "    }",
+            ]
+        )
+    lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
     for k_offset in range(0, block_reduction, 8):
         lines.extend(

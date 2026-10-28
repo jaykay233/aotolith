@@ -232,11 +232,19 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 
 - 每个 SIMD group 负责 `16×32` 输出，使用 2 个 A fragment 和 4 个 B fragment 覆盖一次 `16×8 × 8×32` MMA
 - A/B 仍先协作加载到 threadgroup memory，尾 K 用零填充，避免 `simdgroup_load` 越界
+- reduction 能整除 `32` 且输出列能整除 `8` 时，A/B shared tile 按 16-byte 对齐，并用 `vec<T, 8>` 一次搬运 8 个 FP16/BF16 元素；尾 K 继续使用逐元素加载和边界判断
 - accumulator 保持 `simdgroup_float8x8`，只在最终写回时转换到 FP16/BF16
 - 输出先存入 `threadgroup float` tile，再统一执行 alpha/beta 和 bias broadcast epilogue
 - FP32 SIMD matrix 在当前 Apple GPU 上观察到精度降级，因此不启用；带尾行或尾列的低精度输出也回退到标量 tiled 路径
 
-在当前 M5 Pro 测试中，SIMD 路径比低精度标量 tiled kernel 快约 20%–75%，但与 MLX 仍有明显差距。该路径没有使用 Metal 4 MPP、vectorized load、split-K 或 autotune。
+在当前 M5 Pro 上交替启动进程，对 `512×2048 @ 2048×512` 的 FP16 matmul 各运行 5 次、每次取 101 轮中位数：
+
+| `64×64×32` SIMD path | 耗时 |
+| --- | ---: |
+| scalar load | 0.437 ms |
+| `vec<T, 8>` load | 0.344 ms |
+
+向量加载使该 shape 的 kernel 耗时下降约 21%。SIMD 路径仍比 MLX 慢，并且没有使用 Metal 4 MPP、split-K 或 autotune。
 
 ## 12. Metal attention codegen
 
@@ -294,7 +302,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
-- matmul 的 SIMD matrix 只覆盖 FP16/BF16 完整输出块，且还没有 vectorized load、Metal 4 MPP、split-K 或 autotune
+- matmul 的 SIMD matrix 只覆盖 FP16/BF16 完整输出块；完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout op 已做恒等与逆变换消除，但还没有布局传播
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并

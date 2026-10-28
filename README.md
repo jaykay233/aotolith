@@ -61,7 +61,7 @@ PyTorch FX
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
 ```
 
-matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 64×32 和 B 的 32×64 片段协作加载到 threadgroup memory。FP16/BF16 输入且输出行列都能整除 64 时，8 个 SIMD group 使用 `simdgroup_*8x8` 指令做矩阵乘并保持 FP32 accumulator；FP32 或尾块继续使用每线程 4×4/8×4 的寄存器 microtile。当前仍没有 vectorized load、Metal 4 MPP、split-K 或 autotune，实测仍慢于 MLX，所以默认开关保持关闭。
+matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 64×32 和 B 的 32×64 片段协作加载到 threadgroup memory。FP16/BF16 输入且输出行列都能整除 64 时，8 个 SIMD group 使用 `simdgroup_*8x8` 指令做矩阵乘并保持 FP32 accumulator；reduction 和输出列也满足 8 元素对齐时，A/B shared tile 按 16-byte 对齐并使用 `vec<T, 8>` 加载，尾 K、尾输出块和 F32 仍走标量加载。FP32 或尾块继续使用每线程 4×4/8×4 的寄存器 microtile。当前仍没有 Metal 4 MPP、split-K 或 autotune，实测仍慢于 MLX，所以默认开关保持关闭。
 
 传入 `codegen_attention=True` 会为满足条件的 attention 生成原生 MSL kernel：
 
