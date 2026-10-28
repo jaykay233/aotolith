@@ -1,6 +1,6 @@
 # 架构
 
-当前实现是一条最小但可运行的 Apple Metal 编译链。目标不是覆盖完整 Transformer，而是先把编译产物送到 Apple GPU，并用测试固定住前端、IR、融合、代码生成和 runtime 的接口。
+当前实现是一条最小但可运行的 Apple Metal 编译链。目标不是覆盖完整 Transformer，而是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并持续增加可验证的 lowering。
 
 ## 1. FX 捕获
 
@@ -13,10 +13,26 @@
 | `aten.mm.default` | `matmul` |
 | `aten.addmm.default` | `addmm` |
 | `aten.silu.default` | `silu` |
+| `aten.gelu.default` | `gelu` |
 | `aten.mul.Tensor` | `mul` |
 | `aten.add.Tensor` | `add` |
+| `aten.sub.Tensor` | `sub` |
+| `aten.rsub.Scalar` | `rsub` |
+| `aten.div.Tensor` | `div` |
+| `aten.neg.default` | `neg` |
+| `aten.abs.default` | `abs` |
+| `aten.sigmoid.default` | `sigmoid` |
+| `aten.tanh.default` | `tanh` |
+| `aten.relu.default` | `relu` |
+| `aten.exp.default` | `exp` |
+| `aten.erf.default` | `erf` |
+| `aten.sqrt.default` | `sqrt` |
+| `aten.rsqrt.default` | `rsqrt` |
+| `aten.reciprocal.default` | `reciprocal` |
 
-每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取。动态维度和空维度目前直接报错。`addmm` 的 `alpha`/`beta` 和 `add` 的 `alpha` 会写入 IR attribute；未知 kwargs 直接报错。
+每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。
+
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha` 和 `gelu` 的 `approximate` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
 ## 2. SSA IR
 
@@ -24,15 +40,15 @@ IR 定义在 `ir.py`：
 
 - `Value` 有唯一 ID 和静态 `TensorType`
 - `Operation` 只产生一个输出，输入是已定义的 value ID
-- `Graph.validate()` 检查输入唯一性、use-before-def、重复定义和输出有效性
+- `Graph.validate()` 检查输入唯一性、use-before-def、重复定义、输出类型是否存在
 
-这是刻意限制的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 attribute，而不需要改前端的 value 命名规则。
+这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
 
 ## 3. Pointwise 融合
 
 `fuse_pointwise` 找出图的融合区域：
 
-1. 把 `silu`、`mul`、`add` 标记为 pointwise op。
+1. 把支持的一元和二元运算标记为 pointwise op。
 2. 从 region root 反向收集 producer。
 3. producer 的输出必须只被当前 region 使用，否则停止跨越该 producer。
 4. region 至少包含两个 op 才替换成 `fused_elementwise`。
@@ -43,7 +59,9 @@ region root 是满足以下条件之一的 pointwise op：
 - 它的输出是 graph output
 - 它有一个非 pointwise consumer
 
-融合把 region 内部的中间 value 消掉，只把外部输入放进 `fused_elementwise.inputs`，输出 ID 保持为 root 原来的输出 ID。这样下游 op 不需要改写。
+只有单个 pointwise op 时不做 IR fusion，但 Apple backend 仍会为它生成一个独立 Metal kernel。
+
+融合把 region 内部的中间 value 消掉，只把外部输入放进 `fused_elementwise.inputs`，输出 ID 保持为 root 原来的输出 ID。
 
 例如：
 
@@ -62,40 +80,71 @@ v4 = fused_elementwise(v1, v2) {
 }
 ```
 
-## 4. MSL 生成
+## 4. Broadcast 索引
 
-`AppleMetalBackend._compile_pointwise` 生成一个 elementwise Metal kernel：
+pointwise kernel 使用输出 tensor 的扁平索引 `elem`。每个输入先检查静态 broadcast 规则：
 
-- grid 大小为输出元素数
+- 输入 rank 不能大于输出 rank
+- 从右向左对齐
+- 每一维必须等于输出维，或等于 1
+
+对需要 broadcast 的输入，codegen 根据输出 stride 还原坐标，再按输入 stride 计算线性 offset。例如输出 `[2, 3]`、输入 `[1, 3]` 时：
+
+```text
+input_offset = (elem % 3) * 1
+```
+
+这避免了依赖 MLX 在 kernel 调用前自动 broadcast，也把索引推导留在编译器里。
+
+## 5. Metal pointwise codegen
+
+`AppleMetalBackend._compile_elementwise` 生成 elementwise Metal kernel：
+
+- grid 大小为 `ceil(输出元素数 / 4)`
+- 每个 thread 依次处理最多 4 个元素
 - threadgroup 最大为 256
-- 每个 thread 处理一个输出元素
-- 输入先转成 `float` 计算
+- 输入转成 `float` 计算
 - 最终结果转回模板类型 `T`
 - `mx.fast.metal_kernel` 在首次调用时完成 JIT
 
-当前要求融合 region 的所有输入和输出具有完全相同的 shape 与 dtype。这是为了避免在还没有 broadcast/layout lowering 时生成错误代码。
+精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
 
-`matmul` 和 `addmm` 不经过自定义 MSL，而是由 `CompiledPlan` 调用 `mx.matmul`。因此当前示例的端到端路径是“MLX matmul + 自定义 Metal pointwise kernel”，不是全图由本项目的 codegen 执行。
+## 6. Metal matmul/addmm codegen
 
-## 5. Runtime
+`codegen_matmul=True` 时，backend 为 rank-2 `matmul` 和 `addmm` 生成独立 Metal kernel：
 
-`CompiledPlan` 按 SSA 顺序解释 IR op：
+```text
+C[row, col] = sum_k A[row, k] * B[k, col]
+```
 
-- `matmul`、`addmm`：MLX runtime
-- `fused_elementwise`：预编译的 `mx.fast.metal_kernel`
-- 未融合的 `silu`、`mul`、`add`：MLX runtime
+`addmm` 在同一 kernel 中计算：
 
-每个 graph input 在进入计划前会检查 shape 和 dtype。输出以 tuple 返回，即使图只有一个输出。
+```text
+beta * bias + alpha * (A @ B)
+```
 
-## 6. 已知边界
+bias 可以为标量、一维或二维，只要它满足到输出 shape 的静态 broadcast 规则。FP16/BF16 输入用 float 累加，最后 cast 回输出 dtype。
+
+当前 matmul kernel 没有 tiling、threadgroup memory、向量化 load 或 split-K。它用于验证完整的自定义 codegen 路径，不作为高性能 GEMM 使用。
+
+## 7. Runtime
+
+`CompiledPlan` 按 SSA 顺序执行 IR：
+
+- 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
+- 默认模式下的 `matmul`、`addmm`：调用 MLX
+- 未生成 kernel 的 pointwise op：调用 MLX fallback
+
+每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
+
+## 8. 已知边界
 
 - 只支持静态、非空 shape
-- FX tensor 输入和输出之外的控制流、常量参数、list/dict 输出未支持
-- pointwise 不支持 broadcast 和混合 dtype
-- `addmm` 的 `alpha`、`beta` 和 `add` 的 `alpha` 已保留；其他 ATen kwargs 会被拒绝
+- 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
+- pointwise 要求输入输出 dtype 相同
+- reduction、softmax、normalization 尚未 lowering
 - 没有 kernel cache、autotune、tiling、layout propagation
 - 没有反向传播和训练支持
-- Metal kernel 每次执行一个元素，尚未做向量化和 occupancy 调优
 - NVIDIA Triton/CUDA backend 尚未实现
 
-这些问题应在增加模型覆盖前逐项解决，尤其是 `addmm` 参数语义、broadcast lowering 和 kernel cache。
+下一步最有价值的方向是 reduction/normalization lowering、kernel cache，以及为 matmul 增加 tiled kernel。继续扩大 pointwise 算子覆盖的收益已经开始下降。

@@ -58,6 +58,11 @@ class Graph:
             missing = set(op.inputs) - defined
             if missing:
                 raise ValueError(f"{op.op} uses undefined values: {sorted(missing)}")
+            untyped_outputs = set(op.outputs) - set(self.values)
+            if untyped_outputs:
+                raise ValueError(
+                    f"{op.op} produces values without types: {sorted(untyped_outputs)}"
+                )
             duplicate = defined.intersection(op.outputs)
             if duplicate:
                 raise ValueError(f"values defined more than once: {sorted(duplicate)}")

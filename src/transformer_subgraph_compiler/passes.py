@@ -1,10 +1,26 @@
 from __future__ import annotations
 
-from collections import Counter
-
 from .ir import Graph, Operation
 
-_POINTWISE_OPS = {"silu", "mul", "add"}
+POINTWISE_OPS = {
+    "silu",
+    "gelu",
+    "mul",
+    "add",
+    "sub",
+    "rsub",
+    "div",
+    "neg",
+    "abs",
+    "sigmoid",
+    "tanh",
+    "relu",
+    "exp",
+    "erf",
+    "sqrt",
+    "rsqrt",
+    "reciprocal",
+}
 
 
 def fuse_pointwise(graph: Graph) -> Graph:
@@ -20,7 +36,7 @@ def fuse_pointwise(graph: Graph) -> Graph:
             consumers.setdefault(value_id, []).append(index)
 
     pointwise = {
-        index for index, op in enumerate(graph.ops) if op.op in _POINTWISE_OPS
+        index for index, op in enumerate(graph.ops) if op.op in POINTWISE_OPS
     }
     roots: list[int] = []
     for index in pointwise:

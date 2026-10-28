@@ -9,8 +9,22 @@ _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
     "aten.addmm.default": "addmm",
     "aten.silu.default": "silu",
+    "aten.gelu.default": "gelu",
     "aten.mul.Tensor": "mul",
     "aten.add.Tensor": "add",
+    "aten.sub.Tensor": "sub",
+    "aten.rsub.Scalar": "rsub",
+    "aten.div.Tensor": "div",
+    "aten.neg.default": "neg",
+    "aten.abs.default": "abs",
+    "aten.sigmoid.default": "sigmoid",
+    "aten.tanh.default": "tanh",
+    "aten.relu.default": "relu",
+    "aten.exp.default": "exp",
+    "aten.erf.default": "erf",
+    "aten.sqrt.default": "sqrt",
+    "aten.rsqrt.default": "rsqrt",
+    "aten.reciprocal.default": "reciprocal",
 }
 
 _TORCH_DTYPES = {
@@ -18,6 +32,15 @@ _TORCH_DTYPES = {
     "torch.bfloat16": DType.BF16,
     "torch.float32": DType.F32,
 }
+
+_NUMERIC_ATTRS = {
+    "addmm": {"alpha": 1.0, "beta": 1.0},
+    "add": {"alpha": 1.0},
+    "sub": {"alpha": 1.0},
+    "rsub": {"alpha": 1.0},
+}
+
+_BINARY_OPS = {"mul", "add", "sub", "rsub", "div"}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -46,10 +69,11 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             target = str(node.target)
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
-            inputs = tuple(_argument_ids(arg, node_ids) for arg in node.args)
-            output_id = f"v{len(ops)}"
             op_name = _SUPPORTED_OPS[target]
+            inputs, scalar_attrs = _operation_inputs(op_name, node.args, node_ids)
+            output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
+            attrs.update(scalar_attrs)
             op = Operation(op_name, inputs, (output_id,), attrs)
             ops.append(op)
             node_ids[node] = output_id
@@ -82,32 +106,86 @@ def _node_type(node: object) -> TensorType:
 
 
 def _argument_ids(argument: object, node_ids: dict[object, str]) -> str:
-    if argument in node_ids:
+    try:
         return node_ids[argument]
-    raise ValueError(f"unsupported FX argument: {argument!r}")
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"unsupported FX argument: {argument!r}") from exc
+
+
+def _operation_inputs(
+    op: str,
+    args: tuple[object, ...],
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    if op not in _BINARY_OPS:
+        return tuple(_argument_ids(arg, node_ids) for arg in args), {}
+
+    if len(args) != 2:
+        raise ValueError(f"{op} expects two arguments, got {len(args)}")
+
+    tensor_inputs: list[str] = []
+    scalars: list[tuple[int, float]] = []
+    for position, argument in enumerate(args):
+        try:
+            tensor_inputs.append(_argument_ids(argument, node_ids))
+        except ValueError:
+            if (
+                not isinstance(argument, (int, float))
+                or isinstance(argument, bool)
+            ):
+                raise ValueError(
+                    f"unsupported {op} argument at position {position}: {argument!r}"
+                ) from None
+            scalars.append((position, float(argument)))
+
+    if len(tensor_inputs) == 2:
+        return tuple(tensor_inputs), {}
+    if len(tensor_inputs) == 1 and len(scalars) == 1:
+        position, value = scalars[0]
+        return (
+            tuple(tensor_inputs),
+            {
+                "scalar": value,
+                "scalar_position": (
+                    "lhs" if position == 0 or op == "rsub" else "rhs"
+                ),
+            },
+        )
+    raise ValueError(f"{op} requires at least one tensor input")
 
 
 def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
-    allowed = {
-        "addmm": {"alpha": 1.0, "beta": 1.0},
-        "add": {"alpha": 1.0},
-    }.get(op, {})
-    unknown = set(kwargs) - set(allowed)
+    numeric_attrs = _NUMERIC_ATTRS.get(op, {})
+    allowed = set(numeric_attrs)
+    if op == "gelu":
+        allowed.add("approximate")
+    unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
 
     attrs: dict[str, object] = {}
-    for name, default in allowed.items():
+    for name, default in numeric_attrs.items():
         value = kwargs.get(name, default)
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError(f"{op}.{name} must be a scalar number, got {value!r}")
         attrs[name] = float(value)
+
+    if op == "gelu":
+        approximate = kwargs.get("approximate", "none")
+        if approximate not in {"none", "tanh"}:
+            raise ValueError(
+                "gelu.approximate must be 'none' or 'tanh', "
+                f"got {approximate!r}"
+            )
+        attrs["approximate"] = approximate
     return attrs
 
 
 def _output_ids(output: object, node_ids: dict[object, str]) -> tuple[str, ...]:
-    if output in node_ids:
+    try:
         return (_argument_ids(output, node_ids),)
+    except ValueError:
+        pass
     if isinstance(output, (tuple, list)):
         return tuple(_argument_ids(item, node_ids) for item in output)
     raise ValueError(f"unsupported FX output: {output!r}")

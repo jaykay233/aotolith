@@ -17,12 +17,17 @@ class CompilationResult:
     lowered_graph: Graph
 
 
-def compile_graph(graph: Graph, *, target: str = "apple-metal") -> CompilationResult:
+def compile_graph(
+    graph: Graph,
+    *,
+    target: str = "apple-metal",
+    codegen_matmul: bool = False,
+) -> CompilationResult:
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
 
     lowered = fuse_pointwise(graph)
-    plan = AppleMetalBackend().compile(lowered)
+    plan = AppleMetalBackend(codegen_matmul=codegen_matmul).compile(lowered)
     return CompilationResult(plan=plan, input_graph=graph, lowered_graph=lowered)
 
 
@@ -31,5 +36,10 @@ def compile_callable(
     example_inputs: Sequence[Any],
     *,
     target: str = "apple-metal",
+    codegen_matmul: bool = False,
 ) -> CompilationResult:
-    return compile_graph(capture_fx(fn, example_inputs), target=target)
+    return compile_graph(
+        capture_fx(fn, example_inputs),
+        target=target,
+        codegen_matmul=codegen_matmul,
+    )
