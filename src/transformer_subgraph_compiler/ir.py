@@ -9,6 +9,8 @@ class DType(str, Enum):
     BF16 = "bfloat16"
     F32 = "float32"
     BOOL = "bool"
+    I32 = "int32"
+    I64 = "int64"
 
 
 @dataclass(frozen=True, slots=True)

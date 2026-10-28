@@ -90,6 +90,7 @@ _SUPPORTED_OPS = {
     "aten.masked_fill.Scalar": "masked_fill",
     "aten.scalar_tensor.default": "scalar_tensor",
     "aten.cat.default": "cat",
+    "aten.embedding.default": "embedding",
 }
 
 _TORCH_DTYPES = {
@@ -97,6 +98,8 @@ _TORCH_DTYPES = {
     "torch.bfloat16": DType.BF16,
     "torch.float32": DType.F32,
     "torch.bool": DType.BOOL,
+    "torch.int32": DType.I32,
+    "torch.int64": DType.I64,
 }
 
 _NUMERIC_ATTRS = {
@@ -184,6 +187,15 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 for operation, value in stack_ops:
                     ops.append(operation)
                     values[value.id] = value
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                continue
+            if target == "aten.embedding.default":
+                inputs, attrs, output_type = _embedding_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("embedding", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
@@ -485,6 +497,92 @@ def _stack_operations(
         )
     )
     return tuple(operations), output_id, output_type
+
+
+def _embedding_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, str], dict[str, object], TensorType]:
+    """Validate an embedding gather while ignoring inference-only gradient flags."""
+
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    parameter_names = (
+        "weight",
+        "indices",
+        "padding_idx",
+        "scale_grad_by_freq",
+        "sparse",
+    )
+    if len(args) < 2 or len(args) > len(parameter_names):
+        raise ValueError(
+            f"embedding expects two to five arguments, got {len(args)}"
+        )
+    for position, name in enumerate(parameter_names[: len(args)]):
+        if name in kwargs:
+            raise ValueError(f"embedding received duplicate {name} argument")
+        kwargs[name] = args[position]
+
+    unknown = set(kwargs) - set(parameter_names)
+    if unknown:
+        raise ValueError(
+            f"embedding received unsupported keyword arguments: {sorted(unknown)}"
+        )
+    missing = set(parameter_names[:2]) - set(kwargs)
+    if missing:
+        raise ValueError(f"embedding is missing arguments: {sorted(missing)}")
+
+    padding_idx = kwargs.get("padding_idx", -1)
+    scale_grad_by_freq = kwargs.get("scale_grad_by_freq", False)
+    sparse = kwargs.get("sparse", False)
+    if padding_idx is not None and (
+        not isinstance(padding_idx, int) or isinstance(padding_idx, bool)
+    ):
+        raise ValueError(f"embedding.padding_idx must be an integer, got {padding_idx!r}")
+    if not isinstance(scale_grad_by_freq, bool):
+        raise ValueError(
+            "embedding.scale_grad_by_freq must be a boolean, "
+            f"got {scale_grad_by_freq!r}"
+        )
+    if not isinstance(sparse, bool):
+        raise ValueError(f"embedding.sparse must be a boolean, got {sparse!r}")
+
+    weight_id = _argument_ids(kwargs["weight"], node_ids)
+    indices_id = _argument_ids(kwargs["indices"], node_ids)
+    weight_type = _node_type(kwargs["weight"])
+    indices_type = _node_type(kwargs["indices"])
+    if len(weight_type.shape) != 2:
+        raise NotImplementedError(
+            f"embedding weight must have rank 2, got {weight_type.shape}"
+        )
+    if weight_type.dtype not in {DType.F16, DType.BF16, DType.F32}:
+        raise ValueError(
+            f"embedding weight must be floating point, got {weight_type.dtype.value}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "embedding indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    if padding_idx is not None and not (
+        -weight_type.shape[0] <= padding_idx < weight_type.shape[0]
+    ):
+        raise ValueError(
+            f"embedding.padding_idx {padding_idx} is outside the weight table"
+        )
+
+    output_type = _node_type(node)
+    expected_shape = indices_type.shape + (weight_type.shape[1],)
+    if output_type.shape != expected_shape or output_type.dtype != weight_type.dtype:
+        raise ValueError(
+            f"embedding output metadata {(output_type.shape, output_type.dtype)} does "
+            f"not match expected {(expected_shape, weight_type.dtype)}"
+        )
+    attrs = {
+        "padding_idx": padding_idx,
+        "scale_grad_by_freq": scale_grad_by_freq,
+        "sparse": sparse,
+    }
+    return (weight_id, indices_id), attrs, output_type
 
 
 def _attention_operation(

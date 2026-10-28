@@ -21,6 +21,8 @@ _MLX_DTYPES = {
     torch.bfloat16: mx.bfloat16,
     torch.float32: mx.float32,
     torch.bool: mx.bool_,
+    torch.int32: mx.int32,
+    torch.int64: mx.int64,
 }
 
 
@@ -651,6 +653,70 @@ def test_stack_lowers_to_unsqueeze_and_cat(dim: int) -> None:
     input_shape = inputs[0].shape
     assert actual.shape == input_shape[:axis] + (2,) + input_shape[axis:]
     assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_embedding_uses_mlx_gather_without_a_kernel(index_dtype) -> None:
+    def fn(indices, weight):
+        return torch.nn.functional.embedding(indices, weight, padding_idx=0)
+
+    torch.manual_seed(44)
+    inputs = (
+        torch.tensor([[0, 2], [3, 1]], dtype=index_dtype),
+        torch.randn(4, 8, dtype=torch.float16),
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["embedding"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 2, 8)
+    assert mx.array_equal(actual, expected)
+
+
+def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
+    def fn(indices, embedding, projection):
+        hidden = torch.nn.functional.embedding(indices, embedding)
+        return torch.nn.functional.silu(hidden @ projection)
+
+    torch.manual_seed(45)
+    inputs = (
+        torch.tensor([1, 3, 0, 2], dtype=torch.int64),
+        torch.randn(4, 8, dtype=torch.float16),
+        torch.randn(8, 6, dtype=torch.float16),
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "embedding",
+        "matmul",
+        "silu",
+    ]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert actual.shape == (4, 6)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_embedding_requires_integer_indices() -> None:
+    weight_type = TensorType((4, 8), DType.F32)
+    index_type = TensorType((2,), DType.F32)
+    values = {
+        "weight": Value("weight", weight_type),
+        "indices": Value("indices", index_type),
+        "out": Value("out", TensorType((2, 8), DType.F32)),
+    }
+    graph = Graph(
+        ("weight", "indices"),
+        values,
+        (Operation("embedding", ("weight", "indices"), ("out",)),),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="indices must be int32 or int64"):
+        compile_graph(graph)
 
 
 def test_flip_lowers_to_mlx_layout_without_a_kernel() -> None:

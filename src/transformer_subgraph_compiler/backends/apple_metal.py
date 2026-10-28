@@ -16,6 +16,8 @@ _MLX_DTYPES = {
     DType.BF16: mx.bfloat16,
     DType.F32: mx.float32,
     DType.BOOL: mx.bool_,
+    DType.I32: mx.int32,
+    DType.I64: mx.int64,
 }
 
 _ELEMENTS_PER_THREAD = 4
@@ -113,6 +115,9 @@ class CompiledPlan:
 
             if op.op == "attention":
                 env[op.outputs[0]] = _evaluate_attention_mlx(op, env)
+            elif op.op == "embedding":
+                weight, indices = (env[value_id] for value_id in op.inputs)
+                env[op.outputs[0]] = mx.take(weight, indices, axis=0)
             elif op.op == "cat":
                 rank = len(env[op.inputs[0]].shape)
                 axis = int(op.attrs["dim"]) % rank
@@ -196,6 +201,8 @@ class AppleMetalBackend:
                     compiled = self._compile_attention(graph, op, index)
             elif op.op == "cat":
                 _validate_cat_op(graph, op)
+            elif op.op == "embedding":
+                _validate_embedding_op(graph, op)
             elif op.op == "cast":
                 _validate_cast_op(graph, op)
                 output_type = graph.value(op.outputs[0]).type
@@ -1825,6 +1832,8 @@ def _validate_pointwise_region(
         if op.op == "scalar_tensor":
             if op.inputs:
                 raise ValueError("scalar_tensor must not have tensor inputs")
+            if output_type.dtype in {DType.I32, DType.I64}:
+                raise ValueError("scalar_tensor does not support integer outputs")
             value = op.attrs.get("value")
             if not isinstance(value, (bool, int, float)):
                 raise ValueError(
@@ -1891,6 +1900,11 @@ def _validate_pointwise_region(
             input_type.dtype == DType.BOOL for input_type in input_types
         ):
             raise ValueError(f"{op.op} does not accept boolean tensor operands")
+        if output_type.dtype in {DType.I32, DType.I64} or any(
+            input_type.dtype in {DType.I32, DType.I64}
+            for input_type in input_types
+        ):
+            raise ValueError(f"{op.op} does not accept integer tensor operands")
 
     if graph.value(output_id).type.dtype == DType.BOOL:
         producer = next(
@@ -2958,6 +2972,53 @@ def _validate_cat_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             f"cat output shape {output_type.shape} != {tuple(expected_shape)}"
         )
+
+
+def _validate_embedding_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 2:
+        raise ValueError(f"embedding expects two inputs, got {len(op.inputs)}")
+    weight_type = graph.value(op.inputs[0]).type
+    indices_type = graph.value(op.inputs[1]).type
+    output_type = graph.value(op.outputs[0]).type
+    if len(weight_type.shape) != 2:
+        raise ValueError(
+            f"embedding weight must have rank 2, got {weight_type.shape}"
+        )
+    if weight_type.dtype not in {DType.F16, DType.BF16, DType.F32}:
+        raise ValueError(
+            f"embedding weight must be floating point, got {weight_type.dtype.value}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "embedding indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    expected_shape = indices_type.shape + (weight_type.shape[1],)
+    if output_type.shape != expected_shape or output_type.dtype != weight_type.dtype:
+        raise ValueError(
+            f"embedding output metadata {(output_type.shape, output_type.dtype)} does "
+            f"not match expected {(expected_shape, weight_type.dtype)}"
+        )
+
+    allowed_attrs = {"padding_idx", "scale_grad_by_freq", "sparse"}
+    unknown_attrs = set(op.attrs) - allowed_attrs
+    if unknown_attrs:
+        raise ValueError(
+            f"embedding has unsupported attributes: {sorted(unknown_attrs)}"
+        )
+    padding_idx = op.attrs.get("padding_idx", -1)
+    if padding_idx is not None:
+        if not isinstance(padding_idx, int) or isinstance(padding_idx, bool):
+            raise ValueError(
+                f"embedding.padding_idx must be an integer, got {padding_idx!r}"
+            )
+        if not -weight_type.shape[0] <= padding_idx < weight_type.shape[0]:
+            raise ValueError(
+                f"embedding.padding_idx {padding_idx} is outside the weight table"
+            )
+    for name in ("scale_grad_by_freq", "sparse"):
+        if not isinstance(op.attrs.get(name, False), bool):
+            raise ValueError(f"embedding.{name} must be a boolean")
 
 
 def _validate_cast_op(graph: Graph, op: Operation) -> None:
