@@ -4,7 +4,12 @@ import mlx.core as mx
 import pytest
 import torch
 
-from transformer_subgraph_compiler import compile_callable, compile_graph, fuse_pointwise
+from transformer_subgraph_compiler import (
+    compile_callable,
+    compile_graph,
+    eliminate_common_subexpressions,
+    fuse_pointwise,
+)
 from transformer_subgraph_compiler.backends import apple_metal as metal_backend
 from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
 
@@ -115,6 +120,147 @@ def test_pointwise_region_scheduled_after_interleaved_producer() -> None:
     expected = gate * (mlx_inputs[0] @ mlx_inputs[2])
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_pointwise_fusion_preserves_observed_intermediate() -> None:
+    def fn(x):
+        activated = torch.relu(x)
+        return activated, torch.sigmoid(activated)
+
+    torch.manual_seed(42)
+    x = torch.randn(2, 8)
+    result = compile_callable(fn, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["relu", "sigmoid"]
+    actual = result.plan(mx.array(x.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in fn(x))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(actual_value, expected_value)
+
+
+def test_pointwise_fusion_reuses_shared_expression() -> None:
+    def fn(x):
+        activated = torch.sigmoid(x)
+        return (activated + activated) * activated
+
+    torch.manual_seed(43)
+    x = torch.randn(2, 8)
+    result = compile_callable(fn, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    source = result.plan.kernels[0].source
+    assert source.count("metal::exp") == 1
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
+def test_common_subexpression_elimination_reuses_matmul() -> None:
+    matrix = TensorType((2, 3), DType.F32)
+    weight = TensorType((3, 4), DType.F32)
+    output = TensorType((2, 4), DType.F32)
+    values = {
+        "x": Value("x", matrix),
+        "w": Value("w", weight),
+        "left": Value("left", output),
+        "right": Value("right", output),
+        "out": Value("out", output),
+    }
+    graph = Graph(
+        ("x", "w"),
+        values,
+        (
+            Operation("matmul", ("x", "w"), ("left",)),
+            Operation("matmul", ("x", "w"), ("right",)),
+            Operation("add", ("left", "right"), ("out",)),
+        ),
+        ("out",),
+    )
+
+    optimized = eliminate_common_subexpressions(graph)
+    assert [op.op for op in optimized.ops] == ["matmul", "add"]
+    assert optimized.ops[1].inputs == (optimized.ops[0].outputs[0],) * 2
+
+    result = compile_graph(optimized)
+    x = torch.randn(2, 3)
+    w = torch.randn(3, 4)
+    actual = result.plan(mx.array(x.numpy()), mx.array(w.numpy()))[0]
+    projected = mx.matmul(mx.array(x.numpy()), mx.array(w.numpy()))
+    expected = projected + projected
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
+def test_common_subexpression_key_preserves_cast_dtype() -> None:
+    source = TensorType((2, 3), DType.F16)
+    first_type = TensorType((2, 3), DType.F32)
+    second_type = TensorType((2, 3), DType.BF16)
+    values = {
+        "x": Value("x", source),
+        "first": Value("first", first_type),
+        "second": Value("second", second_type),
+    }
+    graph = Graph(
+        ("x",),
+        values,
+        (
+            Operation("cast", ("x",), ("first",)),
+            Operation("cast", ("x",), ("second",)),
+        ),
+        ("first", "second"),
+    )
+
+    optimized = eliminate_common_subexpressions(graph)
+    assert [op.op for op in optimized.ops] == ["cast", "cast"]
+    assert optimized.outputs == ("first", "second")
+
+
+def test_common_subexpression_key_preserves_attributes() -> None:
+    tensor = TensorType((2, 3), DType.F32)
+    values = {
+        "x": Value("x", tensor),
+        "y": Value("y", tensor),
+        "first": Value("first", tensor),
+        "second": Value("second", tensor),
+    }
+    graph = Graph(
+        ("x", "y"),
+        values,
+        (
+            Operation("add", ("x", "y"), ("first",), {"alpha": 1.0}),
+            Operation("add", ("x", "y"), ("second",), {"alpha": 2.0}),
+        ),
+        ("first", "second"),
+    )
+
+    optimized = eliminate_common_subexpressions(graph)
+    assert [op.op for op in optimized.ops] == ["add", "add"]
+    assert optimized.outputs == ("first", "second")
+
+
+def test_compiler_eliminates_duplicate_graph_outputs() -> None:
+    def fn(x, weight):
+        left = x @ weight
+        right = x @ weight
+        return left, right
+
+    torch.manual_seed(44)
+    x = torch.randn(2, 3)
+    weight = torch.randn(3, 4)
+    result = compile_callable(fn, (x, weight))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    assert result.lowered_graph.outputs == (result.lowered_graph.ops[0].outputs[0],) * 2
+
+    actual = result.plan(mx.array(x.numpy()), mx.array(weight.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in fn(x, weight))
+    mx.eval(*actual, *expected)
+    assert len(actual) == 2
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(actual_value, expected_value, atol=5e-3, rtol=5e-3)
 
 
 def test_layout_ops_match_pytorch() -> None:
@@ -250,6 +396,7 @@ def test_direct_scaled_dot_product_attention_with_mask() -> None:
         "scale": pytest.approx(8**-0.5),
         "has_mask": True,
         "causal": False,
+        "safe_softmax": True,
     }
     assert result.plan.kernels == ()
 
@@ -295,6 +442,150 @@ def test_direct_scaled_dot_product_attention_explicit_scale() -> None:
     expected = mx.array(fn(*inputs).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("codegen_attention", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_direct_scaled_dot_product_attention_distinct_value_head_dim(
+    codegen_attention, dtype
+) -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+            scale=0.25,
+        )
+
+    torch.manual_seed(62)
+    inputs = (
+        torch.randn(2, 2, 3, 8, dtype=dtype),
+        torch.randn(2, 2, 4, 8, dtype=dtype),
+        torch.randn(2, 2, 4, 6, dtype=dtype),
+        torch.randn(2, 1, 3, 4, dtype=dtype) * 0.2,
+    )
+    result = compile_callable(
+        fn, inputs, codegen_attention=codegen_attention
+    )
+
+    input_ops = [op.op for op in result.input_graph.ops]
+    assert input_ops.count("mul") == 2
+    assert "safe_softmax" in input_ops
+    assert [op.op for op in result.lowered_graph.ops] == ["attention"]
+    attention = result.lowered_graph.ops[0]
+    assert attention.attrs == {
+        "scale": 0.25,
+        "has_mask": True,
+        "causal": False,
+        "safe_softmax": True,
+    }
+    assert [kernel.kind for kernel in result.plan.kernels] == (
+        ["attention"] if codegen_attention else []
+    )
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 5e-3
+    assert actual.shape == (2, 2, 3, 6)
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.parametrize("codegen_attention", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_attention_zeroes_fully_masked_rows(codegen_attention, dtype) -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, scale=0.25
+        )
+
+    torch.manual_seed(65)
+    inputs = (
+        torch.randn(2, 2, 3, 8, dtype=dtype),
+        torch.randn(2, 2, 4, 8, dtype=dtype),
+        torch.randn(2, 2, 4, 6, dtype=dtype),
+        torch.full((2, 1, 3, 4), -torch.inf, dtype=dtype),
+    )
+    result = compile_callable(
+        fn, inputs, codegen_attention=codegen_attention
+    )
+    assert "safe_softmax" in [op.op for op in result.input_graph.ops]
+    assert result.lowered_graph.ops[0].attrs["safe_softmax"] is True
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.array_equal(actual, mx.zeros_like(actual))
+    assert mx.allclose(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("codegen_attention", [False, True])
+def test_attention_preserves_explicit_low_precision_cast(codegen_attention) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query.bfloat16(), key.bfloat16(), value.bfloat16()
+        )
+
+    torch.manual_seed(63)
+    inputs = (
+        torch.randn(2, 3, 4, 8, dtype=torch.float16),
+        torch.randn(2, 3, 5, 8, dtype=torch.float16),
+        torch.randn(2, 3, 5, 6, dtype=torch.float16),
+    )
+    result = compile_callable(
+        fn, inputs, codegen_attention=codegen_attention
+    )
+
+    lowered_ops = result.lowered_graph.ops
+    assert [op.op for op in lowered_ops] == ["cast", "cast", "cast", "attention"]
+    attention = lowered_ops[-1]
+    assert all(
+        result.lowered_graph.value(value_id).type.dtype == DType.BF16
+        for value_id in attention.inputs + attention.outputs
+    )
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("codegen_attention", [False, True])
+def test_attention_preserves_explicit_float32_compute(codegen_attention) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query.float(), key.float(), value.float()
+        )
+
+    torch.manual_seed(64)
+    inputs = (
+        torch.randn(2, 3, 4, 8, dtype=torch.float16),
+        torch.randn(2, 3, 5, 8, dtype=torch.float16),
+        torch.randn(2, 3, 5, 6, dtype=torch.float16),
+    )
+    result = compile_callable(
+        fn, inputs, codegen_attention=codegen_attention
+    )
+
+    lowered_ops = result.lowered_graph.ops
+    assert [op.op for op in lowered_ops] == ["cast", "cast", "cast", "attention"]
+    attention = lowered_ops[-1]
+    assert all(
+        result.lowered_graph.value(value_id).type.dtype == DType.F32
+        for value_id in attention.inputs + attention.outputs
+    )
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 def test_direct_scaled_dot_product_attention_grouped_query() -> None:
@@ -1088,6 +1379,26 @@ def test_metal_softmax_last_dim(shape) -> None:
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(torch.nn.functional.softmax(x, dim=-1).numpy())
     mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_safe_softmax_returns_zero_for_fully_masked_rows() -> None:
+    torch.manual_seed(40)
+    x = torch.randn(2, 7)
+    x[0] = -torch.inf
+
+    result = compile_callable(
+        lambda value: torch.ops.aten._safe_softmax.default(value, -1), (x,)
+    )
+    assert [op.op for op in result.lowered_graph.ops] == ["safe_softmax"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["safe_softmax"]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(
+        torch.ops.aten._safe_softmax.default(x, -1).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual[0], mx.zeros((7,)))
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 

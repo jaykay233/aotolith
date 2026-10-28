@@ -151,7 +151,7 @@ class AppleMetalBackend:
                 compiled = self._compile_elementwise(
                     graph, op.inputs, (op,), op.outputs[0], index, op.op
                 )
-            elif op.op == "softmax":
+            elif op.op in {"softmax", "safe_softmax"}:
                 compiled = self._compile_softmax(graph, op, index)
             elif op.op in {"sum", "mean"}:
                 compiled = self._compile_reduction(graph, op, index)
@@ -163,6 +163,13 @@ class AppleMetalBackend:
                 _validate_attention_op(graph, op)
                 if self.codegen_attention:
                     compiled = self._compile_attention(graph, op, index)
+            elif op.op == "cast":
+                _validate_cast_op(graph, op)
+                output_type = graph.value(op.outputs[0]).type
+                dtype = _MLX_DTYPES[output_type.dtype]
+                callables[op.outputs[0]] = (
+                    lambda value, dtype=dtype: value.astype(dtype)
+                )
             elif op.op in LAYOUT_OPS:
                 _validate_layout_op(graph, op)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
@@ -422,25 +429,25 @@ class AppleMetalBackend:
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any]:
         if len(op.inputs) != 1:
-            raise ValueError("softmax expects one input")
+            raise ValueError(f"{op.op} expects one input")
 
         input_type = graph.value(op.inputs[0]).type
         output_type = graph.value(op.outputs[0]).type
         if input_type.dtype != output_type.dtype:
             raise NotImplementedError(
-                "Metal softmax requires identical input/output dtypes"
+                f"Metal {op.op} requires identical input/output dtypes"
             )
         if input_type.shape != output_type.shape:
             raise ValueError(
-                f"softmax output shape {output_type.shape} != {input_type.shape}"
+                f"{op.op} output shape {output_type.shape} != {input_type.shape}"
             )
         if not input_type.shape:
-            raise NotImplementedError("Metal softmax requires a ranked tensor")
+            raise NotImplementedError(f"Metal {op.op} requires a ranked tensor")
 
         rank = len(input_type.shape)
         dim = op.attrs.get("dim")
         if not isinstance(dim, int) or isinstance(dim, bool):
-            raise ValueError(f"softmax.dim must be an integer, got {dim!r}")
+            raise ValueError(f"{op.op}.dim must be an integer, got {dim!r}")
         axis = dim % rank
         columns = input_type.shape[axis]
         outer_size = prod(input_type.shape[:axis]) or 1
@@ -456,6 +463,17 @@ class AppleMetalBackend:
                 f"+ output_index % {inner_size}u"
             )
         axis_offset = "col" if inner_size == 1 else f"col * {inner_size}u"
+        input_expression = f"in_0[offset + ({axis_offset})]"
+        exp_expression = f"metal::exp(float({input_expression}) - max_value)"
+        if op.op == "safe_softmax":
+            exp_expression = (
+                f"(float({input_expression}) == -INFINITY ? 0.0f : {exp_expression})"
+            )
+        normalized_expression = f"{exp_expression} / sum_value"
+        if op.op == "safe_softmax":
+            normalized_expression = (
+                f"(sum_value == 0.0f ? 0.0f : {normalized_expression})"
+            )
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint output_index = threadgroup_position_in_grid.x;
@@ -482,9 +500,7 @@ class AppleMetalBackend:
 
         float local_sum = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            local_sum += metal::exp(
-                float(in_0[offset + ({axis_offset})]) - max_value
-            );
+            local_sum += {exp_expression};
         }}
         scratch[tid] = local_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -499,13 +515,10 @@ class AppleMetalBackend:
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            out[offset + ({axis_offset})] = (T)(
-                metal::exp(float(in_0[offset + ({axis_offset})]) - max_value)
-                / sum_value
-            );
+            out[offset + ({axis_offset})] = (T)({normalized_expression});
         }}
         """
-        name = f"metal_softmax_{threads}_{index}"
+        name = f"metal_{op.op}_{threads}_{index}"
         kernel = _metal_kernel(
             name,
             ("in_0",),
@@ -535,7 +548,7 @@ class AppleMetalBackend:
             input_ids=op.inputs,
             output_id=op.outputs[0],
             tensor_type=output_type,
-            kind="softmax",
+            kind=op.op,
         )
         return artifact, runtime
 
@@ -1271,6 +1284,7 @@ def _emit_pointwise_source(
         "    }",
     ]
     env: dict[str, str] = {}
+    common: dict[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], str] = {}
 
     for position, value_id in enumerate(input_ids):
         variable = f"input_{position}"
@@ -1282,10 +1296,20 @@ def _emit_pointwise_source(
 
     for op_index, op in enumerate(body):
         arguments = [env[value_id] for value_id in op.inputs]
+        key = (
+            op.op,
+            op.inputs,
+            tuple((name, repr(value)) for name, value in sorted(op.attrs.items())),
+        )
+        existing = common.get(key)
+        if existing is not None:
+            env[op.outputs[0]] = existing
+            continue
         output = f"temp_{op_index}"
         expression = _emit_pointwise_expression(op, arguments)
         lines.append(f"    float {output} = {expression};")
         env[op.outputs[0]] = output
+        common[key] = output
 
     if output_id not in env:
         raise ValueError("pointwise region does not produce its declared output")
@@ -1609,6 +1633,15 @@ def _attention_mask_offset_expression(
     return " + ".join(terms) if terms else "0u"
 
 
+def _validate_cast_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"cast expects one input, got {len(op.inputs)}")
+    input_shape = graph.value(op.inputs[0]).type.shape
+    output_shape = graph.value(op.outputs[0]).type.shape
+    if input_shape != output_shape:
+        raise ValueError(f"cast shape {input_shape} != {output_shape}")
+
+
 def _validate_attention_op(graph: Graph, op: Operation) -> None:
     expected_inputs = 4 if op.attrs.get("has_mask") else 3
     if len(op.inputs) != expected_inputs:
@@ -1660,6 +1693,11 @@ def _validate_attention_op(graph: Graph, op: Operation) -> None:
     causal = op.attrs.get("causal", False)
     if not isinstance(causal, bool):
         raise ValueError(f"attention.causal must be a boolean, got {causal!r}")
+    safe_softmax = op.attrs.get("safe_softmax", False)
+    if not isinstance(safe_softmax, bool):
+        raise ValueError(
+            f"attention.safe_softmax must be a boolean, got {safe_softmax!r}"
+        )
     if causal and expected_inputs == 4:
         raise ValueError("attention cannot combine an explicit mask with causal mode")
 
@@ -1684,15 +1722,19 @@ def _validate_attention_op(graph: Graph, op: Operation) -> None:
 
 def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:
     query, key, value = (env[value_id] for value_id in op.inputs[:3])
-    mask = env[op.inputs[3]] if len(op.inputs) == 4 else None
+    explicit_mask = env[op.inputs[3]] if len(op.inputs) == 4 else None
+    mask = explicit_mask
     if op.attrs.get("causal"):
         mask = "causal"
     scale = float(op.attrs["scale"])
 
     if query.ndim == 4:
-        return mx.fast.scaled_dot_product_attention(
+        output = mx.fast.scaled_dot_product_attention(
             query, key, value, scale=scale, mask=mask
         )
+        if op.attrs.get("safe_softmax") and explicit_mask is not None:
+            output = _zero_fully_masked_rows(explicit_mask, output)
+        return output
     if query.ndim != 3:
         raise NotImplementedError(
             f"attention requires rank-3 or rank-4 inputs, got {query.shape}"
@@ -1706,4 +1748,16 @@ def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
     output = mx.fast.scaled_dot_product_attention(
         query, key, value, scale=scale, mask=mask
     )
-    return mx.squeeze(output, axis=1)
+    output = mx.squeeze(output, axis=1)
+    if op.attrs.get("safe_softmax") and explicit_mask is not None:
+        output = _zero_fully_masked_rows(
+            mx.squeeze(explicit_mask, axis=1), output
+        )
+    return output
+
+
+def _zero_fully_masked_rows(mask: mx.array, output: mx.array) -> mx.array:
+    score_shape = output.shape[:-1] + (mask.shape[-1],)
+    broadcast_mask = mx.broadcast_to(mask, score_shape)
+    all_masked = mx.all(broadcast_mask == -mx.inf, axis=-1, keepdims=True)
+    return mx.where(all_masked, mx.array(0, dtype=output.dtype), output)

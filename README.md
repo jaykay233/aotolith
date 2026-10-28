@@ -1,11 +1,11 @@
 # Transformer Subgraph Compiler
 
-一个面向 Transformer 子图的实验性编译器。当前版本以 Apple Silicon 为第一目标，把 PyTorch FX 图转换成自定义 SSA IR，消除冗余布局，融合 attention 和 pointwise 子图，再通过生成的 Metal Shading Language kernel 与 MLX runtime 在 Apple GPU 上执行。
+一个面向 Transformer 子图的实验性编译器。当前版本以 Apple Silicon 为第一目标，把 PyTorch FX 图转换成自定义 SSA IR，消除冗余布局与公共子表达式，融合 attention 和 pointwise 子图，再通过生成的 Metal Shading Language kernel 与 MLX runtime 在 Apple GPU 上执行。
 
 ```text
 PyTorch FX
   -> SSA IR
-  -> layout simplification / matmul canonicalization / attention and pointwise fusion
+  -> layout simplification / matmul canonicalization / attention and pointwise fusion / CSE
   -> Metal Shading Language + MLX runtime lowering
   -> mx.fast.metal_kernel
   -> Apple GPU
@@ -18,11 +18,11 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
-| 视图与布局 | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias` |
+| 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
-| Softmax | `aten._softmax.default`，支持任意单个维度 |
+| Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
@@ -35,9 +35,11 @@ PyTorch FX
 - 消除恒等 layout、连续逆 `transpose/permute` 和 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
+- 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
 - 识别 PyTorch 分解图中 `repeat_kv` 产生的 `unsqueeze -> expand -> reshape`，融合后不再物化复制后的 K/V
 - 把相邻 pointwise op 融合成一个 DAG region
+- 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式，并保持 graph output alias
 - 在 schedule 前校验静态视图和布局变换，Runtime 通过 MLX 执行 view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引
@@ -144,7 +146,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout op 已具备静态校验、恒等与逆变换消除和 MLX lowering，但还没有布局传播与公共子表达式消除。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout op 已具备静态校验、恒等与逆变换消除和 MLX lowering，但还没有布局传播。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见形式会使用生成的 MSL attention kernel，其余形式回退到 MLX。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 

@@ -21,12 +21,15 @@ _SUPPORTED_OPS = {
     "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
     "aten.alias.default": "alias",
+    "aten._to_copy.default": "cast",
     "aten._softmax.default": "softmax",
+    "aten._safe_softmax.default": "safe_softmax",
     "aten.sum.dim_IntList": "sum",
     "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
     "aten.gelu.default": "gelu",
     "aten.mul.Tensor": "mul",
+    "aten.mul.Scalar": "mul",
     "aten.add.Tensor": "add",
     "aten.sub.Tensor": "sub",
     "aten.rsub.Scalar": "rsub",
@@ -150,6 +153,14 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     if not output_ids:
         raise ValueError("captured graph has no outputs")
 
+    needed = set(output_ids)
+    live_ops: list[Operation] = []
+    for op in reversed(ops):
+        if needed.intersection(op.outputs):
+            live_ops.append(op)
+            needed.update(op.inputs)
+    ops = list(reversed(live_ops))
+
     graph = Graph(tuple(input_ids), values, tuple(ops), output_ids)
     graph.validate()
     return graph
@@ -241,6 +252,7 @@ def _attention_operation(
         "scale": float(scale),
         "has_mask": attn_mask is not None,
         "causal": is_causal,
+        "safe_softmax": True,
     }
     return tuple(inputs), attrs, output_node
 
@@ -558,15 +570,20 @@ def _operation_inputs(
     args: tuple[object, ...],
     node_ids: dict[object, str],
 ) -> tuple[tuple[str, ...], dict[str, object]]:
-    if op == "softmax":
-        if len(args) != 3:
-            raise ValueError(f"softmax expects three arguments, got {len(args)}")
-        input_id, dim, half_to_float = args
+    if op == "cast":
+        if len(args) != 1:
+            raise ValueError(f"cast expects one argument, got {len(args)}")
+        return ((_argument_ids(args[0], node_ids),), {})
+
+    if op in {"softmax", "safe_softmax"}:
+        if len(args) not in ({2, 3} if op == "safe_softmax" else {3}):
+            raise ValueError(f"{op} received unexpected arguments: {len(args)}")
+        input_id, dim = args[:2]
         if not isinstance(dim, int) or isinstance(dim, bool):
-            raise ValueError(f"softmax.dim must be an integer, got {dim!r}")
-        if not isinstance(half_to_float, bool):
+            raise ValueError(f"{op}.dim must be an integer, got {dim!r}")
+        if len(args) == 3 and not isinstance(args[2], bool):
             raise ValueError(
-                f"softmax.half_to_float must be a boolean, got {half_to_float!r}"
+                f"{op}.half_to_float must be a boolean, got {args[2]!r}"
             )
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
@@ -739,9 +756,15 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("approximate")
     if op == "contiguous":
         allowed.add("memory_format")
+    if op == "cast":
+        allowed.update(
+            {"dtype", "layout", "device", "pin_memory", "non_blocking", "memory_format"}
+        )
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
+    if op == "cast":
+        return {}
 
     attrs: dict[str, object] = {}
     for name, default in numeric_attrs.items():

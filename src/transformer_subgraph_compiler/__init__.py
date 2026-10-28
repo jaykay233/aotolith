@@ -5,6 +5,7 @@ from .frontend import capture_fx
 from .ir import DType, Graph, Operation, TensorType, Value
 from .passes import (
     canonicalize_batched_matmul,
+    eliminate_common_subexpressions,
     fuse_attention,
     fuse_pointwise,
     simplify_layouts,
@@ -21,6 +22,7 @@ __all__ = [
     "compile_callable",
     "compile_graph",
     "canonicalize_batched_matmul",
+    "eliminate_common_subexpressions",
     "fuse_attention",
     "fuse_pointwise",
     "simplify_layouts",

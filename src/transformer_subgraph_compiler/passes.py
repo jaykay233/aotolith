@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import prod
 
-from .ir import Graph, Operation
+from .ir import DType, Graph, Operation
 
 POINTWISE_OPS = {
     "silu",
@@ -142,25 +142,28 @@ def fuse_pointwise(graph: Graph) -> Graph:
     fused_at: dict[int, Operation] = {}
     removed_members: set[int] = set()
     assigned: set[int] = set()
+    output_set = set(graph.outputs)
 
     for root in roots:
         if root in assigned:
             continue
-        members: set[int] = set()
-
-        def collect(index: int) -> None:
-            if index in members or index not in pointwise:
-                return
-            op = graph.ops[index]
-            if index != root and len(consumers.get(op.outputs[0], [])) != 1:
-                return
-            members.add(index)
-            for value_id in op.inputs:
-                producer = producers.get(value_id)
-                if producer is not None:
-                    collect(producer)
-
-        collect(root)
+        members = {root}
+        changed = True
+        while changed:
+            changed = False
+            for index in sorted(members):
+                op = graph.ops[index]
+                for value_id in op.inputs:
+                    producer = producers.get(value_id)
+                    if producer is None or producer in members or producer not in pointwise:
+                        continue
+                    producer_output = graph.ops[producer].outputs[0]
+                    if producer_output in output_set:
+                        continue
+                    producer_consumers = set(consumers.get(producer_output, []))
+                    if producer_consumers.issubset(members):
+                        members.add(producer)
+                        changed = True
         if len(members) < 2:
             continue
 
@@ -198,6 +201,42 @@ def fuse_pointwise(graph: Graph) -> Graph:
             rewritten.append(op)
 
     return graph.replace_ops(tuple(rewritten))
+
+
+def eliminate_common_subexpressions(graph: Graph) -> Graph:
+    """Reuse identical pure operations with the same inputs and attributes."""
+
+    graph.validate()
+    aliases: dict[str, str] = {}
+
+    def resolve(value_id: str) -> str:
+        while value_id in aliases:
+            value_id = aliases[value_id]
+        return value_id
+
+    common: dict[tuple[object, ...], str] = {}
+    rewritten: list[Operation] = []
+    for op in graph.ops:
+        inputs = tuple(resolve(value_id) for value_id in op.inputs)
+        current = (
+            op if inputs == op.inputs else Operation(op.op, inputs, op.outputs, op.attrs)
+        )
+        output_type = graph.value(op.outputs[0]).type
+        key = (
+            current.op,
+            current.inputs,
+            (output_type.shape, output_type.dtype.value),
+            _freeze_attribute(current.attrs),
+        )
+        existing = common.get(key)
+        if existing is not None:
+            aliases[current.outputs[0]] = existing
+            continue
+        common[key] = current.outputs[0]
+        rewritten.append(current)
+
+    outputs = tuple(resolve(value_id) for value_id in graph.outputs)
+    return _replace_graph(graph, tuple(rewritten), outputs)
 
 
 def _remove_identity_layouts(graph: Graph) -> Graph:
@@ -446,7 +485,7 @@ def _match_attention(
     if probability_index is None or probability_index in matched:
         return None
     probability = graph.ops[probability_index]
-    if probability.op != "softmax" or len(probability.inputs) != 1:
+    if probability.op not in {"softmax", "safe_softmax"} or len(probability.inputs) != 1:
         return None
     probability_type = graph.value(probability.outputs[0]).type
     rank = len(probability_type.shape)
@@ -504,16 +543,44 @@ def _match_attention(
         return None
     intermediate.add(score_index)
 
-    key_transform_index = producers.get(score.inputs[1])
+    key_transform_id = score.inputs[1]
+    key_transform_index = producers.get(key_transform_id)
     if key_transform_index is None or key_transform_index in matched:
         return None
     key_transform = graph.ops[key_transform_index]
+    parsed_key_transform_scale = _parse_scale(key_transform)
+    if parsed_key_transform_scale is not None:
+        scale *= parsed_key_transform_scale
+        key_transform_id = key_transform.inputs[0]
+        intermediate.add(key_transform_index)
+        key_transform_index = producers.get(key_transform_id)
+        if key_transform_index is None or key_transform_index in matched:
+            return None
+        key_transform = graph.ops[key_transform_index]
     if not _is_last_two_transpose(key_transform, rank):
         return None
     intermediate.add(key_transform_index)
 
     query_id = score.inputs[0]
     key_id = key_transform.inputs[0]
+    query_scale_index = producers.get(query_id)
+    if query_scale_index is not None:
+        query_scale = graph.ops[query_scale_index]
+        parsed_query_scale = _parse_scale(query_scale)
+        if parsed_query_scale is not None:
+            scale *= parsed_query_scale
+            query_id = query_scale.inputs[0]
+            intermediate.add(query_scale_index)
+
+    key_scale_index = producers.get(key_id)
+    if key_scale_index is not None:
+        key_scale = graph.ops[key_scale_index]
+        parsed_key_scale = _parse_scale(key_scale)
+        if parsed_key_scale is not None:
+            scale *= parsed_key_scale
+            key_id = key_scale.inputs[0]
+            intermediate.add(key_scale_index)
+
     key_group = _match_grouped_kv(graph, key_id, producers, matched)
     value_group = _match_grouped_kv(graph, value_id, producers, matched)
     if (key_group is None) != (value_group is None):
@@ -523,6 +590,23 @@ def _match_attention(
         value_id, value_internal = value_group
         intermediate.update(key_internal)
         intermediate.update(value_internal)
+
+    original_replacement_index = replacement_index
+    low_precision = _match_internal_float32_casts(
+        graph,
+        query_id,
+        key_id,
+        value_id,
+        mask,
+        replacement_index,
+        producers,
+        consumers,
+        matched,
+    )
+    if low_precision is not None:
+        query_id, key_id, value_id, mask, replacement_index, casts = low_precision
+        intermediate.add(original_replacement_index)
+        intermediate.update(casts)
 
     replacement_output = graph.ops[replacement_index].outputs[0]
     internal_values = {
@@ -555,7 +639,12 @@ def _match_attention(
         "attention",
         inputs,
         (graph.ops[replacement_index].outputs[0],),
-        {"scale": scale, "has_mask": mask is not None, "causal": False},
+        {
+            "scale": scale,
+            "has_mask": mask is not None,
+            "causal": False,
+            "safe_softmax": probability.op == "safe_softmax",
+        },
     )
     return replacement_index, intermediate, attention
 
@@ -704,6 +793,108 @@ def _match_grouped_kv(
     return original_id, internal
 
 
+def _match_internal_float32_casts(
+    graph: Graph,
+    query_id: str,
+    key_id: str,
+    value_id: str,
+    mask: str | None,
+    replacement_index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    matched: set[int],
+) -> tuple[str, str, str, str | None, int, set[int]] | None:
+    """Absorb PyTorch's low-precision attention upcast/round-trip."""
+
+    replacement_output = graph.ops[replacement_index].outputs[0]
+    replacement_type = graph.value(replacement_output).type
+    if replacement_type.dtype != DType.F32:
+        return None
+
+    output_consumers = consumers.get(replacement_output, [])
+    if len(output_consumers) != 1:
+        return None
+    cast_index = output_consumers[0]
+    if cast_index in matched:
+        return None
+    output_cast = graph.ops[cast_index]
+    if output_cast.op != "cast" or output_cast.inputs != (replacement_output,):
+        return None
+    output_type = graph.value(output_cast.outputs[0]).type
+    if (
+        output_type.shape != replacement_type.shape
+        or output_type.dtype not in {DType.F16, DType.BF16}
+    ):
+        return None
+
+    casts: set[int] = set()
+    stripped_ids: list[str] = []
+    source_dtypes: set[DType] = set()
+    for input_id in (query_id, key_id, value_id):
+        stripped = _strip_float32_input_cast(
+            input_id, graph, producers, matched, casts
+        )
+        if stripped is None:
+            return None
+        stripped_id, source_dtype = stripped
+        stripped_ids.append(stripped_id)
+        source_dtypes.add(source_dtype)
+
+    if source_dtypes != {output_type.dtype}:
+        return None
+
+    stripped_mask = mask
+    if mask is not None:
+        mask_type = graph.value(mask).type
+        if mask_type.dtype == output_type.dtype:
+            pass
+        elif mask_type.dtype == DType.F32:
+            stripped = _strip_float32_input_cast(
+                mask, graph, producers, matched, casts
+            )
+            if stripped is None or stripped[1] != output_type.dtype:
+                return None
+            stripped_mask = stripped[0]
+        else:
+            return None
+
+    casts.add(cast_index)
+    return (
+        stripped_ids[0],
+        stripped_ids[1],
+        stripped_ids[2],
+        stripped_mask,
+        cast_index,
+        casts,
+    )
+
+
+def _strip_float32_input_cast(
+    value_id: str,
+    graph: Graph,
+    producers: dict[str, int],
+    matched: set[int],
+    casts: set[int],
+) -> tuple[str, DType] | None:
+    index = producers.get(value_id)
+    if index is None or index in matched:
+        return None
+    op = graph.ops[index]
+    if op.op != "cast":
+        return None
+
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    if (
+        output_type.dtype != DType.F32
+        or input_type.dtype not in {DType.F16, DType.BF16}
+        or input_type.shape != output_type.shape
+    ):
+        return None
+    casts.add(index)
+    return op.inputs[0], input_type.dtype
+
+
 def _parse_scale(op: Operation) -> float | None:
     scalar = op.attrs.get("scalar")
     if op.op == "mul" and _valid_number(scalar):
@@ -818,6 +1009,30 @@ def _valid_ints(values: tuple[object, ...]) -> bool:
 
 def _valid_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _freeze_attribute(value: object) -> tuple[object, ...]:
+    if isinstance(value, Operation):
+        return (
+            "operation",
+            value.op,
+            value.inputs,
+            value.outputs,
+            _freeze_attribute(value.attrs),
+        )
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (str(key), _freeze_attribute(item))
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            ),
+        )
+    if isinstance(value, (tuple, list)):
+        return ("sequence", tuple(_freeze_attribute(item) for item in value))
+    if isinstance(value, float):
+        return ("float", repr(value))
+    return (type(value).__name__, repr(value))
 
 
 def _replace_graph(

@@ -7,7 +7,13 @@ from typing import Any
 from .backends import AppleMetalBackend, CompiledPlan
 from .frontend import capture_fx
 from .ir import Graph
-from .passes import canonicalize_batched_matmul, fuse_attention, fuse_pointwise, simplify_layouts
+from .passes import (
+    canonicalize_batched_matmul,
+    eliminate_common_subexpressions,
+    fuse_attention,
+    fuse_pointwise,
+    simplify_layouts,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +37,7 @@ def compile_graph(
     lowered = canonicalize_batched_matmul(lowered)
     lowered = fuse_attention(lowered)
     lowered = fuse_pointwise(lowered)
+    lowered = eliminate_common_subexpressions(lowered)
     plan = AppleMetalBackend(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,

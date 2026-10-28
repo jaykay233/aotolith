@@ -21,7 +21,8 @@
 | `aten.unsqueeze.default` | `unsqueeze` |
 | `aten.squeeze.dim` | `squeeze` |
 | `aten.clone.default`、`aten.alias.default` | `contiguous`、`alias` |
-| `aten._softmax.default` | `softmax` |
+| `aten._to_copy.default` | `cast` |
+| `aten._softmax.default`、`aten._safe_softmax.default` | `softmax`、`safe_softmax` |
 | `aten.scaled_dot_product_attention.default` 及 CPU/CUDA flash、efficient attention target | `attention` |
 | `aten.sum.dim_IntList` | `sum` |
 | `aten.mean.dim` | `mean` |
@@ -29,7 +30,7 @@
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
 | `aten.gelu.default` | `gelu` |
-| `aten.mul.Tensor` | `mul` |
+| `aten.mul.Tensor`、`aten.mul.Scalar` | `mul` |
 | `aten.add.Tensor` | `add` |
 | `aten.sub.Tensor` | `sub` |
 | `aten.rsub.Scalar` | `rsub` |
@@ -49,13 +50,15 @@
 
 Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
 `F.rms_norm` 没有单独的 ATen target，在当前 PyTorch 中会展开成 `pow -> mean -> add_ -> rsqrt -> mul -> optional weight mul`。前端只在中间节点单消费者、reduction 覆盖连续尾维且 shape 吻合时折叠成 `rms_norm`，避免把任意的平方、均值、rsqrt 组合误认为归一化。FP16/BF16 下 `make_fx` 还会插入 float32 `_to_copy`，折叠范围包含这组 cast。
 
 `F.scaled_dot_product_attention` 可能落到通用 ATen op，也可能被拍平成 CPU/CUDA flash 或 efficient attention 的内部 target。这些 target 的参数顺序和输出个数不同，前端按 target 分别读取 `attn_mask`、`dropout_p`、`is_causal`、`scale` 和关键字参数 `enable_gqa`。当前只接受主输出；辅助 logsumexp、debug mask 等输出被使用时直接报错。dropout 非零也会报错。`enable_gqa` 只做布尔校验，实际 head 分组关系由 Q/K/V 的静态 shape 决定；部分 CPU SDPA 路径在 tracing 后会丢掉这个参数并落到 flash target。
+
+FP16/BF16 的 CPU SDPA 分解图常把 Q/K/V 转成 FP32 计算，再把结果转回输入 dtype。frontend 将这些节点保留为 `cast`。attention fusion 只在输入 cast 来自同一种低精度 dtype、输出 cast 又回到同一 dtype 时吸收整条内部 round-trip；显式 `to(bfloat16)` 或 `to(float32)` 等用户 cast 仍作为独立节点执行，不能被错误地改写成另一种 attention dtype。
 
 ## 2. SSA IR
 
@@ -73,28 +76,25 @@ IR 定义在 `ir.py`：
 
 `canonicalize_batched_matmul` 识别 PyTorch 为 rank-N matmul 生成的折叠模式：输入先 reshape 成二维 batch，执行 `bmm`，输出再 reshape 回原始 batch shape。匹配成功后替换成一个 `matmul`，避免后续 attention pattern 只看到低秩 `bmm`。
 
-`fuse_attention` 从 PV matmul 反向匹配 `QK^T -> optional scale -> optional additive mask -> softmax -> PV`。它也能恢复 PyTorch 把 batch-head 拍平后执行的 `reshape -> mm -> reshape`。只有内部 value 都只有单个 consumer，且没有被 graph output 观察时才会替换成 `attention`。`scale`、`has_mask` 和 `causal` 存在 operation attribute 中，Q/K/V 保持原 graph 中的 rank-3 或 rank-4 形式。softmax probability 被其他节点使用时不会融合，因为替换会丢掉该中间结果。
+`fuse_attention` 从 PV matmul 反向匹配 `QK^T -> optional scale -> optional additive mask -> softmax -> PV`。它也能恢复 PyTorch 把 batch-head 拍平后执行的 `reshape -> mm -> reshape`。只有内部 value 都只有单个 consumer，且没有被 graph output 观察时才会替换成 `attention`。`scale`、`has_mask`、`causal` 和 `safe_softmax` 存在 operation attribute 中，Q/K/V 保持原 graph 中的 rank-3 或 rank-4 形式。softmax probability 被其他节点使用时不会融合，因为替换会丢掉该中间结果。
 
 GQA/MQA 有两种入口。直接调用 `F.scaled_dot_product_attention(..., enable_gqa=True)` 时，前端直接生成 `attention`；显式 `repeat_kv` 的分解图则通过 `unsqueeze -> expand -> reshape` 识别出原始 K/V。后一种模式会去掉物化复制，把 K/V head 数低于 Q head 数的 `attention` 交给 MLX。rank-4 下要求 Q head 数是 K/V head 数的整数倍；MQA 是 K/V head 数为 1 的特例。
 
-Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 attention 会改为执行下面描述的生成 kernel；不满足条件时仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
+Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。当 `safe_softmax=True` 且存在 additive mask 时，MLX lowering 会把整行都被 mask 的输出显式置零，避免 fused SDPA 产生 NaN。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 attention 会改为执行下面描述的生成 kernel；不满足条件时仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
 
 ## 4. Pointwise 融合
 
 `fuse_pointwise` 找出图的融合区域：
 
 1. 把支持的一元和二元运算标记为 pointwise op。
-2. 从 region root 反向收集 producer。
-3. producer 的输出必须只被当前 region 使用，否则停止跨越该 producer。
+2. 找出 region root：输出被 graph output 或非 pointwise consumer 观察的 pointwise op。
+3. 从每个 root 开始迭代式反向闭包，只有 producer 没有被 graph output 观察、且它的全部 consumer 都已经在 region 内时才纳入 producer。
 4. region 至少包含两个 op 才替换成 `fused_elementwise`。
 5. `fused_elementwise` 的 `attrs["body"]` 保存原始 pointwise op 序列。
 
-region root 是满足以下条件之一的 pointwise op：
-
-- 它的输出是 graph output
-- 它有一个非 pointwise consumer
-
 只有单个 pointwise op 时不做 IR fusion，但 Apple backend 仍会为它生成一个独立 Metal kernel。
+
+闭包规则允许共享 producer 的 DAG 进入同一个 region。例如 `s = sigmoid(x); (s + s) * s` 中，`sigmoid` 的三个 consumer 都在 region 内，因此整条链只需一个 kernel。仍然被 graph output 观察的中间值不会从图中删除；backend 按 region 内 value ID 做局部 CSE，让同一表达式只生成一次代码。
 
 softmax 是 reduction op，不会被收进 pointwise region。后面的 pointwise 链会单独融合，因此 `softmax -> mul -> add` 仍然产生两个 kernel，而不是把 reduction 和逐元素计算混在同一个表达式里。
 
@@ -117,7 +117,15 @@ v4 = fused_elementwise(v1, v2) {
 }
 ```
 
-## 5. Broadcast 索引
+## 5. 图级公共子表达式消除
+
+attention 和 pointwise 融合完成后，`eliminate_common_subexpressions` 按 SSA 顺序遍历剩余的纯 op。每个 op 的结构 key 包含 op 类型、已经重映射的输入 ID、输出 shape/dtype 和递归冻结的 attributes。key 相同的后续 op 会被删除，其输出 ID alias 到第一次出现的输出；随后所有 consumer 和 graph output 都改写到保留的 value ID。
+
+输出类型进入 key 是必要的。例如同一输入分别 cast 到 FP32 和 BF16 时，两个 `cast` 的输入和 attributes 相同，但输出 dtype 不同，不能合并。嵌套在 `fused_elementwise.attrs["body"]` 中的 op 也参与稳定序列化，因此相同 region 可以安全比较。CSE 放在 fusion 之后，避免先合并单个 op 再改变 pointwise region 的边界。
+
+当前 CSE 不会为两个 `fused_elementwise` region 内部的临时 value 重新编号。因此两个 region 只有在内部 SSA value ID 也一致时才会被识别为同一结构；单个 matmul、attention、norm、cast 等独立 op 的重复消除不受这个限制。
+
+## 6. Broadcast 索引
 
 pointwise kernel 使用输出 tensor 的扁平索引 `elem`。每个输入先检查静态 broadcast 规则：
 
@@ -133,7 +141,7 @@ input_offset = (elem % 3) * 1
 
 这避免了依赖 MLX 在 kernel 调用前自动 broadcast，也把索引推导留在编译器里。
 
-## 6. Metal pointwise codegen
+## 7. Metal pointwise codegen
 
 `AppleMetalBackend._compile_elementwise` 生成 elementwise Metal kernel：
 
@@ -146,7 +154,7 @@ input_offset = (elem % 3) * 1
 
 精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
 
-## 7. Metal softmax reduction
+## 8. Metal softmax reduction
 
 softmax 支持任意单个维度。backend 把 softmax 轴之前和之后的维度分别压平为 `outer` 和 `inner`，把 softmax 轴作为 `columns`：
 
@@ -160,7 +168,7 @@ softmax 支持任意单个维度。backend 把 softmax 轴之前和之后的维�
 
 grid 大小是 `outer * inner * threads`，每个 threadgroup 的大小固定为 `threads`。当 `columns > 256` 时，每个线程处理多个列；当 `columns` 不是 2 的幂时，线程数向上补齐，全局内存访问由循环条件 `col < columns` 限制。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
 
-## 8. Metal sum/mean reduction
+## 9. Metal sum/mean reduction
 
 sum/mean 接受任意非空 reduction 维集合。backend 把未被 reduction 的维度压平为输出元素，把 reduction 维压平为 `columns`：
 
@@ -174,7 +182,7 @@ sum/mean 接受任意非空 reduction 维集合。backend 把未被 reduction �
 
 输出 dtype 默认与输入一致，也可以通过 PyTorch 的 `dtype=` 指定为 FP16、BF16 或 FP32。kernel 始终用 float 累加，input 和 output 使用不同的模板类型，最后 cast 到请求的输出 dtype。每个输出元素启动一个 threadgroup，因此输出元素很多而 reduction 很小时 dispatch 开销会偏高；交错维的通用索引还会为每次读取增加整数除法和取模。
 
-## 9. Metal LayerNorm 和 RMSNorm lowering
+## 10. Metal LayerNorm 和 RMSNorm lowering
 
 两种归一化都按 normalized shape 的最后一组维度处理。backend 把 normalized shape 之前的维度展平为 `rows`，把 normalized shape 展平为连续的 `columns`：
 
@@ -189,7 +197,7 @@ RMSNorm 只做一遍平方和 reduction，得到 `mean(x^2)` 后用 `rsqrt(mean(
 
 两者都支持 normalized shape 占满最后一维、多个连续尾维，或整个 tensor。若 normalized shape 不是连续尾维，PyTorch 不会产生对应的归一化 FX 结构。
 
-## 10. Metal matmul/addmm codegen
+## 11. Metal matmul/addmm codegen
 
 `codegen_matmul=True` 时，backend 为 rank-2 `matmul` 和 `addmm` 生成独立 Metal kernel：
 
@@ -218,7 +226,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 
 该实现没有 threadgroup memory、vectorized load、SIMD matrix 或 split-K。它在同一台机器上比旧的一线程一输出 kernel 快约 2–4 倍，但仍明显慢于 MLX，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
 
-## 11. Metal attention codegen
+## 12. Metal attention codegen
 
 `codegen_attention=True` 时，backend 为常见 attention 生成 fused MSL kernel。每个 `(batch, query_head, query_position)` 对应一个 threadgroup，thread 数取 Q/K head dim 和 V head dim 最大值向上对齐到 2 的幂，上限为 256。
 
@@ -234,7 +242,7 @@ kernel 的执行方式：
 
 主路径使用 float 计算，最后写回 FP16、BF16 或 FP32。当前没有 tiling、vectorized load、SIMD、split-K 或 autotune，所以它是正确性优先的参考实现，尚未证明能超过 MLX SDPA；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
-## 12. Runtime
+## 13. Runtime
 
 `CompiledPlan` 按 SSA 顺序执行 IR：
 
@@ -242,6 +250,7 @@ kernel 的执行方式：
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
+- cast：调用 MLX `astype`，保留源和目标 dtype、shape
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
 - softmax：调用生成的单轴 reduction kernel
 - sum/mean：调用生成的 static reduction kernel
@@ -252,7 +261,7 @@ kernel 的执行方式：
 
 backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 kernel name、input/output 参数名、MSL source 和 header 组成，容量为 256。它只避免同一 Python 进程内重复构造相同 kernel，不是跨进程磁盘缓存；MLX 自身的编译缓存行为不由这里控制。
 
-## 13. 已知边界
+## 14. 已知边界
 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
@@ -265,7 +274,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
 - matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
 - 没有反向传播和训练支持
-- layout op 已做恒等与逆变换消除，但还没有布局传播与公共子表达式消除
+- layout op 已做恒等与逆变换消除，但还没有布局传播
+- graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - NVIDIA Triton/CUDA backend 尚未实现
