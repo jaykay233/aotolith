@@ -119,6 +119,8 @@ class AppleMetalBackend:
                 )
             elif op.op == "softmax":
                 compiled = self._compile_softmax(graph, op, index)
+            elif op.op == "layer_norm":
+                compiled = self._compile_layer_norm(graph, op, index)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
                 compiled = self._compile_matmul(graph, op, index)
 
@@ -221,7 +223,7 @@ class AppleMetalBackend:
 
         columns = input_type.shape[-1]
         rows = prod(input_type.shape[:-1]) or 1
-        threads = min(256, _next_power_of_two(columns))
+        threads = _reduction_thread_count(columns)
         reduction_stride = threads // 2
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
@@ -297,6 +299,163 @@ class AppleMetalBackend:
             output_id=op.outputs[0],
             tensor_type=output_type,
             kind="softmax",
+        )
+        return artifact, runtime
+
+    def _compile_layer_norm(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        normalized_shape = op.attrs.get("normalized_shape")
+        if not isinstance(normalized_shape, tuple) or not normalized_shape:
+            raise ValueError("layer_norm.normalized_shape must be a non-empty tuple")
+        if not all(
+            isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+            for dim in normalized_shape
+        ):
+            raise ValueError("layer_norm.normalized_shape must contain positive integers")
+
+        has_weight = op.attrs.get("has_weight")
+        has_bias = op.attrs.get("has_bias")
+        if not isinstance(has_weight, bool) or not isinstance(has_bias, bool):
+            raise ValueError("layer_norm has_weight/has_bias must be booleans")
+        expected_inputs = 1 + int(has_weight) + int(has_bias)
+        if len(op.inputs) != expected_inputs:
+            raise ValueError(
+                f"layer_norm expects {expected_inputs} inputs, got {len(op.inputs)}"
+            )
+
+        input_type = graph.value(op.inputs[0]).type
+        output_type = graph.value(op.outputs[0]).type
+        if input_type.dtype != output_type.dtype:
+            raise NotImplementedError(
+                "Metal layer_norm requires identical input/output dtypes"
+            )
+        if input_type.shape != output_type.shape:
+            raise ValueError(
+                f"layer_norm output shape {output_type.shape} != {input_type.shape}"
+            )
+        normalized_rank = len(normalized_shape)
+        if normalized_rank > len(input_type.shape):
+            raise ValueError(
+                f"layer_norm normalized_shape {normalized_shape} exceeds input rank"
+            )
+        if input_type.shape[-normalized_rank:] != normalized_shape:
+            raise ValueError(
+                f"layer_norm normalized_shape {normalized_shape} does not match "
+                f"input shape {input_type.shape}"
+            )
+
+        input_position = 1
+        weight_position: int | None = None
+        bias_position: int | None = None
+        if has_weight:
+            weight_position = input_position
+            input_position += 1
+        if has_bias:
+            bias_position = input_position
+        for position in range(1, len(op.inputs)):
+            parameter_type = graph.value(op.inputs[position]).type
+            if parameter_type.dtype != input_type.dtype:
+                raise NotImplementedError(
+                    "Metal layer_norm requires identical parameter dtypes"
+                )
+            if parameter_type.shape != normalized_shape:
+                raise ValueError(
+                    f"layer_norm parameter shape {parameter_type.shape} != {normalized_shape}"
+                )
+
+        columns = prod(normalized_shape)
+        rows = prod(input_type.shape[:-normalized_rank]) or 1
+        threads = _reduction_thread_count(columns)
+        reduction_stride = threads // 2
+        eps = float(op.attrs.get("eps", 1e-5))
+
+        scale_expression = (
+            f"float(in_{weight_position}[col])"
+            if weight_position is not None
+            else "1.0f"
+        )
+        normalized_expression = (
+            f"(current - mean_value) * inv_std * {scale_expression}"
+        )
+        if bias_position is not None:
+            normalized_expression += f" + float(in_{bias_position}[col])"
+
+        source = f"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint offset = row * {columns}u;
+        threadgroup float scratch[{threads}];
+
+        float local_sum = 0.0f;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            local_sum += float(in_0[offset + col]);
+        }}
+        scratch[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float mean_value = scratch[0] / {columns}.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float local_squared_deviation = 0.0f;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            float centered = float(in_0[offset + col]) - mean_value;
+            local_squared_deviation += centered * centered;
+        }}
+        scratch[tid] = local_squared_deviation;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float variance = scratch[0] / {columns}.0f;
+        float inv_std = metal::rsqrt(variance + {eps!r}f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            float current = float(in_0[offset + col]);
+            out[offset + col] = (T)({normalized_expression});
+        }}
+        """
+        name = f"metal_layer_norm_{threads}_{index}"
+        kernel = mx.fast.metal_kernel(
+            name=name,
+            input_names=[f"in_{position}" for position in range(len(op.inputs))],
+            output_names=["out"],
+            source=source,
+        )
+        grid = (rows * threads, 1, 1)
+        threadgroup = (threads, 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header="",
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="layer_norm",
         )
         return artifact, runtime
 
@@ -406,6 +565,10 @@ def _next_power_of_two(value: int) -> int:
     if value <= 0:
         raise ValueError(f"expected a positive integer, got {value}")
     return 1 << (value - 1).bit_length()
+
+
+def _reduction_thread_count(columns: int) -> int:
+    return min(256, _next_power_of_two(columns))
 
 
 def _offset_expression(

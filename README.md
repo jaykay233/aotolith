@@ -5,7 +5,7 @@
 ```text
 PyTorch FX
   -> SSA IR
-  -> pointwise fusion / reduction lowering
+  -> pointwise fusion / reduction and normalization lowering
   -> Metal Shading Language
   -> mx.fast.metal_kernel
   -> Apple GPU
@@ -22,6 +22,7 @@ PyTorch FX
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
 | Softmax | `aten._softmax.default`，当前仅支持最后一维 |
+| LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 
 编译器已经实现：
 
@@ -35,8 +36,9 @@ PyTorch FX
 - 可选的 Metal matmul/addmm codegen
 - matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
 - last-dim softmax reduction：每行一个 threadgroup，在 threadgroup memory 中完成 max 和 sum
+- LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
 
-默认情况下，`matmul` 和 `addmm` 调用 MLX，pointwise 和 softmax 由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
+默认情况下，`matmul` 和 `addmm` 调用 MLX，pointwise、softmax 和 LayerNorm 由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
@@ -76,12 +78,14 @@ python -m pytest -q
 python examples/mlp.py
 python examples/metal_mlp.py
 python examples/softmax.py
+python examples/layer_norm.py
 python examples/metal_matmul_benchmark.py
 ```
 
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
 - `examples/metal_mlp.py` 使用小矩阵开启 `codegen_matmul=True`，完整验证 FX、IR、自定义 MSL matmul、融合 pointwise 和 runtime。
 - `examples/softmax.py` 用超过 256 列的输入验证 Metal threadgroup max/sum reduction。
+- `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/metal_matmul_benchmark.py` 对比寄存器 tiled kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 
 示例会打印生成的 MSL 或 kernel 类型。首次执行包含 MLX kernel JIT 和 GPU dispatch，耗时不能当作 steady-state 性能。
@@ -113,7 +117,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 只覆盖最后一维 softmax，不支持动态 shape、控制流、自动微分、任意轴 reduction、normalization、layout pass、kernel cache 和训练。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖最后一维 softmax 和 LayerNorm，但不支持动态 shape、控制流、自动微分、任意轴 reduction、RMSNorm 专用 lowering、layout pass、kernel cache 和训练。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 

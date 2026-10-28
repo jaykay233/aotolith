@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -67,7 +68,20 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             input_ids.append(value_id)
             values[value_id] = Value(value_id, _node_type(node))
         elif node.op == "call_function":
+            if node in node_ids:
+                continue
             target = str(node.target)
+            if target == "aten.native_layer_norm.default":
+                output_id = f"v{len(ops)}"
+                inputs, attrs, output_type = _layer_norm_operation(
+                    node, node_ids
+                )
+                ops.append(Operation("layer_norm", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                for user in node.users:
+                    node_ids[user] = output_id
+                continue
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
             op_name = _SUPPORTED_OPS[target]
@@ -104,6 +118,68 @@ def _node_type(node: object) -> TensorType:
     if any(dim <= 0 for dim in tensor.shape):
         raise ValueError(f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}")
     return TensorType(tuple(int(dim) for dim in tensor.shape), dtype)
+
+
+def _layer_norm_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    if len(args) != 5:
+        raise ValueError(f"native_layer_norm expects five arguments, got {len(args)}")
+    input_value, normalized_shape, weight, bias, eps = args
+
+    if not isinstance(normalized_shape, (tuple, list)) or not normalized_shape:
+        raise ValueError(
+            f"layer_norm normalized_shape must be a non-empty sequence, got {normalized_shape!r}"
+        )
+    shape: list[int] = []
+    for dim in normalized_shape:
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
+            raise ValueError(
+                "layer_norm normalized_shape must contain positive integers, "
+                f"got {normalized_shape!r}"
+            )
+        shape.append(dim)
+    if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+        raise ValueError(f"layer_norm.eps must be a scalar number, got {eps!r}")
+
+    output_node = None
+    for user in getattr(node, "users", {}):
+        if user.target is not operator.getitem:
+            raise NotImplementedError(
+                "native_layer_norm must be consumed through getitem"
+            )
+        if len(user.args) != 2 or not isinstance(user.args[1], int):
+            raise ValueError(f"malformed layer_norm getitem: {user!r}")
+        index = user.args[1]
+        if index == 0 and user.users:
+            output_node = user
+        elif index in {1, 2} and user.users:
+            raise NotImplementedError(
+                "layer_norm mean/rstd outputs are not supported yet"
+            )
+        elif index not in {0, 1, 2}:
+            raise ValueError(f"native_layer_norm output index must be 0, 1, or 2, got {index}")
+
+    if output_node is None:
+        raise ValueError("native_layer_norm result is not used")
+
+    inputs = [_argument_ids(input_value, node_ids)]
+    has_weight = weight is not None
+    has_bias = bias is not None
+    if has_weight:
+        inputs.append(_argument_ids(weight, node_ids))
+    if has_bias:
+        inputs.append(_argument_ids(bias, node_ids))
+
+    attrs: dict[str, object] = {
+        "normalized_shape": tuple(shape),
+        "eps": float(eps),
+        "has_weight": has_weight,
+        "has_bias": has_bias,
+    }
+    return tuple(inputs), attrs, _node_type(output_node)
 
 
 def _argument_ids(argument: object, node_ids: dict[object, str]) -> str:

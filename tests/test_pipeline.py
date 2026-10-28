@@ -412,3 +412,121 @@ def test_softmax_and_fused_pointwise_execute_as_separate_kernels() -> None:
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_layer_norm_with_affine_parameters() -> None:
+    torch.manual_seed(47)
+    x = torch.randn(2, 3, 300)
+    weight = torch.randn(300)
+    bias = torch.randn(300)
+
+    def fn(value, scale, shift):
+        return torch.nn.functional.layer_norm(
+            value, (300,), scale, shift, eps=1e-5
+        )
+
+    result = compile_callable(fn, (x, weight, bias))
+    assert [op.op for op in result.input_graph.ops] == ["layer_norm"]
+    assert result.input_graph.ops[0].attrs == {
+        "normalized_shape": (300,),
+        "eps": 1e-5,
+        "has_weight": True,
+        "has_bias": True,
+    }
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_layer_norm_256_0"
+    assert "threadgroup_barrier" in kernel.source
+    assert "in_1[col]" in kernel.source
+    assert "in_2[col]" in kernel.source
+
+    actual = result.plan(
+        mx.array(x.numpy()), mx.array(weight.numpy()), mx.array(bias.numpy())
+    )[0]
+    expected = mx.array(fn(x, weight, bias).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_layer_norm_without_affine_and_multidimensional_shape() -> None:
+    torch.manual_seed(53)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(
+        lambda value: torch.nn.functional.layer_norm(value, (3, 4), eps=1e-3),
+        (x,),
+    )
+    assert result.input_graph.ops[0].attrs["normalized_shape"] == (3, 4)
+    assert result.input_graph.ops[0].attrs["has_weight"] is False
+    assert result.input_graph.ops[0].attrs["has_bias"] is False
+    assert "metal_layer_norm_16_0" == result.plan.kernels[0].name
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(
+        torch.nn.functional.layer_norm(x, (3, 4), eps=1e-3).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_layer_norm_supports_low_precision(dtype) -> None:
+    torch.manual_seed(59)
+    x = torch.randn(2, 3, 7, dtype=dtype)
+    weight = torch.randn(7, dtype=dtype)
+    bias = torch.randn(7, dtype=dtype)
+    result = compile_callable(
+        lambda value, scale, shift: torch.nn.functional.layer_norm(
+            value, (7,), scale, shift
+        ),
+        (x, weight, bias),
+    )
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        *(
+            mx.array(value.float().numpy(), dtype=mlx_dtype)
+            for value in (x, weight, bias)
+        )
+    )[0]
+    expected = mx.array(
+        torch.nn.functional.layer_norm(x.float(), (7,), weight.float(), bias.float()).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_layer_norm_rejects_auxiliary_outputs() -> None:
+    x = torch.randn(2, 3, 7)
+
+    def fn(value):
+        _, mean, _ = torch.native_layer_norm(value, (7,), None, None, 1e-5)
+        return mean
+
+    with pytest.raises(NotImplementedError, match="mean/rstd"):
+        compile_callable(fn, (x,))
+
+
+def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
+    torch.manual_seed(61)
+    inputs = (torch.randn(2, 4), torch.randn(4, 8), torch.randn(8), torch.randn(8))
+
+    def fn(value, weight, scale, shift):
+        projected = value @ weight
+        normalized = torch.nn.functional.layer_norm(
+            projected, (8,), scale, shift
+        )
+        return torch.nn.functional.silu(normalized)
+
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "matmul",
+        "layer_norm",
+        "silu",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "layer_norm",
+        "silu",
+    ]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-4, rtol=5e-4)
