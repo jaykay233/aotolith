@@ -1824,6 +1824,9 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         left, right = _binary_operands(op, arguments)
         operator = "*" if op.op == "mul" else "/"
         return f"{left} {operator} {right}"
+    if op.op == "pow":
+        left, right = _binary_operands(op, arguments)
+        return f"metal::pow({left}, {right})"
     if op.op in {"add", "sub", "rsub"}:
         left, right = _binary_operands(op, arguments)
         operator = "+" if op.op == "add" else "-"
@@ -2423,12 +2426,14 @@ def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
             )
             return 0.5 * value * (1.0 + mx.tanh(inner))
         return 0.5 * value * (1.0 + mx.erf(value * 0.7071067811865476))
-    if op.op in {"mul", "div", "add", "sub", "rsub"}:
+    if op.op in {"mul", "div", "add", "sub", "rsub", "pow"}:
         left, right = _binary_mx_operands(op, arguments)
         if op.op == "mul":
             return left * right
         if op.op == "div":
             return left / right
+        if op.op == "pow":
+            return mx.power(left, right)
         alpha = float(op.attrs.get("alpha", 1.0))
         if op.op == "add":
             return left + alpha * right

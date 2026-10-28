@@ -1456,6 +1456,66 @@ def test_full_mlp_can_use_only_generated_metal_kernels() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "mode", ["square", "scalar_exponent", "scalar_base", "tensor_exponent"]
+)
+def test_pow_variants_match_pytorch(mode) -> None:
+    torch.manual_seed(21)
+    if mode == "square":
+        fn = lambda value: value.square()
+        inputs = (torch.randn(17),)
+    elif mode == "scalar_exponent":
+        fn = lambda value: torch.pow(value, 2.5)
+        inputs = (torch.rand(17) + 0.5,)
+    elif mode == "scalar_base":
+        fn = lambda value: torch.pow(2.0, value)
+        inputs = (torch.randn(17),)
+    else:
+        fn = lambda left, right: torch.pow(left, right)
+        inputs = (torch.rand(17) + 0.5, torch.rand(17) + 0.5)
+
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["pow"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["pow"]
+    assert "metal::pow(" in result.plan.kernels[0].source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_pow_fuses_with_surrounding_pointwise_ops() -> None:
+    def fn(value):
+        return torch.pow(torch.sigmoid(value), 2.0) + torch.exp(value)
+
+    torch.manual_seed(22)
+    x = torch.randn(31)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    assert result.plan.kernels[0].source.count("metal::pow(") == 1
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_pow_supports_low_precision(dtype) -> None:
+    torch.manual_seed(23)
+    x = torch.rand(2, 3, 7, dtype=dtype) + 0.5
+    result = compile_callable(lambda value: value.square(), (x,))
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
+    expected_input = mx.array(x.float().numpy(), dtype=mlx_dtype)
+    expected = expected_input * expected_input
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_scalar_pointwise_ops_are_fused() -> None:
     def fn(x):
         return torch.sigmoid((3.0 - x) * 2.0 + 1.0) / 4.0
@@ -2287,19 +2347,27 @@ def test_rms_norm_composes_with_matmul_and_pointwise() -> None:
 
 
 def test_rms_norm_pattern_does_not_match_non_tail_reduction() -> None:
+    torch.manual_seed(84)
     x = torch.randn(3, 5)
 
     def fn(value):
         mean_square = value.square().mean(dim=0, keepdim=True)
         return value * torch.rsqrt(mean_square + 1e-6)
 
-    with pytest.raises(
-        ValueError, match="unsupported FX target: aten.pow.Tensor_Scalar"
-    ):
-        compile_callable(fn, (x,))
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "pow",
+        "mean",
+        "fused_elementwise",
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
+    torch.manual_seed(85)
     x = torch.randn(2, 5)
 
     def fn(value):
@@ -2309,10 +2377,17 @@ def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
         )
         return normalized, squared
 
-    with pytest.raises(
-        ValueError, match="unsupported FX target: aten.pow.Tensor_Scalar"
-    ):
-        compile_callable(fn, (x,))
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "pow",
+        "mean",
+        "fused_elementwise",
+    ]
+    actual = result.plan(mx.array(x.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in fn(x))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(actual_value, expected_value, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("keepdim", [False, True])

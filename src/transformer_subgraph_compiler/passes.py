@@ -12,6 +12,7 @@ POINTWISE_OPS = {
     "sub",
     "rsub",
     "div",
+    "pow",
     "neg",
     "abs",
     "sigmoid",

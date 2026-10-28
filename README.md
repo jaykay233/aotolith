@@ -21,7 +21,7 @@ PyTorch FX
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
-| 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
+| 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
@@ -44,7 +44,7 @@ PyTorch FX
 - 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式，并保持 graph output alias
 - 在 schedule 前校验静态视图和布局变换；未折叠的 layout op 由 Runtime 执行 MLX view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
-- 按静态 shape 生成 broadcast 索引
+- 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，并参与 pointwise 融合
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出

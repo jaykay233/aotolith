@@ -34,6 +34,9 @@ _SUPPORTED_OPS = {
     "aten.sub.Tensor": "sub",
     "aten.rsub.Scalar": "rsub",
     "aten.div.Tensor": "div",
+    "aten.pow.Tensor_Tensor": "pow",
+    "aten.pow.Tensor_Scalar": "pow",
+    "aten.pow.Scalar": "pow",
     "aten.neg.default": "neg",
     "aten.abs.default": "abs",
     "aten.sigmoid.default": "sigmoid",
@@ -59,7 +62,7 @@ _NUMERIC_ATTRS = {
     "rsub": {"alpha": 1.0},
 }
 
-_BINARY_OPS = {"mul", "add", "sub", "rsub", "div"}
+_BINARY_OPS = {"mul", "add", "sub", "rsub", "div", "pow"}
 _REDUCTION_OPS = {"sum", "mean"}
 _DIRECT_ATTENTION_TARGETS = {
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
