@@ -83,7 +83,7 @@ def canonicalize_batched_matmul(graph: Graph) -> Graph:
 
 
 def fold_matmul_input_layouts(graph: Graph) -> Graph:
-    """Fold a single-use last-two-dimension transpose into matmul operands."""
+    """Fold single-use transpose and batch-expand views into matmul operands."""
 
     graph.validate()
     producers = _producers(graph)
@@ -96,53 +96,31 @@ def fold_matmul_input_layouts(graph: Graph) -> Graph:
         if op.op not in {"matmul", "addmm"}:
             continue
 
-        positions = ((1, "transpose_a"), (2, "transpose_b")) if op.op == "addmm" else (
-            (0, "transpose_a"),
-            (1, "transpose_b"),
+        positions = (
+            ((1, "transpose_a"), (2, "transpose_b"))
+            if op.op == "addmm"
+            else ((0, "transpose_a"), (1, "transpose_b"))
         )
-        inputs = list(op.inputs)
-        attrs = dict(op.attrs)
-        changed = False
-        for position, attribute in positions:
-            operand_id = inputs[position]
-            producer_index = producers.get(operand_id)
-            if producer_index is None:
-                continue
-            if (
-                producer_index in removed
-                or operand_id in output_set
-                or len(consumers.get(operand_id, [])) != 1
-            ):
-                continue
-
-            producer = graph.ops[producer_index]
-            operand_type = graph.value(operand_id).type
-            source_type = graph.value(producer.inputs[0]).type
-            if not _is_last_two_transpose(producer, len(operand_type.shape)):
-                continue
-            if producer.op not in {"transpose", "permute"}:
-                continue
-            if producer.outputs != (operand_id,):
-                continue
-            if operand_type.dtype != source_type.dtype:
-                continue
-            expected_shape = source_type.shape[:-2] + (
-                source_type.shape[-1],
-                source_type.shape[-2],
+        output_shape = graph.value(op.outputs[0]).type.shape
+        for allow_expand in (True, False):
+            inputs, attrs, local_removed = _fold_matmul_operand_layouts(
+                graph,
+                op,
+                positions,
+                producers,
+                consumers,
+                output_set,
+                removed,
+                allow_expand,
             )
-            if operand_type.shape != expected_shape:
+            if not local_removed:
+                break
+            candidate = Operation(op.op, tuple(inputs), op.outputs, attrs)
+            if _matmul_output_shape(graph, candidate) != output_shape:
                 continue
-
-            current = attrs.get(attribute, False)
-            if not isinstance(current, bool):
-                raise ValueError(f"matmul {attribute} must be a boolean")
-            inputs[position] = producer.inputs[0]
-            attrs[attribute] = not current
-            removed.add(producer_index)
-            changed = True
-
-        if changed:
-            replacements[index] = Operation(op.op, tuple(inputs), op.outputs, attrs)
+            replacements[index] = candidate
+            removed.update(local_removed)
+            break
 
     if not removed:
         return graph
@@ -155,6 +133,110 @@ def fold_matmul_input_layouts(graph: Graph) -> Graph:
         elif index not in removed:
             rewritten.append(op)
     return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def _fold_matmul_operand_layouts(
+    graph: Graph,
+    op: Operation,
+    positions: tuple[tuple[int, str], ...],
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    output_set: set[str],
+    already_removed: set[int],
+    allow_expand: bool,
+) -> tuple[list[str], dict[str, object], set[int]]:
+    inputs = list(op.inputs)
+    attrs = dict(op.attrs)
+    removed: set[int] = set()
+
+    for position, attribute in positions:
+        while True:
+            operand_id = inputs[position]
+            producer_index = producers.get(operand_id)
+            if producer_index is None:
+                break
+            if (
+                producer_index in already_removed
+                or producer_index in removed
+                or operand_id in output_set
+                or len(consumers.get(operand_id, [])) != 1
+            ):
+                break
+
+            producer = graph.ops[producer_index]
+            if producer.outputs != (operand_id,):
+                break
+            operand_type = graph.value(operand_id).type
+            source_type = graph.value(producer.inputs[0]).type
+            if operand_type.dtype != source_type.dtype:
+                break
+
+            if producer.op in {"transpose", "permute"}:
+                if not _is_last_two_transpose(producer, len(operand_type.shape)):
+                    break
+                expected_shape = source_type.shape[:-2] + (
+                    source_type.shape[-1],
+                    source_type.shape[-2],
+                )
+                if operand_type.shape != expected_shape:
+                    break
+                current = attrs.get(attribute, False)
+                if not isinstance(current, bool):
+                    raise ValueError(f"matmul {attribute} must be a boolean")
+                inputs[position] = producer.inputs[0]
+                attrs[attribute] = not current
+            elif (
+                allow_expand
+                and producer.op == "expand"
+                and len(source_type.shape) >= 2
+                and len(operand_type.shape) >= 2
+                and source_type.shape[-2:] == operand_type.shape[-2:]
+            ):
+                inputs[position] = producer.inputs[0]
+            else:
+                break
+
+            removed.add(producer_index)
+
+    return inputs, attrs, removed
+
+
+def _matmul_output_shape(graph: Graph, op: Operation) -> tuple[int, ...] | None:
+    if op.op == "addmm":
+        left_position, right_position = 1, 2
+    else:
+        left_position, right_position = 0, 1
+    left_shape = graph.value(op.inputs[left_position]).type.shape
+    right_shape = graph.value(op.inputs[right_position]).type.shape
+    if len(left_shape) < 2 or len(right_shape) < 2:
+        return None
+    if op.attrs.get("transpose_a", False):
+        left_shape = left_shape[:-2] + left_shape[-2:][::-1]
+    if op.attrs.get("transpose_b", False):
+        right_shape = right_shape[:-2] + right_shape[-2:][::-1]
+    if left_shape[-1] != right_shape[-2]:
+        return None
+
+    batch_shape = _broadcast_shape(left_shape[:-2], right_shape[:-2])
+    if batch_shape is None:
+        return None
+    return batch_shape + (left_shape[-2], right_shape[-1])
+
+
+def _broadcast_shape(
+    left: tuple[int, ...], right: tuple[int, ...]
+) -> tuple[int, ...] | None:
+    rank = max(len(left), len(right))
+    result: list[int] = []
+    for axis in range(rank):
+        left_dim = left[axis - (rank - len(left))] if axis >= rank - len(left) else 1
+        right_dim = (
+            right[axis - (rank - len(right))] if axis >= rank - len(right) else 1
+        )
+        if left_dim != right_dim and left_dim != 1 and right_dim != 1:
+            return None
+        result.append(max(left_dim, right_dim))
+    return tuple(result)
 
 
 def fuse_attention(graph: Graph) -> Graph:

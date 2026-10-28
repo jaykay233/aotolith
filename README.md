@@ -35,6 +35,7 @@ PyTorch FX
 - 消除恒等 layout、连续逆 `transpose/permute` 和 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
+- 消除仍能由 matmul batch broadcast 恢复语义的单消费者 `expand`，避免为广播输入生成额外拷贝
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
@@ -47,7 +48,7 @@ PyTorch FX
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出
-- 可选的 Metal matmul/addmm codegen，支持 rank-2 以及 batch shape 一致的 rank-3/4
+- 可选的 Metal matmul/addmm codegen，支持 rank-2 和 rank-3/4 的标准右对齐 batch broadcast
 - 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
 - matmul shared-memory tiling：`64×64×32` threadgroup block；rank-N batch 映射到 grid 的 y 维，FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
@@ -56,7 +57,7 @@ PyTorch FX
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
-默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘以及 batch shape 一致的 rank-3/4 矩阵乘会生成自定义 Metal kernel；尚不直接处理任意 batch broadcast：
+默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 以及 batch 前缀可广播的 rank-3/4 矩阵乘会生成自定义 Metal kernel。编译器会把可由另一操作数或输出 shape 证明安全的单消费者 batch `expand` 折入 matmul；变体无法保持原输出 shape 时保留 `expand`，由 MLX Runtime 执行：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
@@ -149,7 +150,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout 优化已覆盖恒等、逆变换和 matmul 输入转置折叠；`reshape` 跨转置、广播布局等更一般的传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见形式会使用生成的 MSL attention kernel，其余形式回退到 MLX。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 

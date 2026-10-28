@@ -192,10 +192,12 @@ class AppleMetalBackend:
                 left_type = graph.value(op.inputs[left_position]).type
                 right_type = graph.value(op.inputs[right_position]).type
                 output_type = graph.value(op.outputs[0]).type
+                batch_shape = _matmul_batch_shape(
+                    left_type.shape, right_type.shape
+                )
                 if (
-                    len(left_type.shape) >= 2
-                    and left_type.shape[:-2] == right_type.shape[:-2]
-                    and len(output_type.shape) == len(left_type.shape)
+                    batch_shape is not None
+                    and output_type.shape[:-2] == batch_shape
                 ):
                     compiled = self._compile_matmul(graph, op, index)
 
@@ -1337,9 +1339,10 @@ class AppleMetalBackend:
         output_type = graph.value(op.outputs[0]).type
         if len(left_type.shape) < 2 or len(right_type.shape) < 2:
             raise NotImplementedError("Metal matmul requires tensors with rank >= 2")
-        if left_type.shape[:-2] != right_type.shape[:-2]:
+        batch_shape = _matmul_batch_shape(left_type.shape, right_type.shape)
+        if batch_shape is None:
             raise NotImplementedError(
-                "Metal matmul requires identical batch dimensions"
+                "Metal matmul batch dimensions are not broadcast-compatible"
             )
 
         transpose_left = _matmul_transpose_attribute(op, "transpose_a")
@@ -1350,7 +1353,6 @@ class AppleMetalBackend:
             logical_left = logical_left[:-2] + logical_left[-2:][::-1]
         if transpose_right:
             logical_right = logical_right[:-2] + logical_right[-2:][::-1]
-        batch_shape = left_type.shape[:-2]
         rows, reduction = logical_left[-2:]
         right_reduction, columns = logical_right[-2:]
         if reduction != right_reduction:
@@ -1363,6 +1365,12 @@ class AppleMetalBackend:
                 f"matmul output shape {output_type.shape} != {expected_output}"
             )
         batch_count = prod(batch_shape)
+        left_batch_offset = _broadcast_batch_offset_expression(
+            left_type.shape[:-2], batch_shape, rows * reduction
+        )
+        right_batch_offset = _broadcast_batch_offset_expression(
+            right_type.shape[:-2], batch_shape, reduction * columns
+        )
 
         dtypes = {left_type.dtype, right_type.dtype, output_type.dtype}
         if bias_id is not None:
@@ -1389,6 +1397,8 @@ class AppleMetalBackend:
                 transpose_left,
                 transpose_right,
                 batch_count,
+                left_batch_offset,
+                right_batch_offset,
             )
             threads = 256
             batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
@@ -1410,6 +1420,8 @@ class AppleMetalBackend:
                 transpose_left,
                 transpose_right,
                 batch_count,
+                left_batch_offset,
+                right_batch_offset,
             )
             threads = (
                 (_MATMUL_BLOCK_ROWS // micro_rows)
@@ -1854,6 +1866,62 @@ def _supports_simdgroup_matmul(rows: int, columns: int, dtype: DType) -> bool:
     )
 
 
+def _matmul_batch_shape(
+    left_shape: tuple[int, ...], right_shape: tuple[int, ...]
+) -> tuple[int, ...] | None:
+    if len(left_shape) < 2 or len(right_shape) < 2:
+        return None
+
+    left_batch = left_shape[:-2]
+    right_batch = right_shape[:-2]
+    batch_rank = max(len(left_batch), len(right_batch))
+    batch_shape: list[int] = []
+    for axis in range(batch_rank):
+        left_dim = (
+            left_batch[axis - (batch_rank - len(left_batch))]
+            if axis >= batch_rank - len(left_batch)
+            else 1
+        )
+        right_dim = (
+            right_batch[axis - (batch_rank - len(right_batch))]
+            if axis >= batch_rank - len(right_batch)
+            else 1
+        )
+        if left_dim != right_dim and left_dim != 1 and right_dim != 1:
+            return None
+        batch_shape.append(max(left_dim, right_dim))
+    return tuple(batch_shape)
+
+
+def _broadcast_batch_offset_expression(
+    input_batch_shape: tuple[int, ...],
+    output_batch_shape: tuple[int, ...],
+    matrix_elements: int,
+) -> str:
+    """Map a flat output batch index to the source operand's matrix base."""
+
+    if not output_batch_shape or prod(output_batch_shape) == 1:
+        return ""
+    if input_batch_shape == output_batch_shape:
+        return f"batch * {matrix_elements}u"
+
+    batch_offset = len(output_batch_shape) - len(input_batch_shape)
+    terms: list[str] = []
+    for input_axis, input_dim in enumerate(input_batch_shape):
+        output_axis = input_axis + batch_offset
+        if input_dim == 1:
+            continue
+        output_stride = prod(output_batch_shape[output_axis + 1 :])
+        input_stride = prod(input_batch_shape[input_axis + 1 :]) * matrix_elements
+        coordinate = (
+            f"batch % {output_batch_shape[output_axis]}u"
+            if output_stride == 1
+            else f"((batch / {output_stride}u) % {output_batch_shape[output_axis]}u)"
+        )
+        terms.append(f"{coordinate} * {input_stride}u")
+    return " + ".join(terms)
+
+
 def _matmul_transpose_attribute(op: Operation, name: str) -> bool:
     value = op.attrs.get(name, False)
     if not isinstance(value, bool):
@@ -1871,6 +1939,8 @@ def _emit_simdgroup_matmul_source(
     transpose_left: bool,
     transpose_right: bool,
     batch_count: int,
+    left_batch_offset: str,
+    right_batch_offset: str,
 ) -> str:
     if rows % _MATMUL_BLOCK_ROWS != 0 or columns % _MATMUL_BLOCK_COLUMNS != 0:
         raise ValueError("simdgroup matmul requires complete 64x64 output blocks")
@@ -1898,12 +1968,8 @@ def _emit_simdgroup_matmul_source(
     threads = 256
     column_blocks = columns // block_columns
     exact_reduction = reduction % block_reduction == 0
-    left_batch_offset = (
-        f"batch * {rows * reduction}u + " if batch_count > 1 else ""
-    )
-    right_batch_offset = (
-        f"batch * {reduction * columns}u + " if batch_count > 1 else ""
-    )
+    left_batch_prefix = f"{left_batch_offset} + " if left_batch_offset else ""
+    right_batch_prefix = f"{right_batch_offset} + " if right_batch_offset else ""
     output_batch_offset = (
         f"batch * {rows * columns}u + " if batch_count > 1 else ""
     )
@@ -1962,7 +2028,7 @@ def _emit_simdgroup_matmul_source(
                 "                tile_a + index);",
                 f"        const device vec<T, {load_vector_width}>* source =",
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
-                f"                in_{left_position} + {left_batch_offset}"
+                f"                in_{left_position} + {left_batch_prefix}"
                 f"(row_base + local_row) * {reduction}u",
                 f"                    + k_base + local_k);",
                 "        *destination = *source;",
@@ -1978,7 +2044,7 @@ def _emit_simdgroup_matmul_source(
                 "                tile_b + index);",
                 f"        const device vec<T, {load_vector_width}>* source =",
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
-                f"                in_{right_position} + {right_batch_offset}"
+                f"                in_{right_position} + {right_batch_prefix}"
                 f"(k_base + local_k) * {columns}u",
                 f"                    + col_base + local_column);",
                 "        *destination = *source;",
@@ -2003,8 +2069,8 @@ def _emit_simdgroup_matmul_source(
             left_index = (
                 f"(row_base + local_row) * {reduction}u + k_base + local_k"
             )
-        if batch_count > 1:
-            left_index = f"batch * {rows * reduction}u + {left_index}"
+        if left_batch_offset:
+            left_index = f"{left_batch_offset} + {left_index}"
         load_a = f"in_{left_position}[{left_index}]"
         if not exact_reduction:
             load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
@@ -2027,8 +2093,8 @@ def _emit_simdgroup_matmul_source(
             right_index = (
                 f"(k_base + local_k) * {columns}u + col_base + local_column"
             )
-        if batch_count > 1:
-            right_index = f"batch * {reduction * columns}u + {right_index}"
+        if right_batch_offset:
+            right_index = f"{right_batch_offset} + {right_index}"
         load_b = f"in_{right_position}[{right_index}]"
         if not exact_reduction:
             load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
@@ -2119,6 +2185,8 @@ def _emit_tiled_matmul_source(
     transpose_left: bool,
     transpose_right: bool,
     batch_count: int,
+    left_batch_offset: str,
+    right_batch_offset: str,
 ) -> str:
     if op.op == "addmm":
         bias_id, _, _ = op.inputs
@@ -2183,8 +2251,8 @@ def _emit_tiled_matmul_source(
         left_index = f"(k_base + local_k) * {rows}u + row_base + local_row"
     else:
         left_index = f"(row_base + local_row) * {reduction}u + k_base + local_k"
-    if batch_count > 1:
-        left_index = f"batch * {rows * reduction}u + {left_index}"
+    if left_batch_offset:
+        left_index = f"{left_batch_offset} + {left_index}"
     load_a = f"float(in_{left_position}[{left_index}])"
     a_guards = []
     if not exact_rows:
@@ -2208,8 +2276,8 @@ def _emit_tiled_matmul_source(
         )
     else:
         right_index = f"(k_base + local_k) * {columns}u + col_base + local_column"
-    if batch_count > 1:
-        right_index = f"batch * {reduction * columns}u + {right_index}"
+    if right_batch_offset:
+        right_index = f"{right_batch_offset} + {right_index}"
     load_b = f"float(in_{right_position}[{right_index}])"
     b_guards = []
     if not exact_columns:

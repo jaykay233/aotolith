@@ -1612,6 +1612,29 @@ def test_metal_batched_matmul_codegen_supports_rank_three_and_four(
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_metal_matmul_codegen_handles_singleton_batch_dimension() -> None:
+    torch.manual_seed(54)
+    inputs = (
+        torch.randn(1, 5, 7),
+        torch.randn(1, 7, 4),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert result.plan.kernels[0].name == "metal_matmul_tiled_64x64x32_4x4_0"
+    source = result.plan.kernels[0].source
+    assert "threadgroup_position_in_grid.y" not in source
+    assert "batch *" not in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(torch.matmul(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_metal_batched_simdgroup_matmul_vectorizes_batch_inputs() -> None:
     torch.manual_seed(44)
     inputs = (
@@ -1664,6 +1687,186 @@ def test_metal_batched_matmul_combines_transposes_with_batch_strides() -> None:
     )
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_codegen_broadcasts_rank_four_batch_dimensions() -> None:
+    torch.manual_seed(46)
+    inputs = (
+        torch.randn(2, 1, 5, 7),
+        torch.randn(1, 3, 7, 4),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    source = result.plan.kernels[0].source
+    assert "((batch / 3u) % 2u) * 35u" in source
+    assert "batch % 3u * 28u" in source
+    assert "batch * 20u" in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(torch.matmul(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_codegen_folds_single_use_batch_expands() -> None:
+    torch.manual_seed(47)
+    inputs = (
+        torch.randn(2, 1, 5, 7),
+        torch.randn(1, 3, 7, 4),
+    )
+
+    def fn(left, right):
+        return left.expand(2, 3, 5, 7) @ right.expand(2, 3, 7, 4)
+
+    result = compile_callable(fn, inputs, codegen_matmul=True)
+    assert [op.op for op in result.input_graph.ops].count("expand") >= 2
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_batch_expand_is_kept_when_it_is_a_graph_output() -> None:
+    torch.manual_seed(48)
+    inputs = (
+        torch.randn(2, 1, 5, 7),
+        torch.randn(1, 3, 7, 4),
+    )
+
+    def fn(left, right):
+        expanded = left.expand(2, 3, 5, 7)
+        return expanded @ right.expand(2, 3, 7, 4), expanded
+
+    result = compile_callable(fn, inputs, codegen_matmul=True)
+    assert "expand" in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    expected = tuple(mx.array(value.numpy()) for value in fn(*inputs))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(actual_value, expected_value, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_batch_expand_is_kept_when_shared() -> None:
+    torch.manual_seed(49)
+    inputs = (
+        torch.randn(2, 1, 5, 7),
+        torch.randn(1, 3, 7, 4),
+    )
+
+    def fn(left, right):
+        expanded = left.expand(2, 3, 5, 7)
+        return expanded @ right.expand(2, 3, 7, 4), expanded.sum(dim=-1)
+
+    result = compile_callable(fn, inputs, codegen_matmul=True)
+    assert "expand" in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    expected = tuple(mx.array(value.numpy()) for value in fn(*inputs))
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(actual_value, expected_value, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_batch_expand_is_kept_when_shape_is_not_inferable() -> None:
+    torch.manual_seed(50)
+    inputs = (
+        torch.randn(1, 2, 5, 7),
+        torch.randn(1, 2, 7, 4),
+    )
+
+    def fn(left, right):
+        return left.expand(3, 2, 5, 7) @ right.expand(3, 2, 7, 4)
+
+    result = compile_callable(fn, inputs, codegen_matmul=True)
+    assert [op.op for op in result.lowered_graph.ops].count("expand") == 2
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_broadcast_combines_with_transpose() -> None:
+    torch.manual_seed(51)
+    inputs = (
+        torch.randn(2, 1, 5, 7),
+        torch.randn(1, 3, 5, 4),
+    )
+
+    def fn(left, right):
+        return left.transpose(-2, -1).expand(2, 3, 7, 5) @ right.expand(
+            2, 3, 5, 4
+        )
+
+    result = compile_callable(fn, inputs, codegen_matmul=True)
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    assert result.lowered_graph.ops[0].attrs == {"transpose_a": True}
+    source = result.plan.kernels[0].source
+    assert "((batch / 3u) % 2u) * 35u" in source
+    assert "batch % 3u * 20u" in source
+    assert "(k_base + local_k) * 7u + row_base + local_row" in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_matmul_broadcasts_rank_two_against_rank_four() -> None:
+    torch.manual_seed(52)
+    inputs = (
+        torch.randn(5, 7),
+        torch.randn(2, 3, 7, 4),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    source = result.plan.kernels[0].source
+    assert "batch * 28u" in source
+    assert "batch * 20u" in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(torch.matmul(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_metal_simdgroup_matmul_broadcasts_batch_inputs() -> None:
+    torch.manual_seed(53)
+    inputs = (
+        torch.randn(2, 1, 64, 32, dtype=torch.float16),
+        torch.randn(1, 3, 32, 64, dtype=torch.float16),
+    )
+    result = compile_callable(
+        lambda left, right: left @ right,
+        inputs,
+        codegen_matmul=True,
+    )
+
+    assert result.plan.kernels[0].name == (
+        "metal_matmul_simdgroup_64x64x32_batch6_0"
+    )
+    source = result.plan.kernels[0].source
+    assert "((batch / 3u) % 2u) * 2048u" in source
+    assert "batch % 3u * 2048u" in source
+    assert "batch * 4096u" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(torch.matmul(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
 
 
 def test_metal_matmul_codegen_folds_transposed_operand() -> None:
