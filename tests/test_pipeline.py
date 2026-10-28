@@ -642,6 +642,38 @@ def test_native_attention_rank4_mha_and_gqa(key_value_heads) -> None:
 
 
 @pytest.mark.parametrize(
+    ("dtype", "simdgroup_type"),
+    [(torch.float16, "half"), (torch.bfloat16, "bfloat")],
+)
+def test_native_attention_uses_simdgroup_qk(dtype, simdgroup_type) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    torch.manual_seed(64)
+    inputs = (
+        torch.randn(2, 2, 5, 64, dtype=dtype),
+        torch.randn(2, 2, 7, 64, dtype=dtype),
+        torch.randn(2, 2, 7, 64, dtype=dtype),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    source = result.plan.kernels[0].source
+
+    assert "threadgroup float tile_scores[256]" in source
+    assert "if (warp < 4u)" in source
+    assert "simdgroup_float8x8 qk_accumulator" in source
+    assert f"simdgroup_{simdgroup_type}8x8 qk_frag_q" in source
+    assert "simdgroup_load(qk_frag_k" in source
+    assert f"tile_k + warp * 8u * 64u" in source
+    assert "simdgroup_multiply_accumulate" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 5e-3
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.bfloat16, torch.float32],
 )

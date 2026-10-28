@@ -301,6 +301,58 @@ class AppleMetalBackend:
             score_expression = (
                 f"key > query_pos ? -INFINITY : ({score_expression})"
             )
+
+        use_simdgroup_qk = (
+            output_type.dtype in {DType.F16, DType.BF16}
+            and query_head_dim % 8 == 0
+        )
+        if use_simdgroup_qk:
+            simdgroup_type = {
+                DType.F16: "half",
+                DType.BF16: "bfloat",
+            }[output_type.dtype]
+            qk_steps = "\n".join(
+                f"""                simdgroup_load(qk_frag_q, tile_q + {dimension}u,
+                    {query_head_dim}, 0, false);
+                simdgroup_load(qk_frag_k, tile_k + warp * 8u * {query_head_dim}u
+                    + {dimension}u, {query_head_dim}, 0, true);
+                simdgroup_multiply_accumulate(
+                    qk_accumulator, qk_frag_q, qk_frag_k, qk_accumulator);"""
+                for dimension in range(0, query_head_dim, 8)
+            )
+            qk_score_source = f"""
+            if (warp < 4u) {{
+                simdgroup_float8x8 qk_accumulator =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_{simdgroup_type}8x8 qk_frag_q;
+                simdgroup_{simdgroup_type}8x8 qk_frag_k;
+{qk_steps}
+                simdgroup_store(
+                    qk_accumulator, tile_scores + warp * 8u, {key_tile}, 0, false);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint key = key_base + lane;
+            float score = -INFINITY;
+            if (query_pos < {query_length}u && key < {key_length}u) {{
+                float dot = tile_scores[warp * {key_tile}u + lane];
+                score = {score_expression};
+            }}
+"""
+        else:
+            qk_score_source = f"""
+            uint key = key_base + lane;
+            float score = -INFINITY;
+            if (query_pos < {query_length}u && key < {key_length}u) {{
+                float dot = 0.0f;
+                for (uint dimension = 0u; dimension < {query_head_dim}u;
+                     ++dimension) {{
+                    dot = fma(float(tile_q[warp * {query_head_dim}u + dimension]),
+                        float(tile_k[lane * {query_head_dim}u + dimension]), dot);
+                }}
+                score = {score_expression};
+            }}
+"""
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint lane = tid % 32u;
@@ -313,6 +365,7 @@ class AppleMetalBackend:
         uint query_pos = query_block * {query_tile}u + warp;
         threadgroup T tile_q[{query_tile * query_head_dim}];
         threadgroup T tile_k[{key_tile * query_head_dim}];
+        threadgroup float tile_scores[{query_tile * key_tile}];
         threadgroup float tile_probabilities[{query_tile * key_tile}];
 
         for (uint index = tid; index < {query_tile * query_head_dim}u;
@@ -344,19 +397,7 @@ class AppleMetalBackend:
                     : T(0);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            uint key = key_base + lane;
-            float score = -INFINITY;
-            if (query_pos < {query_length}u && key < {key_length}u) {{
-                float dot = 0.0f;
-                for (uint dimension = 0u; dimension < {query_head_dim}u;
-                     ++dimension) {{
-                    dot = fma(float(tile_q[warp * {query_head_dim}u + dimension]),
-                        float(tile_k[lane * {query_head_dim}u + dimension]), dot);
-                }}
-                score = {score_expression};
-            }}
-
+{qk_score_source}
             float block_max = simd_max(score);
             float new_max = metal::max(running_max, block_max);
             float alpha = running_max == -INFINITY
