@@ -96,6 +96,7 @@ _SUPPORTED_OPS = {
     "aten.scalar_tensor.default": "scalar_tensor",
     "aten.cat.default": "cat",
     "aten.embedding.default": "embedding",
+    "aten.index_select.default": "index_select",
 }
 
 _TORCH_DTYPES = {
@@ -201,6 +202,15 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 )
                 output_id = f"v{len(ops)}"
                 ops.append(Operation("embedding", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                continue
+            if target == "aten.index_select.default":
+                inputs, attrs, output_type = _index_select_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("index_select", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
@@ -588,6 +598,59 @@ def _embedding_operation(
         "sparse": sparse,
     }
     return (weight_id, indices_id), attrs, output_type
+
+
+def _index_select_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, str], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    if kwargs:
+        raise ValueError(
+            "index_select received unsupported keyword arguments: "
+            f"{sorted(kwargs)}"
+        )
+    if len(args) != 3:
+        raise ValueError(f"index_select expects three arguments, got {len(args)}")
+
+    source, dim, indices = args
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"index_select.dim must be an integer, got {dim!r}")
+    source_type = _node_type(source)
+    indices_type = _node_type(indices)
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("index_select requires a tensor with rank >= 1")
+    if dim < -rank or dim >= rank:
+        raise ValueError(f"index_select.dim {dim} is outside rank {rank}")
+    axis = dim + rank if dim < 0 else dim
+    if len(indices_type.shape) != 1:
+        raise ValueError(
+            "index_select indices must have rank 1, "
+            f"got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "index_select indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+
+    output_type = _node_type(node)
+    expected_shape = (
+        source_type.shape[:axis]
+        + (indices_type.shape[0],)
+        + source_type.shape[axis + 1 :]
+    )
+    if output_type != TensorType(expected_shape, source_type.dtype):
+        raise ValueError(
+            f"index_select output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(expected_shape, source_type.dtype)}"
+        )
+    return (
+        (_argument_ids(source, node_ids), _argument_ids(indices, node_ids)),
+        {"dim": axis},
+        output_type,
+    )
 
 
 def _attention_operation(

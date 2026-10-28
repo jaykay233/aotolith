@@ -81,6 +81,16 @@ class KernelArtifact:
     kind: str
 
 
+def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.array:
+    """Match PyTorch gather bounds instead of MLX's wrap-and-fill behavior."""
+
+    if bool(mx.any(indices < 0).item()) or bool(
+        mx.any(indices >= source.shape[axis]).item()
+    ):
+        raise IndexError("index out of range in self")
+    return mx.take(source, indices, axis=axis)
+
+
 @dataclass(slots=True)
 class CompiledPlan:
     graph: Graph
@@ -117,7 +127,11 @@ class CompiledPlan:
                 env[op.outputs[0]] = _evaluate_attention_mlx(op, env)
             elif op.op == "embedding":
                 weight, indices = (env[value_id] for value_id in op.inputs)
-                env[op.outputs[0]] = mx.take(weight, indices, axis=0)
+                env[op.outputs[0]] = _mlx_take_checked(weight, indices, axis=0)
+            elif op.op == "index_select":
+                source, indices = (env[value_id] for value_id in op.inputs)
+                axis = int(op.attrs["dim"])
+                env[op.outputs[0]] = _mlx_take_checked(source, indices, axis=axis)
             elif op.op in {"triu", "tril"}:
                 diagonal = int(op.attrs["diagonal"])
                 operation = mx.triu if op.op == "triu" else mx.tril
@@ -207,6 +221,8 @@ class AppleMetalBackend:
                 _validate_cat_op(graph, op)
             elif op.op == "embedding":
                 _validate_embedding_op(graph, op)
+            elif op.op == "index_select":
+                _validate_index_select_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -3033,6 +3049,48 @@ def _validate_embedding_op(graph: Graph, op: Operation) -> None:
     for name in ("scale_grad_by_freq", "sparse"):
         if not isinstance(op.attrs.get(name, False), bool):
             raise ValueError(f"embedding.{name} must be a boolean")
+
+
+def _validate_index_select_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 2:
+        raise ValueError(
+            f"index_select expects two inputs, got {len(op.inputs)}"
+        )
+    source_type = graph.value(op.inputs[0]).type
+    indices_type = graph.value(op.inputs[1]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("index_select requires a tensor with rank >= 1")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"index_select.dim must be an integer, got {dim!r}")
+    if dim < 0 or dim >= rank:
+        raise ValueError(f"index_select.dim {dim} is outside rank {rank}")
+    if len(indices_type.shape) != 1:
+        raise ValueError(
+            "index_select indices must have rank 1, "
+            f"got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "index_select indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    expected_shape = (
+        source_type.shape[:dim]
+        + (indices_type.shape[0],)
+        + source_type.shape[dim + 1 :]
+    )
+    if output_type != TensorType(expected_shape, source_type.dtype):
+        raise ValueError(
+            f"index_select output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(expected_shape, source_type.dtype)}"
+        )
+    if set(op.attrs) != {"dim"}:
+        raise ValueError(
+            f"index_select has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
+        )
 
 
 def _validate_triangular_op(graph: Graph, op: Operation) -> None:
