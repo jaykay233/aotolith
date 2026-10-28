@@ -206,6 +206,8 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 
+backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 kernel name、input/output 参数名、MSL source 和 header 组成，容量为 256。它只避免同一 Python 进程内重复构造相同 kernel，不是跨进程磁盘缓存；MLX 自身的编译缓存行为不由这里控制。
+
 ## 11. 已知边界
 
 - 只支持静态、非空 shape
@@ -216,9 +218,9 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
-- 没有 kernel cache、autotune、layout propagation
+- kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
 - matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是 kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是跨进程 kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

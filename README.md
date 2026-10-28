@@ -41,6 +41,7 @@ PyTorch FX
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
+- 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
 默认情况下，`matmul` 和 `addmm` 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
 
@@ -125,7 +126,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖最后一维 softmax、任意非空维度集合的 sum/mean、LayerNorm 和 RMSNorm，但不支持动态 shape、控制流、自动微分、layout pass、kernel cache 和训练。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖最后一维 softmax、任意非空维度集合的 sum/mean、LayerNorm 和 RMSNorm，但不支持动态 shape、控制流、自动微分、layout pass、跨进程 kernel cache 和训练。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 

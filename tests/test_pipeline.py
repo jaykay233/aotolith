@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from transformer_subgraph_compiler import compile_callable, compile_graph, fuse_pointwise
+from transformer_subgraph_compiler.backends import apple_metal as metal_backend
 from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
 
 
@@ -30,6 +31,24 @@ def test_pointwise_fusion_emits_one_metal_region() -> None:
     result = compile_graph(graph)
     assert len(result.plan.kernels) == 1
     assert "metal::exp" in result.plan.kernels[0].source
+
+
+def test_repeated_compilation_reuses_identical_metal_kernel() -> None:
+    metal_backend._metal_kernel.cache_clear()
+    x = torch.randn(2, 8)
+    first = compile_callable(lambda value: torch.relu(value), (x,))
+    second = compile_callable(lambda value: torch.relu(value), (x,))
+
+    cache_info = metal_backend._metal_kernel.cache_info()
+    assert cache_info.misses == 1
+    assert cache_info.hits == 1
+
+    input_array = mx.array(x.numpy())
+    expected = mx.maximum(input_array, 0.0)
+    for result in (first, second):
+        actual = result.plan(input_array)[0]
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected)
 
 
 def test_mlp_end_to_end_on_metal() -> None:

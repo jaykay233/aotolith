@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 from dataclasses import dataclass
+from functools import lru_cache
 from math import ceil, prod
 from typing import Any
 
@@ -20,6 +21,7 @@ _ELEMENTS_PER_THREAD = 4
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
+_METAL_KERNEL_CACHE_SIZE = 256
 
 _MSL_HEADER = """
 inline float tsc_erf(float value) {
@@ -31,6 +33,25 @@ inline float tsc_erf(float value) {
     return sign * (1.0f - polynomial * metal::exp(-x * x));
 }
 """
+
+
+@lru_cache(maxsize=_METAL_KERNEL_CACHE_SIZE)
+def _metal_kernel(
+    name: str,
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
+    source: str,
+    header: str,
+) -> Any:
+    """Reuse an mx.fast.metal_kernel for an identical static kernel spec."""
+
+    return mx.fast.metal_kernel(
+        name=name,
+        input_names=list(input_names),
+        output_names=list(output_names),
+        source=source,
+        header=header,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,12 +183,12 @@ class AppleMetalBackend:
             graph, input_ids, body, output_id, output_type.shape
         )
         name = f"{kind}_{index}"
-        kernel = mx.fast.metal_kernel(
-            name=name,
-            input_names=[f"in_{position}" for position in range(len(input_ids))],
-            output_names=["out"],
-            source=source,
-            header=_MSL_HEADER,
+        kernel = _metal_kernel(
+            name,
+            tuple(f"in_{position}" for position in range(len(input_ids))),
+            ("out",),
+            source,
+            _MSL_HEADER,
         )
 
         element_count = prod(output_type.shape)
@@ -275,11 +296,12 @@ class AppleMetalBackend:
         }}
         """
         name = f"metal_softmax_{threads}_{index}"
-        kernel = mx.fast.metal_kernel(
-            name=name,
-            input_names=["in_0"],
-            output_names=["out"],
-            source=source,
+        kernel = _metal_kernel(
+            name,
+            ("in_0",),
+            ("out",),
+            source,
+            "",
         )
         grid = (rows * threads, 1, 1)
         threadgroup = (threads, 1, 1)
@@ -420,11 +442,12 @@ class AppleMetalBackend:
         }}
         """
         name = f"metal_{op.op}_{threads}_{index}"
-        kernel = mx.fast.metal_kernel(
-            name=name,
-            input_names=["in_0"],
-            output_names=["out"],
-            source=source,
+        kernel = _metal_kernel(
+            name,
+            ("in_0",),
+            ("out",),
+            source,
+            "",
         )
         grid = (output_count * threads, 1, 1)
         threadgroup = (threads, 1, 1)
@@ -626,13 +649,12 @@ class AppleMetalBackend:
         }}
         """
         name = f"metal_{kind}_{threads}_{index}"
-        kernel = mx.fast.metal_kernel(
-            name=name,
-            input_names=[
-                f"in_{position}" for position in range(len(op.inputs))
-            ],
-            output_names=["out"],
-            source=source,
+        kernel = _metal_kernel(
+            name,
+            tuple(f"in_{position}" for position in range(len(op.inputs))),
+            ("out",),
+            source,
+            "",
         )
         grid = (rows * threads, 1, 1)
         threadgroup = (threads, 1, 1)
@@ -715,11 +737,12 @@ class AppleMetalBackend:
             graph,
         )
         name = f"metal_{op.op}_{micro_rows}x{micro_columns}_{index}"
-        kernel = mx.fast.metal_kernel(
-            name=name,
-            input_names=[f"in_{position}" for position in range(len(op.inputs))],
-            output_names=["out"],
-            source=source,
+        kernel = _metal_kernel(
+            name,
+            tuple(f"in_{position}" for position in range(len(op.inputs))),
+            ("out",),
+            source,
+            "",
         )
         grid = (
             ceil(columns / micro_columns),
