@@ -743,6 +743,19 @@ def test_sum_reduces_leading_dimension() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_sum_can_reduce_all_dimensions() -> None:
+    torch.manual_seed(96)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(
+        lambda value: torch.sum(value, dim=(0, 1, 2)), (x,)
+    )
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(torch.sum(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == ()
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mean_supports_low_precision(dtype) -> None:
     torch.manual_seed(97)
@@ -779,13 +792,43 @@ def test_mean_composes_with_matmul() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_reduction_rejects_non_contiguous_dimensions() -> None:
-    x = torch.randn(2, 3, 4)
-    with pytest.raises(
-        NotImplementedError,
-        match="currently supports one contiguous reduction block",
-    ):
-        compile_callable(lambda value: torch.mean(value, dim=(0, 2)), (x,))
+def test_mean_reduces_interleaved_dimensions() -> None:
+    torch.manual_seed(103)
+    x = torch.randn(2, 3, 4, 5)
+
+    def fn(value):
+        return torch.mean(value, dim=(0, 2), keepdim=True)
+
+    result = compile_callable(fn, (x,))
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_mean_8_0"
+    assert "col / 4u" in kernel.source
+    assert "col % 4u" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (1, 3, 1, 5)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_sum_reduces_interleaved_dimensions_without_keepdim() -> None:
+    torch.manual_seed(105)
+    x = torch.randn(2, 3, 4, 5)
+
+    def fn(value):
+        return torch.sum(value, dim=(1, 3))
+
+    result = compile_callable(fn, (x,))
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_sum_16_0"
+    assert "col / 5u" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 4)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_reduction_rejects_explicit_dtype_override() -> None:

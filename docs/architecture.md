@@ -136,17 +136,17 @@ grid 大小是 `rows * threads`，每个 threadgroup 的大小固定为 `threads
 
 ## 7. Metal sum/mean reduction
 
-sum/mean 接受一个或多个 reduction 维，当前要求这些维组成一个连续 block，但不要求位于末尾。backend 把输入拆成 `outer × reduction_block × inner`，并把 reduction block 展平为 `columns`：
+sum/mean 接受任意非空 reduction 维集合。backend 把未被 reduction 的维度压平为输出元素，把 reduction 维压平为 `columns`：
 
 - 每个输出元素对应一个 threadgroup
 - threadgroup 线程数复用 softmax 的选择规则，最多 256 个线程
 - 每个线程跨步累加局部结果，再在 threadgroup memory 中做树形加法
 - sum 直接写回归约值；mean 在 float 中除以 `columns` 后写回
-- `inner` 维把输出元素映射到输入起点，reduction 元素之间的步长是 `inner_size`
-- `inner_size == 1` 时省略除法和取模，直接按连续尾维寻址
+- reduction 维组成连续 block 时，backend 把输入拆成 `outer × reduction_block × inner`，用紧凑地址映射；尾维还省略除法和取模
+- reduction 维交错时，backend 从 `output_index` 生成非 reduction 维的输入基址，从 `col` 生成各 reduction 维坐标，再组合成静态输入偏移
 - 只有 `tid == 0` 写一个输出元素，`keepdim` 只影响输出 shape，不影响线性写入位置
 
-输入输出必须保持相同 dtype。显式传入不同的 reduction dtype 会在前端被拒绝。交错轴 reduction 会由 backend 抛出 `NotImplementedError`，不会静默调用 MLX。每个输出元素启动一个 threadgroup，因此当 `inner` 很大而 reduction 很小的时候，dispatch 开销会偏高。
+输入输出必须保持相同 dtype。显式传入不同的 reduction dtype 会在前端被拒绝。每个输出元素启动一个 threadgroup，因此输出元素很多而 reduction 很小时 dispatch 开销会偏高；交错维的通用索引还会为每次读取增加整数除法和取模。
 
 ## 8. Metal LayerNorm 和 RMSNorm lowering
 
@@ -200,7 +200,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
 - softmax：调用生成的 last-dim reduction kernel
-- sum/mean：调用生成的连续 block reduction kernel
+- sum/mean：调用生成的 static reduction kernel
 - layer_norm：调用生成的两遍 mean/variance reduction kernel
 - rms_norm：调用生成的平方和 reduction kernel
 
@@ -212,7 +212,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
 - softmax 只支持最后一维
-- sum/mean 只支持一个连续 reduction block，且不支持 reduction dtype override
+- sum/mean 支持任意非空维度集合，但不支持 reduction dtype override
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
@@ -221,4 +221,4 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是交错轴 reduction、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是 kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

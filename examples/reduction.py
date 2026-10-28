@@ -14,6 +14,7 @@ def main() -> None:
         return (
             torch.sum(value, dim=-1),
             torch.mean(value, dim=(1, 2), keepdim=True),
+            torch.sum(value, dim=(0, 2), keepdim=True),
         )
 
     result = compile_callable(reductions, (x,))
@@ -26,7 +27,10 @@ def main() -> None:
     expected = tuple(mx.array(value.numpy()) for value in reductions(x))
     mx.eval(*actual, *expected)
     for name, actual_value, expected_value in zip(
-        ("sum", "mean"), actual, expected, strict=True
+        ("sum_last", "mean_contiguous", "sum_interleaved"),
+        actual,
+        expected,
+        strict=True,
     ):
         max_error = float(mx.max(mx.abs(actual_value - expected_value)))
         print(f"{name} max abs error against PyTorch CPU: {max_error:.3e}")

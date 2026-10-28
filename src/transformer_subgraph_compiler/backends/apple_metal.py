@@ -335,50 +335,67 @@ class AppleMetalBackend:
                 raise ValueError(f"{op.op}.dims must not contain duplicates")
             normalized_dims.append(axis)
         normalized_dims.sort()
-        first_reduced_dim = normalized_dims[0]
-        if normalized_dims != list(
-            range(first_reduced_dim, first_reduced_dim + len(normalized_dims))
-        ):
-            raise NotImplementedError(
-                f"Metal {op.op} currently supports one contiguous reduction block"
-            )
 
         keepdim = op.attrs.get("keepdim")
         if not isinstance(keepdim, bool):
             raise ValueError(f"{op.op}.keepdim must be a boolean")
         reduced_rank = len(normalized_dims)
+        reduced_dims = set(normalized_dims)
         columns = prod(input_type.shape[axis] for axis in normalized_dims)
-        outer_shape = input_type.shape[:first_reduced_dim]
-        inner_shape = input_type.shape[first_reduced_dim + reduced_rank :]
-        expected_output_shape = outer_shape
         if keepdim:
-            expected_output_shape += (1,) * reduced_rank
-        expected_output_shape += inner_shape
+            expected_output_shape = tuple(
+                1 if axis in reduced_dims else dim
+                for axis, dim in enumerate(input_type.shape)
+            )
+        else:
+            expected_output_shape = tuple(
+                dim
+                for axis, dim in enumerate(input_type.shape)
+                if axis not in reduced_dims
+            )
         if output_type.shape != expected_output_shape:
             raise ValueError(
                 f"{op.op} output shape {output_type.shape} "
                 f"!= {expected_output_shape}"
             )
 
-        outer_size = prod(outer_shape) or 1
-        inner_size = prod(inner_shape) or 1
-        output_count = outer_size * inner_size
+        output_count = prod(expected_output_shape) or 1
         threads = _reduction_thread_count(columns)
         reduction_stride = threads // 2
         result_expression = "scratch[0]"
         if op.op == "mean":
             result_expression = f"scratch[0] / {columns}.0f"
-        if inner_size == 1:
-            input_index_source = (
-                f"        uint offset = output_index * {columns}u;"
+
+        first_reduced_dim = normalized_dims[0]
+        is_contiguous = normalized_dims == list(
+            range(first_reduced_dim, first_reduced_dim + reduced_rank)
+        )
+        if is_contiguous:
+            inner_shape = input_type.shape[first_reduced_dim + reduced_rank :]
+            inner_size = prod(inner_shape) or 1
+            if inner_size == 1:
+                input_base = f"output_index * {columns}u"
+            else:
+                input_base = (
+                    f"(output_index / {inner_size}u) * {columns * inner_size}u "
+                    f"+ output_index % {inner_size}u"
+                )
+            reduction_offset = (
+                "col" if inner_size == 1 else f"col * {inner_size}u"
             )
         else:
-            input_index_source = f"""        uint outer_index = output_index / {inner_size}u;
-        uint inner_index = output_index % {inner_size}u;
-        uint offset = outer_index * {columns * inner_size}u + inner_index;"""
-        reduction_offset = (
-            "col" if inner_size == 1 else f"col * {inner_size}u"
-        )
+            compact_output_shape = tuple(
+                dim
+                for axis, dim in enumerate(input_type.shape)
+                if axis not in reduced_dims
+            )
+            input_base = _reduction_output_base_expression(
+                input_type.shape, compact_output_shape, reduced_dims
+            )
+            reduction_offset = _reduction_offset_expression(
+                input_type.shape, normalized_dims
+            )
+        input_index_source = f"        uint offset = {input_base};"
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint output_index = threadgroup_position_in_grid.x;
@@ -387,7 +404,7 @@ class AppleMetalBackend:
 
         float local_value = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            local_value += float(in_0[offset + {reduction_offset}]);
+            local_value += float(in_0[offset + ({reduction_offset})]);
         }}
         scratch[tid] = local_value;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -749,6 +766,54 @@ def _next_power_of_two(value: int) -> int:
     if value <= 0:
         raise ValueError(f"expected a positive integer, got {value}")
     return 1 << (value - 1).bit_length()
+
+
+def _reduction_output_base_expression(
+    input_shape: tuple[int, ...],
+    compact_output_shape: tuple[int, ...],
+    reduced_dims: set[int],
+) -> str:
+    """Map a flattened output index to the first input element it reduces."""
+
+    non_reduced_axes = [
+        axis for axis in range(len(input_shape)) if axis not in reduced_dims
+    ]
+    terms: list[str] = []
+    for output_axis, input_axis in enumerate(non_reduced_axes):
+        output_stride = prod(compact_output_shape[output_axis + 1 :])
+        output_dim = compact_output_shape[output_axis]
+        coordinate = (
+            f"((output_index / {output_stride}u) % {output_dim}u)"
+            if output_stride > 1
+            else f"(output_index % {output_dim}u)"
+        )
+        input_stride = prod(input_shape[input_axis + 1 :])
+        terms.append(
+            coordinate if input_stride == 1 else f"{coordinate} * {input_stride}u"
+        )
+    return " + ".join(terms) if terms else "0u"
+
+
+def _reduction_offset_expression(
+    input_shape: tuple[int, ...], reduced_dims: list[int]
+) -> str:
+    """Map a flattened reduction index to its input offset."""
+
+    terms: list[str] = []
+    reduction_stride = 1
+    for axis in reversed(reduced_dims):
+        dimension = input_shape[axis]
+        coordinate = (
+            f"(col % {dimension}u)"
+            if reduction_stride == 1
+            else f"((col / {reduction_stride}u) % {dimension}u)"
+        )
+        input_stride = prod(input_shape[axis + 1 :])
+        terms.append(
+            coordinate if input_stride == 1 else f"{coordinate} * {input_stride}u"
+        )
+        reduction_stride *= dimension
+    return " + ".join(reversed(terms))
 
 
 def _reduction_thread_count(columns: int) -> int:
