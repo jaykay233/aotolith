@@ -52,12 +52,18 @@
 | `aten.clamp.default`、`aten.clamp.Tensor`、`aten.hardtanh.default` | `clamp` |
 | `aten.clamp_min.default`、`aten.clamp_min.Tensor` | `clamp_min` |
 | `aten.clamp_max.default`、`aten.clamp_max.Tensor` | `clamp_max` |
+| `aten.eq`、`aten.ne`、`aten.lt`、`aten.le`、`aten.gt`、`aten.ge` 的 Tensor/Scalar 变体 | `eq`、`ne`、`lt`、`le`、`gt`、`ge` |
+| `aten.logical_and/or/xor/not`，以及 bool tensor 的 `aten.bitwise_and/or/xor/not` Tensor/Scalar 变体 | `logical_and`、`logical_or`、`logical_xor`、`logical_not` |
+| `aten.isnan.default`、`aten.isinf.default` | `isnan`、`isinf` |
+| `aten.where.self` | `where` |
+| `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
+| `aten.scalar_tensor.default` | `scalar_tensor`，标量值和输出 dtype 进入 IR |
 
-每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
+每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。IR 的数值 dtype 包括 FP16、BF16 和 FP32，另外支持 `DType.BOOL` 表示谓词、logical op、bool mask 和 bool 输出。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute；`scalar_tensor` 是无 tensor 输入的 pointwise 常量节点，值和输出 dtype 分别来自 operation attribute 与节点 metadata。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
@@ -89,7 +95,7 @@ IR 定义在 `ir.py`：
 
 GQA/MQA 有两种入口。直接调用 `F.scaled_dot_product_attention(..., enable_gqa=True)` 时，前端直接生成 `attention`；显式 `repeat_kv` 的分解图则通过 `unsqueeze -> expand -> reshape` 识别出原始 K/V。后一种模式会去掉物化复制，把 K/V head 数低于 Q head 数的 `attention` 交给 MLX。rank-4 下要求 Q head 数是 K/V head 数的整数倍；MQA 是 K/V head 数为 1 的特例。
 
-Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。当 `safe_softmax=True` 且存在 additive mask 时，MLX lowering 会把整行都被 mask 的输出显式置零，避免 fused SDPA 产生 NaN。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 attention 会改为执行下面描述的生成 kernel；不满足条件时仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
+Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。显式 mask 可以是与 Q/K/V 同 dtype 的 additive mask，也可以是 bool mask；bool mask 中 `True` 表示允许该 key 参与 attention。当 `safe_softmax=True` 且存在显式 mask 时，MLX lowering 会把整行都被 mask 的输出显式置零：additive mask 判断整行是否为 `-inf`，bool mask 判断整行是否为 `False`，避免 fused SDPA 产生 NaN 或错误结果。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 additive-mask attention 会改为执行下面描述的生成 kernel；直接 bool mask 或不满足条件的形状仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
 
 ## 4. Pointwise 融合
 
@@ -157,9 +163,13 @@ input_offset = (elem % 3) * 1
 - grid 大小为 `ceil(输出元素数 / 4)`
 - 每个 thread 依次处理最多 4 个元素
 - threadgroup 最大为 256
-- 输入转成 `float` 计算
-- 最终结果转回模板类型 `T`
+- 数值输入加载为 `float`，bool 输入和中间谓词加载或声明为 `bool`
+- 比较必须产生 bool；logical op 只接受 bool 输入并产生 bool；`where` 的第一个输入必须是 bool condition
+- 普通数值 op 不接受 bool operand；数值分支与 bool condition 可以处于同一个 DAG region
+- 中间临时值和最终结果的 MSL 类型由各自 IR 输出的 dtype 决定，最终写回模板类型 `T`
 - `mx.fast.metal_kernel` 在首次调用时完成 JIT
+
+混合 dtype 融合让 `(x > y) & mask -> where(condition, x + y, x - y)` 仍只生成一个 kernel。bool 输出使用 `mx.bool_` 分配，FP16/BF16/FP32 数值路径仍以 float 计算并 cast 回目标 dtype。
 
 精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
 
@@ -288,7 +298,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 | `1×8×1024×128` | 1.720 ms | 1.314 ms | 23.6% |
 | `1×8×2048×128` | 6.211 ms | 4.612 ms | 25.7% |
 
-数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
+数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256、直接传入 bool mask，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
 ## 13. Runtime
 
@@ -296,7 +306,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 - 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
 - 默认模式下的 `matmul`、`addmm`：调用 MLX，并按 `transpose_a`/`transpose_b` 执行对应的 swapaxes
-- attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`
+- attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`，并对安全 softmax 的整行 mask 补零
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
 - cast：调用 MLX `astype`，保留源和目标 dtype、shape
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
@@ -312,8 +322,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 ## 14. 已知边界
 
 - 只支持静态、非空 shape
-- 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
-- pointwise 要求输入输出 dtype 相同
+- 不支持动态 shape、控制流和 list/dict 输出；常量生成只识别前端当前需要的 `scalar_tensor.default`，`ones_like` 等节点尚未支持
+- bool tensor 只支持比较、logical、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`，没有整数 dtype，也不支持一般整数 bitwise 运算
 - softmax 支持任意单轴，但不支持一次对多个轴做 softmax
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
@@ -323,7 +333,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
-- attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
+- attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；64-key tile 仅在同样条件成立时使用 8/16 元素向量加载，不满足条件的单个阶段回退到标量路径
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune

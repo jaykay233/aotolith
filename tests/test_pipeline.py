@@ -20,6 +20,7 @@ _MLX_DTYPES = {
     torch.float16: mx.float16,
     torch.bfloat16: mx.bfloat16,
     torch.float32: mx.float32,
+    torch.bool: mx.bool_,
 }
 
 
@@ -158,6 +159,210 @@ def test_pointwise_fusion_reuses_shared_expression() -> None:
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected)
+
+
+@pytest.mark.parametrize("op_name", ["eq", "ne", "lt", "le", "gt", "ge"])
+def test_comparison_ops_produce_metal_boolean_outputs(op_name) -> None:
+    compare = getattr(torch, op_name)
+
+    def fn(left, right):
+        return compare(left, right)
+
+    torch.manual_seed(11)
+    inputs = (torch.randn(13), torch.randn(13))
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert result.plan.kernels[0].tensor_type.dtype == DType.BOOL
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.bool_
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_boolean_predicates_and_where_fuse_into_one_kernel(dtype) -> None:
+    def fn(left, right, enabled):
+        condition = (left > right) & (left < 0.5)
+        condition = condition | (right < -0.5)
+        condition = condition ^ (left == 0.5)
+        condition = ~condition
+        return torch.where(condition & enabled, left + right, left - right)
+
+    torch.manual_seed(13)
+    inputs = (
+        torch.randn(4, 7).to(dtype),
+        torch.randn(4, 7).to(dtype),
+        torch.rand(4, 7) > 0.5,
+    )
+    result = compile_callable(fn, inputs)
+    input_ops = [op.op for op in result.input_graph.ops]
+    expected_ops = {
+        "gt",
+        "lt",
+        "eq",
+        "logical_and",
+        "logical_or",
+        "logical_xor",
+        "logical_not",
+        "where",
+    }
+    assert expected_ops <= set(input_ops)
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert len(result.plan.kernels) == 1
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_where_fuses_scalar_tensor_constant() -> None:
+    def fn(value):
+        return torch.where(value > 0, value, 0.0)
+
+    value = torch.randn(19)
+    result = compile_callable(fn, (value,))
+    assert "scalar_tensor" in [op.op for op in result.input_graph.ops]
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scalar"),
+    [
+        (torch.bool, True),
+        (torch.bool, False),
+        (torch.float32, True),
+        (torch.float32, False),
+    ],
+)
+def test_comparison_with_boolean_scalar(dtype, scalar) -> None:
+    def fn(value):
+        return value == scalar
+
+    torch.manual_seed(17)
+    if dtype == torch.bool:
+        value = torch.rand(23) > 0.5
+    else:
+        value = torch.randn(23)
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["eq"]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.bool_
+    assert mx.array_equal(actual, expected)
+
+
+def test_where_fuses_two_boolean_scalar_constants() -> None:
+    def fn(condition):
+        return torch.where(condition, True, False)
+
+    condition = torch.rand(17) > 0.5
+    result = compile_callable(fn, (condition,))
+    input_ops = [op.op for op in result.input_graph.ops]
+    assert input_ops.count("scalar_tensor") == 2
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(condition))[0]
+    expected = mx.array(fn(condition).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.bool_
+    assert mx.array_equal(actual, expected)
+
+
+def test_bitwise_boolean_scalars_fuse_with_numeric_selection() -> None:
+    def fn(value):
+        condition = (value > 0) & True
+        condition = condition | False
+        condition = condition ^ True
+        return torch.where(condition, value, -1.0)
+
+    torch.manual_seed(19)
+    value = torch.randn(29)
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert len(result.plan.kernels) == 1
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_isnan_and_isinf_fuse_into_boolean_output() -> None:
+    def fn(value):
+        return torch.isnan(value) | torch.isinf(value)
+
+    value = torch.tensor([float("nan"), float("inf"), -float("inf"), 0.0, 2.0])
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert result.plan.kernels[0].tensor_type.dtype == DType.BOOL
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_masked_fill_lowers_broadcast_boolean_mask(dtype) -> None:
+    def fn(value, mask):
+        return value.masked_fill(mask, float("-inf"))
+
+    torch.manual_seed(23)
+    value = torch.randn(2, 2, 3, 4).to(dtype)
+    mask = torch.rand(1, 1, 3, 4) > 0.5
+    result = compile_callable(fn, (value, mask))
+    assert [op.op for op in result.lowered_graph.ops] == ["masked_fill"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["masked_fill"]
+
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(mask))[0]
+    expected = _torch_to_mlx(fn(value, mask))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_masked_fill_preserves_boolean_tensor_type() -> None:
+    def fn(value, mask):
+        return value.masked_fill(mask, True)
+
+    value = torch.zeros(19, dtype=torch.bool)
+    mask = torch.rand(19) > 0.5
+    result = compile_callable(fn, (value, mask))
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(mask))[0]
+    expected = mx.array(fn(value, mask).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.bool_
+    assert mx.array_equal(actual, expected)
+
+
+def test_masked_fill_fuses_with_inline_predicate() -> None:
+    def fn(value):
+        return value.masked_fill((value < 0) | torch.isnan(value), 0.0)
+
+    torch.manual_seed(27)
+    value = torch.randn(31)
+    value[3] = float("nan")
+    value[7] = -float("inf")
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
 
 
 def test_common_subexpression_elimination_reuses_matmul() -> None:
@@ -968,6 +1173,93 @@ def test_native_attention_all_masked_row_is_zero() -> None:
     zero_row = mx.zeros((2, 2, 16))
     mx.eval(actual, expected, zero_row)
     assert mx.array_equal(actual[:, :, 0, :], zero_row)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_boolean_attention_mask_falls_back_to_mlx_and_zeroes_empty_rows() -> None:
+    dtype = DType.F32
+    values = {
+        "query": Value("query", TensorType((2, 2, 3, 8), dtype)),
+        "key": Value("key", TensorType((2, 2, 4, 8), dtype)),
+        "value": Value("value", TensorType((2, 2, 4, 8), dtype)),
+        "mask": Value("mask", TensorType((1, 1, 3, 4), DType.BOOL)),
+        "output": Value("output", TensorType((2, 2, 3, 8), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {
+                    "scale": 8**-0.5,
+                    "has_mask": True,
+                    "causal": False,
+                    "safe_softmax": True,
+                },
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    assert result.plan.kernels == ()
+
+    torch.manual_seed(68)
+    mask = torch.rand(1, 1, 3, 4) > 0.25
+    mask[:, :, 1, :] = False
+    inputs = (
+        torch.randn(2, 2, 3, 8),
+        torch.randn(2, 2, 4, 8),
+        torch.randn(2, 2, 4, 8),
+        mask,
+    )
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(
+        torch.nn.functional.scaled_dot_product_attention(
+            inputs[0], inputs[1], inputs[2], attn_mask=inputs[3]
+        ).numpy()
+    )
+    empty_row = mx.zeros((2, 2, 8))
+    mx.eval(actual, expected, empty_row)
+    assert mx.array_equal(actual[:, :, 1, :], empty_row)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_frontend_boolean_attention_mask_uses_additive_pointwise_path() -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask
+        )
+
+    torch.manual_seed(70)
+    mask = torch.rand(1, 1, 3, 4) > 0.25
+    mask[:, :, 2, :] = False
+    inputs = (
+        torch.randn(1, 2, 3, 8),
+        torch.randn(1, 2, 4, 8),
+        torch.randn(1, 2, 4, 8),
+        mask,
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    input_ops = [op.op for op in result.input_graph.ops]
+    assert "scalar_tensor" in input_ops
+    assert "where" in input_ops
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "fused_elementwise",
+        "attention",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "fused_elementwise",
+        "attention",
+    ]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    empty_row = mx.zeros((1, 2, 8))
+    mx.eval(actual, expected, empty_row)
+    assert mx.array_equal(actual[:, :, 2, :], empty_row)
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 

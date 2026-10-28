@@ -15,9 +15,18 @@ _MLX_DTYPES = {
     DType.F16: mx.float16,
     DType.BF16: mx.bfloat16,
     DType.F32: mx.float32,
+    DType.BOOL: mx.bool_,
 }
 
 _ELEMENTS_PER_THREAD = 4
+_COMPARISON_POINTWISE_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
+_LOGICAL_POINTWISE_OPS = {
+    "logical_and",
+    "logical_or",
+    "logical_xor",
+    "logical_not",
+}
+_NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf"}
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
@@ -125,7 +134,9 @@ class CompiledPlan:
                 beta = float(op.attrs.get("beta", 1.0))
                 env[op.outputs[0]] = beta * bias + alpha * mx.matmul(left, right)
             else:
-                env[op.outputs[0]] = _evaluate_pointwise_mlx(op, env)
+                env[op.outputs[0]] = _evaluate_pointwise_mlx(
+                    op, env, self.graph.value(op.outputs[0]).type
+                )
 
         return tuple(env[value_id] for value_id in self.graph.outputs)
 
@@ -218,12 +229,9 @@ class AppleMetalBackend:
         kind: str,
     ) -> tuple[KernelArtifact, Any]:
         output_type = graph.value(output_id).type
+        _validate_pointwise_region(graph, body, output_id)
         for value_id in input_ids:
             input_type = graph.value(value_id).type
-            if input_type.dtype != output_type.dtype:
-                raise NotImplementedError(
-                    "pointwise kernels require identical input/output dtypes"
-                )
             if not _can_broadcast(input_type.shape, output_type.shape):
                 raise NotImplementedError(
                     f"cannot broadcast pointwise input {input_type.shape} "
@@ -288,7 +296,10 @@ class AppleMetalBackend:
             return None
 
         has_mask = bool(op.attrs.get("has_mask"))
-        mask_shape = graph.value(op.inputs[3]).type.shape if has_mask else None
+        mask_type = graph.value(op.inputs[3]).type if has_mask else None
+        mask_shape = mask_type.shape if mask_type is not None else None
+        if mask_type is not None and mask_type.dtype == DType.BOOL:
+            return None
         if has_mask and not _native_attention_mask_supported(rank, mask_shape):
             return None
 
@@ -1738,6 +1749,96 @@ def _offset_expression(
     return " + ".join(terms) if terms else "0"
 
 
+def _validate_pointwise_region(
+    graph: Graph, body: tuple[Operation, ...], output_id: str
+) -> None:
+    for op in body:
+        output_type = graph.value(op.outputs[0]).type
+        input_types = tuple(graph.value(value_id).type for value_id in op.inputs)
+
+        if op.op == "scalar_tensor":
+            if op.inputs:
+                raise ValueError("scalar_tensor must not have tensor inputs")
+            value = op.attrs.get("value")
+            if not isinstance(value, (bool, int, float)):
+                raise ValueError(
+                    f"scalar_tensor.value must be scalar, got {value!r}"
+                )
+            continue
+
+        if op.op in _COMPARISON_POINTWISE_OPS:
+            if output_type.dtype != DType.BOOL:
+                raise ValueError(f"{op.op} must produce a boolean tensor")
+            if not (
+                len(input_types) == 2
+                or (len(input_types) == 1 and "scalar" in op.attrs)
+            ):
+                raise ValueError(f"malformed comparison op: {op.op}")
+            continue
+
+        if op.op in _LOGICAL_POINTWISE_OPS:
+            if output_type.dtype != DType.BOOL:
+                raise ValueError(f"{op.op} must produce a boolean tensor")
+            if op.op == "logical_not":
+                expected_inputs = len(input_types) == 1
+            else:
+                expected_inputs = len(input_types) == 2 or (
+                    len(input_types) == 1
+                    and isinstance(op.attrs.get("scalar"), bool)
+                )
+            if not expected_inputs:
+                raise ValueError(f"malformed logical op: {op.op}")
+            if any(input_type.dtype != DType.BOOL for input_type in input_types):
+                raise ValueError(f"{op.op} requires boolean tensor inputs")
+            continue
+
+        if op.op in _NUMERIC_PREDICATE_POINTWISE_OPS:
+            if output_type.dtype != DType.BOOL or len(input_types) != 1:
+                raise ValueError(f"malformed predicate op: {op.op}")
+            if input_types[0].dtype == DType.BOOL:
+                raise ValueError(f"{op.op} requires a numeric tensor input")
+            continue
+
+        if op.op == "where":
+            if len(input_types) != 3:
+                raise ValueError("where requires condition, input and other tensors")
+            if input_types[0].dtype != DType.BOOL:
+                raise ValueError("where condition must be a boolean tensor")
+            continue
+
+        if op.op == "masked_fill":
+            if len(input_types) != 2:
+                raise ValueError("masked_fill requires input and mask tensors")
+            if input_types[1].dtype != DType.BOOL:
+                raise ValueError("masked_fill mask must be a boolean tensor")
+            if output_type != input_types[0]:
+                raise ValueError("masked_fill must preserve the input tensor type")
+            value = op.attrs.get("value")
+            if output_type.dtype == DType.BOOL:
+                if not isinstance(value, bool):
+                    raise ValueError("boolean masked_fill requires a boolean value")
+            elif not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError("numeric masked_fill requires a numeric value")
+            continue
+
+        if output_type.dtype == DType.BOOL or any(
+            input_type.dtype == DType.BOOL for input_type in input_types
+        ):
+            raise ValueError(f"{op.op} does not accept boolean tensor operands")
+
+    if graph.value(output_id).type.dtype == DType.BOOL:
+        producer = next(
+            (op for op in reversed(body) if op.outputs[0] == output_id), None
+        )
+        if producer is None or producer.op not in (
+            _COMPARISON_POINTWISE_OPS
+            | _LOGICAL_POINTWISE_OPS
+            | _NUMERIC_PREDICATE_POINTWISE_OPS
+            | {"where", "masked_fill", "scalar_tensor"}
+        ):
+            raise ValueError("boolean pointwise region has an unsupported root op")
+
+
 def _emit_pointwise_source(
     graph: Graph,
     input_ids: tuple[str, ...],
@@ -1755,14 +1856,19 @@ def _emit_pointwise_source(
         "    }",
     ]
     env: dict[str, str] = {}
-    common: dict[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], str] = {}
+    common: dict[tuple[object, ...], str] = {}
 
     for position, value_id in enumerate(input_ids):
         variable = f"input_{position}"
         offset = _offset_expression(
             graph.value(value_id).type.shape, output_shape, "elem"
         )
-        lines.append(f"    float {variable} = float(in_{position}[{offset}]);")
+        ctype = (
+            "bool"
+            if graph.value(value_id).type.dtype == DType.BOOL
+            else "float"
+        )
+        lines.append(f"    {ctype} {variable} = in_{position}[{offset}];")
         env[value_id] = variable
 
     for op_index, op in enumerate(body):
@@ -1770,6 +1876,7 @@ def _emit_pointwise_source(
         key = (
             op.op,
             op.inputs,
+            graph.value(op.outputs[0]).type.dtype.value,
             tuple((name, repr(value)) for name, value in sorted(op.attrs.items())),
         )
         existing = common.get(key)
@@ -1778,7 +1885,12 @@ def _emit_pointwise_source(
             continue
         output = f"temp_{op_index}"
         expression = _emit_pointwise_expression(op, arguments)
-        lines.append(f"    float {output} = {expression};")
+        ctype = (
+            "bool"
+            if graph.value(op.outputs[0]).type.dtype == DType.BOOL
+            else "float"
+        )
+        lines.append(f"    {ctype} {output} = {expression};")
         env[op.outputs[0]] = output
         common[key] = output
 
@@ -1798,13 +1910,67 @@ def _binary_operands(op: Operation, arguments: list[str]) -> tuple[str, str]:
         return arguments[0], arguments[1]
     if len(arguments) != 1 or "scalar" not in op.attrs:
         raise ValueError(f"malformed binary pointwise op: {op.op}")
-    scalar = repr(float(op.attrs["scalar"]))
+    scalar_value = op.attrs["scalar"]
+    if isinstance(scalar_value, bool):
+        scalar = "true" if scalar_value else "false"
+    else:
+        scalar = _msl_float_literal(float(scalar_value))
     if op.attrs.get("scalar_position") == "lhs":
         return scalar, arguments[0]
     return arguments[0], scalar
 
 
+def _msl_float_literal(value: float) -> str:
+    if isnan(value):
+        return "NAN"
+    if isinf(value):
+        return "INFINITY" if value > 0 else "-INFINITY"
+    return repr(value)
+
+
 def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
+    if op.op == "scalar_tensor":
+        value = op.attrs.get("value")
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return _msl_float_literal(float(value))
+        raise ValueError(f"scalar_tensor.value must be scalar, got {value!r}")
+    if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
+        left, right = _binary_operands(op, arguments)
+        operator = {
+            "eq": "==",
+            "ne": "!=",
+            "lt": "<",
+            "le": "<=",
+            "gt": ">",
+            "ge": ">=",
+        }[op.op]
+        return f"({left} {operator} {right})"
+    if op.op == "logical_and":
+        left, right = _binary_operands(op, arguments)
+        return f"({left} && {right})"
+    if op.op == "logical_or":
+        left, right = _binary_operands(op, arguments)
+        return f"({left} || {right})"
+    if op.op == "logical_xor":
+        left, right = _binary_operands(op, arguments)
+        return f"({left} != {right})"
+    if op.op == "logical_not":
+        return f"(!{arguments[0]})"
+    if op.op == "isnan":
+        return f"metal::isnan({arguments[0]})"
+    if op.op == "isinf":
+        return f"metal::isinf({arguments[0]})"
+    if op.op == "where":
+        return f"({arguments[0]} ? {arguments[1]} : {arguments[2]})"
+    if op.op == "masked_fill":
+        value = op.attrs.get("value")
+        if isinstance(value, bool):
+            fill = "true" if value else "false"
+        else:
+            fill = _msl_float_literal(float(value))
+        return f"({arguments[1]} ? {fill} : {arguments[0]})"
     if op.op == "silu":
         value = arguments[0]
         return f"{value} / (1.0f + metal::exp(-{value}))"
@@ -1844,11 +2010,11 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"metal::max(0.0f, {arguments[0]})"
     if op.op == "leaky_relu":
         value = arguments[0]
-        slope = repr(float(op.attrs.get("negative_slope", 0.01)))
+        slope = _msl_float_literal(float(op.attrs.get("negative_slope", 0.01)))
         return f"(({value}) >= 0.0f ? ({value}) : {slope} * ({value}))"
     if op.op == "elu":
         value = arguments[0]
-        alpha = repr(float(op.attrs.get("alpha", 1.0)))
+        alpha = _msl_float_literal(float(op.attrs.get("alpha", 1.0)))
         return (
             f"(({value}) >= 0.0f ? ({value}) : "
             f"{alpha} * (metal::exp({value}) - 1.0f))"
@@ -2478,8 +2644,48 @@ def _evaluate_layout_mlx(
     raise NotImplementedError(f"no Apple runtime lowering for {op.op}")
 
 
-def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:
+def _evaluate_pointwise_mlx(
+    op: Operation, env: dict[str, mx.array], output_type: TensorType
+) -> mx.array:
     arguments = [env[value_id] for value_id in op.inputs]
+    if op.op == "scalar_tensor":
+        value = op.attrs.get("value")
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"scalar_tensor.value must be scalar, got {value!r}")
+        return mx.array(value, dtype=_MLX_DTYPES[output_type.dtype])
+    if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
+        left, right = _binary_mx_operands(op, arguments)
+        if op.op == "eq":
+            return left == right
+        if op.op == "ne":
+            return left != right
+        if op.op == "lt":
+            return left < right
+        if op.op == "le":
+            return left <= right
+        if op.op == "gt":
+            return left > right
+        return left >= right
+    if op.op == "logical_and":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.logical_and(left, right)
+    if op.op == "logical_or":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.logical_or(left, right)
+    if op.op == "logical_xor":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.logical_xor(left, right)
+    if op.op == "logical_not":
+        return mx.logical_not(arguments[0])
+    if op.op == "isnan":
+        return mx.isnan(arguments[0])
+    if op.op == "isinf":
+        return mx.isinf(arguments[0])
+    if op.op == "where":
+        return mx.where(arguments[0], arguments[1], arguments[2])
+    if op.op == "masked_fill":
+        fill = mx.array(op.attrs["value"], dtype=arguments[0].dtype)
+        return mx.where(arguments[1], fill, arguments[0])
     if op.op == "silu":
         value = arguments[0]
         return value / (1.0 + mx.exp(-value))
@@ -2560,7 +2766,12 @@ def _binary_mx_operands(
         return arguments[0], arguments[1]
     if len(arguments) != 1 or "scalar" not in op.attrs:
         raise ValueError(f"malformed binary pointwise op: {op.op}")
-    scalar = float(op.attrs["scalar"])
+    scalar_value = op.attrs["scalar"]
+    scalar = (
+        mx.array(scalar_value)
+        if isinstance(scalar_value, bool)
+        else float(scalar_value)
+    )
     if op.attrs.get("scalar_position") == "lhs":
         return scalar, arguments[0]
     return arguments[0], scalar
@@ -2709,8 +2920,10 @@ def _validate_attention_op(graph: Graph, op: Operation) -> None:
                 + (query_shape[-3], query_shape[-2], key_shape[-2])
             )
         )
-        if mask_type.dtype != query_type.dtype:
-            raise NotImplementedError("attention mask dtype must match Q/K/V")
+        if mask_type.dtype not in {query_type.dtype, DType.BOOL}:
+            raise NotImplementedError(
+                "attention mask must be boolean or match the Q/K/V dtype"
+            )
         if not _can_broadcast(mask_type.shape, score_shape):
             raise ValueError(
                 f"attention mask shape {mask_type.shape} cannot broadcast "
@@ -2757,5 +2970,8 @@ def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
 def _zero_fully_masked_rows(mask: mx.array, output: mx.array) -> mx.array:
     score_shape = output.shape[:-1] + (mask.shape[-1],)
     broadcast_mask = mx.broadcast_to(mask, score_shape)
-    all_masked = mx.all(broadcast_mask == -mx.inf, axis=-1, keepdims=True)
+    if broadcast_mask.dtype == mx.bool_:
+        all_masked = mx.all(mx.logical_not(broadcast_mask), axis=-1, keepdims=True)
+    else:
+        all_masked = mx.all(broadcast_mask == -mx.inf, axis=-1, keepdims=True)
     return mx.where(all_masked, mx.array(0, dtype=output.dtype), output)

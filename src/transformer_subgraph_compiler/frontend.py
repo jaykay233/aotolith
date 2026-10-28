@@ -59,12 +59,41 @@ _SUPPORTED_OPS = {
     "aten.leaky_relu.default": "leaky_relu",
     "aten.elu.default": "elu",
     "aten.hardswish.default": "hardswish",
+    "aten.eq.Tensor": "eq",
+    "aten.eq.Scalar": "eq",
+    "aten.ne.Tensor": "ne",
+    "aten.ne.Scalar": "ne",
+    "aten.lt.Tensor": "lt",
+    "aten.lt.Scalar": "lt",
+    "aten.le.Tensor": "le",
+    "aten.le.Scalar": "le",
+    "aten.gt.Tensor": "gt",
+    "aten.gt.Scalar": "gt",
+    "aten.ge.Tensor": "ge",
+    "aten.ge.Scalar": "ge",
+    "aten.where.self": "where",
+    "aten.logical_and.default": "logical_and",
+    "aten.logical_or.default": "logical_or",
+    "aten.logical_xor.default": "logical_xor",
+    "aten.logical_not.default": "logical_not",
+    "aten.bitwise_and.Tensor": "logical_and",
+    "aten.bitwise_and.Scalar": "logical_and",
+    "aten.bitwise_or.Tensor": "logical_or",
+    "aten.bitwise_or.Scalar": "logical_or",
+    "aten.bitwise_xor.Tensor": "logical_xor",
+    "aten.bitwise_xor.Scalar": "logical_xor",
+    "aten.bitwise_not.default": "logical_not",
+    "aten.isnan.default": "isnan",
+    "aten.isinf.default": "isinf",
+    "aten.masked_fill.Scalar": "masked_fill",
+    "aten.scalar_tensor.default": "scalar_tensor",
 }
 
 _TORCH_DTYPES = {
     "torch.float16": DType.F16,
     "torch.bfloat16": DType.BF16,
     "torch.float32": DType.F32,
+    "torch.bool": DType.BOOL,
 }
 
 _NUMERIC_ATTRS = {
@@ -76,7 +105,19 @@ _NUMERIC_ATTRS = {
     "elu": {"alpha": 1.0},
 }
 
-_BINARY_OPS = {"mul", "add", "sub", "rsub", "div", "pow"}
+_COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
+_LOGICAL_BINARY_OPS = {"logical_and", "logical_or", "logical_xor"}
+_BINARY_OPS = _COMPARISON_OPS | {
+    "mul",
+    "add",
+    "sub",
+    "rsub",
+    "div",
+    "pow",
+    "logical_and",
+    "logical_or",
+    "logical_xor",
+}
 _REDUCTION_OPS = {"sum", "mean"}
 _DIRECT_ATTENTION_TARGETS = {
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
@@ -591,6 +632,14 @@ def _operation_inputs(
     args: tuple[object, ...],
     node_ids: dict[object, str],
 ) -> tuple[tuple[str, ...], dict[str, object]]:
+    if op == "scalar_tensor":
+        if len(args) != 1:
+            raise ValueError(f"scalar_tensor expects one argument, got {len(args)}")
+        value = args[0]
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"scalar_tensor value must be scalar, got {value!r}")
+        return (), {"value": value}
+
     if op == "cast":
         if len(args) != 1:
             raise ValueError(f"cast expects one argument, got {len(args)}")
@@ -706,6 +755,22 @@ def _operation_inputs(
             raise ValueError(f"{op} expects one argument, got {len(args)}")
         return ((_argument_ids(args[0], node_ids),), {})
 
+    if op == "where":
+        if len(args) != 3:
+            raise ValueError(f"where expects three arguments, got {len(args)}")
+        return tuple(_argument_ids(argument, node_ids) for argument in args), {}
+
+    if op == "masked_fill":
+        if len(args) != 3:
+            raise ValueError(f"masked_fill expects three arguments, got {len(args)}")
+        input_id, mask_id, value = args
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"masked_fill.value must be scalar, got {value!r}")
+        return (
+            (_argument_ids(input_id, node_ids), _argument_ids(mask_id, node_ids)),
+            {"value": value},
+        )
+
     if op == "clamp":
         if len(args) not in {1, 2, 3}:
             raise ValueError(
@@ -793,11 +858,16 @@ def _operation_inputs(
         raise ValueError(f"{op} expects two arguments, got {len(args)}")
 
     tensor_inputs: list[str] = []
-    scalars: list[tuple[int, float]] = []
+    scalars: list[tuple[int, bool | float]] = []
     for position, argument in enumerate(args):
         try:
             tensor_inputs.append(_argument_ids(argument, node_ids))
         except ValueError:
+            if isinstance(argument, bool) and op in (
+                _COMPARISON_OPS | _LOGICAL_BINARY_OPS
+            ):
+                scalars.append((position, argument))
+                continue
             if (
                 not isinstance(argument, (int, float))
                 or isinstance(argument, bool)
@@ -836,10 +906,14 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update(
             {"dtype", "layout", "device", "pin_memory", "non_blocking", "memory_format"}
         )
+    if op == "scalar_tensor":
+        allowed.update(
+            {"dtype", "layout", "device", "pin_memory", "requires_grad"}
+        )
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
-    if op == "cast":
+    if op in {"cast", "scalar_tensor"}:
         return {}
 
     attrs: dict[str, object] = {}

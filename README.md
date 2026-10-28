@@ -20,8 +20,9 @@ PyTorch FX
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
-| 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
+| 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
+| 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持不指定维度的全量归约、任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
@@ -36,7 +37,7 @@ PyTorch FX
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
 - 消除仍能由 matmul batch broadcast 恢复语义的单消费者 `expand`，避免为广播输入生成额外拷贝
-- 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
+- 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive/bool mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
 - 识别 PyTorch 分解图中 `repeat_kv` 产生的 `unsqueeze -> expand -> reshape`，融合后不再物化复制后的 K/V
@@ -46,8 +47,9 @@ PyTorch FX
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，`clamp`/`clamp_min`/`clamp_max` 支持标量和可广播 tensor 边界，并与 `leaky_relu`、`elu`、`hardswish` 一起参与 pointwise 融合
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
+- 支持 `torch.bool` IR value、比较/logical/NaN/Inf 谓词、`where`、`masked_fill`、标量常量生成，并允许 bool predicate/condition 与 FP16/BF16/FP32 数值分支融合在同一个 kernel
 - 生成每个 thread 处理 4 个元素的 Metal kernel
-- FP16、BF16、FP32 输入和输出
+- FP16、BF16、FP32 数值输入和输出，以及 bool 中间值和输出
 - 可选的 Metal matmul/addmm codegen，支持 rank-2 和 rank-3/4 的标准右对齐 batch broadcast
 - 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
 - matmul shared-memory tiling：`64×64×32` threadgroup block；rank-N batch 映射到 grid 的 y 维，FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
@@ -57,7 +59,7 @@ PyTorch FX
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
-默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 以及 batch 前缀可广播的 rank-3/4 矩阵乘会生成自定义 Metal kernel。编译器会把可由另一操作数或输出 shape 证明安全的单消费者 batch `expand` 折入 matmul；变体无法保持原输出 shape 时保留 `expand`，由 MLX Runtime 执行：
+默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。bool mask 固定走 MLX SDPA；PyTorch 也可能先把 bool mask 分解成 `where(mask, 0, -inf)`，此分解后的 additive mask 仍可进入原生 attention kernel。传入 `codegen_matmul=True` 后，rank-2 以及 batch 前缀可广播的 rank-3/4 矩阵乘会生成自定义 Metal kernel。编译器会把可由另一操作数或输出 shape 证明安全的单消费者 batch `expand` 折入 matmul；变体无法保持原输出 shape 时保留 `expand`，由 MLX Runtime 执行：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
@@ -71,7 +73,7 @@ matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 6
 result = compile_callable(fn, example_inputs, codegen_attention=True)
 ```
 
-kernel 每个 threadgroup 处理 8、16 或 24 个 query。短序列使用 32-key tile；query sequence 达到 768 后，FP16/BF16 且 QK/PV 都满足 SIMD matrix 条件时优先尝试 `24×64` tile、768 个 thread，再依次回退到 `16×64`、`24×32` 和 `16×32`。64-key 路径用 16 或 24 个 SIMD group 并行计算 QK，并在 shared memory 中复用 score 与 probability workspace；PV 按 64 个 value 维度分块，避免超过 31 KiB。Q/K/V tile 先协作加载到 32-byte 对齐的 threadgroup memory；head dim 都能被 16 整除时使用 16 元素向量加载，否则使用 8 元素向量加载。warp 内用 `simd_max`/`simd_sum` 做 online softmax。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有运行时 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
+kernel 每个 threadgroup 处理 8、16 或 24 个 query。短序列使用 32-key tile；query sequence 达到 768 后，FP16/BF16 且 QK/PV 都满足 SIMD matrix 条件时优先尝试 `24×64` tile、768 个 thread，再依次回退到 `16×64`、`24×32` 和 `16×32`。64-key 路径用 16 或 24 个 SIMD group 并行计算 QK，并在 shared memory 中复用 score 与 probability workspace；PV 按 64 个 value 维度分块，避免超过 31 KiB。Q/K/V tile 先协作加载到 32-byte 对齐的 threadgroup memory；head dim 都能被 16 整除时使用 16 元素向量加载，否则使用 8 元素向量加载。warp 内用 `simd_max`/`simd_sum` 做 online softmax。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前还没有运行时 autotune，实测仍慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256`、直接传入 bool mask 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
 
 ## 为什么没有直接改 Triton
 
@@ -152,7 +154,7 @@ mx.eval(output)
 
 编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
-attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见形式会使用生成的 MSL attention kernel，其余形式回退到 MLX。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
+attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask 可以是同 dtype 的 additive mask 或 bool mask。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见 additive-mask 形式会使用生成的 MSL attention kernel，直接 bool mask 会回退到 MLX。bool mask 的 `True` 表示允许该 key 参与 attention，整行都为 `False` 时输出为零。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 

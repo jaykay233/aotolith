@@ -30,6 +30,21 @@ POINTWISE_OPS = {
     "leaky_relu",
     "elu",
     "hardswish",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "logical_and",
+    "logical_or",
+    "logical_xor",
+    "logical_not",
+    "isnan",
+    "isinf",
+    "where",
+    "masked_fill",
+    "scalar_tensor",
 }
 
 LAYOUT_OPS = {
