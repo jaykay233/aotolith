@@ -114,6 +114,12 @@ _SUPPORTED_OPS = {
     "aten.logaddexp.default": "logaddexp",
     "aten.atan2.default": "atan2",
     "aten.scalar_tensor.default": "scalar_tensor",
+    "aten.zeros.default": "zeros",
+    "aten.ones.default": "ones",
+    "aten.full.default": "full",
+    "aten.new_zeros.default": "new_zeros",
+    "aten.new_ones.default": "new_ones",
+    "aten.new_full.default": "new_full",
     "aten.zeros_like.default": "zeros_like",
     "aten.ones_like.default": "ones_like",
     "aten.full_like.default": "full_like",
@@ -1383,6 +1389,36 @@ def _operation_inputs(
             raise ValueError(f"scalar_tensor value must be scalar, got {value!r}")
         return (), {"value": value}
 
+    if op in {"zeros", "ones", "full", "new_zeros", "new_ones", "new_full"}:
+        has_template = op.startswith("new_")
+        base_op = op.removeprefix("new_")
+        expected_args = 2 if has_template else 1
+        if base_op == "full":
+            expected_args += 1
+        if len(args) != expected_args:
+            raise ValueError(
+                f"{op} expects {expected_args} positional arguments, got {len(args)}"
+            )
+
+        offset = 0
+        if has_template:
+            _argument_ids(args[0], node_ids)
+            offset = 1
+        shape = args[offset]
+        if not isinstance(shape, (tuple, list)) or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        ):
+            raise ValueError(f"{op}.size must contain integers, got {shape!r}")
+
+        value = (
+            args[offset + 1]
+            if base_op == "full"
+            else (0.0 if base_op == "zeros" else 1.0)
+        )
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"{op} fill value must be scalar, got {value!r}")
+        return (), {"value": value}
+
     if op in {"zeros_like", "ones_like", "full_like"}:
         expected_args = 2 if op == "full_like" else 1
         if len(args) != expected_args:
@@ -1775,7 +1811,18 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update(
             {"dtype", "layout", "device", "pin_memory", "non_blocking", "memory_format"}
         )
-    if op in {"scalar_tensor", "zeros_like", "ones_like", "full_like"}:
+    if op in {
+        "scalar_tensor",
+        "zeros",
+        "ones",
+        "full",
+        "new_zeros",
+        "new_ones",
+        "new_full",
+        "zeros_like",
+        "ones_like",
+        "full_like",
+    }:
         allowed.update(
             {
                 "dtype",
@@ -1800,6 +1847,12 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
     if op in {
         "cast",
         "scalar_tensor",
+        "zeros",
+        "ones",
+        "full",
+        "new_zeros",
+        "new_ones",
+        "new_full",
         "zeros_like",
         "ones_like",
         "full_like",

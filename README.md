@@ -25,7 +25,7 @@ PyTorch FX
 | 一元运算与谓词 | `neg`、`abs`、`exp`、`expm1`、`exp2`、`log`、`log2`、`log10`、`log1p`、`erf`、`sin`、`cos`、`floor`、`ceil`、`round`、`trunc`、`sign`、`square`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow`、`maximum`、`minimum`、`logaddexp`、`atan2` |
 | 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
-| 常量生成 | `aten.scalar_tensor.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default`；静态 shape/dtype 来自输出 metadata |
+| 常量生成 | `aten.scalar_tensor.default`、`aten.zeros.default`、`aten.ones.default`、`aten.full.default`、`aten.new_zeros.default`、`aten.new_ones.default`、`aten.new_full.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default`；静态 shape/dtype 来自输出 metadata |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持不指定维度的全量归约、任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
@@ -47,7 +47,7 @@ PyTorch FX
 - 支持沿正负轴拼接 tensor，可用于 RoPE 的 `rotate_half`、QKV 拼接等常见结构；`cat` 本身由 MLX runtime 执行，前后 pointwise 子图仍分别融合
 - 把 `stack` 展开为每个输入的 `unsqueeze` 加一个 `cat`；把 `flip`、`roll`、`triu`、`tril` 保留为可校验 op，由 MLX 执行而不生成额外 Metal kernel
 - 把 `aten.select.int` 展开为单元素 `slice` 加 `squeeze`，支持负轴和负索引，并能输出 rank-0 scalar
-- 支持 `zeros_like`、`ones_like` 和 `full_like` 生成静态 FP16/BF16/FP32/bool 常量；模板 tensor 只用于捕获 shape/dtype，不进入运行时 IR，常量可与相邻 pointwise op 融合
+- 支持 `zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 生成静态 FP16/BF16/FP32/bool 常量；模板 tensor 只用于捕获 shape/dtype，不进入 op 的运行时输入，常量可与相邻 pointwise op 融合
 - 把静态 `split`、`chunk` 和 `unbind` 展开为已有的 `slice`/`squeeze` op；Q/K/V 投影结果拆开后仍可共享 layout、CSE 和 pointwise 融合
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive/bool mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op

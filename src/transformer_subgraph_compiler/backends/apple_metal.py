@@ -31,6 +31,12 @@ _LOGICAL_POINTWISE_OPS = {
 _NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf"}
 _CONSTANT_POINTWISE_OPS = {
     "scalar_tensor",
+    "zeros",
+    "ones",
+    "full",
+    "new_zeros",
+    "new_ones",
+    "new_full",
     "zeros_like",
     "ones_like",
     "full_like",
@@ -2956,7 +2962,17 @@ def _evaluate_pointwise_mlx(
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"scalar_tensor.value must be scalar, got {value!r}")
         return mx.array(value, dtype=_MLX_DTYPES[output_type.dtype])
-    if op.op in {"zeros_like", "ones_like", "full_like"}:
+    if op.op in {
+        "zeros",
+        "ones",
+        "full",
+        "new_zeros",
+        "new_ones",
+        "new_full",
+        "zeros_like",
+        "ones_like",
+        "full_like",
+    }:
         value = op.attrs.get("value")
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
