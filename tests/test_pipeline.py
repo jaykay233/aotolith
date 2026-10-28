@@ -1620,6 +1620,53 @@ def test_multi_head_attention_end_to_end_on_metal() -> None:
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
+def test_cat_lowering_preserves_concatenation_order() -> None:
+    def rotate_half(x):
+        half = x.shape[-1] // 2
+        return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+    torch.manual_seed(78)
+    x = torch.randn(2, 3, 8)
+    result = compile_callable(rotate_half, (x,))
+
+    ops = [op.op for op in result.lowered_graph.ops]
+    assert ops == ["slice", "neg", "slice", "cat"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["neg"]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(rotate_half(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
+def test_rotary_embedding_rotate_half_compiles_and_runs() -> None:
+    def apply_rotary_embedding(x, cosine, sine):
+        half = x.shape[-1] // 2
+        rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+        return x * cosine + rotated * sine
+
+    torch.manual_seed(79)
+    inputs = (
+        torch.randn(2, 3, 8),
+        torch.randn(1, 1, 8),
+        torch.randn(1, 1, 8),
+    )
+    result = compile_callable(apply_rotary_embedding, inputs)
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert "cat" in lowered_ops
+    assert "fused_elementwise" in lowered_ops
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "neg",
+        "fused_elementwise",
+    ]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(apply_rotary_embedding(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 3, 8)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_transformer_decoder_block_compiles_and_runs() -> None:
     def decoder_block(
         x,

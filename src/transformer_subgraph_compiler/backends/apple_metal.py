@@ -113,6 +113,12 @@ class CompiledPlan:
 
             if op.op == "attention":
                 env[op.outputs[0]] = _evaluate_attention_mlx(op, env)
+            elif op.op == "cat":
+                rank = len(env[op.inputs[0]].shape)
+                axis = int(op.attrs["dim"]) % rank
+                env[op.outputs[0]] = mx.concatenate(
+                    [env[value_id] for value_id in op.inputs], axis=axis
+                )
             elif op.op in LAYOUT_OPS:
                 env[op.outputs[0]] = _evaluate_layout_mlx(
                     self.graph, op, env[op.inputs[0]]
@@ -188,6 +194,8 @@ class AppleMetalBackend:
                 _validate_attention_op(graph, op)
                 if self.codegen_attention:
                     compiled = self._compile_attention(graph, op, index)
+            elif op.op == "cat":
+                _validate_cat_op(graph, op)
             elif op.op == "cast":
                 _validate_cast_op(graph, op)
                 output_type = graph.value(op.outputs[0]).type
@@ -2619,11 +2627,13 @@ def _evaluate_layout_mlx(
     if op.op == "slice":
         index: list[slice] = [slice(None)] * rank
         axis = int(op.attrs["dim"]) % rank
-        index[axis] = slice(
-            int(op.attrs["start"]) if op.attrs.get("start") is not None else None,
-            int(op.attrs["end"]) if op.attrs.get("end") is not None else None,
-            int(op.attrs["step"]),
+        start = (
+            int(op.attrs["start"]) if op.attrs.get("start") is not None else None
         )
+        end = int(op.attrs["end"]) if op.attrs.get("end") is not None else None
+        step = int(op.attrs["step"])
+        start, end, step = slice(start, end, step).indices(value.shape[axis])
+        index[axis] = slice(start, end, step)
         return value[tuple(index)]
 
     if op.op == "unsqueeze":
@@ -2844,6 +2854,41 @@ def _attention_mask_offset_expression(
         stride = prod(mask_shape[axis + 1 :])
         terms.append(coordinate if stride == 1 else f"{coordinate} * {stride}u")
     return " + ".join(terms) if terms else "0u"
+
+
+def _validate_cat_op(graph: Graph, op: Operation) -> None:
+    if not op.inputs:
+        raise ValueError("cat expects at least one input tensor")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"cat.dim must be an integer, got {dim!r}")
+
+    input_types = [graph.value(value_id).type for value_id in op.inputs]
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_types[0].shape)
+    if rank == 0:
+        raise NotImplementedError("cat requires ranked tensors")
+    axis = dim % rank
+    if any(len(input_type.shape) != rank for input_type in input_types):
+        raise ValueError("cat inputs must have the same rank")
+    if any(input_type.dtype != output_type.dtype for input_type in input_types):
+        raise ValueError("cat must preserve input dtype")
+    for position, input_type in enumerate(input_types):
+        for input_axis, (input_dim, output_dim) in enumerate(
+            zip(input_type.shape, output_type.shape, strict=True)
+        ):
+            if input_axis != axis and input_dim != output_dim:
+                raise ValueError(
+                    f"cat input {position} shape {input_type.shape} is incompatible "
+                    f"with output shape {output_type.shape} on axis {input_axis}"
+                )
+
+    expected_shape = list(output_type.shape)
+    expected_shape[axis] = sum(input_type.shape[axis] for input_type in input_types)
+    if tuple(expected_shape) != output_type.shape:
+        raise ValueError(
+            f"cat output shape {output_type.shape} != {tuple(expected_shape)}"
+        )
 
 
 def _validate_cast_op(graph: Graph, op: Operation) -> None:

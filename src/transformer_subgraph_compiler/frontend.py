@@ -87,6 +87,7 @@ _SUPPORTED_OPS = {
     "aten.isinf.default": "isinf",
     "aten.masked_fill.Scalar": "masked_fill",
     "aten.scalar_tensor.default": "scalar_tensor",
+    "aten.cat.default": "cat",
 }
 
 _TORCH_DTYPES = {
@@ -195,7 +196,9 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
             op_name = _SUPPORTED_OPS[target]
-            inputs, scalar_attrs = _operation_inputs(op_name, node.args, node_ids)
+            inputs, scalar_attrs = _operation_inputs(
+                op_name, node.args, node_ids, node.kwargs
+            )
             output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
             attrs.update(scalar_attrs)
@@ -631,7 +634,27 @@ def _operation_inputs(
     op: str,
     args: tuple[object, ...],
     node_ids: dict[object, str],
+    kwargs: dict[str, object] | None = None,
 ) -> tuple[tuple[str, ...], dict[str, object]]:
+    kwargs = {} if kwargs is None else kwargs
+    if op == "cat":
+        if len(args) not in {1, 2}:
+            raise ValueError(f"cat expects one or two arguments, got {len(args)}")
+        tensors = args[0]
+        if not isinstance(tensors, (tuple, list)) or not tensors:
+            raise ValueError("cat expects a non-empty tensor sequence")
+        if len(args) == 2:
+            if "dim" in kwargs:
+                raise ValueError("cat received duplicate dim arguments")
+            dim = args[1]
+        else:
+            dim = kwargs.get("dim", 0)
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"cat.dim must be an integer, got {dim!r}")
+        return tuple(_argument_ids(tensor, node_ids) for tensor in tensors), {
+            "dim": dim
+        }
+
     if op == "scalar_tensor":
         if len(args) != 1:
             raise ValueError(f"scalar_tensor expects one argument, got {len(args)}")
@@ -910,10 +933,12 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update(
             {"dtype", "layout", "device", "pin_memory", "requires_grad"}
         )
+    if op == "cat":
+        allowed.add("dim")
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
-    if op in {"cast", "scalar_tensor"}:
+    if op in {"cast", "scalar_tensor", "cat"}:
         return {}
 
     attrs: dict[str, object] = {}

@@ -58,8 +58,11 @@
 | `aten.where.self` | `where` |
 | `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
 | `aten.scalar_tensor.default` | `scalar_tensor`，标量值和输出 dtype 进入 IR |
+| `aten.cat.default` | `cat`，tensor 输入序列和拼接轴进入 IR |
 
 每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。IR 的数值 dtype 包括 FP16、BF16 和 FP32，另外支持 `DType.BOOL` 表示谓词、logical op、bool mask 和 bool 输出。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
+
+`cat` 保留所有 tensor 输入，并把归一化前的轴写入 `dim` attribute。Backend 要求输入 rank、非拼接轴 shape 和非拼接轴目标 shape 完全一致，且所有输入与输出 dtype 相同；拼接轴长度必须等于各输入该轴长度之和。Runtime 用 `mx.concatenate` 执行，不生成 Metal kernel。
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
@@ -307,6 +310,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 - 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
 - 默认模式下的 `matmul`、`addmm`：调用 MLX，并按 `transpose_a`/`transpose_b` 执行对应的 swapaxes
 - attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`，并对安全 softmax 的整行 mask 补零
+- `cat`：校验后的 tensor 输入交给 `mx.concatenate`
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
 - cast：调用 MLX `astype`，保留源和目标 dtype、shape
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
