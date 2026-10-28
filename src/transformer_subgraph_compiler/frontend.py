@@ -97,6 +97,7 @@ _SUPPORTED_OPS = {
     "aten.cat.default": "cat",
     "aten.embedding.default": "embedding",
     "aten.index_select.default": "index_select",
+    "aten.gather.default": "gather",
 }
 
 _TORCH_DTYPES = {
@@ -211,6 +212,13 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 )
                 output_id = f"v{len(ops)}"
                 ops.append(Operation("index_select", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                continue
+            if target == "aten.gather.default":
+                inputs, attrs, output_type = _gather_operation(node, node_ids)
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("gather", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
@@ -645,6 +653,63 @@ def _index_select_operation(
         raise ValueError(
             f"index_select output metadata {(output_type.shape, output_type.dtype)} "
             f"does not match expected {(expected_shape, source_type.dtype)}"
+        )
+    return (
+        (_argument_ids(source, node_ids), _argument_ids(indices, node_ids)),
+        {"dim": axis},
+        output_type,
+    )
+
+
+def _gather_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, str], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    sparse_grad = kwargs.pop("sparse_grad", False)
+    if kwargs:
+        raise ValueError(
+            "gather received unsupported keyword arguments: " f"{sorted(kwargs)}"
+        )
+    if not isinstance(sparse_grad, bool):
+        raise ValueError(f"gather.sparse_grad must be a boolean, got {sparse_grad!r}")
+    if len(args) != 3:
+        raise ValueError(f"gather expects three arguments, got {len(args)}")
+
+    source, dim, indices = args
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"gather.dim must be an integer, got {dim!r}")
+    source_type = _node_type(source)
+    indices_type = _node_type(indices)
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("gather requires a tensor with rank >= 1")
+    if dim < -rank or dim >= rank:
+        raise ValueError(f"gather.dim {dim} is outside rank {rank}")
+    axis = dim + rank if dim < 0 else dim
+    if len(indices_type.shape) != rank:
+        raise ValueError(
+            f"gather indices must have rank {rank}, got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "gather indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    for index_axis, (index_dim, source_dim) in enumerate(
+        zip(indices_type.shape, source_type.shape, strict=True)
+    ):
+        if index_axis != axis and index_dim > source_dim:
+            raise ValueError(
+                f"gather indices shape {indices_type.shape} exceeds source shape "
+                f"{source_type.shape} on non-gather axis {index_axis}"
+            )
+
+    output_type = _node_type(node)
+    if output_type != TensorType(indices_type.shape, source_type.dtype):
+        raise ValueError(
+            f"gather output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(indices_type.shape, source_type.dtype)}"
         )
     return (
         (_argument_ids(source, node_ids), _argument_ids(indices, node_ids)),

@@ -714,6 +714,49 @@ def test_index_select_rejects_out_of_range_indices() -> None:
             result.plan(source_mlx, _torch_to_mlx(invalid))
 
 
+@pytest.mark.parametrize(
+    ("dim", "index_dtype", "values"),
+    [
+        (0, torch.int32, [[2, 0], [1, 2]]),
+        (-1, torch.int64, [[3, 2], [0, 1]]),
+    ],
+)
+def test_gather_uses_mlx_without_a_kernel(dim, index_dtype, values) -> None:
+    def fn(source, indices):
+        return torch.gather(source, dim, indices)
+
+    torch.manual_seed(46)
+    source = torch.randn(3, 4, dtype=torch.float16)
+    indices = torch.tensor(values, dtype=index_dtype)
+    result = compile_callable(fn, (source, indices))
+    assert [op.op for op in result.lowered_graph.ops] == ["gather"]
+    assert result.lowered_graph.ops[0].attrs["dim"] == dim % 2
+    assert result.plan.kernels == ()
+
+    actual = result.plan(_torch_to_mlx(source), _torch_to_mlx(indices))[0]
+    expected = _torch_to_mlx(fn(source, indices))
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(fn(source, indices).shape)
+    assert mx.array_equal(actual, expected)
+
+
+def test_gather_rejects_out_of_range_indices() -> None:
+    def fn(source, indices):
+        return torch.gather(source, dim=-1, index=indices)
+
+    source = torch.randn(3, 4)
+    indices = torch.tensor([[3, 2], [0, 1]], dtype=torch.int64)
+    result = compile_callable(fn, (source, indices))
+    source_mlx = _torch_to_mlx(source)
+
+    for invalid in (
+        torch.tensor([[4, 0], [0, 0]]),
+        torch.tensor([[-1, 0], [0, 0]]),
+    ):
+        with pytest.raises(IndexError, match="index out of range"):
+            result.plan(source_mlx, _torch_to_mlx(invalid))
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)

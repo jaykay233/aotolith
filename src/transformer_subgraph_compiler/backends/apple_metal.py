@@ -81,13 +81,17 @@ class KernelArtifact:
     kind: str
 
 
-def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.array:
+def _check_take_indices(indices: mx.array, upper_bound: int) -> None:
     """Match PyTorch gather bounds instead of MLX's wrap-and-fill behavior."""
 
     if bool(mx.any(indices < 0).item()) or bool(
-        mx.any(indices >= source.shape[axis]).item()
+        mx.any(indices >= upper_bound).item()
     ):
         raise IndexError("index out of range in self")
+
+
+def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.array:
+    _check_take_indices(indices, source.shape[axis])
     return mx.take(source, indices, axis=axis)
 
 
@@ -132,6 +136,17 @@ class CompiledPlan:
                 source, indices = (env[value_id] for value_id in op.inputs)
                 axis = int(op.attrs["dim"])
                 env[op.outputs[0]] = _mlx_take_checked(source, indices, axis=axis)
+            elif op.op == "gather":
+                source, indices = (env[value_id] for value_id in op.inputs)
+                axis = int(op.attrs["dim"])
+                _check_take_indices(indices, source.shape[axis])
+                source_slices = [
+                    slice(0, indices.shape[dim]) if dim != axis else slice(None)
+                    for dim in range(len(source.shape))
+                ]
+                env[op.outputs[0]] = mx.take_along_axis(
+                    source[tuple(source_slices)], indices, axis=axis
+                )
             elif op.op in {"triu", "tril"}:
                 diagonal = int(op.attrs["diagonal"])
                 operation = mx.triu if op.op == "triu" else mx.tril
@@ -223,6 +238,8 @@ class AppleMetalBackend:
                 _validate_embedding_op(graph, op)
             elif op.op == "index_select":
                 _validate_index_select_op(graph, op)
+            elif op.op == "gather":
+                _validate_gather_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -3090,6 +3107,48 @@ def _validate_index_select_op(graph: Graph, op: Operation) -> None:
     if set(op.attrs) != {"dim"}:
         raise ValueError(
             f"index_select has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
+        )
+
+
+def _validate_gather_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 2:
+        raise ValueError(f"gather expects two inputs, got {len(op.inputs)}")
+    source_type = graph.value(op.inputs[0]).type
+    indices_type = graph.value(op.inputs[1]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("gather requires a tensor with rank >= 1")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"gather.dim must be an integer, got {dim!r}")
+    if dim < 0 or dim >= rank:
+        raise ValueError(f"gather.dim {dim} is outside rank {rank}")
+    if len(indices_type.shape) != rank:
+        raise ValueError(
+            f"gather indices must have rank {rank}, got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "gather indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    for index_axis, (index_dim, source_dim) in enumerate(
+        zip(indices_type.shape, source_type.shape, strict=True)
+    ):
+        if index_axis != dim and index_dim > source_dim:
+            raise ValueError(
+                f"gather indices shape {indices_type.shape} exceeds source shape "
+                f"{source_type.shape} on non-gather axis {index_axis}"
+            )
+    if output_type != TensorType(indices_type.shape, source_type.dtype):
+        raise ValueError(
+            f"gather output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(indices_type.shape, source_type.dtype)}"
+        )
+    if set(op.attrs) != {"dim"}:
+        raise ValueError(
+            f"gather has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
         )
 
 

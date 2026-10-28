@@ -18,7 +18,7 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm`、`aten.baddbmm` |
-| 索引 gather | `aten.embedding.default`、`aten.index_select.default`，支持 `int32/int64` indices，并由 MLX gather 执行 |
+| 索引 gather | `aten.embedding.default`、`aten.index_select.default`、`aten.gather.default`，支持 `int32/int64` indices，并由 MLX gather 执行 |
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`flip`、`roll`、`triu`、`tril`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
@@ -37,6 +37,7 @@ PyTorch FX
 - 构建带 dtype/shape 校验的 SSA IR
 - 支持 `aten.embedding.default` 的 token-id gather，接受 `int32/int64` indices 和 FP16/BF16/FP32 embedding table，并可与后续 matmul、pointwise 子图组合
 - 支持 `aten.index_select.default` 沿任意单轴 gather，保留负轴归一化、输出 dtype 和静态 shape；运行时校验索引非负且未越界
+- 支持 `aten.gather.default` 的逐元素单轴 gather；前端校验 index rank 和静态 shape，运行时裁掉非 gather 轴的多余范围后交给 MLX `take_along_axis`
 - 消除恒等 layout、连续逆 `transpose/permute`、`flip`、`roll` 以及 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
@@ -56,7 +57,7 @@ PyTorch FX
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 支持 `torch.bool` IR value、比较/logical/NaN/Inf 谓词、`where`、`masked_fill`、标量常量生成，并允许 bool predicate/condition 与 FP16/BF16/FP32 数值分支融合在同一个 kernel
 - 生成每个 thread 处理 4 个元素的 Metal kernel
-- FP16、BF16、FP32 数值计算，bool 中间值和输出，以及供 embedding/index_select indices 使用的 `int32/int64` 输入
+- FP16、BF16、FP32 数值计算，bool 中间值和输出，以及供 embedding/index_select/gather indices 使用的 `int32/int64` 输入
 - 可选的 Metal matmul/addmm codegen，支持 rank-2 和 rank-3/4 的标准右对齐 batch broadcast
 - 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive/bool mask 和 FP16/BF16/FP32
 - matmul shared-memory tiling：`64×64×32` threadgroup block；rank-N batch 映射到 grid 的 y 维，FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
