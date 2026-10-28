@@ -4,24 +4,31 @@
 
 ## 项目目标
 
-项目的主目标不是实现推理引擎，而是把模型计算图编译成可验证、可复用、与具体调度策略无关的执行计划。第一阶段以 Apple Metal 为目标后端，后续再扩展其他 backend。
+这个项目是模型编译器，不是推理引擎。输入是一个 PyTorch Transformer 模型、模型状态和静态输入规格；输出是一个版本化、可重新加载、与请求调度解耦的编译产物。外部推理系统负责什么时候执行、如何组 batch 以及请求如何进出，编译器负责模型计算图本身如何被验证、优化和 lower。
 
-编译器的职责是：
+完整编译链包含：
 
-- 导入模型图、绑定参数，并建立稳定的输入输出 ABI
-- 建立 typed SSA IR、shape 系统和 verifier
-- 做 legalization、常量折叠、DCE、CSE、布局传播和算子融合
-- 做 buffer 复用、liveness 分析和内存规划
-- 完成算子 lowering、kernel 选择、代码生成和可选的 autotune
-- 产出可序列化的编译产物，并提供跨进程 kernel cache
+1. 捕获 PyTorch FX 图，绑定模型参数和 buffer，建立模型级输入输出 ABI。
+2. 转换为 typed SSA IR，校验 shape、dtype、layout、alias 和算子语义。
+3. 执行 legalization、常量折叠、DCE、CSE、布局传播和算子融合。
+4. 分析 tensor lifetime，完成 buffer 复用和内存规划。
+5. 根据 backend capability 选择 kernel，生成 Metal kernel 或保留 MLX fallback。
+6. 产出包含 manifest、IR、权重布局、kernel 和 ABI 版本的编译产物，并支持保存、重载和跨进程 kernel cache。
+7. 用 PyTorch 参考结果验证数值语义，并记录编译期选择、内存计划和 autotune 结果。
 
-当前交付物是进程内的 `CompiledPlan`，包含输入输出契约、IR 执行序列以及本项目生成的 Metal kernel。可序列化产物、稳定 ABI 和真实的 HuggingFace 风格模型导入仍是后续目标。
+当前交付物仍是进程内的 `CompiledPlan`。真实 tiny Llama/Qwen 风格的模型级编译和 logits 对齐已经打通；序列化产物、稳定 ABI、liveness/buffer planning、backend capability table、autotune 和跨进程重载尚未完成。
 
-这一阶段的完成标准是：能够编译一个真实的 tiny Llama/Qwen 风格模型；输出 logits 与 PyTorch 参考实现对齐；编译产物可以不依赖原始 Python 模型对象重新加载并执行；同一个模型图能够经过 verifier、图优化、buffer planning 和 backend selection 形成稳定计划。
+目标按以下三个验收门推进：
+
+| 验收门 | 必须满足的条件 |
+|---|---|
+| 模型前端 | 能直接编译 tiny Llama/Qwen 风格 `nn.Module`；参数和 buffer 完整绑定；输出与 PyTorch 对齐；编译计划不再依赖原始 Python 模型对象 |
+| 编译产物 | 图、ABI、权重布局和 kernel 能写入磁盘，并在新进程中重新加载执行；不兼容版本会明确拒绝；相同输入可复现 |
+| 编译器质量 | 能查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 行为一致；autotune 有可复现的 profile 和选择记录 |
 
 ## 项目边界
 
-请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 属于推理运行时，不是这个编译器的实现目标。编译器只处理这些系统中的模型计算部分，以及它们暴露给模型图的输入输出和张量布局。
+请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 属于推理运行时，不是这个编译器的实现目标。EP/MoE 的 rank 放置、expert dispatch、EPLB、通信调度和负载均衡同样属于运行时；编译器只负责模型中对应的计算图和静态布局契约。
 
 KV Cache 在项目里是图输入、图输出和内存布局契约。编译器可以 lower cache 读写、选择布局并规划 buffer；cache 的分配、回收、分页和跨请求复用由外部运行时负责。仓库中的 `CompiledPlan` 执行代码和 `examples/tiny_transformer_generate.py` 的 greedy host loop 只用于验证 lowering 的正确性，不作为推理引擎功能定义。
 
@@ -42,7 +49,7 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm`、`aten.baddbmm` |
-| 索引读写 | `aten.embedding.default`、`aten.index_select.default`、`aten.gather.default`、`aten.scatter.src`、`aten.scatter.value`，支持 `int32/int64` indices，并由 MLX gather/scatter 执行 |
+| 索引读写 | `aten.embedding.default`、`aten.index_select.default`、`aten.index.Tensor`、`aten.gather.default`、`aten.scatter.src`、`aten.scatter.value`；支持单轴和连续多轴 advanced indexing，indices 可为 `int32/int64` |
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`select`、`flip`、`roll`、`triu`、`tril`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`softplus`、`mish`、`logsigmoid`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`hardsigmoid`、`threshold`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
@@ -54,12 +61,15 @@ PyTorch FX
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持不指定维度的全量归约、任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
+| 前缀扫描 | `aten.cumsum.default`，沿任意单轴执行带 dtype 校验的前缀和 |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 | RMSNorm | `F.rms_norm` 的 `pow/mean/add_/rsqrt/mul` 分解，折叠为专用 `rms_norm` |
 
 编译器已经实现：
 
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
+- `compile_module` 通过 `torch.func.functional_call` 绑定参数和 buffer，把模块状态转成执行计划的私有输入；返回计划不持有原始 `nn.Module`
+- 支持 `aten.t`、`aten.cumsum`、`aten.index.Tensor`，并对可证明无别名观察者的 `aten.add_` 做 SSA legalization
 - 已用端到端测试验证两层 decoder-only Transformer forward：token embedding、RoPE、causal GQA attention、预归一化 residual、SwiGLU MLP、最终 RMSNorm 和 LM head 可以一起编译到 Metal，并在 FP32 下与 PyTorch CPU 对齐
 - 已验证固定容量静态 KV Cache 的 prefill/decode 图接口：prefill 把 prompt 的 K/V 右对齐写入 cache，decode 接收并返回每层更新后的 K/V；单请求和左侧 padding 的双请求 batch 都连续生成三步，并逐请求与完整序列 forward 的 logits、贪心 token 对齐
 - 构建带 dtype/shape 校验的 SSA IR
@@ -155,6 +165,7 @@ python examples/reduction.py
 python examples/layer_norm.py
 python examples/rms_norm.py
 python examples/tiny_transformer.py
+python examples/tiny_llama_compile.py
 python examples/tiny_transformer_generate.py
 python examples/metal_matmul_benchmark.py
 python examples/metal_attention_benchmark.py
@@ -168,6 +179,7 @@ python examples/metal_attention_benchmark.py
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
 - `examples/tiny_transformer.py` 编译并执行一个两层 decoder-only Transformer，覆盖 RoPE、causal attention、SwiGLU 和 LM head。
+- `examples/tiny_llama_compile.py` 直接编译随机初始化的两层 HuggingFace Llama，验证参数/buffer 绑定、logits 对齐、原生 matmul 与 attention kernel，以及删除原模型后的独立执行。
 - `examples/tiny_transformer_generate.py` 分别编译 prefill 和 decode 图，用左侧 padding 的双请求 batch 演示不同有效 prompt 长度下的三步 greedy 生成。它展示的是 cache 输入输出契约和正确性，不是分页、动态 batch 或高吞吐实现。
 - `examples/metal_matmul_benchmark.py` 对比 FP32 tiled 和 FP16 SIMD matmul kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 - `examples/metal_attention_benchmark.py` 对比 tiled online-softmax attention kernel 与 MLX SDPA，并检查 PyTorch CPU 数值误差。
@@ -200,6 +212,36 @@ inputs = tuple(mx.array(value.numpy()) for value in example_inputs)
 output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
+
+模型级编译使用 `compile_module`：
+
+```python
+from transformers import LlamaConfig, LlamaForCausalLM
+from transformer_subgraph_compiler import compile_module
+
+model = LlamaForCausalLM(
+    LlamaConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+        use_cache=False,
+    )
+).eval()
+input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+compiled = compile_module(
+    model,
+    (input_ids,),
+    example_kwargs={"use_cache": False},
+)
+logits = compiled(input_ids)[0]
+mx.eval(logits)
+```
+
+`compile_module` 在编译期把 `named_parameters()` 和 `named_buffers()` 复制为 MLX array，作为图的私有输入。释放原始 module 后计划仍可执行，但当前同名参数会被去重为同一个状态项；需要保留共享参数的别名关系时应在后续状态布局阶段显式建模。
 
 编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以用固定最大 batch、左侧 padding 和逐请求 mask 执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此这个例子只验证 cache 的图 ABI 和生成正确性，不代表编译器要提供 cache allocator 或生成引擎。编译器和执行计划目前还不支持动态 shape、控制流、跨进程 kernel 产物以及训练。分页 cache、请求动态进出 batch、采样策略和 serving 由外部推理系统负责，不属于本项目目标。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 

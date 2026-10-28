@@ -32,6 +32,7 @@ _SUPPORTED_OPS = {
     "aten._safe_softmax.default": "safe_softmax",
     "aten.sum.default": "sum",
     "aten.sum.dim_IntList": "sum",
+    "aten.cumsum.default": "cumsum",
     "aten.mean.default": "mean",
     "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
@@ -41,6 +42,7 @@ _SUPPORTED_OPS = {
     "aten.mul.Tensor": "mul",
     "aten.mul.Scalar": "mul",
     "aten.add.Tensor": "add",
+    "aten.add_.Tensor": "add",
     "aten.sub.Tensor": "sub",
     "aten.rsub.Scalar": "rsub",
     "aten.div.Tensor": "div",
@@ -204,9 +206,12 @@ _SEQUENCE_VIEW_TARGETS = {
 }
 
 _SELECT_TARGET = "aten.select.int"
+_INDEX_TARGET = "aten.index.Tensor"
+_MATRIX_TRANSPOSE_TARGET = "aten.t.default"
 _STACK_TARGET = "aten.stack.default"
 _SCATTER_TARGETS = {"aten.scatter.src", "aten.scatter.value"}
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
+_INPLACE_TARGETS = {"aten.add_.Tensor"}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -236,12 +241,41 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             if node in node_ids:
                 continue
             target = str(node.target)
+            if target == _MATRIX_TRANSPOSE_TARGET:
+                input_node = node.args[0]
+                input_type = _node_type(input_node)
+                if len(input_type.shape) != 2:
+                    raise ValueError(
+                        "aten.t is only supported for rank-2 tensors, got "
+                        f"shape {input_type.shape}"
+                    )
+                output_id = f"v{len(ops)}"
+                ops.append(
+                    Operation(
+                        "transpose",
+                        (_argument_ids(input_node, node_ids),),
+                        (output_id,),
+                        {"dim0": 1, "dim1": 0},
+                    )
+                )
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, _node_type(node))
+                continue
             if target == _SELECT_TARGET:
                 select_ops = _select_operations(node, node_ids, len(ops))
                 for operation, value in select_ops:
                     ops.append(operation)
                     values[value.id] = value
                 node_ids[node] = select_ops[-1][0].outputs[0]
+                continue
+            if target == _INDEX_TARGET:
+                inputs, attrs, output_type = _advanced_index_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("index", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
                 continue
             if target in _SEQUENCE_VIEW_TARGETS:
                 sequence_ops = _sequence_view_operations(node, node_ids, len(ops))
@@ -334,6 +368,8 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 continue
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
+            if target in _INPLACE_TARGETS:
+                _validate_inplace_legalization(node)
             op_name = _SUPPORTED_OPS[target]
             if (
                 target == "aten.pow.Tensor_Scalar"
@@ -824,6 +860,106 @@ def _index_select_operation(
         {"dim": axis},
         output_type,
     )
+
+
+def _advanced_index_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    if kwargs:
+        raise ValueError(
+            "index received unsupported keyword arguments: "
+            f"{sorted(kwargs)}"
+        )
+    if len(args) != 2:
+        raise ValueError(f"index expects two arguments, got {len(args)}")
+
+    source, indices = args
+    if not isinstance(indices, (tuple, list)) or not indices:
+        raise ValueError("index expects a non-empty sequence of indices")
+    source_type = _node_type(source)
+    if len(indices) > len(source_type.shape):
+        raise ValueError(
+            f"index has {len(indices)} indices for rank-{len(source_type.shape)} "
+            "input"
+        )
+
+    index_nodes = [index for index in indices if index is not None]
+    if not index_nodes:
+        raise ValueError("index requires at least one tensor index")
+    index_types = tuple(
+        _node_type(index) for index in index_nodes
+    )
+    for index_type in index_types:
+        if index_type.dtype not in {DType.I32, DType.I64}:
+            raise ValueError(
+                "index indices must be int32 or int64, "
+                f"got {index_type.dtype.value}"
+            )
+
+    indexed_axes = tuple(
+        axis for axis, index in enumerate(indices) if index is not None
+    )
+    first_axis = indexed_axes[0]
+    last_axis = indexed_axes[-1]
+    if indexed_axes != tuple(range(first_axis, last_axis + 1)):
+        raise NotImplementedError(
+            "non-contiguous advanced indexing is not supported: "
+            f"indexed axes {indexed_axes}"
+        )
+
+    broadcast_shape = _broadcast_shapes(
+        tuple(index_type.shape for index_type in index_types),
+        "advanced index",
+    )
+    expected_shape = (
+        source_type.shape[:first_axis]
+        + broadcast_shape
+        + source_type.shape[last_axis + 1 :]
+    )
+    expected_type = TensorType(expected_shape, source_type.dtype)
+    output_type = _node_type(node)
+    if output_type != expected_type:
+        raise ValueError(
+            f"index output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(expected_type.shape, expected_type.dtype)}"
+        )
+
+    inputs = (_argument_ids(source, node_ids),) + tuple(
+        _argument_ids(index, node_ids) for index in index_nodes
+    )
+    return inputs, {"axes": indexed_axes}, output_type
+
+
+def _broadcast_shapes(
+    shapes: tuple[tuple[int, ...], ...], context: str
+) -> tuple[int, ...]:
+    rank = max(len(shape) for shape in shapes)
+    result = [1] * rank
+    for shape in shapes:
+        offset = rank - len(shape)
+        for axis, dim in enumerate(shape):
+            current = result[offset + axis]
+            if current != dim and current != 1 and dim != 1:
+                raise ValueError(
+                    f"{context} shapes cannot broadcast: {shapes}"
+                )
+            result[offset + axis] = max(current, dim)
+    return tuple(result)
+
+
+def _validate_inplace_legalization(node: object) -> None:
+    args = getattr(node, "args", ())
+    if not args:
+        raise ValueError("in-place operation has no input")
+    source = args[0]
+    users = set(getattr(source, "users", ()))
+    if users != {node}:
+        raise NotImplementedError(
+            "in-place operation has aliasing observers and cannot be lowered "
+            f"safely: {getattr(node, 'target', '<unknown>')}"
+        )
 
 
 def _gather_operation(
@@ -1550,6 +1686,20 @@ def _operation_inputs(
             )
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
+    if op == "cumsum":
+        if len(args) not in {2, 3}:
+            raise ValueError(
+                f"cumsum expects two or three arguments, got {len(args)}"
+            )
+        input_id, dim = args[:2]
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"cumsum.dim must be an integer, got {dim!r}")
+        if len(args) == 3 and args[2] is not None:
+            dtype_name = str(args[2])
+            if _TORCH_DTYPES.get(dtype_name) is None:
+                raise ValueError(f"unsupported cumsum dtype: {dtype_name}")
+        return ((_argument_ids(input_id, node_ids),), {"dim": dim})
+
     if op == "reshape":
         if len(args) != 2:
             raise ValueError(f"reshape expects two arguments, got {len(args)}")
@@ -1887,6 +2037,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         )
     if op == "cat":
         allowed.add("dim")
+    if op == "cumsum":
+        allowed.update({"dim", "dtype"})
     if op == "flip":
         allowed.add("dims")
     if op == "roll":

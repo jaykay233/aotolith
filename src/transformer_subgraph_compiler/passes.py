@@ -522,6 +522,7 @@ def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
             producer_index in removed
             or producer_index in replacements
             or len(consumers.get(op.inputs[0], [])) != 1
+            or not producer.inputs
         ):
             continue
         if op.inputs[0] in output_set:

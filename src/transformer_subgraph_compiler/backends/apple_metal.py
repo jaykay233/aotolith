@@ -278,6 +278,13 @@ def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.arra
     return mx.take(source, indices, axis=axis)
 
 
+def _check_advanced_index_indices(indices: mx.array, upper_bound: int) -> None:
+    if bool(mx.any(indices < -upper_bound).item()) or bool(
+        mx.any(indices >= upper_bound).item()
+    ):
+        raise IndexError("index out of range in self")
+
+
 @dataclass(slots=True)
 class CompiledPlan:
     graph: Graph
@@ -319,6 +326,14 @@ class CompiledPlan:
                 source, indices = (env[value_id] for value_id in op.inputs)
                 axis = int(op.attrs["dim"])
                 env[op.outputs[0]] = _mlx_take_checked(source, indices, axis=axis)
+            elif op.op == "index":
+                source = env[op.inputs[0]]
+                indices = tuple(env[value_id] for value_id in op.inputs[1:])
+                axes = tuple(int(axis) for axis in op.attrs["axes"])
+                for axis, index in zip(axes, indices, strict=True):
+                    _check_advanced_index_indices(index, source.shape[axis])
+                indexing = (slice(None),) * axes[0] + indices
+                env[op.outputs[0]] = source[indexing]
             elif op.op == "gather":
                 source, indices = (env[value_id] for value_id in op.inputs)
                 axis = int(op.attrs["dim"])
@@ -352,6 +367,13 @@ class CompiledPlan:
                 output = mx.array(source)
                 output[slices] = updated
                 env[op.outputs[0]] = output
+            elif op.op == "cumsum":
+                axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
+                value = mx.cumsum(env[op.inputs[0]], axis=axis)
+                output_dtype = _MLX_DTYPES[
+                    self.graph.value(op.outputs[0]).type.dtype
+                ]
+                env[op.outputs[0]] = value.astype(output_dtype)
             elif op.op in {"triu", "tril"}:
                 diagonal = int(op.attrs["diagonal"])
                 operation = mx.triu if op.op == "triu" else mx.tril
@@ -450,10 +472,14 @@ class AppleMetalBackend:
                 _validate_embedding_op(graph, op)
             elif op.op == "index_select":
                 _validate_index_select_op(graph, op)
+            elif op.op == "index":
+                _validate_index_op(graph, op)
             elif op.op == "gather":
                 _validate_gather_op(graph, op)
             elif op.op == "scatter":
                 _validate_scatter_op(graph, op)
+            elif op.op == "cumsum":
+                _validate_cumsum_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -3943,6 +3969,80 @@ def _validate_index_select_op(graph: Graph, op: Operation) -> None:
         )
 
 
+def _validate_index_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) < 2:
+        raise ValueError(f"index expects at least two inputs, got {len(op.inputs)}")
+    source_type = graph.value(op.inputs[0]).type
+    axes_value = op.attrs.get("axes")
+    if not isinstance(axes_value, tuple) or not axes_value:
+        raise ValueError(f"index.axes must be a non-empty tuple, got {axes_value!r}")
+    if not all(
+        isinstance(axis, int) and not isinstance(axis, bool) for axis in axes_value
+    ):
+        raise ValueError(f"index.axes must contain integers, got {axes_value!r}")
+    if len(op.inputs) != len(axes_value) + 1:
+        raise ValueError(
+            f"index has {len(op.inputs) - 1} indices for axes {axes_value}"
+        )
+
+    first_axis = axes_value[0]
+    last_axis = axes_value[-1]
+    if axes_value != tuple(range(first_axis, last_axis + 1)):
+        raise NotImplementedError(
+            "non-contiguous advanced indexing is not supported: "
+            f"indexed axes {axes_value}"
+        )
+    if first_axis < 0 or last_axis >= len(source_type.shape):
+        raise ValueError(
+            f"index axes {axes_value} exceed source rank {len(source_type.shape)}"
+        )
+
+    index_shapes: list[tuple[int, ...]] = []
+    for index_id, axis in zip(op.inputs[1:], axes_value, strict=True):
+        index_type = graph.value(index_id).type
+        if index_type.dtype not in {DType.I32, DType.I64}:
+            raise ValueError(
+                "index indices must be int32 or int64, "
+                f"got {index_type.dtype.value}"
+            )
+        index_shapes.append(index_type.shape)
+
+    broadcast_shape = _broadcast_shapes(tuple(index_shapes))
+    expected_shape = (
+        source_type.shape[:first_axis]
+        + broadcast_shape
+        + source_type.shape[last_axis + 1 :]
+    )
+    output_type = graph.value(op.outputs[0]).type
+    expected_type = TensorType(expected_shape, source_type.dtype)
+    if output_type != expected_type:
+        raise ValueError(
+            f"index output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match expected {(expected_shape, expected_type.dtype)}"
+        )
+    if set(op.attrs) != {"axes"}:
+        raise ValueError(
+            f"index has unsupported attributes: {sorted(set(op.attrs) - {'axes'})}"
+        )
+
+
+def _broadcast_shapes(
+    shapes: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    rank = max(len(shape) for shape in shapes)
+    result = [1] * rank
+    for shape in shapes:
+        offset = rank - len(shape)
+        for axis, dim in enumerate(shape):
+            current = result[offset + axis]
+            if current != dim and current != 1 and dim != 1:
+                raise ValueError(
+                    f"index shapes cannot broadcast: {shapes}"
+                )
+            result[offset + axis] = max(current, dim)
+    return tuple(result)
+
+
 def _validate_gather_op(graph: Graph, op: Operation) -> None:
     if len(op.inputs) != 2:
         raise ValueError(f"gather expects two inputs, got {len(op.inputs)}")
@@ -4053,6 +4153,25 @@ def _validate_scatter_op(graph: Graph, op: Operation) -> None:
                     f"scatter source shape {update_type.shape} is smaller than "
                     f"indices shape {indices_type.shape} on axis {update_axis}"
                 )
+
+
+def _validate_cumsum_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"cumsum expects one input, got {len(op.inputs)}")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"cumsum.dim must be an integer, got {dim!r}")
+    input_type = graph.value(op.inputs[0]).type
+    if not input_type.shape:
+        raise ValueError("cumsum does not support rank-0 tensors")
+    axis = dim + len(input_type.shape) if dim < 0 else dim
+    if axis < 0 or axis >= len(input_type.shape):
+        raise ValueError(f"cumsum.dim {dim} exceeds rank {len(input_type.shape)}")
+    output_type = graph.value(op.outputs[0]).type
+    if output_type.shape != input_type.shape:
+        raise ValueError(
+            f"cumsum output shape {output_type.shape} != {input_type.shape}"
+        )
 
 
 def _validate_triangular_op(graph: Graph, op: Operation) -> None:

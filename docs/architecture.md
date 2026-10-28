@@ -4,15 +4,37 @@
 
 ## 0. 目标与边界
 
-项目目标是把 PyTorch 导出的模型图编译成 typed SSA IR，完成合法化、图优化、内存与布局规划、kernel 选择和代码生成，最终产出可序列化、可验证、与具体推理调度策略解耦的执行计划。Apple Metal 是当前第一目标后端。
+项目的唯一主目标是构建一个 PyTorch Transformer 模型编译器。输入是模型、state 和静态 input spec，输出是版本化、自包含、可重新加载的编译产物。编译产物描述模型计算的 ABI、IR、权重布局、内存计划、backend plan 和 kernel；请求级控制流留在外部推理系统。
 
-编译器负责图导入、参数绑定、shape 系统、legalization、常量折叠、DCE、CSE、布局传播、算子融合、liveness 与 buffer planning、后端 lowering、kernel codegen/autotune，以及编译产物和跨进程 cache。
+编译器负责：
 
-请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 由外部推理系统负责。KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contract；编译器可以 lower cache 读写和规划静态内存，但不管理 page table、分配、回收或跨请求复用。
+- FX 捕获、参数与 buffer 绑定、模型级输入输出 ABI
+- typed SSA IR、shape/dtype/layout/alias 校验和 legalization
+- 常量折叠、DCE、CSE、布局传播、算子融合
+- liveness、buffer planning 和静态内存复用
+- backend capability 查询、kernel selection、Metal codegen、fallback 和 autotune
+- manifest、产物版本、序列化/反序列化、跨进程 kernel cache
+- 数值对齐、可复现性和编译产物兼容性验证
+
+目标按三个验收门推进：
+
+1. **模型前端**：tiny Llama/Qwen 风格 `nn.Module` 可以直接编译；logits 与 PyTorch 对齐；编译计划不持有或依赖原始 Python 模型对象。
+2. **编译产物**：manifest、图、ABI、权重布局和 kernel 可以落盘，并在新进程中重新加载；版本不兼容时明确失败；同一输入和 compiler version 产生可复现结果。
+3. **编译器质量**：可以查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 的数值行为一致；autotune 保存 profile 依据和最终选择。
+
+请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 由外部推理系统负责。EP/MoE 的 rank 放置、expert dispatch、EPLB、通信调度和负载均衡也不是编译器职责；编译器只表达 MoE 计算和静态布局契约。
+
+KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contract。编译器可以 lower cache 读写和规划静态内存，但不管理 page table、分配、回收或跨请求复用。
 
 ## 1. FX 捕获
 
 `capture_fx` 调用 `make_fx(fn)(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata。
+
+模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；后续状态布局阶段需要把 storage alias 纳入 ABI。
+
+HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 尚未提升为图输入，当前只接受可被 tracing 捕获的静态关键字参数。
+
+两周层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 
 前端当前处理以下 FX target 和折叠模式：
 
@@ -24,8 +46,12 @@
 | `aten.baddbmm.default` | `addmm`，batch 维按 broadcasting 语义执行 |
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
+| `aten.index.Tensor` | `index`，支持连续多轴 advanced indexing 和 index broadcasting |
+| `aten.cumsum.default` | `cumsum`，沿单个静态轴执行前缀和 |
+| `aten.t.default` | `transpose`，rank-2 矩阵转置 |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
+| `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
 | `aten.permute.default` | `permute` |
@@ -440,10 +466,11 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ## 15. 编译器路线
 
-1. 导入真实的 HuggingFace 风格小模型图，完成参数绑定、输出 logits 对齐和模型级回归测试。
-2. 把静态 shape 系统扩展到符号 shape、shape propagation 和 specialization，建立图级 verifier 和 legalization 规则。
-3. 补齐常量折叠、DCE、跨 reshape 的布局传播，以及更通用的广播和边界布局优化。
-4. 增加 liveness 分析与 buffer planning，减少中间 tensor 分配和重复物化。
-5. 建立 backend 能力表和 kernel selection，使 MSL kernel、MLX fallback 和后续 CUDA/Triton backend 共享同一 IR。
-6. 产出可序列化的编译产物，定义稳定 ABI，并加入跨进程 kernel cache。
-7. 用真实模型做端到端数值对齐、编译产物复用和 kernel 性能回归。
+模型前端已经打通 tiny Llama/Qwen 风格的 `nn.Module` 编译、参数与 buffer 绑定以及 logits 对齐。后续工作按编译产物链条推进：
+
+1. 增加 liveness 分析、buffer planning 和可检查的静态内存计划。
+2. 建立 backend capability table 和 kernel selection，记录原生 kernel、MLX fallback 及选择原因。
+3. 定义稳定 ABI 和版本化 manifest，把图、权重布局、内存计划、backend plan 和 kernel 序列化到磁盘。
+4. 实现产物加载器，在新进程中恢复执行，并对版本、dtype、shape 和 backend 不兼容明确报错。
+5. 加入 profile 驱动的 autotune，保存候选 kernel、测量结果和最终选择。
+6. 扩展真实模型覆盖与性能回归；符号 shape、控制流和其他 backend 在核心产物链稳定后继续推进。
