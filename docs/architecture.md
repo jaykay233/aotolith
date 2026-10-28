@@ -224,7 +224,19 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - row/column 能被 `64` 整除时跳过写回 predicate，reduction 能整除 `32` 时跳过 tail load predicate
 - 尾部 block 用零填充越界的 A/B 元素，不执行越界读取
 
-该实现还没有 vectorized load、SIMD matrix、split-K 或 autotune，在当前 Apple Silicon 测试中比 MLX 慢约 1.8–5.6 倍，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
+该标量路径还没有 vectorized load、SIMD matrix、split-K 或 autotune，在当前 Apple Silicon 测试中比 MLX 慢约 1.8–5.6 倍，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
+
+### SIMD matrix fast path
+
+FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 个 SIMD group：
+
+- 每个 SIMD group 负责 `16×32` 输出，使用 2 个 A fragment 和 4 个 B fragment 覆盖一次 `16×8 × 8×32` MMA
+- A/B 仍先协作加载到 threadgroup memory，尾 K 用零填充，避免 `simdgroup_load` 越界
+- accumulator 保持 `simdgroup_float8x8`，只在最终写回时转换到 FP16/BF16
+- 输出先存入 `threadgroup float` tile，再统一执行 alpha/beta 和 bias broadcast epilogue
+- FP32 SIMD matrix 在当前 Apple GPU 上观察到精度降级，因此不启用；带尾行或尾列的低精度输出也回退到标量 tiled 路径
+
+在当前 M5 Pro 测试中，SIMD 路径比低精度标量 tiled kernel 快约 20%–75%，但与 MLX 仍有明显差距。该路径没有使用 Metal 4 MPP、vectorized load、split-K 或 autotune。
 
 ## 12. Metal attention codegen
 
@@ -272,7 +284,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存、autotune 或 layout propagation
-- matmul 还没有 vectorized load、SIMD matrix、split-K 或 autotune
+- matmul 的 SIMD matrix 只覆盖 FP16/BF16 完整输出块，且还没有 vectorized load、Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout op 已做恒等与逆变换消除，但还没有布局传播
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
@@ -280,4 +292,4 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步可以对原生 attention kernel 做 tiling、SIMD 和 autotune，并继续做布局传播、跨进程 kernel cache 与 SIMD matrix matmul。
+下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 也需要 tiling、SIMD 和 autotune。编译器侧仍可推进布局传播与跨进程 kernel cache。

@@ -48,7 +48,7 @@ PyTorch FX
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
 - 可选的 fused Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
-- matmul shared-memory tiling：`64×64×32` threadgroup block，小 K 用 4×4、大 K 用 8×4 每线程 microtile
+- matmul shared-memory tiling：`64×64×32` threadgroup block；FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
@@ -61,7 +61,7 @@ PyTorch FX
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
 ```
 
-matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 64×32 和 B 的 32×64 片段协作加载到 threadgroup memory，再由每个 thread 的寄存器 microtile 复用。K 小于 1024 时使用 4×4 microtile，K 较大时使用 8×4；完整 tile 走无边界检查快路径，尾部 shape 才生成 predicate。当前仍没有 vectorized load、SIMD matrix、split-K 或 autotune，实测仍慢于 MLX，所以默认开关保持关闭。
+matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 64×32 和 B 的 32×64 片段协作加载到 threadgroup memory。FP16/BF16 输入且输出行列都能整除 64 时，8 个 SIMD group 使用 `simdgroup_*8x8` 指令做矩阵乘并保持 FP32 accumulator；FP32 或尾块继续使用每线程 4×4/8×4 的寄存器 microtile。当前仍没有 vectorized load、Metal 4 MPP、split-K 或 autotune，实测仍慢于 MLX，所以默认开关保持关闭。
 
 传入 `codegen_attention=True` 会为满足条件的 attention 生成原生 MSL kernel：
 
@@ -115,7 +115,7 @@ python examples/metal_matmul_benchmark.py
 - `examples/reduction.py` 验证 last-dim sum、连续维 mean、交错维 sum、`keepdim` 和 FP16 输出 dtype 覆盖。
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
-- `examples/metal_matmul_benchmark.py` 对比寄存器 tiled kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
+- `examples/metal_matmul_benchmark.py` 对比 FP32 tiled 和 FP16 SIMD matmul kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 
 示例会打印生成的 MSL 或 kernel 类型。首次执行包含 MLX kernel JIT 和 GPU dispatch，耗时不能当作 steady-state 性能。
 

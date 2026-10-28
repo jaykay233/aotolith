@@ -955,27 +955,43 @@ class AppleMetalBackend:
         if len(dtypes) != 1:
             raise NotImplementedError("Metal matmul requires identical input/output dtypes")
 
-        micro_rows, micro_columns = _select_matmul_microtile(reduction)
-        source = _emit_tiled_matmul_source(
-            op,
-            rows,
-            reduction,
-            columns,
-            micro_rows,
-            micro_columns,
-            graph,
-        )
-        threads = (
-            (_MATMUL_BLOCK_ROWS // micro_rows)
-            * (_MATMUL_BLOCK_COLUMNS // micro_columns)
-        )
         row_blocks = ceil(rows / _MATMUL_BLOCK_ROWS)
         column_blocks = ceil(columns / _MATMUL_BLOCK_COLUMNS)
-        name = (
-            f"metal_{op.op}_tiled_"
-            f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
-            f"{_MATMUL_BLOCK_REDUCTION}_{micro_rows}x{micro_columns}_{index}"
-        )
+        if _supports_simdgroup_matmul(rows, columns, output_type.dtype):
+            source = _emit_simdgroup_matmul_source(
+                op,
+                rows,
+                reduction,
+                columns,
+                graph,
+                output_type.dtype,
+            )
+            threads = 256
+            name = (
+                f"metal_{op.op}_simdgroup_"
+                f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
+                f"{_MATMUL_BLOCK_REDUCTION}_{index}"
+            )
+        else:
+            micro_rows, micro_columns = _select_matmul_microtile(reduction)
+            source = _emit_tiled_matmul_source(
+                op,
+                rows,
+                reduction,
+                columns,
+                micro_rows,
+                micro_columns,
+                graph,
+            )
+            threads = (
+                (_MATMUL_BLOCK_ROWS // micro_rows)
+                * (_MATMUL_BLOCK_COLUMNS // micro_columns)
+            )
+            name = (
+                f"metal_{op.op}_tiled_"
+                f"{_MATMUL_BLOCK_ROWS}x{_MATMUL_BLOCK_COLUMNS}x"
+                f"{_MATMUL_BLOCK_REDUCTION}_{micro_rows}x{micro_columns}_{index}"
+            )
         kernel = _metal_kernel(
             name,
             tuple(f"in_{position}" for position in range(len(op.inputs))),
@@ -1398,6 +1414,177 @@ def _select_matmul_microtile(reduction: int) -> tuple[int, int]:
     if reduction >= _MATMUL_LARGE_K_THRESHOLD:
         return _MATMUL_LARGE_K_MICROTILE
     return _MATMUL_MICROTILE
+
+
+def _supports_simdgroup_matmul(rows: int, columns: int, dtype: DType) -> bool:
+    return (
+        dtype in {DType.F16, DType.BF16}
+        and rows % _MATMUL_BLOCK_ROWS == 0
+        and columns % _MATMUL_BLOCK_COLUMNS == 0
+    )
+
+
+def _emit_simdgroup_matmul_source(
+    op: Operation,
+    rows: int,
+    reduction: int,
+    columns: int,
+    graph: Graph,
+    dtype: DType,
+) -> str:
+    if rows % _MATMUL_BLOCK_ROWS != 0 or columns % _MATMUL_BLOCK_COLUMNS != 0:
+        raise ValueError("simdgroup matmul requires complete 64x64 output blocks")
+
+    if op.op == "addmm":
+        bias_id, _, _ = op.inputs
+        bias_type = graph.value(bias_id).type
+        output_shape = graph.value(op.outputs[0]).type.shape
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+        left_position = 1
+        right_position = 2
+    else:
+        bias_id = None
+        bias_type = None
+        output_shape = ()
+        alpha = 1.0
+        beta = 1.0
+        left_position = 0
+        right_position = 1
+
+    block_rows = _MATMUL_BLOCK_ROWS
+    block_columns = _MATMUL_BLOCK_COLUMNS
+    block_reduction = _MATMUL_BLOCK_REDUCTION
+    threads = 256
+    column_blocks = columns // block_columns
+    exact_reduction = reduction % block_reduction == 0
+    simdgroup_type = {
+        DType.F16: "half",
+        DType.BF16: "bfloat",
+    }[dtype]
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint warp = tid / 32u;",
+        "uint warp_row = warp / 2u;",
+        "uint warp_column = warp % 2u;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+        f"uint block_row = threadgroup_index / {column_blocks}u;",
+        f"uint block_column = threadgroup_index % {column_blocks}u;",
+        f"uint row_base = block_row * {block_rows}u;",
+        f"uint col_base = block_column * {block_columns}u;",
+        f"threadgroup T tile_a[{block_rows * block_reduction}];",
+        f"threadgroup T tile_b[{block_reduction * block_columns}];",
+        f"threadgroup float tile_c[{block_rows * block_columns}];",
+        "simdgroup_float8x8 acc[8];",
+        f"simdgroup_{simdgroup_type}8x8 frag_a[2];",
+        f"simdgroup_{simdgroup_type}8x8 frag_b[4];",
+        "for (uint i = 0u; i < 8u; ++i) {",
+        "    acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);",
+        "}",
+        f"for (uint k_base = 0u; k_base < {reduction}u; "
+        f"k_base += {block_reduction}u) {{",
+        f"    for (uint index = tid; index < {block_rows * block_reduction}u; "
+        f"index += {threads}u) {{",
+        f"        uint local_row = index / {block_reduction}u;",
+        f"        uint local_k = index % {block_reduction}u;",
+    ]
+    load_a = (
+        f"in_{left_position}[(row_base + local_row) * {reduction}u "
+        f"+ k_base + local_k]"
+    )
+    if not exact_reduction:
+        load_a = f"k_base + local_k < {reduction}u ? {load_a} : T(0.0)"
+    lines.append(f"        tile_a[index] = {load_a};")
+    lines.extend(
+        [
+            "    }",
+            f"    for (uint index = tid; "
+            f"index < {block_reduction * block_columns}u; "
+            f"index += {threads}u) {{",
+            f"        uint local_k = index / {block_columns}u;",
+            f"        uint local_column = index % {block_columns}u;",
+        ]
+    )
+    load_b = (
+        f"in_{right_position}[(k_base + local_k) * {columns}u "
+        f"+ col_base + local_column]"
+    )
+    if not exact_reduction:
+        load_b = f"k_base + local_k < {reduction}u ? {load_b} : T(0.0)"
+    lines.extend(
+        [
+            f"        tile_b[index] = {load_b};",
+            "    }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+    )
+
+    for k_offset in range(0, block_reduction, 8):
+        lines.extend(
+            [
+                f"    simdgroup_load(frag_a[0], tile_a + "
+                f"(warp_row * 16u) * {block_reduction}u + {k_offset}u, "
+                f"{block_reduction}, 0, false);",
+                f"    simdgroup_load(frag_a[1], tile_a + "
+                f"(warp_row * 16u + 8u) * {block_reduction}u + {k_offset}u, "
+                f"{block_reduction}, 0, false);",
+            ]
+        )
+        for column_fragment in range(4):
+            lines.append(
+                f"    simdgroup_load(frag_b[{column_fragment}], tile_b + "
+                f"{k_offset}u * {block_columns}u + warp_column * 32u + "
+                f"{column_fragment * 8}u, {block_columns}, 0, false);"
+            )
+        for row_fragment in range(2):
+            for column_fragment in range(4):
+                accumulator = row_fragment * 4 + column_fragment
+                lines.append(
+                    f"    simdgroup_multiply_accumulate(acc[{accumulator}], "
+                    f"frag_a[{row_fragment}], frag_b[{column_fragment}], "
+                    f"acc[{accumulator}]);"
+                )
+
+    lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+    lines.append("}")
+
+    for row_fragment in range(2):
+        row_offset = row_fragment * 8
+        for column_fragment in range(4):
+            accumulator = row_fragment * 4 + column_fragment
+            column_offset = column_fragment * 8
+            lines.append(
+                f"simdgroup_store(acc[{accumulator}], tile_c + "
+                f"(warp_row * 16u + {row_offset}u) * {block_columns}u + "
+                f"warp_column * 32u + {column_offset}u, "
+                f"{block_columns}, 0, false);"
+            )
+    lines.extend(
+        [
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"for (uint index = tid; index < {block_rows * block_columns}u; "
+            f"index += {threads}u) {{",
+            f"    uint local_row = index / {block_columns}u;",
+            f"    uint local_column = index % {block_columns}u;",
+            f"    uint linear = (row_base + local_row) * {columns}u "
+            "+ col_base + local_column;",
+        ]
+    )
+    value = "tile_c[index]"
+    if bias_id is not None:
+        assert bias_type is not None
+        bias_offset = _offset_expression(bias_type.shape, output_shape, "linear")
+        value = (
+            f"{beta!r} * float(in_0[{bias_offset}]) "
+            f"+ {alpha!r} * {value}"
+        )
+    lines.extend(
+        [
+            f"    out[linear] = (T)({value});",
+            "}",
+        ]
+    )
+    return "\n".join(f"        {line}" for line in lines)
 
 
 def _emit_tiled_matmul_source(

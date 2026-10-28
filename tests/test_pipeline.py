@@ -1346,6 +1346,51 @@ def test_metal_matmul_supports_low_precision(dtype) -> None:
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "simdgroup_type"),
+    [(torch.float16, "half"), (torch.bfloat16, "bfloat")],
+)
+def test_metal_matmul_uses_simdgroup_for_complete_blocks(
+    dtype, simdgroup_type
+) -> None:
+    torch.manual_seed(30)
+    inputs = (torch.randn(64, 35, dtype=dtype), torch.randn(35, 64, dtype=dtype))
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    kernel = result.plan.kernels[0]
+
+    assert kernel.name == "metal_matmul_simdgroup_64x64x32_0"
+    assert f"simdgroup_{simdgroup_type}8x8 frag_a[2]" in kernel.source
+    assert "simdgroup_float8x8 acc[8]" in kernel.source
+    assert "simdgroup_multiply_accumulate" in kernel.source
+    assert "k_base + local_k < 35u" in kernel.source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(inputs[0] @ inputs[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_simdgroup_addmm_applies_broadcast_bias() -> None:
+    torch.manual_seed(32)
+    inputs = (
+        torch.randn(1, 64, dtype=torch.float16),
+        torch.randn(64, 32, dtype=torch.float16),
+        torch.randn(32, 64, dtype=torch.float16),
+    )
+
+    def addmm(bias, left, right):
+        return torch.addmm(bias, left, right, alpha=0.75, beta=1.25)
+
+    result = compile_callable(addmm, inputs, codegen_matmul=True)
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_addmm_simdgroup_64x64x32_0"
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(addmm(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("bias_shape", [(5,), (1, 5), (3, 1)])
 def test_addmm_codegen_broadcasts_bias(bias_shape) -> None:
     torch.manual_seed(31)
