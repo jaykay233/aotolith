@@ -9,7 +9,7 @@ from typing import Any
 import mlx.core as mx
 
 from ..ir import DType, Graph, Operation, TensorType
-from ..passes import POINTWISE_OPS
+from ..passes import LAYOUT_OPS, POINTWISE_OPS
 
 _MLX_DTYPES = {
     DType.F16: mx.float16,
@@ -97,7 +97,13 @@ class CompiledPlan:
                 env[op.outputs[0]] = runtime(*(env[value_id] for value_id in op.inputs))
                 continue
 
-            if op.op == "matmul":
+            if op.op == "attention":
+                env[op.outputs[0]] = _evaluate_attention_mlx(op, env)
+            elif op.op in LAYOUT_OPS:
+                env[op.outputs[0]] = _evaluate_layout_mlx(
+                    self.graph, op, env[op.inputs[0]]
+                )
+            elif op.op == "matmul":
                 env[op.outputs[0]] = mx.matmul(env[op.inputs[0]], env[op.inputs[1]])
             elif op.op == "addmm":
                 bias, left, right = (env[value_id] for value_id in op.inputs)
@@ -147,8 +153,17 @@ class AppleMetalBackend:
                 compiled = self._compile_layer_norm(graph, op, index)
             elif op.op == "rms_norm":
                 compiled = self._compile_rms_norm(graph, op, index)
+            elif op.op == "attention":
+                _validate_attention_op(graph, op)
+            elif op.op in LAYOUT_OPS:
+                _validate_layout_op(graph, op)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
-                compiled = self._compile_matmul(graph, op, index)
+                left_position = 1 if op.op == "addmm" else 0
+                right_position = 2 if op.op == "addmm" else 1
+                left_type = graph.value(op.inputs[left_position]).type
+                right_type = graph.value(op.inputs[right_position]).type
+                if len(left_type.shape) == 2 and len(right_type.shape) == 2:
+                    compiled = self._compile_matmul(graph, op, index)
 
             if compiled is not None:
                 artifact, runtime = compiled
@@ -788,6 +803,165 @@ class AppleMetalBackend:
         return artifact, runtime
 
 
+def _validate_layout_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input")
+
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    if input_type.dtype != output_type.dtype:
+        raise ValueError(f"{op.op} must preserve dtype")
+
+    rank = len(input_type.shape)
+    if op.op == "reshape":
+        shape = op.attrs.get("shape")
+        if not isinstance(shape, tuple) or not shape or not all(
+            isinstance(dim, int) and not isinstance(dim, bool)
+            for dim in shape
+        ):
+            raise ValueError("reshape.shape must be a non-empty tuple of integers")
+        if any(dim == 0 or dim < -1 for dim in shape):
+            raise ValueError(f"reshape.shape contains an invalid dimension: {shape}")
+        if shape.count(-1) > 1:
+            raise ValueError(f"reshape.shape has multiple inferred dimensions: {shape}")
+
+        input_count = prod(input_type.shape) or 1
+        known_count = prod(dim for dim in shape if dim != -1) or 1
+        if -1 in shape:
+            if input_count % known_count:
+                raise ValueError(
+                    f"reshape shape {shape} cannot infer a dimension for "
+                    f"{input_count} elements"
+                )
+            inferred = input_count // known_count
+            resolved_shape = tuple(inferred if dim == -1 else dim for dim in shape)
+        else:
+            resolved_shape = shape
+        if resolved_shape != output_type.shape:
+            raise ValueError(
+                f"reshape output shape {output_type.shape} != {resolved_shape}"
+            )
+        return
+
+    if op.op == "transpose":
+        dim0 = op.attrs.get("dim0")
+        dim1 = op.attrs.get("dim1")
+        if not all(
+            isinstance(dim, int) and not isinstance(dim, bool)
+            for dim in (dim0, dim1)
+        ):
+            raise ValueError("transpose dimensions must be integers")
+        normalized = tuple(
+            dim + rank if dim < 0 else dim for dim in (dim0, dim1)
+        )
+        if any(dim < 0 or dim >= rank for dim in normalized):
+            raise ValueError(f"transpose dimensions {(dim0, dim1)} exceed rank {rank}")
+        expected_shape = list(input_type.shape)
+        expected_shape[normalized[0]], expected_shape[normalized[1]] = (
+            expected_shape[normalized[1]],
+            expected_shape[normalized[0]],
+        )
+        if tuple(expected_shape) != output_type.shape:
+            raise ValueError(
+                f"transpose output shape {output_type.shape} != {tuple(expected_shape)}"
+            )
+        return
+
+    if op.op == "permute":
+        dims = op.attrs.get("dims")
+        if not isinstance(dims, tuple) or len(dims) != rank or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            raise ValueError(
+                f"permute.dims must contain {rank} integer dimensions"
+            )
+        normalized = tuple(dim + rank if dim < 0 else dim for dim in dims)
+        if sorted(normalized) != list(range(rank)):
+            raise ValueError(f"permute dimensions {dims} are not a permutation of rank {rank}")
+        expected_shape = tuple(input_type.shape[dim] for dim in normalized)
+        if expected_shape != output_type.shape:
+            raise ValueError(
+                f"permute output shape {output_type.shape} != {expected_shape}"
+            )
+        return
+
+    if op.op == "expand":
+        shape = op.attrs.get("shape")
+        if not isinstance(shape, tuple) or len(shape) != len(output_type.shape):
+            raise ValueError(
+                f"expand.shape must have rank {len(output_type.shape)}, got {shape!r}"
+            )
+        if not all(
+            isinstance(dim, int) and not isinstance(dim, bool) and (dim == -1 or dim > 0)
+            for dim in shape
+        ):
+            raise ValueError(f"expand.shape contains invalid dimensions: {shape}")
+        if not _can_broadcast(input_type.shape, output_type.shape):
+            raise ValueError(
+                f"cannot expand shape {input_type.shape} to {output_type.shape}"
+            )
+        resolved_shape = tuple(
+            output_type.shape[axis] if dim == -1 else dim
+            for axis, dim in enumerate(shape)
+        )
+        if resolved_shape != output_type.shape:
+            raise ValueError(
+                f"expand output shape {resolved_shape} != {output_type.shape}"
+            )
+        return
+
+    if op.op == "slice":
+        dim = op.attrs.get("dim")
+        start = op.attrs.get("start")
+        end = op.attrs.get("end")
+        step = op.attrs.get("step")
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"slice.dim must be an integer, got {dim!r}")
+        if start is not None and (
+            not isinstance(start, int) or isinstance(start, bool)
+        ):
+            raise ValueError(f"slice.start must be an integer or None, got {start!r}")
+        if end is not None and (
+            not isinstance(end, int) or isinstance(end, bool)
+        ):
+            raise ValueError(f"slice.end must be an integer or None, got {end!r}")
+        if not isinstance(step, int) or isinstance(step, bool) or step <= 0:
+            raise ValueError(f"slice.step must be a positive integer, got {step!r}")
+        if dim < -rank or dim >= rank:
+            raise ValueError(f"slice.dim {dim} exceeds rank {rank}")
+        axis = dim + rank if dim < 0 else dim
+        sliced_length = len(
+            range(*slice(start, end, step).indices(input_type.shape[axis]))
+        )
+        expected_shape = list(input_type.shape)
+        expected_shape[axis] = sliced_length
+        if tuple(expected_shape) != output_type.shape:
+            raise ValueError(
+                f"slice output shape {output_type.shape} != {tuple(expected_shape)}"
+            )
+        return
+
+    if op.op == "unsqueeze":
+        dim = op.attrs.get("dim")
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"unsqueeze.dim must be an integer, got {dim!r}")
+        output_rank = rank + 1
+        axis = dim + output_rank if dim < 0 else dim
+        if axis < 0 or axis >= output_rank:
+            raise ValueError(f"unsqueeze.dim {dim} exceeds output rank {output_rank}")
+        expected_shape = input_type.shape[:axis] + (1,) + input_type.shape[axis:]
+        if expected_shape != output_type.shape:
+            raise ValueError(
+                f"unsqueeze output shape {output_type.shape} != {expected_shape}"
+            )
+        return
+
+    if input_type.shape != output_type.shape:
+        raise ValueError(
+            f"{op.op} output shape {output_type.shape} != {input_type.shape}"
+        )
+
+
 def _can_broadcast(input_shape: tuple[int, ...], output_shape: tuple[int, ...]) -> bool:
     if len(input_shape) > len(output_shape):
         return False
@@ -1086,6 +1260,53 @@ def _emit_register_matmul_source(
     return "\n".join(f"        {line}" for line in lines)
 
 
+def _evaluate_layout_mlx(
+    graph: Graph, op: Operation, value: mx.array
+) -> mx.array:
+    if op.op == "reshape":
+        return mx.reshape(value, graph.value(op.outputs[0]).type.shape)
+
+    rank = len(value.shape)
+    if op.op == "transpose":
+        dim0 = int(op.attrs["dim0"])
+        dim1 = int(op.attrs["dim1"])
+        dim0 = dim0 + rank if dim0 < 0 else dim0
+        dim1 = dim1 + rank if dim1 < 0 else dim1
+        return mx.swapaxes(value, dim0, dim1)
+
+    if op.op == "permute":
+        dims = tuple(int(dim) for dim in op.attrs["dims"])
+        normalized = tuple(dim + rank if dim < 0 else dim for dim in dims)
+        return mx.transpose(value, normalized)
+
+    if op.op == "expand":
+        return mx.broadcast_to(value, graph.value(op.outputs[0]).type.shape)
+
+    if op.op == "slice":
+        index: list[slice] = [slice(None)] * rank
+        axis = int(op.attrs["dim"]) % rank
+        index[axis] = slice(
+            int(op.attrs["start"]) if op.attrs.get("start") is not None else None,
+            int(op.attrs["end"]) if op.attrs.get("end") is not None else None,
+            int(op.attrs["step"]),
+        )
+        return value[tuple(index)]
+
+    if op.op == "unsqueeze":
+        output_rank = rank + 1
+        dim = int(op.attrs["dim"])
+        axis = dim + output_rank if dim < 0 else dim
+        return mx.expand_dims(value, axis=axis)
+
+    if op.op == "contiguous":
+        return mx.contiguous(value)
+
+    if op.op == "alias":
+        return value
+
+    raise NotImplementedError(f"no Apple runtime lowering for {op.op}")
+
+
 def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:
     arguments = [env[value_id] for value_id in op.inputs]
     if op.op == "silu":
@@ -1143,3 +1364,102 @@ def _binary_mx_operands(
     if op.attrs.get("scalar_position") == "lhs":
         return scalar, arguments[0]
     return arguments[0], scalar
+
+
+def _validate_attention_op(graph: Graph, op: Operation) -> None:
+    expected_inputs = 4 if op.attrs.get("has_mask") else 3
+    if len(op.inputs) != expected_inputs:
+        raise ValueError(
+            f"attention expects {expected_inputs} inputs, got {len(op.inputs)}"
+        )
+
+    query_type = graph.value(op.inputs[0]).type
+    key_type = graph.value(op.inputs[1]).type
+    value_type = graph.value(op.inputs[2]).type
+    output_type = graph.value(op.outputs[0]).type
+    query_shape = query_type.shape
+    key_shape = key_type.shape
+    value_shape = value_type.shape
+    if len(query_shape) not in {3, 4}:
+        raise NotImplementedError(
+            f"attention requires rank-3 or rank-4 inputs, got {query_shape}"
+        )
+    if len(key_shape) != len(query_shape) or len(value_shape) != len(query_shape):
+        raise ValueError("attention Q/K/V ranks must match")
+    if query_shape[:1] != key_shape[:1]:
+        raise ValueError("attention Q/K batch dimensions must match")
+    if key_shape[:1] != value_shape[:1]:
+        raise ValueError("attention K/V batch dimensions must match")
+    if query_shape[-1] != key_shape[-1]:
+        raise ValueError("attention Q/K head dimensions must match")
+    if key_shape[-2] != value_shape[-2]:
+        raise ValueError("attention K/V sequence dimensions must match")
+    if len(query_shape) == 4:
+        query_heads, key_value_heads = query_shape[-3], key_shape[-3]
+        if query_heads < key_value_heads or query_heads % key_value_heads != 0:
+            raise ValueError(
+                "attention query heads must be a multiple of key/value heads, "
+                f"got {query_heads} and {key_value_heads}"
+            )
+    expected_output_shape = query_shape[:-1] + (value_shape[-1],)
+    if output_type.shape != expected_output_shape:
+        raise ValueError(
+            f"attention output shape {output_type.shape} != {expected_output_shape}"
+        )
+    if not (query_type.dtype == key_type.dtype == value_type.dtype == output_type.dtype):
+        raise NotImplementedError(
+            "attention requires identical Q/K/V/output dtypes"
+        )
+
+    scale = op.attrs.get("scale")
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool):
+        raise ValueError(f"attention.scale must be a scalar number, got {scale!r}")
+    causal = op.attrs.get("causal", False)
+    if not isinstance(causal, bool):
+        raise ValueError(f"attention.causal must be a boolean, got {causal!r}")
+    if causal and expected_inputs == 4:
+        raise ValueError("attention cannot combine an explicit mask with causal mode")
+
+    if expected_inputs == 4:
+        mask_type = graph.value(op.inputs[3]).type
+        score_shape = (
+            query_shape[:1]
+            + (1, query_shape[-2], key_shape[-2])
+            if len(query_shape) == 3
+            else query_shape[:1]
+            + (query_shape[-3], query_shape[-2], key_shape[-2])
+        )
+        if mask_type.dtype != query_type.dtype:
+            raise NotImplementedError("attention mask dtype must match Q/K/V")
+        if not _can_broadcast(mask_type.shape, score_shape):
+            raise ValueError(
+                f"attention mask shape {mask_type.shape} cannot broadcast "
+                f"to {score_shape}"
+            )
+
+
+def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:
+    query, key, value = (env[value_id] for value_id in op.inputs[:3])
+    mask = env[op.inputs[3]] if len(op.inputs) == 4 else None
+    if op.attrs.get("causal"):
+        mask = "causal"
+    scale = float(op.attrs["scale"])
+
+    if query.ndim == 4:
+        return mx.fast.scaled_dot_product_attention(
+            query, key, value, scale=scale, mask=mask
+        )
+    if query.ndim != 3:
+        raise NotImplementedError(
+            f"attention requires rank-3 or rank-4 inputs, got {query.shape}"
+        )
+
+    query = mx.expand_dims(query, axis=1)
+    key = mx.expand_dims(key, axis=1)
+    value = mx.expand_dims(value, axis=1)
+    if mask is not None and mask.ndim == 3:
+        mask = mx.expand_dims(mask, axis=1)
+    output = mx.fast.scaled_dot_product_attention(
+        query, key, value, scale=scale, mask=mask
+    )
+    return mx.squeeze(output, axis=1)

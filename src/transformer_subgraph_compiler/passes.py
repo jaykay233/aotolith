@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import prod
+
 from .ir import Graph, Operation
 
 POINTWISE_OPS = {
@@ -21,6 +23,94 @@ POINTWISE_OPS = {
     "rsqrt",
     "reciprocal",
 }
+
+LAYOUT_OPS = {
+    "reshape",
+    "transpose",
+    "permute",
+    "expand",
+    "slice",
+    "unsqueeze",
+    "contiguous",
+    "alias",
+}
+
+
+def simplify_layouts(graph: Graph) -> Graph:
+    """Remove identity views and fold adjacent inverse layout operations."""
+
+    graph.validate()
+    graph = _remove_identity_layouts(graph)
+    while True:
+        graph, changed = _fold_inverse_layouts(graph)
+        if not changed:
+            return graph
+
+
+def canonicalize_batched_matmul(graph: Graph) -> Graph:
+    """Recover rank-N matmul from PyTorch's fold-bmm-unfold decomposition."""
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    replaced: set[int] = set()
+    replacement_at: dict[int, Operation] = {}
+
+    for index, op in enumerate(graph.ops):
+        if index in replaced or op.op != "matmul":
+            continue
+        canonical = _match_folded_batched_matmul(
+            graph, index, producers, consumers, replaced
+        )
+        if canonical is None:
+            continue
+        left, right, output_id = canonical
+        replacement_at[index] = Operation(
+            "matmul", (left, right), (output_id,), op.attrs
+        )
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = replacement_at.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in replaced:
+            rewritten.append(op)
+
+    result = _replace_graph(graph, tuple(rewritten), graph.outputs)
+    return simplify_layouts(result)
+
+
+def fuse_attention(graph: Graph) -> Graph:
+    """Fold QK^T, scale/mask, softmax and PV into one attention operation."""
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    matched: set[int] = set()
+    replacement_at: dict[int, Operation] = {}
+
+    for pv_index, pv in enumerate(graph.ops):
+        if pv_index in matched or pv.op != "matmul":
+            continue
+        match = _match_attention(graph, pv_index, producers, consumers, matched)
+        if match is None:
+            continue
+        replacement_index, internal, attention = match
+        matched.update(internal)
+        replacement_at[replacement_index] = attention
+
+    if not replacement_at:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = replacement_at.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in matched:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
 
 
 def fuse_pointwise(graph: Graph) -> Graph:
@@ -48,9 +138,9 @@ def fuse_pointwise(graph: Graph) -> Graph:
             roots.append(index)
     roots.sort()
 
-    region_for_op: dict[int, tuple[int, Operation]] = {}
+    fused_at: dict[int, Operation] = {}
+    removed_members: set[int] = set()
     assigned: set[int] = set()
-    next_region = 0
 
     for root in roots:
         if root in assigned:
@@ -91,26 +181,638 @@ def fuse_pointwise(graph: Graph) -> Graph:
             (output_id,),
             {"body": body},
         )
-        start = ordered[0]
-        region_for_op.update({index: (next_region, fused) for index in members})
-        next_region += 1
+        fused_at[root] = fused
+        removed_members.update(members)
         assigned.update(members)
-        region_for_op[start] = (next_region - 1, fused)
 
-    if not region_for_op:
+    if not fused_at:
         return graph
 
     rewritten: list[Operation] = []
-    emitted_regions: set[int] = set()
     for index, op in enumerate(graph.ops):
-        region = region_for_op.get(index)
-        if region is None:
-            rewritten.append(op)
-            continue
-        region_id, fused = region
-        if region_id not in emitted_regions:
+        fused = fused_at.get(index)
+        if fused is not None:
             rewritten.append(fused)
-            emitted_regions.add(region_id)
+        elif index not in removed_members:
+            rewritten.append(op)
 
-    fused_graph = graph.replace_ops(tuple(rewritten))
-    return fused_graph
+    return graph.replace_ops(tuple(rewritten))
+
+
+def _remove_identity_layouts(graph: Graph) -> Graph:
+    aliases: dict[str, str] = {}
+    rewritten: list[Operation] = []
+
+    def resolve(value_id: str) -> str:
+        while value_id in aliases:
+            value_id = aliases[value_id]
+        return value_id
+
+    for op in graph.ops:
+        inputs = tuple(resolve(value_id) for value_id in op.inputs)
+        current = (
+            op
+            if inputs == op.inputs
+            else Operation(op.op, inputs, op.outputs, op.attrs)
+        )
+        if current.op in LAYOUT_OPS and _is_identity_layout(graph, current):
+            aliases[current.outputs[0]] = current.inputs[0]
+            continue
+        rewritten.append(current)
+
+    outputs = tuple(resolve(value_id) for value_id in graph.outputs)
+    return _replace_graph(graph, tuple(rewritten), outputs)
+
+
+def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    aliases: dict[str, str] = {}
+    removed: set[int] = set()
+    replacements: dict[int, Operation] = {}
+
+    for index, op in enumerate(graph.ops):
+        if op.op not in {"reshape", "transpose", "permute"}:
+            continue
+        producer_index = producers.get(op.inputs[0])
+        if producer_index is None:
+            continue
+        producer = graph.ops[producer_index]
+        if (
+            producer_index in removed
+            or producer_index in replacements
+            or len(consumers.get(op.inputs[0], [])) != 1
+        ):
+            continue
+        if op.inputs[0] in output_set:
+            continue
+        input_type = graph.value(op.inputs[0]).type
+        output_type = graph.value(op.outputs[0]).type
+        producer_input_type = graph.value(producer.inputs[0]).type
+        if input_type.dtype != output_type.dtype:
+            continue
+        if producer_input_type.dtype != graph.value(producer.outputs[0]).type.dtype:
+            continue
+
+        rank = len(input_type.shape)
+        if op.op == "transpose" and producer.op == "transpose":
+            outer_axes = _transpose_axes(op, rank)
+            inner_axes = _transpose_axes(producer, rank)
+            if outer_axes is not None and outer_axes == inner_axes:
+                aliases[op.outputs[0]] = producer.inputs[0]
+                removed.update({producer_index, index})
+                continue
+
+        if op.op == "permute" and producer.op == "permute":
+            outer = _normalized_dims(op, rank)
+            inner = _normalized_dims(producer, rank)
+            if outer is None or inner is None:
+                continue
+            composed = tuple(inner[axis] for axis in outer)
+            if composed == tuple(range(rank)):
+                aliases[op.outputs[0]] = producer.inputs[0]
+                removed.update({producer_index, index})
+            continue
+
+        if op.op == "reshape" and producer.op == "reshape":
+            replacements[index] = Operation(
+                "reshape", (producer.inputs[0],), op.outputs, op.attrs
+            )
+            removed.add(producer_index)
+
+    if not removed:
+        return graph, False
+
+    def resolve(value_id: str) -> str:
+        while value_id in aliases:
+            value_id = aliases[value_id]
+        return value_id
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = replacements.get(index)
+        if replacement is not None:
+            rewritten.append(
+                Operation(
+                    replacement.op,
+                    tuple(resolve(value_id) for value_id in replacement.inputs),
+                    replacement.outputs,
+                    replacement.attrs,
+                )
+            )
+            continue
+        if index in removed:
+            continue
+        rewritten.append(
+            Operation(
+                op.op,
+                tuple(resolve(value_id) for value_id in op.inputs),
+                op.outputs,
+                op.attrs,
+            )
+        )
+    outputs = tuple(resolve(value_id) for value_id in graph.outputs)
+    return _replace_graph(graph, tuple(rewritten), outputs), True
+
+
+def _is_identity_layout(graph: Graph, op: Operation) -> bool:
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    if input_type.dtype != output_type.dtype:
+        return False
+
+    if op.op in {"contiguous", "alias"}:
+        return input_type.shape == output_type.shape
+    if op.op in {"reshape", "expand"}:
+        return input_type.shape == output_type.shape
+    if op.op == "transpose":
+        axes = _transpose_axes(op, rank)
+        return axes is not None and axes[0] == axes[1]
+    if op.op == "permute":
+        dims = op.attrs.get("dims")
+        if not isinstance(dims, (tuple, list)) or len(dims) != rank:
+            return False
+        normalized = _normalized_dims(op, rank)
+        return normalized == tuple(range(rank))
+    if op.op == "slice":
+        dim = op.attrs.get("dim")
+        if not _valid_int(dim) or rank == 0 or int(dim) < -rank or int(dim) >= rank:
+            return False
+        axis = int(dim) + rank if int(dim) < 0 else int(dim)
+        start = op.attrs.get("start")
+        end = op.attrs.get("end")
+        step = op.attrs.get("step")
+        if start is not None and not _valid_int(start):
+            return False
+        if end is not None and not _valid_int(end):
+            return False
+        if not _valid_int(step) or int(step) <= 0:
+            return False
+        return slice(start, end, step).indices(input_type.shape[axis]) == (
+            0,
+            input_type.shape[axis],
+            1,
+        )
+    return False
+
+
+def _match_folded_batched_matmul(
+    graph: Graph,
+    index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    replaced: set[int],
+) -> tuple[str, str, str] | None:
+    matmul = graph.ops[index]
+    if len(matmul.inputs) != 2:
+        return None
+    left_type = graph.value(matmul.inputs[0]).type
+    right_type = graph.value(matmul.inputs[1]).type
+    if len(left_type.shape) != 3 or len(right_type.shape) != 3:
+        return None
+
+    left_index = producers.get(matmul.inputs[0])
+    right_index = producers.get(matmul.inputs[1])
+    if left_index is None or right_index is None:
+        return None
+    left_reshape = graph.ops[left_index]
+    right_reshape = graph.ops[right_index]
+    if left_reshape.op != "reshape" or right_reshape.op != "reshape":
+        return None
+    if len(consumers.get(matmul.inputs[0], [])) != 1:
+        return None
+    if len(consumers.get(matmul.inputs[1], [])) != 1:
+        return None
+
+    left_base = graph.value(left_reshape.inputs[0]).type
+    right_base = graph.value(right_reshape.inputs[0]).type
+    if len(left_base.shape) < 3 or left_base.shape[:-2] != right_base.shape[:-2]:
+        return None
+    if left_type.shape != (
+        prod(left_base.shape[:-2]),
+        left_base.shape[-2],
+        left_base.shape[-1],
+    ):
+        return None
+    if right_type.shape != (
+        prod(right_base.shape[:-2]),
+        right_base.shape[-2],
+        right_base.shape[-1],
+    ):
+        return None
+
+    out_consumers = consumers.get(matmul.outputs[0], [])
+    if len(out_consumers) != 1:
+        return None
+    output_index = out_consumers[0]
+    output_reshape = graph.ops[output_index]
+    if output_reshape.op != "reshape" or output_reshape.inputs[0] != matmul.outputs[0]:
+        return None
+    expected_output = left_base.shape[:-2] + (left_base.shape[-2], right_base.shape[-1])
+    if graph.value(output_reshape.outputs[0]).type.shape != expected_output:
+        return None
+
+    replaced.update({left_index, right_index, index, output_index})
+    return left_reshape.inputs[0], right_reshape.inputs[0], output_reshape.outputs[0]
+
+
+def _match_attention(
+    graph: Graph,
+    pv_index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    matched: set[int],
+) -> tuple[int, set[int], Operation] | None:
+    pv = graph.ops[pv_index]
+    pv_match = _match_attention_product(
+        graph, pv_index, producers, consumers, matched
+    )
+    if pv_match is None:
+        return None
+    replacement_index, probability_id, value_id, internal = pv_match
+    probability_index = producers.get(probability_id)
+    if probability_index is None or probability_index in matched:
+        return None
+    probability = graph.ops[probability_index]
+    if probability.op != "softmax" or len(probability.inputs) != 1:
+        return None
+    probability_type = graph.value(probability.outputs[0]).type
+    rank = len(probability_type.shape)
+    dim = probability.attrs.get("dim")
+    if not _valid_int(dim) or int(dim) % rank != rank - 1:
+        return None
+
+    stage = probability.inputs[0]
+    scale = 1.0
+    mask: str | None = None
+    has_scale = False
+    has_mask = False
+    intermediate = set(internal)
+    intermediate.add(probability_index)
+
+    for _ in range(2):
+        index = producers.get(stage)
+        if index is None:
+            break
+        op = graph.ops[index]
+        parsed_scale = _parse_scale(op)
+        if parsed_scale is not None and not has_scale:
+            scale = parsed_scale
+            stage = op.inputs[0]
+            has_scale = True
+            intermediate.add(index)
+            continue
+        if op.op == "add" and not has_mask and float(op.attrs.get("alpha", 1.0)) == 1.0:
+            score_sides = [
+                value_id
+                for value_id in op.inputs
+                if _looks_like_score_value(graph, value_id, producers)
+            ]
+            if len(score_sides) == 1:
+                stage = score_sides[0]
+                mask = next(value_id for value_id in op.inputs if value_id != stage)
+                has_mask = True
+                intermediate.add(index)
+                continue
+        break
+
+    parsed_scale = _parse_scale(graph.ops[producers[stage]]) if stage in producers else None
+    if parsed_scale is not None and not has_scale:
+        scale_index = producers[stage]
+        scale = parsed_scale
+        stage = graph.ops[scale_index].inputs[0]
+        has_scale = True
+        intermediate.add(scale_index)
+
+    score_index = producers.get(stage)
+    if score_index is None or score_index in intermediate or score_index in matched:
+        return None
+    score = graph.ops[score_index]
+    if score.op != "matmul" or len(score.inputs) != 2:
+        return None
+    intermediate.add(score_index)
+
+    key_transform_index = producers.get(score.inputs[1])
+    if key_transform_index is None or key_transform_index in matched:
+        return None
+    key_transform = graph.ops[key_transform_index]
+    if not _is_last_two_transpose(key_transform, rank):
+        return None
+    intermediate.add(key_transform_index)
+
+    query_id = score.inputs[0]
+    key_id = key_transform.inputs[0]
+    key_group = _match_grouped_kv(graph, key_id, producers, matched)
+    value_group = _match_grouped_kv(graph, value_id, producers, matched)
+    if (key_group is None) != (value_group is None):
+        return None
+    if key_group is not None and value_group is not None:
+        key_id, key_internal = key_group
+        value_id, value_internal = value_group
+        intermediate.update(key_internal)
+        intermediate.update(value_internal)
+
+    replacement_output = graph.ops[replacement_index].outputs[0]
+    internal_values = {
+        graph.ops[index].outputs[0] for index in intermediate
+    } - {replacement_output}
+    if internal_values.intersection(graph.outputs):
+        return None
+    for internal_value_id in internal_values:
+        if len(consumers.get(internal_value_id, [])) != 1:
+            return None
+
+    query_type = graph.value(query_id).type
+    key_type = graph.value(key_id).type
+    value_type = graph.value(value_id).type
+    if not _valid_attention_shapes(query_type.shape, key_type.shape, value_type.shape):
+        return None
+    if not (query_type.dtype == key_type.dtype == value_type.dtype):
+        return None
+    if scale == 0.0:
+        return None
+    if mask is not None:
+        mask_type = graph.value(mask).type
+        if mask_type.dtype not in {query_type.dtype}:
+            return None
+        if not _can_broadcast_to(mask_type.shape, probability_type.shape):
+            return None
+
+    inputs = (query_id, key_id, value_id) + ((mask,) if mask is not None else ())
+    attention = Operation(
+        "attention",
+        inputs,
+        (graph.ops[replacement_index].outputs[0],),
+        {"scale": scale, "has_mask": mask is not None, "causal": False},
+    )
+    return replacement_index, intermediate, attention
+
+
+def _match_attention_product(
+    graph: Graph,
+    pv_index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    matched: set[int],
+) -> tuple[int, str, str, set[int]] | None:
+    """Recover ``softmax @ V`` when PyTorch flattened it into an ``mm``."""
+
+    pv = graph.ops[pv_index]
+    if len(pv.inputs) != 2:
+        return None
+    probability_id, value_id = pv.inputs
+    probability_type = graph.value(probability_id).type
+    value_type = graph.value(value_id).type
+    if len(probability_type.shape) == 4 and len(value_type.shape) == 4:
+        return pv_index, probability_id, value_id, set()
+    if len(probability_type.shape) != 3 or len(value_type.shape) != 3:
+        return None
+
+    probability_index = producers.get(probability_id)
+    value_index = producers.get(value_id)
+    if probability_index is None or value_index is None:
+        return pv_index, probability_id, value_id, set()
+    probability_reshape = graph.ops[probability_index]
+    value_reshape = graph.ops[value_index]
+    if probability_reshape.op != "reshape" or value_reshape.op != "reshape":
+        return pv_index, probability_id, value_id, set()
+    if len(consumers.get(probability_id, [])) != 1:
+        return None
+    if len(consumers.get(value_id, [])) != 1:
+        return None
+
+    output_consumers = consumers.get(pv.outputs[0], [])
+    if len(output_consumers) != 1:
+        return None
+    output_index = output_consumers[0]
+    output_reshape = graph.ops[output_index]
+    if output_reshape.op != "reshape" or output_reshape.inputs[0] != pv.outputs[0]:
+        return None
+
+    probability_base_id = probability_reshape.inputs[0]
+    value_base_id = value_reshape.inputs[0]
+    probability_base = graph.value(probability_base_id).type
+    value_base = graph.value(value_base_id).type
+    if len(probability_base.shape) != 4 or len(value_base.shape) not in {4, 5}:
+        return None
+    batch_heads = probability_base.shape[:2]
+    if probability_base.shape != (
+        batch_heads[0],
+        batch_heads[1],
+        probability_type.shape[-2],
+        value_type.shape[-2],
+    ):
+        return None
+    if value_base.shape[-2:] != value_type.shape[-2:]:
+        return None
+    if prod(value_base.shape[:-2]) != prod(batch_heads):
+        return None
+    if probability_type.shape != (
+        prod(batch_heads),
+        probability_base.shape[-2],
+        value_base.shape[-2],
+    ):
+        return None
+    if value_type.shape != (prod(batch_heads), value_base.shape[-2], value_base.shape[-1]):
+        return None
+
+    expected_output_shape = probability_base.shape[:-1] + (value_base.shape[-1],)
+    if graph.value(output_reshape.outputs[0]).type.shape != expected_output_shape:
+        return None
+
+    internal = {pv_index, probability_index, value_index, output_index}
+    if internal.intersection(matched):
+        return None
+    return output_index, probability_base_id, value_base_id, internal
+
+
+def _match_grouped_kv(
+    graph: Graph,
+    value_id: str,
+    producers: dict[str, int],
+    matched: set[int],
+) -> tuple[str, set[int]] | None:
+    """Strip PyTorch's unsqueeze-expand-reshape K/V head replication."""
+
+    value_type = graph.value(value_id).type
+    current_id = value_id
+    internal: set[int] = set()
+    if len(value_type.shape) == 4:
+        reshape_index = producers.get(current_id)
+        if reshape_index is None or reshape_index in matched:
+            return None
+        reshape = graph.ops[reshape_index]
+        if reshape.op != "reshape":
+            return None
+        current_id = reshape.inputs[0]
+        expanded_type = graph.value(current_id).type
+        if len(expanded_type.shape) != 5:
+            return None
+        if value_type.shape != (
+            expanded_type.shape[0],
+            expanded_type.shape[1] * expanded_type.shape[2],
+            expanded_type.shape[3],
+            expanded_type.shape[4],
+        ):
+            return None
+        internal.add(reshape_index)
+    elif len(value_type.shape) == 5:
+        pass
+    else:
+        return None
+
+    expand_index = producers.get(current_id)
+    if expand_index is None or expand_index in matched:
+        return None
+    expand = graph.ops[expand_index]
+    if expand.op != "expand":
+        return None
+    unsqueeze_id = expand.inputs[0]
+    unsqueeze_index = producers.get(unsqueeze_id)
+    if unsqueeze_index is None or unsqueeze_index in matched:
+        return None
+    unsqueeze = graph.ops[unsqueeze_index]
+    if unsqueeze.op != "unsqueeze":
+        return None
+    original_id = unsqueeze.inputs[0]
+    original_type = graph.value(original_id).type
+    unsqueezed_type = graph.value(unsqueeze_id).type
+    expanded_type = graph.value(expand.outputs[0]).type
+    if len(original_type.shape) != 4 or len(unsqueezed_type.shape) != 5:
+        return None
+    if unsqueezed_type.shape != original_type.shape[:2] + (1,) + original_type.shape[2:]:
+        return None
+    if expanded_type.shape != original_type.shape[:2] + (
+        expanded_type.shape[2],
+    ) + original_type.shape[2:]:
+        return None
+    if expanded_type.shape[2] < 2:
+        return None
+    internal.update({expand_index, unsqueeze_index})
+    return original_id, internal
+
+
+def _parse_scale(op: Operation) -> float | None:
+    scalar = op.attrs.get("scalar")
+    if op.op == "mul" and _valid_number(scalar):
+        return float(scalar)
+    if op.op == "div" and _valid_number(scalar):
+        position = op.attrs.get("scalar_position")
+        if position == "rhs" and float(scalar) != 0.0:
+            return 1.0 / float(scalar)
+    return None
+
+
+def _looks_like_score_value(
+    graph: Graph, value_id: str, producers: dict[str, int]
+) -> bool:
+    index = producers.get(value_id)
+    if index is None:
+        return False
+    op = graph.ops[index]
+    if op.op == "matmul":
+        return True
+    if _parse_scale(op) is None:
+        return False
+    producer_index = producers.get(op.inputs[0])
+    return (
+        producer_index is not None
+        and graph.ops[producer_index].op == "matmul"
+    )
+
+
+def _valid_attention_shapes(
+    query: tuple[int, ...], key: tuple[int, ...], value: tuple[int, ...]
+) -> bool:
+    if len(query) not in {3, 4} or len(key) != len(query) or len(value) != len(query):
+        return False
+    if query[:1] != key[:1]:
+        return False
+    if key[:1] != value[:1]:
+        return False
+    if query[-1] != key[-1] or key[-2] != value[-2]:
+        return False
+    if len(query) == 3:
+        return True
+    query_heads, key_value_heads = query[-3], key[-3]
+    return query_heads >= key_value_heads and query_heads % key_value_heads == 0
+
+
+def _is_last_two_transpose(op: Operation, rank: int) -> bool:
+    if op.op == "transpose":
+        dim0, dim1 = op.attrs.get("dim0"), op.attrs.get("dim1")
+        if not _valid_ints((dim0, dim1)):
+            return False
+        return {int(dim0) % rank, int(dim1) % rank} == {rank - 2, rank - 1}
+    if op.op == "permute":
+        dims = op.attrs.get("dims")
+        if not isinstance(dims, (tuple, list)) or len(dims) != rank:
+            return False
+        expected = list(range(rank))
+        expected[-2], expected[-1] = expected[-1], expected[-2]
+        normalized = _normalized_dims(op, rank)
+        return normalized == tuple(expected)
+    return False
+
+
+def _can_broadcast_to(shape: tuple[int, ...], output: tuple[int, ...]) -> bool:
+    if len(shape) > len(output):
+        return False
+    offset = len(output) - len(shape)
+    return all(dim in {1, output[offset + index]} for index, dim in enumerate(shape))
+
+
+def _producers(graph: Graph) -> dict[str, int]:
+    return {value_id: index for index, op in enumerate(graph.ops) for value_id in op.outputs}
+
+
+def _consumers(graph: Graph) -> dict[str, list[int]]:
+    consumers: dict[str, list[int]] = {}
+    for index, op in enumerate(graph.ops):
+        for value_id in op.inputs:
+            consumers.setdefault(value_id, []).append(index)
+    return consumers
+
+
+def _transpose_axes(op: Operation, rank: int) -> tuple[int, int] | None:
+    dim0, dim1 = op.attrs.get("dim0"), op.attrs.get("dim1")
+    if not _valid_ints((dim0, dim1)):
+        return None
+    normalized = tuple(int(dim) + rank if int(dim) < 0 else int(dim) for dim in (dim0, dim1))
+    if any(dim < 0 or dim >= rank for dim in normalized):
+        return None
+    return normalized
+
+
+def _normalized_dims(op: Operation, rank: int) -> tuple[int, ...] | None:
+    dims = op.attrs.get("dims")
+    if not isinstance(dims, (tuple, list)) or not all(_valid_int(dim) for dim in dims):
+        return None
+    normalized = tuple(
+        int(dim) + rank if int(dim) < 0 else int(dim) for dim in dims
+    )
+    if any(dim < 0 or dim >= rank for dim in normalized):
+        return None
+    return normalized
+
+
+def _valid_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_ints(values: tuple[object, ...]) -> bool:
+    return all(_valid_int(value) for value in values)
+
+
+def _valid_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _replace_graph(
+    graph: Graph, ops: tuple[Operation, ...], outputs: tuple[str, ...]
+) -> Graph:
+    result = Graph(graph.inputs, graph.values, ops, outputs)
+    result.validate()
+    return result

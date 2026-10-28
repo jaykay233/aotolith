@@ -82,6 +82,449 @@ def test_mlp_end_to_end_on_metal() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_pointwise_region_scheduled_after_interleaved_producer() -> None:
+    def fn(x, gate_weight, up_weight):
+        gate = torch.nn.functional.silu(x @ gate_weight)
+        up = x @ up_weight
+        return gate * up
+
+    torch.manual_seed(41)
+    inputs = (torch.randn(3, 8), torch.randn(8, 16), torch.randn(8, 16))
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "matmul",
+        "matmul",
+        "fused_elementwise",
+    ]
+
+    mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
+    actual = result.plan(*mlx_inputs)[0]
+    gate = mlx_inputs[0] @ mlx_inputs[1]
+    gate = gate / (1.0 + mx.exp(-gate))
+    expected = gate * (mlx_inputs[0] @ mlx_inputs[2])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_layout_ops_match_pytorch() -> None:
+    def fn(x):
+        grouped = x.reshape(2, 3, 4, 5).transpose(1, 2).permute(0, 2, 1, 3)
+        return (
+            grouped.reshape(2, -1, 5),
+            torch.ops.aten.alias.default(grouped).clone(),
+            grouped[:, :, :, :1].expand(2, 3, 4, 5),
+            grouped.unsqueeze(0).expand(2, 2, 3, 4, 5),
+        )
+
+    x = torch.randn(24, 5)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.input_graph.ops] == [
+        "reshape",
+        "transpose",
+        "permute",
+        "reshape",
+        "alias",
+        "contiguous",
+        "slice",
+        "expand",
+        "unsqueeze",
+        "expand",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))
+    expected = fn(x)
+    expected_arrays = tuple(mx.array(value.numpy()) for value in expected)
+    mx.eval(*actual, *expected_arrays)
+    for actual_value, expected_value in zip(actual, expected_arrays, strict=True):
+        assert mx.allclose(actual_value, expected_value)
+
+
+def test_identity_and_inverse_layouts_are_eliminated() -> None:
+    def fn(x):
+        return (
+            x.reshape(2, 3)
+            .transpose(0, 1)
+            .transpose(0, 1)
+            .reshape(3, 2)
+            .clone()
+        )
+
+    x = torch.randn(2, 3)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["reshape"]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_out_of_range_slice_is_not_removed_as_identity() -> None:
+    tensor_type = TensorType((4,), DType.F32)
+    values = {
+        "x": Value("x", tensor_type),
+        "out": Value("out", tensor_type),
+    }
+    graph = Graph(
+        ("x",),
+        values,
+        (
+            Operation(
+                "slice",
+                ("x",),
+                ("out",),
+                {"dim": 1, "start": None, "end": None, "step": 1},
+            ),
+        ),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="slice.dim 1 exceeds rank 1"):
+        compile_graph(graph)
+
+
+def test_folded_batched_matmul_is_restored_to_rank_four() -> None:
+    def fn(query, key):
+        return torch.matmul(query, key.transpose(-2, -1))
+
+    query = torch.randn(2, 4, 6, 8)
+    key = torch.randn(2, 4, 3, 8)
+    result = compile_callable(fn, (query, key))
+    assert [op.op for op in result.lowered_graph.ops] == ["transpose", "matmul"]
+
+    inputs = (mx.array(query.numpy()), mx.array(key.numpy()))
+    actual = result.plan(*inputs)[0]
+    expected = mx.matmul(inputs[0], mx.swapaxes(inputs[1], -1, -2))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_direct_scaled_dot_product_attention_with_mask() -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask
+        )
+
+    torch.manual_seed(47)
+    inputs = (
+        torch.randn(2, 3, 4, 8),
+        torch.randn(2, 3, 5, 8),
+        torch.randn(2, 3, 5, 8),
+        torch.randn(2, 1, 4, 5) * 0.2,
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.input_graph.ops] == ["attention"]
+    attention = result.input_graph.ops[0]
+    assert attention.attrs == {
+        "scale": pytest.approx(8**-0.5),
+        "has_mask": True,
+        "causal": False,
+    }
+    assert result.plan.kernels == ()
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_direct_scaled_dot_product_attention_causal() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=True
+        )
+
+    torch.manual_seed(53)
+    inputs = tuple(torch.randn(2, 3, 6, 8) for _ in range(3))
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.input_graph.ops] == ["attention"]
+    attention = result.input_graph.ops[0]
+    assert attention.attrs["scale"] == pytest.approx(8**-0.5)
+    assert attention.attrs["has_mask"] is False
+    assert attention.attrs["causal"] is True
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_direct_scaled_dot_product_attention_explicit_scale() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, scale=0.25
+        )
+
+    torch.manual_seed(59)
+    inputs = tuple(torch.randn(2, 3, 4, 8) for _ in range(3))
+    result = compile_callable(fn, inputs)
+    assert result.input_graph.ops[0].attrs["scale"] == 0.25
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_direct_scaled_dot_product_attention_grouped_query() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, enable_gqa=True
+        )
+
+    torch.manual_seed(61)
+    inputs = (
+        torch.randn(2, 8, 5, 16),
+        torch.randn(2, 2, 5, 16),
+        torch.randn(2, 2, 5, 16),
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["attention"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("key_value_heads", [1, 2])
+def test_decomposed_grouped_query_attention_is_fused(key_value_heads) -> None:
+    def fn(query, key, value):
+        batch, query_heads, sequence, head_dim = query.shape
+        groups = query_heads // key_value_heads
+        key = key[:, :, None].expand(
+            batch, key_value_heads, groups, sequence, head_dim
+        ).reshape(batch, query_heads, sequence, head_dim)
+        value = value[:, :, None].expand(
+            batch, key_value_heads, groups, sequence, head_dim
+        ).reshape(batch, query_heads, sequence, head_dim)
+        scores = torch.matmul(query, key.transpose(-2, -1)) * (head_dim**-0.5)
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.matmul(probabilities, value)
+
+    torch.manual_seed(67)
+    inputs = (
+        torch.randn(2, 8, 5, 16),
+        torch.randn(2, key_value_heads, 5, 16),
+        torch.randn(2, key_value_heads, 5, 16),
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["attention"]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_attention_rejects_non_divisible_grouped_query_heads() -> None:
+    dtype = DType.F32
+    values = {
+        "q": Value("q", TensorType((2, 6, 4, 8), dtype)),
+        "k": Value("k", TensorType((2, 4, 4, 8), dtype)),
+        "v": Value("v", TensorType((2, 4, 4, 8), dtype)),
+        "out": Value("out", TensorType((2, 6, 4, 8), dtype)),
+    }
+    graph = Graph(
+        ("q", "k", "v"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("q", "k", "v"),
+                ("out",),
+                {"scale": 8**-0.5, "has_mask": False, "causal": False},
+            ),
+        ),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="multiple of key/value heads"):
+        compile_graph(graph)
+
+
+def test_direct_scaled_dot_product_attention_rejects_dropout() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.1
+        )
+
+    inputs = tuple(torch.randn(2, 3, 4, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError, match="dropout"):
+        compile_callable(fn, inputs)
+
+
+def test_attention_is_not_fused_when_probabilities_are_observed() -> None:
+    def fn(query, key, value, mask):
+        scores = torch.matmul(query, key.transpose(-2, -1)) * 0.1 + mask
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.matmul(probabilities, value), probabilities
+
+    inputs = (
+        *(torch.randn(2, 4, 6, 8) for _ in range(3)),
+        torch.zeros(2, 1, 6, 6),
+    )
+    result = compile_callable(fn, inputs)
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert "attention" not in lowered_ops
+    assert "softmax" in lowered_ops
+    assert len(result.plan(*(mx.array(value.numpy()) for value in inputs))) == 2
+
+
+def test_multi_head_attention_end_to_end_on_metal() -> None:
+    def attention(query, key, value):
+        batch, sequence, heads, head_dim = query.shape
+        query = query.transpose(1, 2).reshape(batch * heads, sequence, head_dim)
+        key = key.transpose(1, 2).reshape(batch * heads, sequence, head_dim)
+        value = value.transpose(1, 2).reshape(batch * heads, sequence, head_dim)
+        scores = torch.matmul(query, key.transpose(1, 2)) / (head_dim**0.5)
+        probabilities = torch.softmax(scores, dim=-1)
+        output = torch.matmul(probabilities, value)
+        return output.reshape(batch, heads, sequence, head_dim).transpose(1, 2)
+
+    torch.manual_seed(37)
+    inputs = tuple(torch.randn(2, 4, 3, 8) for _ in range(3))
+    result = compile_callable(attention, inputs, codegen_matmul=True)
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert "bmm" not in {op.op for op in result.input_graph.ops}
+    assert "softmax" in {op.op for op in result.input_graph.ops}
+    assert lowered_ops.count("attention") == 1
+    assert "softmax" not in lowered_ops
+
+    mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
+    actual = result.plan(*mlx_inputs)[0]
+    query, key, value = mlx_inputs
+    batch, sequence, heads, head_dim = query.shape
+    query = mx.reshape(mx.transpose(query, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
+    key = mx.reshape(mx.transpose(key, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
+    value = mx.reshape(mx.transpose(value, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
+    scores = mx.matmul(query, mx.swapaxes(key, 1, 2)) / (head_dim**0.5)
+    probabilities = mx.softmax(scores, axis=-1)
+    expected = mx.matmul(probabilities, value)
+    expected = mx.transpose(
+        mx.reshape(expected, (batch, heads, sequence, head_dim)), (0, 2, 1, 3)
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_transformer_decoder_block_compiles_and_runs() -> None:
+    def decoder_block(
+        x,
+        norm_weight,
+        query_weight,
+        key_weight,
+        value_weight,
+        output_weight,
+        gate_weight,
+        up_weight,
+        down_weight,
+        causal_mask,
+    ):
+        batch, sequence, hidden = x.shape
+        heads, head_dim = 4, hidden // 4
+        normalized = torch.nn.functional.rms_norm(
+            x, (hidden,), norm_weight, eps=1e-6
+        )
+        query = (normalized @ query_weight).reshape(
+            batch, sequence, heads, head_dim
+        ).transpose(1, 2)
+        key = (normalized @ key_weight).reshape(
+            batch, sequence, heads, head_dim
+        ).transpose(1, 2)
+        value = (normalized @ value_weight).reshape(
+            batch, sequence, heads, head_dim
+        ).transpose(1, 2)
+        scores = torch.matmul(query, key.transpose(-2, -1)) * (
+            head_dim**-0.5
+        ) + causal_mask
+        probabilities = torch.softmax(scores, dim=-1)
+        attention = torch.matmul(probabilities, value)
+        attention = attention.transpose(1, 2).reshape(batch, sequence, hidden)
+        x = x + attention @ output_weight
+
+        normalized = torch.nn.functional.rms_norm(
+            x, (hidden,), norm_weight, eps=1e-6
+        )
+        mlp = torch.nn.functional.silu(normalized @ gate_weight) * (
+            normalized @ up_weight
+        )
+        x = x + mlp @ down_weight
+        return torch.nn.functional.rms_norm(
+            x, (hidden,), norm_weight, eps=1e-6
+        )
+
+    torch.manual_seed(43)
+    batch, sequence, hidden, heads = 2, 6, 16, 4
+    head_dim = hidden // heads
+    inputs = (
+        torch.randn(batch, sequence, hidden),
+        torch.randn(hidden),
+        *(torch.randn(hidden, hidden) for _ in range(4)),
+        torch.randn(hidden, 32),
+        torch.randn(hidden, 32),
+        torch.randn(32, hidden),
+        torch.zeros(batch, 1, sequence, sequence),
+    )
+    result = compile_callable(decoder_block, inputs)
+    op_names = [op.op for op in result.input_graph.ops]
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert op_names.count("rms_norm") == 3
+    assert lowered_ops.count("attention") == 1
+    assert "softmax" not in lowered_ops
+    assert {"matmul", "rms_norm", "fused_elementwise"} <= set(lowered_ops)
+
+    mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
+    actual = result.plan(*mlx_inputs)[0]
+    (
+        x,
+        norm_weight,
+        query_weight,
+        key_weight,
+        value_weight,
+        output_weight,
+        gate_weight,
+        up_weight,
+        down_weight,
+        causal_mask,
+    ) = mlx_inputs
+
+    def normalized(value):
+        return value * mx.rsqrt(
+            mx.mean(value * value, axis=-1, keepdims=True) + 1e-6
+        ) * norm_weight
+
+    hidden_state = normalized(x)
+    query = mx.transpose(
+        mx.reshape(hidden_state @ query_weight, (batch, sequence, heads, head_dim)),
+        (0, 2, 1, 3),
+    )
+    key = mx.transpose(
+        mx.reshape(hidden_state @ key_weight, (batch, sequence, heads, head_dim)),
+        (0, 2, 1, 3),
+    )
+    value = mx.transpose(
+        mx.reshape(hidden_state @ value_weight, (batch, sequence, heads, head_dim)),
+        (0, 2, 1, 3),
+    )
+    probabilities = mx.softmax(
+        mx.matmul(query, mx.swapaxes(key, -1, -2)) * (head_dim**-0.5)
+        + causal_mask,
+        axis=-1,
+    )
+    attention = mx.reshape(
+        mx.transpose(mx.matmul(probabilities, value), (0, 2, 1, 3)),
+        (batch, sequence, hidden),
+    )
+    hidden_state = x + attention @ output_weight
+    normalized_state = normalized(hidden_state)
+    gate = normalized_state @ gate_weight
+    mlp = gate / (1.0 + mx.exp(-gate)) * (normalized_state @ up_weight)
+    expected = normalized(hidden_state + mlp @ down_weight)
+
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-4, rtol=2e-4)
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_fused_kernel_supports_float16_and_bfloat16(dtype) -> None:
     ir_dtype = DType.F16 if dtype == mx.float16 else DType.BF16

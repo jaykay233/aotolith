@@ -3,7 +3,12 @@
 from .compiler import CompilationResult, compile_callable, compile_graph
 from .frontend import capture_fx
 from .ir import DType, Graph, Operation, TensorType, Value
-from .passes import fuse_pointwise
+from .passes import (
+    canonicalize_batched_matmul,
+    fuse_attention,
+    fuse_pointwise,
+    simplify_layouts,
+)
 
 __all__ = [
     "CompilationResult",
@@ -15,5 +20,8 @@ __all__ = [
     "capture_fx",
     "compile_callable",
     "compile_graph",
+    "canonicalize_batched_matmul",
+    "fuse_attention",
     "fuse_pointwise",
+    "simplify_layouts",
 ]

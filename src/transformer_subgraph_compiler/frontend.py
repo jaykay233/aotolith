@@ -8,7 +8,18 @@ from .ir import DType, Graph, Operation, TensorType, Value
 
 _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
+    "aten.bmm.default": "matmul",
     "aten.addmm.default": "addmm",
+    "aten.view.default": "reshape",
+    "aten._unsafe_view.default": "reshape",
+    "aten.reshape.default": "reshape",
+    "aten.transpose.int": "transpose",
+    "aten.permute.default": "permute",
+    "aten.expand.default": "expand",
+    "aten.slice.Tensor": "slice",
+    "aten.unsqueeze.default": "unsqueeze",
+    "aten.clone.default": "contiguous",
+    "aten.alias.default": "alias",
     "aten._softmax.default": "softmax",
     "aten.sum.dim_IntList": "sum",
     "aten.mean.dim": "mean",
@@ -46,6 +57,18 @@ _NUMERIC_ATTRS = {
 
 _BINARY_OPS = {"mul", "add", "sub", "rsub", "div"}
 _REDUCTION_OPS = {"sum", "mean"}
+_DIRECT_ATTENTION_TARGETS = {
+    "aten._scaled_dot_product_flash_attention_for_cpu.default",
+    "aten._scaled_dot_product_flash_attention.default",
+    "aten._scaled_dot_product_efficient_attention.default",
+    "aten.scaled_dot_product_attention.default",
+}
+
+_TUPLE_ATTENTION_TARGETS = {
+    "aten._scaled_dot_product_flash_attention_for_cpu.default",
+    "aten._scaled_dot_product_flash_attention.default",
+    "aten._scaled_dot_product_efficient_attention.default",
+}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -58,6 +81,7 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
         raise RuntimeError("PyTorch is required for the FX frontend") from exc
 
     traced = make_fx(fn)(*example_inputs)
+    _reject_unsupported_attention_dropout(traced.graph)
     values: dict[str, Value] = {}
     input_ids: list[str] = []
     node_ids: dict[object, str] = {}
@@ -83,6 +107,18 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                     node_ids[folded_node] = output_id
                 continue
             target = str(node.target)
+            if target in _DIRECT_ATTENTION_TARGETS:
+                inputs, attrs, output_node = _attention_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("attention", inputs, (output_id,), attrs))
+                values[output_id] = Value(output_id, _node_type(output_node))
+                node_ids[node] = output_id
+                if target in _TUPLE_ATTENTION_TARGETS:
+                    for user in node.users:
+                        node_ids[user] = output_id
+                continue
             if target == "aten.native_layer_norm.default":
                 output_id = f"v{len(ops)}"
                 inputs, attrs, output_type = _layer_norm_operation(
@@ -118,6 +154,14 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     return graph
 
 
+def _reject_unsupported_attention_dropout(graph: object) -> None:
+    for node in getattr(graph, "nodes", ()):
+        if str(getattr(node, "target", "")) == "aten.bernoulli_.float":
+            raise NotImplementedError(
+                "scaled_dot_product_attention dropout is not supported"
+            )
+
+
 def _node_type(node: object) -> TensorType:
     meta = getattr(node, "meta", {})
     tensor = meta.get("val")
@@ -130,6 +174,150 @@ def _node_type(node: object) -> TensorType:
     if any(dim <= 0 for dim in tensor.shape):
         raise ValueError(f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}")
     return TensorType(tuple(int(dim) for dim in tensor.shape), dtype)
+
+
+def _attention_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], object]:
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) < 3:
+        raise ValueError("scaled_dot_product_attention expects Q, K and V")
+
+    query, key, value = args[:3]
+    query_type = _node_type(query)
+    key_type = _node_type(key)
+    value_type = _node_type(value)
+    if len(query_type.shape) not in {3, 4}:
+        raise NotImplementedError(
+            "scaled_dot_product_attention requires rank-3 or rank-4 inputs, "
+            f"got {query_type.shape}"
+        )
+    if not (query_type.dtype == key_type.dtype == value_type.dtype):
+        raise NotImplementedError(
+            "scaled_dot_product_attention requires identical Q/K/V dtypes"
+        )
+    if not (
+        len(query_type.shape)
+        == len(key_type.shape)
+        == len(value_type.shape)
+    ):
+        raise NotImplementedError(
+            "scaled_dot_product_attention requires matching Q/K/V ranks"
+        )
+
+    attn_mask, dropout_p, is_causal, enable_gqa, scale = (
+        _attention_call_arguments(target, args, kwargs)
+    )
+    if isinstance(dropout_p, bool) or not isinstance(dropout_p, (int, float)):
+        raise ValueError(f"dropout_p must be a scalar number, got {dropout_p!r}")
+    if float(dropout_p) != 0.0:
+        raise NotImplementedError("scaled_dot_product_attention dropout is not supported")
+    if not isinstance(is_causal, bool):
+        raise ValueError(f"is_causal must be a boolean, got {is_causal!r}")
+    if not isinstance(enable_gqa, bool):
+        raise ValueError(f"enable_gqa must be a boolean, got {enable_gqa!r}")
+    if scale is None:
+        scale = query_type.shape[-1] ** -0.5
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError(f"attention scale must be a scalar number, got {scale!r}")
+    if attn_mask is not None and is_causal:
+        raise ValueError("attn_mask and is_causal=True cannot both be specified")
+
+    inputs = [
+        _argument_ids(query, node_ids),
+        _argument_ids(key, node_ids),
+        _argument_ids(value, node_ids),
+    ]
+    if attn_mask is not None:
+        inputs.append(_argument_ids(attn_mask, node_ids))
+
+    output_node = _attention_output_node(node, target)
+
+    attrs: dict[str, object] = {
+        "scale": float(scale),
+        "has_mask": attn_mask is not None,
+        "causal": is_causal,
+    }
+    return tuple(inputs), attrs, output_node
+
+
+def _attention_call_arguments(
+    target: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> tuple[object, object, object, object, object]:
+    def argument(
+        name: str, position: int | None = None, default: object = None
+    ) -> object:
+        if name in kwargs:
+            return kwargs[name]
+        if position is not None and position < len(args):
+            return args[position]
+        return default
+
+    if target == "aten.scaled_dot_product_attention.default":
+        return (
+            argument("attn_mask", 3),
+            argument("dropout_p", 4, 0.0),
+            argument("is_causal", 5, False),
+            argument("enable_gqa", default=False),
+            argument("scale"),
+        )
+    if target == "aten._scaled_dot_product_flash_attention_for_cpu.default":
+        return (
+            argument("attn_mask"),
+            argument("dropout_p", 3, 0.0),
+            argument("is_causal", 4, False),
+            False,
+            argument("scale"),
+        )
+    if target == "aten._scaled_dot_product_flash_attention.default":
+        if argument("return_debug_mask", 5, False):
+            raise NotImplementedError(
+                "scaled_dot_product_attention debug masks are not supported"
+            )
+        return (
+            None,
+            argument("dropout_p", 3, 0.0),
+            argument("is_causal", 4, False),
+            False,
+            argument("scale"),
+        )
+    if target == "aten._scaled_dot_product_efficient_attention.default":
+        return (
+            argument("attn_bias", 3),
+            argument("dropout_p", 5, 0.0),
+            argument("is_causal", 6, False),
+            False,
+            argument("scale"),
+        )
+    raise ValueError(f"unsupported attention target: {target}")
+
+
+def _attention_output_node(node: object, target: str) -> object:
+    if target == "aten.scaled_dot_product_attention.default":
+        return node
+
+    output_node = None
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(
+                "scaled_dot_product_attention outputs must be selected with getitem"
+            )
+        if len(user.args) != 2 or not isinstance(user.args[1], int):
+            raise ValueError(f"malformed attention output selection: {user!r}")
+        if user.args[1] == 0 and user.users:
+            output_node = user
+        elif user.args[1] != 0 and user.users:
+            raise NotImplementedError(
+                "scaled_dot_product_attention auxiliary outputs are not supported"
+            )
+    if output_node is None:
+        raise ValueError("scaled_dot_product_attention result is not used")
+    return output_node
 
 
 def _layer_norm_operation(
@@ -381,6 +569,96 @@ def _operation_inputs(
             )
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
+    if op == "reshape":
+        if len(args) != 2:
+            raise ValueError(f"reshape expects two arguments, got {len(args)}")
+        input_id, shape = args
+        if not isinstance(shape, (tuple, list)) or not shape or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        ):
+            raise ValueError(f"reshape.shape must contain integers, got {shape!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"shape": tuple(shape)},
+        )
+
+    if op == "transpose":
+        if len(args) != 3:
+            raise ValueError(f"transpose expects three arguments, got {len(args)}")
+        input_id, dim0, dim1 = args
+        if not all(
+            isinstance(dim, int) and not isinstance(dim, bool)
+            for dim in (dim0, dim1)
+        ):
+            raise ValueError(
+                f"transpose dimensions must be integers, got {(dim0, dim1)!r}"
+            )
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"dim0": dim0, "dim1": dim1},
+        )
+
+    if op == "permute":
+        if len(args) != 2:
+            raise ValueError(f"permute expects two arguments, got {len(args)}")
+        input_id, dims = args
+        if not isinstance(dims, (tuple, list)) or not dims or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            raise ValueError(f"permute.dims must contain integers, got {dims!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"dims": tuple(dims)},
+        )
+
+    if op == "expand":
+        if len(args) != 2:
+            raise ValueError(f"expand expects two arguments, got {len(args)}")
+        input_id, shape = args
+        if not isinstance(shape, (tuple, list)) or not shape or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        ):
+            raise ValueError(f"expand.shape must contain integers, got {shape!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"shape": tuple(shape)},
+        )
+
+    if op == "slice":
+        if len(args) not in {4, 5}:
+            raise ValueError(f"slice expects four or five arguments, got {len(args)}")
+        input_id, dim, start, end = args[:4]
+        step = args[4] if len(args) == 5 else 1
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"slice.dim must be an integer, got {dim!r}")
+        if start is not None and (
+            not isinstance(start, int) or isinstance(start, bool)
+        ):
+            raise ValueError(f"slice.start must be an integer or None, got {start!r}")
+        if end is not None and (
+            not isinstance(end, int) or isinstance(end, bool)
+        ):
+            raise ValueError(f"slice.end must be an integer or None, got {end!r}")
+        if not isinstance(step, int) or isinstance(step, bool) or step <= 0:
+            raise ValueError(f"slice.step must be a positive integer, got {step!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"dim": dim, "start": start, "end": end, "step": step},
+        )
+
+    if op == "unsqueeze":
+        if len(args) != 2:
+            raise ValueError(f"unsqueeze expects two arguments, got {len(args)}")
+        input_id, dim = args
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"unsqueeze.dim must be an integer, got {dim!r}")
+        return ((_argument_ids(input_id, node_ids),), {"dim": dim})
+
+    if op in {"contiguous", "alias"}:
+        if len(args) != 1:
+            raise ValueError(f"{op} expects one argument, got {len(args)}")
+        return ((_argument_ids(args[0], node_ids),), {})
+
     if op in _REDUCTION_OPS:
         if len(args) not in {2, 3}:
             raise ValueError(
@@ -450,6 +728,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("dtype")
     if op == "gelu":
         allowed.add("approximate")
+    if op == "contiguous":
+        allowed.add("memory_format")
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")

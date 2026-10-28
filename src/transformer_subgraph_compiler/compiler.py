@@ -7,7 +7,7 @@ from typing import Any
 from .backends import AppleMetalBackend, CompiledPlan
 from .frontend import capture_fx
 from .ir import Graph
-from .passes import fuse_pointwise
+from .passes import canonicalize_batched_matmul, fuse_attention, fuse_pointwise, simplify_layouts
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +26,10 @@ def compile_graph(
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
 
-    lowered = fuse_pointwise(graph)
+    lowered = simplify_layouts(graph)
+    lowered = canonicalize_batched_matmul(lowered)
+    lowered = fuse_attention(lowered)
+    lowered = fuse_pointwise(lowered)
     plan = AppleMetalBackend(codegen_matmul=codegen_matmul).compile(lowered)
     return CompilationResult(plan=plan, input_graph=graph, lowered_graph=lowered)
 

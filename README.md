@@ -1,12 +1,12 @@
 # Transformer Subgraph Compiler
 
-一个面向 Transformer 子图的实验性编译器。当前版本以 Apple Silicon 为第一目标，把 PyTorch FX 图转换成自定义 SSA IR，融合 pointwise 子图，生成 Metal Shading Language，并通过 MLX 在 Apple GPU 上执行。
+一个面向 Transformer 子图的实验性编译器。当前版本以 Apple Silicon 为第一目标，把 PyTorch FX 图转换成自定义 SSA IR，消除冗余布局，融合 attention 和 pointwise 子图，再通过生成的 Metal Shading Language kernel 与 MLX runtime 在 Apple GPU 上执行。
 
 ```text
 PyTorch FX
   -> SSA IR
-  -> pointwise fusion / reduction and normalization lowering
-  -> Metal Shading Language
+  -> layout simplification / matmul canonicalization / attention and pointwise fusion
+  -> Metal Shading Language + MLX runtime lowering
   -> mx.fast.metal_kernel
   -> Apple GPU
 ```
@@ -17,11 +17,13 @@ PyTorch FX
 
 | 类别 | 节点 |
 |---|---|
-| 矩阵乘 | `aten.mm`、`aten.addmm` |
+| 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
+| 视图与布局 | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`clone`、`alias` |
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
 | Softmax | `aten._softmax.default`，支持任意单个维度 |
+| Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
 | Reduction | `sum`、`mean`，支持任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 | RMSNorm | `F.rms_norm` 的 `pow/mean/add_/rsqrt/mul` 分解，折叠为专用 `rms_norm` |
@@ -30,7 +32,14 @@ PyTorch FX
 
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
 - 构建带 dtype/shape 校验的 SSA IR
+- 消除恒等 layout 和连续逆 `transpose/permute`，折叠相邻 `reshape`
+- 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
+- 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
+- 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
+- 识别 PyTorch 分解图中 `repeat_kv` 产生的 `unsqueeze -> expand -> reshape`，融合后不再物化复制后的 K/V
 - 把相邻 pointwise op 融合成一个 DAG region
+- 在 schedule 前校验静态视图和布局变换，Runtime 通过 MLX 执行 view 语义
+- 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 生成每个 thread 处理 4 个元素的 Metal kernel
@@ -43,7 +52,7 @@ PyTorch FX
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
-默认情况下，`matmul` 和 `addmm` 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
+默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘和 bias 也会生成自定义 Metal kernel：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
@@ -126,7 +135,9 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖任意单轴 softmax、任意非空维度集合的 sum/mean、LayerNorm 和 RMSNorm，但不支持动态 shape、控制流、自动微分、layout pass、跨进程 kernel cache 和训练。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout op 已具备静态校验、恒等与逆变换消除和 MLX lowering，但还没有布局传播与公共子表达式消除。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+
+attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。暂不支持 attention dropout、自定义 MSL attention kernel，也不会在 softmax 概率被其他节点观察时做激进融合。GQA 的 lowering 使用 `mx.fast.scaled_dot_product_attention`，不是本项目生成的 MSL attention kernel。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 
