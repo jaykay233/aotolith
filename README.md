@@ -37,7 +37,7 @@ PyTorch FX
 
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
 - 已用端到端测试验证两层 decoder-only Transformer forward：token embedding、RoPE、causal GQA attention、预归一化 residual、SwiGLU MLP、最终 RMSNorm 和 LM head 可以一起编译到 Metal，并在 FP32 下与 PyTorch CPU 对齐
-- 已验证固定容量静态 KV Cache 的 prefill/decode 图接口：prefill 把 prompt 的 K/V 右对齐写入 cache，decode 接收并返回每层更新后的 K/V，连续三步生成与完整序列 forward 的 logits 和贪心 token 对齐
+- 已验证固定容量静态 KV Cache 的 prefill/decode 图接口：prefill 把 prompt 的 K/V 右对齐写入 cache，decode 接收并返回每层更新后的 K/V；单请求和左侧 padding 的双请求 batch 都连续生成三步，并逐请求与完整序列 forward 的 logits、贪心 token 对齐
 - 构建带 dtype/shape 校验的 SSA IR
 - 支持 `aten.embedding.default` 的 token-id gather，接受 `int32/int64` indices 和 FP16/BF16/FP32 embedding table，并可与后续 matmul、pointwise 子图组合
 - 支持 `aten.index_select.default` 沿任意单轴 gather，保留负轴归一化、输出 dtype 和静态 shape；运行时校验索引非负且未越界
@@ -144,7 +144,7 @@ python examples/metal_attention_benchmark.py
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
 - `examples/tiny_transformer.py` 编译并执行一个两层 decoder-only Transformer，覆盖 RoPE、causal attention、SwiGLU 和 LM head。
-- `examples/tiny_transformer_generate.py` 分别编译 prefill 和 decode 图，从静态 KV Cache 执行三步 greedy 生成。它展示的是 cache 输入输出契约和正确性，不是分页或高吞吐实现。
+- `examples/tiny_transformer_generate.py` 分别编译 prefill 和 decode 图，用左侧 padding 的双请求 batch 演示不同有效 prompt 长度下的三步 greedy 生成。它展示的是 cache 输入输出契约和正确性，不是分页、动态 batch 或高吞吐实现。
 - `examples/metal_matmul_benchmark.py` 对比 FP32 tiled 和 FP16 SIMD matmul kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 - `examples/metal_attention_benchmark.py` 对比 tiled online-softmax attention kernel 与 MLX SDPA，并检查 PyTorch CPU 数值误差。
 
@@ -177,7 +177,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此它验证的是 cache ABI 和生成正确性，不是高性能实现。项目还没有动态或分页 cache、通用生成 API、采样和 serving 运行时。当前也不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以用固定最大 batch、左侧 padding 和逐请求 mask 执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此它验证的是 cache ABI 和生成正确性，不是高性能实现。项目还没有动态 shape、分页 cache、请求动态进出 batch、通用生成 API、采样和 serving 运行时。当前也不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask 可以是同 dtype 的 additive mask 或 bool mask。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见 additive-mask 或 bool-mask 形式会使用生成的 MSL attention kernel。bool mask 的 `True` 表示允许该 key 参与 attention，整行都为 `False` 时输出为零。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 

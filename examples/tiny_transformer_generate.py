@@ -1,9 +1,12 @@
-"""Compile static KV-cache prefill and decode graphs for greedy generation.
+"""Compile static KV-cache prefill and decode graphs for batched generation.
 
-The cache is a correctness-oriented ABI demonstration. Decode shifts the full
-fixed-capacity cache on every step; it is not a paged or streaming cache.
+The batch and cache shapes are fixed, while each request can have a different
+valid prompt length. The cache is a correctness-oriented ABI demonstration:
+decode shifts the full fixed-capacity cache and is not a paged cache.
 """
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import mlx.core as mx
 import torch
@@ -11,7 +14,6 @@ import torch.nn.functional as F
 
 from transformer_subgraph_compiler import compile_callable
 
-BATCH_SIZE = 1
 PROMPT_LENGTH = 4
 CACHE_CAPACITY = 8
 HIDDEN_SIZE = 32
@@ -52,15 +54,15 @@ def project_qkv(
     query, key, attention_value = (normalized @ qkv_weight).split(
         HIDDEN_SIZE, dim=-1
     )
-    sequence_length = value.shape[1]
+    batch_size, sequence_length = value.shape[:2]
     query = query.reshape(
-        BATCH_SIZE, sequence_length, NUM_HEADS, HEAD_DIM
+        batch_size, sequence_length, NUM_HEADS, HEAD_DIM
     ).transpose(1, 2)
     key = key.reshape(
-        BATCH_SIZE, sequence_length, NUM_HEADS, HEAD_DIM
+        batch_size, sequence_length, NUM_HEADS, HEAD_DIM
     ).transpose(1, 2)
     attention_value = attention_value.reshape(
-        BATCH_SIZE, sequence_length, NUM_HEADS, HEAD_DIM
+        batch_size, sequence_length, NUM_HEADS, HEAD_DIM
     ).transpose(1, 2)
     return (
         apply_rope(query, cosine_table, sine_table, positions),
@@ -78,9 +80,9 @@ def finish_layer(
     up_weight: torch.Tensor,
     down_weight: torch.Tensor,
 ) -> torch.Tensor:
-    sequence_length = value.shape[1]
+    batch_size, sequence_length = value.shape[:2]
     attention_output = attention_output.transpose(1, 2).reshape(
-        BATCH_SIZE, sequence_length, HIDDEN_SIZE
+        batch_size, sequence_length, HIDDEN_SIZE
     )
     value = value + attention_output @ output_weight
     normalized = rms_norm(value, mlp_norm)
@@ -160,7 +162,7 @@ def cached_layer(
     )
     if cache_key is None:
         padding = CACHE_CAPACITY - key.shape[2]
-        padding_shape = (BATCH_SIZE, NUM_HEADS, padding, HEAD_DIM)
+        padding_shape = (key.shape[0], NUM_HEADS, padding, HEAD_DIM)
         zeros = torch.zeros(padding_shape, dtype=key.dtype)
         next_key = torch.cat((zeros, key), dim=2)
         next_value = torch.cat((zeros, attention_value), dim=2)
@@ -281,17 +283,43 @@ def make_rotary_tables() -> tuple[torch.Tensor, torch.Tensor]:
     return frequencies.cos(), frequencies.sin()
 
 
-def make_prefill_mask() -> torch.Tensor:
-    mask = torch.zeros(1, 1, PROMPT_LENGTH, CACHE_CAPACITY, dtype=torch.bool)
-    start = CACHE_CAPACITY - PROMPT_LENGTH
-    for query_position in range(PROMPT_LENGTH):
-        mask[0, 0, query_position, start : start + query_position + 1] = True
+def make_prefill_mask(
+    batch_size: int = 1,
+    sequence_length: int = PROMPT_LENGTH,
+    valid_lengths: Sequence[int] | None = None,
+) -> torch.Tensor:
+    if valid_lengths is None:
+        valid_lengths = (sequence_length,) * batch_size
+    if len(valid_lengths) != batch_size:
+        raise ValueError("valid_lengths must contain one entry per batch row")
+    if any(length <= 0 or length > sequence_length for length in valid_lengths):
+        raise ValueError("valid lengths must fit the padded prompt length")
+
+    mask = torch.zeros(
+        batch_size, 1, sequence_length, CACHE_CAPACITY, dtype=torch.bool
+    )
+    cache_start = CACHE_CAPACITY - sequence_length
+    for batch_index, valid_length in enumerate(valid_lengths):
+        first_query = sequence_length - valid_length
+        first_valid = cache_start + first_query
+        for query_position in range(first_query, sequence_length):
+            mask[
+                batch_index,
+                0,
+                query_position,
+                first_valid : cache_start + query_position + 1,
+            ] = True
     return mask
 
 
-def make_decode_mask(valid_length: int) -> torch.Tensor:
-    mask = torch.zeros(1, 1, 1, CACHE_CAPACITY, dtype=torch.bool)
-    mask[0, 0, 0, -valid_length:] = True
+def make_decode_mask(valid_lengths: int | Sequence[int]) -> torch.Tensor:
+    if isinstance(valid_lengths, int):
+        valid_lengths = (valid_lengths,)
+    mask = torch.zeros(
+        len(valid_lengths), 1, 1, CACHE_CAPACITY, dtype=torch.bool
+    )
+    for batch_index, valid_length in enumerate(valid_lengths):
+        mask[batch_index, 0, 0, -valid_length:] = True
     return mask
 
 
@@ -305,18 +333,27 @@ def next_token(logits: mx.array) -> int:
 
 
 def main() -> None:
-    prompt = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
-    prompt_positions = torch.arange(PROMPT_LENGTH, dtype=torch.int64)[None, :]
+    prompts = torch.tensor(
+        [[1, 2, 3, 4], [0, 5, 6, 7]],
+        dtype=torch.int32,
+    )
+    initial_valid_lengths = (4, 3)
+    prompt_positions = torch.tensor(
+        [[0, 1, 2, 3], [0, 0, 1, 2]],
+        dtype=torch.int64,
+    )
     cosine, sine = make_rotary_tables()
     embedding, final_norm, lm_head, *layer_weights = make_model_inputs()
     weights = (embedding, final_norm, lm_head, *layer_weights)
 
     prefill_inputs = (
-        prompt,
+        prompts,
         prompt_positions,
         cosine,
         sine,
-        make_prefill_mask(),
+        make_prefill_mask(
+            prompts.shape[0], prompts.shape[1], initial_valid_lengths
+        ),
         *weights,
     )
     prefill_result = compile_callable(
@@ -330,15 +367,17 @@ def main() -> None:
     mx.eval(*prefill_outputs)
 
     empty_caches = tuple(
-        torch.zeros(1, NUM_HEADS, CACHE_CAPACITY, HEAD_DIM)
+        torch.zeros(
+            prompts.shape[0], NUM_HEADS, CACHE_CAPACITY, HEAD_DIM
+        )
         for _ in range(2 * NUM_LAYERS)
     )
     decode_inputs = (
-        torch.tensor([[5]], dtype=torch.int32),
-        torch.tensor([[PROMPT_LENGTH]], dtype=torch.int64),
+        torch.tensor([[5], [8]], dtype=torch.int32),
+        torch.tensor([[4], [3]], dtype=torch.int64),
         cosine,
         sine,
-        make_decode_mask(PROMPT_LENGTH + 1),
+        make_decode_mask((5, 4)),
         *empty_caches,
         *weights,
     )
@@ -349,26 +388,40 @@ def main() -> None:
         codegen_matmul=True,
     )
 
-    generated = [next_token(prefill_outputs[0])]
+    generated = [
+        [next_token(prefill_outputs[0][row : row + 1])]
+        for row in range(prompts.shape[0])
+    ]
     for step in range(3):
-        valid_length = PROMPT_LENGTH + step + 1
+        valid_lengths = tuple(length + step for length in initial_valid_lengths)
         decode_outputs = decode_result.plan(
-            mx.array([[generated[-1]]], dtype=mx.int32),
-            mx.array([[valid_length - 1]], dtype=mx.int64),
+            mx.array([[tokens[-1]] for tokens in generated], dtype=mx.int32),
+            mx.array(
+                [[length] for length in valid_lengths], dtype=mx.int64
+            ),
             mx.array(cosine.numpy()),
             mx.array(sine.numpy()),
-            mx.array(make_decode_mask(valid_length).numpy()),
+            mx.array(
+                make_decode_mask(
+                    tuple(length + 1 for length in valid_lengths)
+                ).numpy()
+            ),
             *caches,
             *(mx.array(weight.numpy()) for weight in weights),
         )
         mx.eval(*decode_outputs)
         caches = decode_outputs[1:]
-        generated.append(next_token(decode_outputs[0]))
+        for row, tokens in enumerate(generated):
+            tokens.append(next_token(decode_outputs[0][row : row + 1]))
 
-    print("prompt tokens:", prompt.tolist()[0])
+    print("prompt tokens:", prompts.tolist())
+    print("valid prompt lengths:", initial_valid_lengths)
     print("generated tokens:", generated)
     print("cache shape:", tuple(caches[0].shape))
-    print("kernels:", [kernel.kind for kernel in decode_result.plan.kernels])
+    print(
+        "kernels:",
+        [kernel.kind for kernel in decode_result.plan.kernels],
+    )
 
 
 if __name__ == "__main__":
