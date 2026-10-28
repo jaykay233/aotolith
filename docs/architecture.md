@@ -6,7 +6,7 @@
 
 `capture_fx` 调用 `make_fx(fn)(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata。
 
-前端当前只接受以下 ATen 目标：
+前端当前处理以下 FX target 和折叠模式：
 
 | FX target | IR op |
 |---|---|
@@ -14,6 +14,7 @@
 | `aten.addmm.default` | `addmm` |
 | `aten._softmax.default` | `softmax` |
 | `aten.native_layer_norm.default` | `layer_norm`，仅第 0 个输出 |
+| `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
 | `aten.gelu.default` | `gelu` |
 | `aten.mul.Tensor` | `mul` |
@@ -37,6 +38,8 @@
 `addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate` 和 softmax 的 `dim` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
+
+`F.rms_norm` 没有单独的 ATen target，在当前 PyTorch 中会展开成 `pow -> mean -> add_ -> rsqrt -> mul -> optional weight mul`。前端只在中间节点单消费者、reduction 覆盖连续尾维且 shape 吻合时折叠成 `rms_norm`，避免把任意的平方、均值、rsqrt 组合误认为归一化。FP16/BF16 下 `make_fx` 还会插入 float32 `_to_copy`，折叠范围包含这组 cast。
 
 ## 2. SSA IR
 
@@ -129,18 +132,20 @@ grid 大小是 `rows * threads`，每个 threadgroup 的大小固定为 `threads
 
 非最后一维的 softmax 会在 backend 编译阶段抛 `NotImplementedError`，不会静默退化成 MLX。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
 
-## 7. Metal LayerNorm lowering
+## 7. Metal LayerNorm 和 RMSNorm lowering
 
-LayerNorm 按 normalized shape 的最后一组维度处理。backend 把 normalized shape 之前的维度展平为 `rows`，把 normalized shape 展平为连续的 `columns`：
+两种归一化都按 normalized shape 的最后一组维度处理。backend 把 normalized shape 之前的维度展平为 `rows`，把 normalized shape 展平为连续的 `columns`：
 
 - 每个 threadgroup 处理一行
 - threadgroup 大小与 softmax 使用同一套选择规则，最多 256 个线程
-- 第一遍计算行均值
-- 第二遍基于 `(x - mean)^2` 计算 variance，避免 `E[x^2] - E[x]^2` 的相消误差
-- 最终用 `rsqrt(variance + eps)` 归一化，并在同一个 kernel 中应用可选 weight/bias
 - reduction 和归一化都使用 float，最后 cast 回输入 dtype
+- weight 与 normalized shape 完全一致，并且 dtype 与输入相同
 
-weight/bias 必须与 normalized shape 完全一致，并且 dtype 与输入相同。当前支持 normalized shape 占满最后一维、多个连续尾维，或整个 tensor。若 normalized shape 不是连续尾维，PyTorch 本身不会产生这个 FX 结构。
+LayerNorm 分两遍读取输入：先计算行均值，再基于 `(x - mean)^2` 计算 variance，避免 `E[x^2] - E[x]^2` 的相消误差。最后用 `rsqrt(variance + eps)` 归一化，并可在同一 kernel 中应用 weight/bias。bias 与 weight 可以分别缺省。
+
+RMSNorm 只做一遍平方和 reduction，得到 `mean(x^2)` 后用 `rsqrt(mean(x^2) + eps)` 缩放输入，再应用可选 weight。kernel 不接受 bias，因为当前折叠的 `F.rms_norm` 语义没有 bias。
+
+两者都支持 normalized shape 占满最后一维、多个连续尾维，或整个 tensor。若 normalized shape 不是连续尾维，PyTorch 不会产生对应的归一化 FX 结构。
 
 ## 8. Metal matmul/addmm codegen
 
@@ -179,7 +184,8 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
 - softmax：调用生成的 last-dim reduction kernel
-- layer_norm：调用生成的两遍 reduction kernel
+- layer_norm：调用生成的两遍 mean/variance reduction kernel
+- rms_norm：调用生成的平方和 reduction kernel
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 
@@ -188,11 +194,12 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
-- softmax 只支持最后一维，其他 reduction 和 normalization 尚未 lowering
-- LayerNorm 只支持主输出，不支持直接使用 mean/rstd，也没有 RMSNorm 专用 lowering
+- softmax 只支持最后一维；LayerNorm/RMSNorm 只支持连续尾维 reduction
+- LayerNorm 只支持主输出，不支持直接使用 mean/rstd
+- RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - 没有 kernel cache、autotune、layout propagation
 - matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是 RMSNorm 和通用 reduction lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是通用 reduction lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

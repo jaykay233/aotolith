@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import textwrap
 from dataclasses import dataclass
 from math import ceil, prod
 from typing import Any
@@ -121,6 +122,8 @@ class AppleMetalBackend:
                 compiled = self._compile_softmax(graph, op, index)
             elif op.op == "layer_norm":
                 compiled = self._compile_layer_norm(graph, op, index)
+            elif op.op == "rms_norm":
+                compiled = self._compile_rms_norm(graph, op, index)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
                 compiled = self._compile_matmul(graph, op, index)
 
@@ -305,43 +308,64 @@ class AppleMetalBackend:
     def _compile_layer_norm(
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any]:
+        return self._compile_normalization(graph, op, index, kind="layer_norm")
+
+    def _compile_rms_norm(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        return self._compile_normalization(graph, op, index, kind="rms_norm")
+
+    def _compile_normalization(
+        self,
+        graph: Graph,
+        op: Operation,
+        index: int,
+        *,
+        kind: str,
+    ) -> tuple[KernelArtifact, Any]:
         normalized_shape = op.attrs.get("normalized_shape")
         if not isinstance(normalized_shape, tuple) or not normalized_shape:
-            raise ValueError("layer_norm.normalized_shape must be a non-empty tuple")
+            raise ValueError(f"{kind}.normalized_shape must be a non-empty tuple")
         if not all(
             isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
             for dim in normalized_shape
         ):
-            raise ValueError("layer_norm.normalized_shape must contain positive integers")
+            raise ValueError(
+                f"{kind}.normalized_shape must contain positive integers"
+            )
 
         has_weight = op.attrs.get("has_weight")
-        has_bias = op.attrs.get("has_bias")
-        if not isinstance(has_weight, bool) or not isinstance(has_bias, bool):
-            raise ValueError("layer_norm has_weight/has_bias must be booleans")
+        if not isinstance(has_weight, bool):
+            raise ValueError(f"{kind}.has_weight must be a boolean")
+        has_bias = False
+        if kind == "layer_norm":
+            has_bias = op.attrs.get("has_bias")
+            if not isinstance(has_bias, bool):
+                raise ValueError("layer_norm.has_bias must be a boolean")
         expected_inputs = 1 + int(has_weight) + int(has_bias)
         if len(op.inputs) != expected_inputs:
             raise ValueError(
-                f"layer_norm expects {expected_inputs} inputs, got {len(op.inputs)}"
+                f"{kind} expects {expected_inputs} inputs, got {len(op.inputs)}"
             )
 
         input_type = graph.value(op.inputs[0]).type
         output_type = graph.value(op.outputs[0]).type
         if input_type.dtype != output_type.dtype:
             raise NotImplementedError(
-                "Metal layer_norm requires identical input/output dtypes"
+                f"Metal {kind} requires identical input/output dtypes"
             )
         if input_type.shape != output_type.shape:
             raise ValueError(
-                f"layer_norm output shape {output_type.shape} != {input_type.shape}"
+                f"{kind} output shape {output_type.shape} != {input_type.shape}"
             )
         normalized_rank = len(normalized_shape)
         if normalized_rank > len(input_type.shape):
             raise ValueError(
-                f"layer_norm normalized_shape {normalized_shape} exceeds input rank"
+                f"{kind} normalized_shape {normalized_shape} exceeds input rank"
             )
         if input_type.shape[-normalized_rank:] != normalized_shape:
             raise ValueError(
-                f"layer_norm normalized_shape {normalized_shape} does not match "
+                f"{kind} normalized_shape {normalized_shape} does not match "
                 f"input shape {input_type.shape}"
             )
 
@@ -357,11 +381,12 @@ class AppleMetalBackend:
             parameter_type = graph.value(op.inputs[position]).type
             if parameter_type.dtype != input_type.dtype:
                 raise NotImplementedError(
-                    "Metal layer_norm requires identical parameter dtypes"
+                    f"Metal {kind} requires identical parameter dtypes"
                 )
             if parameter_type.shape != normalized_shape:
                 raise ValueError(
-                    f"layer_norm parameter shape {parameter_type.shape} != {normalized_shape}"
+                    f"{kind} parameter shape {parameter_type.shape} "
+                    f"!= {normalized_shape}"
                 )
 
         columns = prod(normalized_shape)
@@ -370,23 +395,8 @@ class AppleMetalBackend:
         reduction_stride = threads // 2
         eps = float(op.attrs.get("eps", 1e-5))
 
-        scale_expression = (
-            f"float(in_{weight_position}[col])"
-            if weight_position is not None
-            else "1.0f"
-        )
-        normalized_expression = (
-            f"(current - mean_value) * inv_std * {scale_expression}"
-        )
-        if bias_position is not None:
-            normalized_expression += f" + float(in_{bias_position}[col])"
-
-        source = f"""
-        uint tid = thread_position_in_threadgroup.x;
-        uint row = threadgroup_position_in_grid.x;
-        uint offset = row * {columns}u;
-        threadgroup float scratch[{threads}];
-
+        if kind == "layer_norm":
+            reduction_source = textwrap.dedent(f"""
         float local_sum = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
             local_sum += float(in_0[offset + col]);
@@ -418,7 +428,49 @@ class AppleMetalBackend:
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
         float variance = scratch[0] / {columns}.0f;
-        float inv_std = metal::rsqrt(variance + {eps!r}f);
+            """).strip()
+            reduction_result = "variance"
+            centered_expression = "current - mean_value"
+        else:
+            reduction_source = textwrap.dedent(f"""
+        float local_square_sum = 0.0f;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            float current = float(in_0[offset + col]);
+            local_square_sum += current * current;
+        }}
+        scratch[tid] = local_square_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float mean_square = scratch[0] / {columns}.0f;
+            """).strip()
+            reduction_result = "mean_square"
+            centered_expression = "current"
+
+        scale_expression = (
+            f"float(in_{weight_position}[col])"
+            if weight_position is not None
+            else "1.0f"
+        )
+        normalized_expression = (
+            f"({centered_expression}) * inv_std * {scale_expression}"
+        )
+        if bias_position is not None:
+            normalized_expression += f" + float(in_{bias_position}[col])"
+
+        source = f"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint offset = row * {columns}u;
+        threadgroup float scratch[{threads}];
+
+{textwrap.indent(reduction_source, '        ')}
+        float inv_std = metal::rsqrt({reduction_result} + {eps!r}f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
@@ -426,10 +478,12 @@ class AppleMetalBackend:
             out[offset + col] = (T)({normalized_expression});
         }}
         """
-        name = f"metal_layer_norm_{threads}_{index}"
+        name = f"metal_{kind}_{threads}_{index}"
         kernel = mx.fast.metal_kernel(
             name=name,
-            input_names=[f"in_{position}" for position in range(len(op.inputs))],
+            input_names=[
+                f"in_{position}" for position in range(len(op.inputs))
+            ],
             output_names=["out"],
             source=source,
         )
@@ -455,7 +509,7 @@ class AppleMetalBackend:
             input_ids=op.inputs,
             output_id=op.outputs[0],
             tensor_type=output_type,
-            kind="layer_norm",
+            kind=kind,
         )
         return artifact, runtime
 

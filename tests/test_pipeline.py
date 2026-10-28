@@ -530,3 +530,140 @@ def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
     expected = mx.array(fn(*inputs).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=5e-4, rtol=5e-4)
+
+
+def test_rms_norm_with_weight_and_multidimensional_shape() -> None:
+    torch.manual_seed(67)
+    x = torch.randn(2, 3, 4, 7)
+    weight = torch.randn(4, 7)
+
+    def fn(value, scale):
+        return torch.nn.functional.rms_norm(
+            value, (4, 7), scale, eps=1e-6
+        )
+
+    result = compile_callable(fn, (x, weight))
+    assert [op.op for op in result.input_graph.ops] == ["rms_norm"]
+    attrs = result.input_graph.ops[0].attrs
+    assert attrs["normalized_shape"] == (4, 7)
+    assert attrs["eps"] == pytest.approx(1e-6)
+    assert attrs["has_weight"] is True
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_rms_norm_32_0"
+    assert "local_square_sum" in kernel.source
+    assert "mean_square" in kernel.source
+    assert "mean_value" not in kernel.source
+    assert "in_1[col]" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()), mx.array(weight.numpy()))[0]
+    expected = mx.array(fn(x, weight).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rms_norm_without_weight() -> None:
+    torch.manual_seed(71)
+    x = torch.randn(2, 3, 300)
+    result = compile_callable(
+        lambda value: torch.nn.functional.rms_norm(
+            value, (300,), None, eps=1e-5
+        ),
+        (x,),
+    )
+    assert result.input_graph.ops[0].attrs["has_weight"] is False
+    assert result.plan.kernels[0].name == "metal_rms_norm_256_0"
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(
+        torch.nn.functional.rms_norm(x, (300,), None, eps=1e-5).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rms_norm_supports_low_precision(dtype) -> None:
+    torch.manual_seed(73)
+    x = torch.randn(2, 3, 7, dtype=dtype)
+    weight = torch.randn(7, dtype=dtype)
+    result = compile_callable(
+        lambda value, scale: torch.nn.functional.rms_norm(
+            value, (7,), scale, eps=1e-6
+        ),
+        (x, weight),
+    )
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        *(
+            mx.array(value.float().numpy(), dtype=mlx_dtype)
+            for value in (x, weight)
+        )
+    )[0]
+    expected = mx.array(
+        torch.nn.functional.rms_norm(
+            x.float(), (7,), weight.float(), eps=1e-6
+        ).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_rms_norm_composes_with_matmul_and_pointwise() -> None:
+    torch.manual_seed(79)
+    inputs = (
+        torch.randn(2, 4),
+        torch.randn(4, 8),
+        torch.randn(8),
+    )
+
+    def fn(value, weight, scale):
+        projected = value @ weight
+        normalized = torch.nn.functional.rms_norm(
+            projected, (8,), scale, eps=1e-6
+        )
+        return torch.nn.functional.silu(normalized)
+
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "matmul",
+        "rms_norm",
+        "silu",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "rms_norm",
+        "silu",
+    ]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-4, rtol=5e-4)
+
+
+def test_rms_norm_pattern_does_not_match_non_tail_reduction() -> None:
+    x = torch.randn(3, 5)
+
+    def fn(value):
+        mean_square = value.square().mean(dim=0, keepdim=True)
+        return value * torch.rsqrt(mean_square + 1e-6)
+
+    with pytest.raises(
+        ValueError, match="unsupported FX target: aten.pow.Tensor_Scalar"
+    ):
+        compile_callable(fn, (x,))
+
+
+def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
+    x = torch.randn(2, 5)
+
+    def fn(value):
+        squared = value.square()
+        normalized = value * torch.rsqrt(
+            squared.mean(dim=-1, keepdim=True) + 1e-6
+        )
+        return normalized, squared
+
+    with pytest.raises(
+        ValueError, match="unsupported FX target: aten.pow.Tensor_Scalar"
+    ):
+        compile_callable(fn, (x,))
