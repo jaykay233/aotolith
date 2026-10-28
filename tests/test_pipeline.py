@@ -9,6 +9,17 @@ from transformer_subgraph_compiler.backends import apple_metal as metal_backend
 from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
 
 
+_MLX_DTYPES = {
+    torch.float16: mx.float16,
+    torch.bfloat16: mx.bfloat16,
+    torch.float32: mx.float32,
+}
+
+
+def _torch_to_mlx(value: torch.Tensor) -> mx.array:
+    return mx.array(value.float().numpy()).astype(_MLX_DTYPES[value.dtype])
+
+
 def _manual_gate_graph(dtype: DType = DType.F32) -> Graph:
     tensor_type = TensorType((3,), dtype)
     values = {
@@ -159,6 +170,27 @@ def test_identity_and_inverse_layouts_are_eliminated() -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_squeeze_identity_and_inverse_are_eliminated() -> None:
+    def fn(x):
+        unchanged = x.squeeze(1)
+        round_trip = x.unsqueeze(1).squeeze(1)
+        return unchanged, round_trip
+
+    x = torch.randn(2, 3)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.input_graph.ops] == [
+        "squeeze",
+        "unsqueeze",
+        "squeeze",
+    ]
+    assert result.lowered_graph.ops == ()
+
+    actual = result.plan(mx.array(x.numpy()))
+    mx.eval(*actual)
+    assert mx.array_equal(actual[0], mx.array(x.numpy()))
+    assert mx.array_equal(actual[1], mx.array(x.numpy()))
+
+
 def test_out_of_range_slice_is_not_removed_as_identity() -> None:
     tensor_type = TensorType((4,), DType.F32)
     values = {
@@ -285,6 +317,233 @@ def test_direct_scaled_dot_product_attention_grouped_query() -> None:
     expected = mx.array(fn(*inputs).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("key_value_heads", [8, 2, 1])
+def test_native_attention_rank4_mha_and_gqa(key_value_heads) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            enable_gqa=key_value_heads != 8,
+        )
+
+    torch.manual_seed(63)
+    inputs = (
+        torch.randn(2, 8, 5, 16),
+        torch.randn(2, key_value_heads, 7, 16),
+        torch.randn(2, key_value_heads, 7, 16),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+    assert "threadgroup float partial" in result.plan.kernels[0].source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+)
+def test_native_attention_additive_mask_dtypes(dtype) -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+            scale=0.17,
+        )
+
+    torch.manual_seed(65)
+    inputs = (
+        torch.randn(2, 2, 3, 20, dtype=dtype),
+        torch.randn(2, 2, 4, 20, dtype=dtype),
+        torch.randn(2, 2, 4, 20, dtype=dtype),
+        torch.randn(2, 1, 3, 4, dtype=dtype) * 0.2,
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 5e-3
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+def test_native_attention_all_masked_row_is_zero() -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+        )
+
+    torch.manual_seed(67)
+    mask = torch.randn(2, 1, 3, 4) * 0.2
+    mask[:, :, 0, :] = -torch.inf
+    inputs = (
+        torch.randn(2, 2, 3, 16),
+        torch.randn(2, 2, 4, 16),
+        torch.randn(2, 2, 4, 16),
+        mask,
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    zero_row = mx.zeros((2, 2, 16))
+    mx.eval(actual, expected, zero_row)
+    assert mx.array_equal(actual[:, :, 0, :], zero_row)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_native_attention_causal_with_rectangular_sequence() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=True,
+        )
+
+    torch.manual_seed(69)
+    inputs = (
+        torch.randn(2, 2, 4, 12),
+        torch.randn(2, 2, 6, 12),
+        torch.randn(2, 2, 6, 12),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_native_attention_supports_distinct_value_head_dim() -> None:
+    dtype = DType.F32
+    values = {
+        "query": Value("query", TensorType((2, 2, 3, 8), dtype)),
+        "key": Value("key", TensorType((2, 2, 4, 8), dtype)),
+        "value": Value("value", TensorType((2, 2, 4, 6), dtype)),
+        "output": Value("output", TensorType((2, 2, 3, 6), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value"),
+                ("output",),
+                {"scale": 8**-0.5, "has_mask": False, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    torch.manual_seed(71)
+    inputs = (
+        torch.randn(2, 2, 3, 8),
+        torch.randn(2, 2, 4, 8),
+        torch.randn(2, 2, 4, 6),
+    )
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(
+        torch.nn.functional.scaled_dot_product_attention(*inputs).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_native_attention_squeezes_rank3_output() -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+        )
+
+    torch.manual_seed(73)
+    inputs = (
+        torch.randn(2, 5, 16),
+        torch.randn(2, 7, 16),
+        torch.randn(2, 7, 16),
+        torch.randn(2, 5, 7) * 0.2,
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert "squeeze" in [op.op for op in result.lowered_graph.ops]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 5, 16)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("mask_shape", [(5, 7), (2, 5, 7)])
+def test_native_attention_rank3_direct_ir_supports_broadcast_masks(mask_shape) -> None:
+    dtype = DType.F32
+    values = {
+        "query": Value("query", TensorType((2, 5, 16), dtype)),
+        "key": Value("key", TensorType((2, 7, 16), dtype)),
+        "value": Value("value", TensorType((2, 7, 16), dtype)),
+        "mask": Value("mask", TensorType(mask_shape, dtype)),
+        "output": Value("output", TensorType((2, 5, 16), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {"scale": 16**-0.5, "has_mask": True, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+
+    torch.manual_seed(75)
+    inputs = (
+        torch.randn(2, 5, 16),
+        torch.randn(2, 7, 16),
+        torch.randn(2, 7, 16),
+        torch.randn(mask_shape) * 0.2,
+    )
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = mx.array(
+        torch.nn.functional.scaled_dot_product_attention(
+            inputs[0], inputs[1], inputs[2], attn_mask=inputs[3]
+        ).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_native_attention_falls_back_above_threadgroup_limit() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    inputs = tuple(torch.randn(1, 2, 3, 512) for _ in range(3))
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    assert result.plan.kernels == ()
 
 
 @pytest.mark.parametrize("key_value_heads", [1, 2])

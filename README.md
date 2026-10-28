@@ -18,7 +18,7 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
-| 视图与布局 | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`clone`、`alias` |
+| 视图与布局 | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`unsqueeze`、`squeeze`、`clone`、`alias` |
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
@@ -32,7 +32,7 @@ PyTorch FX
 
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
 - 构建带 dtype/shape 校验的 SSA IR
-- 消除恒等 layout 和连续逆 `transpose/permute`，折叠相邻 `reshape`
+- 消除恒等 layout、连续逆 `transpose/permute` 和 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive mask、causal mask、显式 scale，以及 GQA/MQA
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
@@ -45,6 +45,7 @@ PyTorch FX
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
+- 可选的 fused Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
 - matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
@@ -52,13 +53,21 @@ PyTorch FX
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
 
-默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘和 bias 也会生成自定义 Metal kernel：
+默认情况下，`matmul`、`addmm` 和融合后的 attention 调用 MLX，pointwise、softmax、sum/mean、LayerNorm 和 RMSNorm 由本项目生成 MSL。attention 使用 `mx.fast.scaled_dot_product_attention`，不会进入 `CompiledPlan.kernels`；该列表只包含本项目生成的 Metal kernel。传入 `codegen_matmul=True` 后，rank-2 矩阵乘和 bias 会生成自定义 Metal kernel：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
 ```
 
 matmul kernel 现在使用寄存器 tiling：每个 thread 一次计算多个输出，复用 A/B 的加载，用 float 做 FMA 累加。K 小于 1024 时使用 4×4 microtile，K 较大时使用 8×4；完整 tile 走无边界检查快路径，尾部 shape 才生成 predicate。它仍没有 shared memory、SIMD matrix 或 autotune，实测比旧的一线程一输出版本快，但仍慢于 MLX，所以默认开关保持关闭。
+
+传入 `codegen_attention=True` 会为满足条件的 attention 生成原生 MSL kernel：
+
+```python
+result = compile_callable(fn, example_inputs, codegen_attention=True)
+```
+
+kernel 为每个 `(batch, query head, query position)` 启动一个 threadgroup，在 threadgroup memory 中完成 QK 点积，再用 online softmax 累积 V。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前实现以正确性为先，还没有针对 MLX SDPA 做性能调优，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
 
 ## 为什么没有直接改 Triton
 
@@ -137,7 +146,7 @@ mx.eval(output)
 
 编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前可以编译并执行包含 RMSNorm、多头 attention、残差连接和 SwiGLU MLP 的完整 decoder block，但不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。Layout op 已具备静态校验、恒等与逆变换消除和 MLX lowering，但还没有布局传播与公共子表达式消除。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
-attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。暂不支持 attention dropout、自定义 MSL attention kernel，也不会在 softmax 概率被其他节点观察时做激进融合。GQA 的 lowering 使用 `mx.fast.scaled_dot_product_attention`，不是本项目生成的 MSL attention kernel。
+attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask dtype 与输入相同。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见形式会使用生成的 MSL attention kernel，其余形式回退到 MLX。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 

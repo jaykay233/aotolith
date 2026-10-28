@@ -119,8 +119,14 @@ class CompiledPlan:
 class AppleMetalBackend:
     """Lower supported IR regions to Metal kernels with an MLX runtime."""
 
-    def __init__(self, *, codegen_matmul: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        codegen_matmul: bool = False,
+        codegen_attention: bool = False,
+    ) -> None:
         self.codegen_matmul = codegen_matmul
+        self.codegen_attention = codegen_attention
 
     def compile(self, graph: Graph) -> CompiledPlan:
         if not mx.metal.is_available():
@@ -155,6 +161,8 @@ class AppleMetalBackend:
                 compiled = self._compile_rms_norm(graph, op, index)
             elif op.op == "attention":
                 _validate_attention_op(graph, op)
+                if self.codegen_attention:
+                    compiled = self._compile_attention(graph, op, index)
             elif op.op in LAYOUT_OPS:
                 _validate_layout_op(graph, op)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
@@ -230,6 +238,183 @@ class AppleMetalBackend:
             output_id=output_id,
             tensor_type=output_type,
             kind=kind,
+        )
+        return artifact, runtime
+
+    def _compile_attention(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any] | None:
+        """Emit a correctness-first fused attention kernel for common shapes."""
+
+        query_type = graph.value(op.inputs[0]).type
+        key_type = graph.value(op.inputs[1]).type
+        value_type = graph.value(op.inputs[2]).type
+        output_type = graph.value(op.outputs[0]).type
+        query_shape = query_type.shape
+        key_shape = key_type.shape
+        value_shape = value_type.shape
+        rank = len(query_shape)
+        query_head_dim = query_shape[-1]
+        value_head_dim = value_shape[-1]
+        threads = _next_power_of_two(max(query_head_dim, value_head_dim))
+        if threads > 256:
+            return None
+
+        has_mask = bool(op.attrs.get("has_mask"))
+        mask_shape = graph.value(op.inputs[3]).type.shape if has_mask else None
+        if has_mask and not _native_attention_mask_supported(rank, mask_shape):
+            return None
+
+        batch, query_length, key_length = query_shape[0], query_shape[-2], key_shape[-2]
+        query_heads = query_shape[-3] if rank == 4 else 1
+        key_value_heads = key_shape[-3] if rank == 4 else 1
+        group_size = query_heads // key_value_heads
+        query_count = batch * query_heads * query_length
+
+        if rank == 4:
+            query_input_offset = (
+                f"(((batch * {query_heads}u + head) * {query_length}u + query_pos) "
+                f"* {query_head_dim}u + tid)"
+            )
+            key_offset = (
+                f"(((batch * {key_value_heads}u + head / {group_size}u) "
+                f"* {key_length}u + key) * {query_head_dim}u + tid)"
+            )
+            value_offset = (
+                f"(((batch * {key_value_heads}u + head / {group_size}u) "
+                f"* {key_length}u + key) * {value_head_dim}u + tid)"
+            )
+            output_offset = (
+                f"(((batch * {query_heads}u + head) * {query_length}u + query_pos) "
+                f"* {value_head_dim}u + tid)"
+            )
+        else:
+            query_input_offset = (
+                f"((batch * {query_length}u + query_pos) * {query_head_dim}u + tid)"
+            )
+            key_offset = (
+                f"((batch * {key_length}u + key) * {query_head_dim}u + tid)"
+            )
+            value_offset = (
+                f"((batch * {key_length}u + key) * {value_head_dim}u + tid)"
+            )
+            output_offset = (
+                f"((batch * {query_length}u + query_pos) * {value_head_dim}u + tid)"
+            )
+
+        score_expression = f"partial[0] * {float(op.attrs['scale'])!r}"
+        if has_mask:
+            mask_offset = _attention_mask_offset_expression(rank, mask_shape)
+            score_expression += f" + float(in_3[{mask_offset}])"
+        if op.attrs.get("causal"):
+            score_expression = (
+                f"key > query_pos ? -INFINITY : ({score_expression})"
+            )
+
+        reduction_stride = threads // 2
+        source = f"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint query_index = threadgroup_position_in_grid.x;
+        uint batch = query_index / {query_heads * query_length}u;
+        uint query_remainder = query_index % {query_heads * query_length}u;
+        uint head = query_remainder / {query_length}u;
+        uint query_pos = query_remainder % {query_length}u;
+        threadgroup float partial[{threads}];
+        threadgroup float state[4];
+
+        if (tid == 0u) {{
+            state[0] = -INFINITY;
+            state[1] = 0.0f;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float query_value = 0.0f;
+        if (tid < {query_head_dim}u) {{
+            query_value = float(in_0[{query_input_offset}]);
+        }}
+        float accumulator = 0.0f;
+
+        for (uint key = 0u; key < {key_length}u; ++key) {{
+            float partial_value = 0.0f;
+            if (tid < {query_head_dim}u) {{
+                partial_value = query_value * float(in_1[{key_offset}]);
+            }}
+            partial[tid] = partial_value;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+                if (tid < stride) {{
+                    partial[tid] += partial[tid + stride];
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }}
+
+            if (tid == 0u) {{
+                float score = {score_expression};
+                float previous_max = state[0];
+                float new_max = metal::max(previous_max, score);
+                float alpha = previous_max == -INFINITY
+                    ? 0.0f
+                    : metal::exp(previous_max - new_max);
+                float probability = score == -INFINITY
+                    ? 0.0f
+                    : metal::exp(score - new_max);
+                state[0] = new_max;
+                state[1] = state[1] * alpha + probability;
+                state[2] = alpha;
+                state[3] = probability;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid < {value_head_dim}u) {{
+                accumulator = accumulator * state[2]
+                    + state[3] * float(in_2[{value_offset}]);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        if (tid < {value_head_dim}u) {{
+            out[{output_offset}] = (T)(state[1] == 0.0f
+                ? 0.0f
+                : accumulator / state[1]);
+        }}
+        """
+        input_names = ("in_0", "in_1", "in_2", "in_3") if has_mask else (
+            "in_0",
+            "in_1",
+            "in_2",
+        )
+        name = f"metal_attention_{threads}_{index}"
+        kernel = _metal_kernel(
+            name,
+            input_names,
+            ("out",),
+            source,
+            "",
+        )
+        grid = (query_count * threads, 1, 1)
+        threadgroup = (threads, 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header="",
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="attention",
         )
         return artifact, runtime
 
@@ -956,6 +1141,24 @@ def _validate_layout_op(graph: Graph, op: Operation) -> None:
             )
         return
 
+    if op.op == "squeeze":
+        dim = op.attrs.get("dim")
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"squeeze.dim must be an integer, got {dim!r}")
+        if rank == 0 or dim < -rank or dim >= rank:
+            raise ValueError(f"squeeze.dim {dim} exceeds rank {rank}")
+        axis = dim + rank if dim < 0 else dim
+        expected_shape = input_type.shape
+        if input_type.shape[axis] == 1:
+            expected_shape = (
+                input_type.shape[:axis] + input_type.shape[axis + 1 :]
+            )
+        if expected_shape != output_type.shape:
+            raise ValueError(
+                f"squeeze output shape {output_type.shape} != {expected_shape}"
+            )
+        return
+
     if input_type.shape != output_type.shape:
         raise ValueError(
             f"{op.op} output shape {output_type.shape} != {input_type.shape}"
@@ -1298,6 +1501,13 @@ def _evaluate_layout_mlx(
         axis = dim + output_rank if dim < 0 else dim
         return mx.expand_dims(value, axis=axis)
 
+    if op.op == "squeeze":
+        dim = int(op.attrs["dim"])
+        axis = dim + rank if dim < 0 else dim
+        if value.shape[axis] != 1:
+            return value
+        return mx.squeeze(value, axis=axis)
+
     if op.op == "contiguous":
         return mx.contiguous(value)
 
@@ -1366,6 +1576,39 @@ def _binary_mx_operands(
     return arguments[0], scalar
 
 
+def _native_attention_mask_supported(
+    query_rank: int, mask_shape: tuple[int, ...] | None
+) -> bool:
+    if mask_shape is None:
+        return False
+    if query_rank == 4:
+        return len(mask_shape) == 4
+    if query_rank == 3:
+        return len(mask_shape) in {2, 3}
+    return False
+
+
+def _attention_mask_offset_expression(
+    query_rank: int, mask_shape: tuple[int, ...]
+) -> str:
+    if query_rank == 4:
+        coordinates = ("batch", "head", "query_pos", "key")
+    else:
+        coordinates = ("batch", "query_pos", "key")
+    offset = len(coordinates) - len(mask_shape)
+    if offset < 0:
+        raise ValueError(f"attention mask rank exceeds query rank: {mask_shape}")
+
+    terms: list[str] = []
+    for axis, dimension in enumerate(mask_shape):
+        if dimension == 1:
+            continue
+        coordinate = coordinates[axis + offset]
+        stride = prod(mask_shape[axis + 1 :])
+        terms.append(coordinate if stride == 1 else f"{coordinate} * {stride}u")
+    return " + ".join(terms) if terms else "0u"
+
+
 def _validate_attention_op(graph: Graph, op: Operation) -> None:
     expected_inputs = 4 if op.attrs.get("has_mask") else 3
     if len(op.inputs) != expected_inputs:
@@ -1423,11 +1666,12 @@ def _validate_attention_op(graph: Graph, op: Operation) -> None:
     if expected_inputs == 4:
         mask_type = graph.value(op.inputs[3]).type
         score_shape = (
-            query_shape[:1]
-            + (1, query_shape[-2], key_shape[-2])
+            (query_shape[0], query_shape[-2], key_shape[-2])
             if len(query_shape) == 3
-            else query_shape[:1]
-            + (query_shape[-3], query_shape[-2], key_shape[-2])
+            else (
+                query_shape[:1]
+                + (query_shape[-3], query_shape[-2], key_shape[-2])
+            )
         )
         if mask_type.dtype != query_type.dtype:
             raise NotImplementedError("attention mask dtype must match Q/K/V")

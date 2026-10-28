@@ -31,6 +31,7 @@ LAYOUT_OPS = {
     "expand",
     "slice",
     "unsqueeze",
+    "squeeze",
     "contiguous",
     "alias",
 }
@@ -233,7 +234,7 @@ def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
     replacements: dict[int, Operation] = {}
 
     for index, op in enumerate(graph.ops):
-        if op.op not in {"reshape", "transpose", "permute"}:
+        if op.op not in {"reshape", "transpose", "permute", "unsqueeze", "squeeze"}:
             continue
         producer_index = producers.get(op.inputs[0])
         if producer_index is None:
@@ -280,6 +281,13 @@ def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
                 "reshape", (producer.inputs[0],), op.outputs, op.attrs
             )
             removed.add(producer_index)
+            continue
+
+        if {op.op, producer.op} == {"unsqueeze", "squeeze"}:
+            original_type = graph.value(producer.inputs[0]).type
+            if output_type.shape == original_type.shape:
+                aliases[op.outputs[0]] = producer.inputs[0]
+                removed.update({producer_index, index})
 
     if not removed:
         return graph, False
@@ -326,6 +334,8 @@ def _is_identity_layout(graph: Graph, op: Operation) -> bool:
     if op.op in {"contiguous", "alias"}:
         return input_type.shape == output_type.shape
     if op.op in {"reshape", "expand"}:
+        return input_type.shape == output_type.shape
+    if op.op == "squeeze":
         return input_type.shape == output_type.shape
     if op.op == "transpose":
         axes = _transpose_axes(op, rank)

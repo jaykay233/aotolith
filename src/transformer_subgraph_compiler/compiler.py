@@ -22,6 +22,7 @@ def compile_graph(
     *,
     target: str = "apple-metal",
     codegen_matmul: bool = False,
+    codegen_attention: bool = False,
 ) -> CompilationResult:
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
@@ -30,7 +31,10 @@ def compile_graph(
     lowered = canonicalize_batched_matmul(lowered)
     lowered = fuse_attention(lowered)
     lowered = fuse_pointwise(lowered)
-    plan = AppleMetalBackend(codegen_matmul=codegen_matmul).compile(lowered)
+    plan = AppleMetalBackend(
+        codegen_matmul=codegen_matmul,
+        codegen_attention=codegen_attention,
+    ).compile(lowered)
     return CompilationResult(plan=plan, input_graph=graph, lowered_graph=lowered)
 
 
@@ -40,9 +44,11 @@ def compile_callable(
     *,
     target: str = "apple-metal",
     codegen_matmul: bool = False,
+    codegen_attention: bool = False,
 ) -> CompilationResult:
     return compile_graph(
         capture_fx(fn, example_inputs),
         target=target,
         codegen_matmul=codegen_matmul,
+        codegen_attention=codegen_attention,
     )

@@ -18,6 +18,7 @@ _SUPPORTED_OPS = {
     "aten.expand.default": "expand",
     "aten.slice.Tensor": "slice",
     "aten.unsqueeze.default": "unsqueeze",
+    "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
     "aten.alias.default": "alias",
     "aten._softmax.default": "softmax",
@@ -652,6 +653,14 @@ def _operation_inputs(
         input_id, dim = args
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"unsqueeze.dim must be an integer, got {dim!r}")
+        return ((_argument_ids(input_id, node_ids),), {"dim": dim})
+
+    if op == "squeeze":
+        if len(args) != 2:
+            raise ValueError(f"squeeze expects two arguments, got {len(args)}")
+        input_id, dim = args
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"squeeze.dim must be an integer, got {dim!r}")
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
     if op in {"contiguous", "alias"}:
