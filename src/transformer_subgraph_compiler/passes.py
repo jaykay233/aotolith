@@ -23,6 +23,7 @@ POINTWISE_OPS = {
     "sqrt",
     "rsqrt",
     "reciprocal",
+    "clamp",
 }
 
 LAYOUT_OPS = {

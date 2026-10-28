@@ -1502,6 +1502,113 @@ def test_pow_fuses_with_surrounding_pointwise_ops() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "mode", ["min_max", "min_only", "max_only", "tensor_bounds", "hardtanh"]
+)
+def test_clamp_variants_match_pytorch(mode) -> None:
+    torch.manual_seed(24)
+    x = torch.randn(2, 3)
+    if mode == "min_max":
+        fn = lambda value: torch.clamp(value, min=-0.25, max=0.5)
+        inputs = (x,)
+    elif mode == "min_only":
+        fn = lambda value: torch.clamp(value, min=0.0)
+        inputs = (x,)
+    elif mode == "max_only":
+        fn = lambda value: torch.clamp(value, max=0.0)
+        inputs = (x,)
+    elif mode == "tensor_bounds":
+        fn = lambda value, lower, upper: torch.clamp(
+            value, min=lower, max=upper
+        )
+        inputs = (x, torch.randn(1, 3), torch.randn(2, 1))
+    else:
+        fn = lambda value: torch.nn.functional.hardtanh(value, -0.5, 0.75)
+        inputs = (x,)
+
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["clamp"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["clamp"]
+    source = result.plan.kernels[0].source
+    assert "metal::max(" in source or mode == "max_only"
+    assert "metal::min(" in source or mode == "min_only"
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_clamp_fuses_with_surrounding_pointwise_ops() -> None:
+    def fn(value):
+        return torch.clamp(torch.sigmoid(value), 0.2, 0.8) + torch.tanh(value)
+
+    torch.manual_seed(25)
+    x = torch.randn(31)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert result.plan.kernels[0].source.count("metal::min(") == 1
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_clamp_fuses_with_tensor_bounds() -> None:
+    def fn(value, lower, upper):
+        return torch.clamp(torch.sigmoid(value), min=lower, max=upper) + value
+
+    torch.manual_seed(27)
+    inputs = (torch.randn(2, 3), torch.randn(1, 3) - 0.5, torch.randn(2, 1))
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    body = result.lowered_graph.ops[0].attrs["body"]
+    assert body[-2].attrs["min_input"] == 1
+    assert body[-2].attrs["max_input"] == 2
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("nan_bound", [False, True])
+def test_clamp_propagates_nan(nan_bound) -> None:
+    x = torch.tensor([float("nan"), -2.0, 0.0, 2.0])
+    if nan_bound:
+        fn = lambda value: torch.clamp(value, min=float("nan"), max=1.0)
+    else:
+        fn = lambda value: torch.clamp(value, min=-1.0, max=1.0)
+
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(mx.isnan(actual), mx.isnan(expected))
+    actual_values = mx.where(mx.isnan(actual), 0.0, actual)
+    expected_values = mx.where(mx.isnan(expected), 0.0, expected)
+    assert mx.allclose(actual_values, expected_values, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_clamp_supports_low_precision(dtype) -> None:
+    torch.manual_seed(26)
+    x = torch.randn(2, 3, 7, dtype=dtype)
+    result = compile_callable(
+        lambda value: torch.clamp(value, min=-0.5, max=0.5), (x,)
+    )
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
+    expected = mx.array(
+        torch.clamp(x.float(), min=-0.5, max=0.5).numpy(),
+        dtype=mlx_dtype,
+    )
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_pow_supports_low_precision(dtype) -> None:
     torch.manual_seed(23)

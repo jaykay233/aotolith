@@ -3,7 +3,7 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass
 from functools import lru_cache
-from math import ceil, prod
+from math import ceil, isinf, isnan, prod
 from typing import Any
 
 import mlx.core as mx
@@ -1852,7 +1852,54 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"metal::rsqrt({arguments[0]})"
     if op.op == "reciprocal":
         return f"1.0f / {arguments[0]}"
+    if op.op == "clamp":
+        value = arguments[0]
+        lower = _clamp_bound_expression(op, arguments, "min")
+        upper = _clamp_bound_expression(op, arguments, "max")
+        if lower is not None and upper is not None:
+            clipped = f"metal::min(metal::max({value}, {lower}), {upper})"
+        elif lower is not None:
+            clipped = f"metal::max({value}, {lower})"
+        elif upper is not None:
+            clipped = f"metal::min({value}, {upper})"
+        else:
+            return value
+        invalid_inputs = [value]
+        if lower is not None:
+            invalid_inputs.append(lower)
+        if upper is not None:
+            invalid_inputs.append(upper)
+        nan_check = " || ".join(
+            f"metal::isnan({expression})" for expression in invalid_inputs
+        )
+        return f"(({nan_check}) ? NAN : {clipped})"
     raise NotImplementedError(f"cannot emit fused pointwise op: {op.op}")
+
+
+def _clamp_bound_expression(
+    op: Operation, arguments: list[str], name: str
+) -> str | None:
+    input_position = op.attrs.get(f"{name}_input")
+    if input_position is not None:
+        if (
+            not isinstance(input_position, int)
+            or isinstance(input_position, bool)
+            or input_position < 1
+            or input_position >= len(arguments)
+        ):
+            raise ValueError(f"clamp.{name}_input is malformed")
+        return arguments[input_position]
+    bound = op.attrs.get(name)
+    if bound is None:
+        return None
+    if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+        raise ValueError(f"clamp.{name} must be a scalar number")
+    value = float(bound)
+    if isnan(value):
+        return "NAN"
+    if isinf(value):
+        return "INFINITY" if value > 0 else "-INFINITY"
+    return repr(value)
 
 
 def _select_matmul_microtile(reduction: int) -> tuple[int, int]:
@@ -2458,6 +2505,21 @@ def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
         return 1.0 / mx.sqrt(arguments[0])
     if op.op == "reciprocal":
         return 1.0 / arguments[0]
+    if op.op == "clamp":
+        value = arguments[0]
+        lower: mx.array | float = -float("inf")
+        upper: mx.array | float = float("inf")
+        if "min_input" in op.attrs:
+            lower = arguments[int(op.attrs["min_input"])]
+        elif "min" in op.attrs:
+            lower = float(op.attrs["min"])
+        if "max_input" in op.attrs:
+            upper = arguments[int(op.attrs["max_input"])]
+        elif "max" in op.attrs:
+            upper = float(op.attrs["max"])
+        clipped = mx.minimum(mx.maximum(value, lower), upper)
+        invalid = mx.isnan(value) | mx.isnan(lower) | mx.isnan(upper)
+        return mx.where(invalid, float("nan"), clipped)
     raise NotImplementedError(f"no Apple runtime lowering for {op.op}")
 
 

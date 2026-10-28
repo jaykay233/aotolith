@@ -49,6 +49,9 @@ _SUPPORTED_OPS = {
     "aten.sqrt.default": "sqrt",
     "aten.rsqrt.default": "rsqrt",
     "aten.reciprocal.default": "reciprocal",
+    "aten.clamp.default": "clamp",
+    "aten.clamp.Tensor": "clamp",
+    "aten.hardtanh.default": "clamp",
 }
 
 _TORCH_DTYPES = {
@@ -693,6 +696,30 @@ def _operation_inputs(
         if len(args) != 1:
             raise ValueError(f"{op} expects one argument, got {len(args)}")
         return ((_argument_ids(args[0], node_ids),), {})
+
+    if op == "clamp":
+        if len(args) not in {1, 2, 3}:
+            raise ValueError(
+                f"clamp expects one to three positional arguments, got {len(args)}"
+            )
+        inputs = [_argument_ids(args[0], node_ids)]
+        attrs: dict[str, object] = {}
+        for position, name in ((1, "min"), (2, "max")):
+            if position >= len(args) or args[position] is None:
+                continue
+            bound = args[position]
+            try:
+                bound_id = _argument_ids(bound, node_ids)
+            except ValueError:
+                if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+                    raise ValueError(
+                        f"unsupported clamp {name} at position {position}: {bound!r}"
+                    ) from None
+                attrs[name] = float(bound)
+            else:
+                attrs[f"{name}_input"] = len(inputs)
+                inputs.append(bound_id)
+        return tuple(inputs), attrs
 
     if op in _REDUCTION_OPS:
         if len(args) == 1:
