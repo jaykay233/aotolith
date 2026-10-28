@@ -1,6 +1,6 @@
 # 架构
 
-当前实现是一条最小但可运行的 Apple Metal 编译链，目标是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并逐步覆盖 Transformer 推理所需的能力。静态、多层 decoder-only forward 已经有端到端验证；KV Cache、生成循环和动态 batching 仍属于后续运行时能力。
+当前实现是一条最小但可运行的 Apple Metal 编译链，目标是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并逐步覆盖 Transformer 推理所需的能力。静态、多层 decoder-only forward 和固定容量静态 KV Cache 的 prefill/decode 已经有端到端验证；动态 shape、分页 cache、continuous batching 和 serving 调度仍属于后续运行时能力。
 
 ## 1. FX 捕获
 
@@ -393,6 +393,17 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 kernel name、input/output 参数名、MSL source 和 header 组成，容量为 256。它只避免同一 Python 进程内重复构造相同 kernel，不是跨进程磁盘缓存；MLX 自身的编译缓存行为不由这里控制。
 
+### 静态 KV Cache 生成
+
+`examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
+
+- prefill 图接收 prompt token、RoPE position、固定 shape 的 bool mask，以及模型权重；它把 prompt 的 K/V 右对齐写入固定容量 cache。对应的 mask 为 `[B, 1, prompt_len, capacity]`，每个 query 只能看到右对齐区域中的 causal prefix。
+- decode 图接收一个 token、当前位置、`[B, 1, 1, capacity]` mask、每层旧 cache 和权重；它沿 sequence 维把 cache 左移一格，在末尾拼接当前 token 的 K/V，再返回 logits 和全部更新后的 cache。
+- RoPE position 通过 `F.embedding` 从静态 cos/sin 表选行。这个操作已经能被现有 embedding lowering 执行，不需要新增 cache 专用算子。
+- 测试会把连续三步 decode 的 logits 和贪心 token 对照完整序列 forward，验证 prefill/decode 的 cache 接口没有改变模型语义。
+
+这个实现特意选择容易验证的布局，不是性能路径。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；它没有 block table、slot mapping、paged attention、prefix sharing 或 cache eviction。
+
 ## 14. 已知边界
 
 - 只支持静态、非空 shape
@@ -409,7 +420,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
-- 没有 KV Cache、prefill/decode 生成循环、采样或 serving 运行时；当前端到端 Transformer 测试验证的是完整序列上的单次 forward
+- 静态 KV Cache 只有固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；没有动态 valid length、paged cache、prefix sharing、continuous batching、通用采样 API 或 serving 运行时
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
