@@ -1,6 +1,14 @@
 # 架构
 
-当前实现是一条最小但可运行的 Apple Metal 编译链，目标是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并逐步覆盖 Transformer 推理所需的能力。静态、多层 decoder-only forward 和固定容量静态 KV Cache 的 prefill/decode 已经有端到端验证；动态 shape、分页 cache、continuous batching 和 serving 调度仍属于后续运行时能力。
+当前实现是一条最小但可运行的 Apple Metal 模型编译链。项目定位是模型编译器，不是推理引擎：它负责把 Transformer 计算图转换为带 ABI 的执行计划，不负责请求调度、cache 分配、采样策略或 serving。静态、多层 decoder-only forward 和固定容量静态 KV Cache 的 prefill/decode 已经有端到端验证；MLX 在这里既是回退算子提供者，也是编译结果的验证执行底座。
+
+## 0. 目标与边界
+
+项目目标是把 PyTorch 导出的模型图编译成 typed SSA IR，完成合法化、图优化、内存与布局规划、kernel 选择和代码生成，最终产出可序列化、可验证、与具体推理调度策略解耦的执行计划。Apple Metal 是当前第一目标后端。
+
+编译器负责图导入、参数绑定、shape 系统、legalization、常量折叠、DCE、CSE、布局传播、算子融合、liveness 与 buffer planning、后端 lowering、kernel codegen/autotune，以及编译产物和跨进程 cache。
+
+请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 由外部推理系统负责。KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contract；编译器可以 lower cache 读写和规划静态内存，但不管理 page table、分配、回收或跨请求复用。
 
 ## 1. FX 捕获
 
@@ -370,7 +378,9 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
-## 13. Runtime
+## 13. CompiledPlan 执行器
+
+本节中的 Runtime 只指编译结果的最小执行器。它按照 `CompiledPlan` 调用生成的 Metal kernel 或 MLX 回退算子，不实现请求调度、batching、采样或 serving。
 
 `CompiledPlan` 按 SSA 顺序执行 IR：
 
@@ -395,14 +405,14 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ### 静态 KV Cache 生成
 
-`examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。batch 和 cache shape 固定，但每个 batch row 可以通过 mask 和 position 使用不同的有效长度。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
+`examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。这个例子用于验证 KV Cache 的图 ABI，不是编译器提供的生成运行时。batch 和 cache shape 固定，但每个 batch row 可以通过 mask 和 position 使用不同的有效长度。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
 
 - prefill 图接收左侧 padding 的 prompt token、RoPE position、逐请求 bool mask，以及模型权重；它把 padded prompt 的 K/V 右对齐写入固定容量 cache。对应的 mask 为 `[B, 1, prompt_len, capacity]`，padding query 被整行 mask，每个有效 query 只能看到本请求有效区域中的 causal prefix。
 - decode 图接收每行一个 token、各自当前位置、`[B, 1, 1, capacity]` mask、每层旧 cache 和权重；它沿 sequence 维把 cache 左移一格，在末尾拼接当前 token 的 K/V，再返回 logits 和全部更新后的 cache。
 - RoPE position 通过 `F.embedding` 从静态 cos/sin 表选行。这个操作已经能被现有 embedding lowering 执行，不需要新增 cache 专用算子。
 - 测试覆盖 `B=1` 和左侧 padding 的 `B=2`，第二个请求的有效 prompt 更短。连续三步 decode 会逐请求对照完整序列 forward 的 logits 和贪心 token，验证 padding、mask、position 和 cache 更新没有改变模型语义。
 
-这个实现特意选择容易验证的布局，不是性能路径。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；它没有 block table、slot mapping、paged attention、prefix sharing 或 cache eviction。
+这个实现特意选择容易验证的布局，不是性能路径。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
 
 ## 14. 已知边界
 
@@ -420,7 +430,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
-- 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达，没有动态 shape、paged cache、prefix sharing、请求动态进出 batch、通用采样 API 或 serving 运行时
+- 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
@@ -428,4 +438,12 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K、shape autotune 与更通用的布局传播；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进更一般的布局传播与跨进程 kernel cache。
+## 15. 编译器路线
+
+1. 导入真实的 HuggingFace 风格小模型图，完成参数绑定、输出 logits 对齐和模型级回归测试。
+2. 把静态 shape 系统扩展到符号 shape、shape propagation 和 specialization，建立图级 verifier 和 legalization 规则。
+3. 补齐常量折叠、DCE、跨 reshape 的布局传播，以及更通用的广播和边界布局优化。
+4. 增加 liveness 分析与 buffer planning，减少中间 tensor 分配和重复物化。
+5. 建立 backend 能力表和 kernel selection，使 MSL kernel、MLX fallback 和后续 CUDA/Triton backend 共享同一 IR。
+6. 产出可序列化的编译产物，定义稳定 ABI，并加入跨进程 kernel cache。
+7. 用真实模型做端到端数值对齐、编译产物复用和 kernel 性能回归。

@@ -1,13 +1,37 @@
 # Transformer Subgraph Compiler
 
-一个面向 Transformer 子图的实验性编译器。当前版本以 Apple Silicon 为第一目标，把 PyTorch FX 图转换成自定义 SSA IR，消除冗余布局与公共子表达式，融合 attention 和 pointwise 子图，再通过生成的 Metal Shading Language kernel 与 MLX runtime 在 Apple GPU 上执行。
+一个面向 Transformer 模型的实验性编译器。项目把 PyTorch FX 图转换成带类型和 shape 的 SSA IR，再逐步经过合法化、布局简化、融合、CSE 和内存规划，最终 lower 成 Metal Shading Language kernel 与可直接执行的编译计划。当前以 Apple Silicon 为第一目标，MLX 用作执行计划和回退算子的验证底座。
+
+## 项目目标
+
+项目的主目标不是实现推理引擎，而是把模型计算图编译成可验证、可复用、与具体调度策略无关的执行计划。第一阶段以 Apple Metal 为目标后端，后续再扩展其他 backend。
+
+编译器的职责是：
+
+- 导入模型图、绑定参数，并建立稳定的输入输出 ABI
+- 建立 typed SSA IR、shape 系统和 verifier
+- 做 legalization、常量折叠、DCE、CSE、布局传播和算子融合
+- 做 buffer 复用、liveness 分析和内存规划
+- 完成算子 lowering、kernel 选择、代码生成和可选的 autotune
+- 产出可序列化的编译产物，并提供跨进程 kernel cache
+
+当前交付物是进程内的 `CompiledPlan`，包含输入输出契约、IR 执行序列以及本项目生成的 Metal kernel。可序列化产物、稳定 ABI 和真实的 HuggingFace 风格模型导入仍是后续目标。
+
+这一阶段的完成标准是：能够编译一个真实的 tiny Llama/Qwen 风格模型；输出 logits 与 PyTorch 参考实现对齐；编译产物可以不依赖原始 Python 模型对象重新加载并执行；同一个模型图能够经过 verifier、图优化、buffer planning 和 backend selection 形成稳定计划。
+
+## 项目边界
+
+请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 属于推理运行时，不是这个编译器的实现目标。编译器只处理这些系统中的模型计算部分，以及它们暴露给模型图的输入输出和张量布局。
+
+KV Cache 在项目里是图输入、图输出和内存布局契约。编译器可以 lower cache 读写、选择布局并规划 buffer；cache 的分配、回收、分页和跨请求复用由外部运行时负责。仓库中的 `CompiledPlan` 执行代码和 `examples/tiny_transformer_generate.py` 的 greedy host loop 只用于验证 lowering 的正确性，不作为推理引擎功能定义。
 
 ```text
 PyTorch FX
   -> SSA IR
   -> layout simplification / matmul layout folding and canonicalization / attention and pointwise fusion / CSE
-  -> Metal Shading Language + MLX runtime lowering
+  -> Metal Shading Language + MLX fallback lowering
   -> mx.fast.metal_kernel
+  -> CompiledPlan
   -> Apple GPU
 ```
 
@@ -177,7 +201,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以用固定最大 batch、左侧 padding 和逐请求 mask 执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此它验证的是 cache ABI 和生成正确性，不是高性能实现。项目还没有动态 shape、分页 cache、请求动态进出 batch、通用生成 API、采样和 serving 运行时。当前也不支持动态 shape、控制流、自动微分、跨进程 kernel cache 和训练。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。完整多层 decoder-only Transformer forward 以及固定容量静态 KV Cache 的 prefill/decode 已通过端到端验证，`examples/tiny_transformer_generate.py` 可以用固定最大 batch、左侧 padding 和逐请求 mask 执行三步 greedy 生成。当前 cache 在每个 decode step 对整段固定容量 cache 做左移和拼接，attention 仍读取 padded capacity，因此这个例子只验证 cache 的图 ABI 和生成正确性，不代表编译器要提供 cache allocator 或生成引擎。编译器和执行计划目前还不支持动态 shape、控制流、跨进程 kernel 产物以及训练。分页 cache、请求动态进出 batch、采样策略和 serving 由外部推理系统负责，不属于本项目目标。`split`、`chunk`、`unbind` 要求由 example inputs 求出的每个输出 shape 都是静态且非空的。Layout 优化已覆盖恒等、逆变换、matmul 输入转置和单消费者 batch `expand` 折叠；`reshape` 跨转置以及非 matmul 边界的一般广播布局传播尚未实现。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask 可以是同 dtype 的 additive mask 或 bool mask。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见 additive-mask 或 bool-mask 形式会使用生成的 MSL attention kernel。bool mask 的 `True` 表示允许该 key 参与 attention，整行都为 `False` 时输出为零。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 
