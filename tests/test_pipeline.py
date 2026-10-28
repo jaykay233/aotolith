@@ -6,14 +6,14 @@ import mlx.core as mx
 import pytest
 import torch
 
-from transformer_subgraph_compiler import (
+from aotolith import (
     compile_callable,
     compile_graph,
     eliminate_common_subexpressions,
     fuse_pointwise,
 )
-from transformer_subgraph_compiler.backends import apple_metal as metal_backend
-from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
+from aotolith.backends import apple_metal as metal_backend
+from aotolith.ir import DType, Graph, Operation, TensorType, Value
 
 
 _MLX_DTYPES = {

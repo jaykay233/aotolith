@@ -4,7 +4,7 @@ import mlx.core as mx
 import torch
 import torch.nn.functional as F
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
@@ -35,8 +35,8 @@ def run_case(batch: int, heads: int, sequence: int, head_dim: int) -> None:
         )
         for _ in range(3)
     )
-    native = compile_callable(attention, torch_inputs, codegen_attention=True)
-    fallback = compile_callable(attention, torch_inputs)
+    native = aoto.compile_callable(attention, torch_inputs, codegen_attention=True)
+    fallback = aoto.compile_callable(attention, torch_inputs)
     kernel = native.plan.kernels[0]
     inputs = tuple(
         mx.array(value.float().numpy(), dtype=mx.float16) for value in torch_inputs

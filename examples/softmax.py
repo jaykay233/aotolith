@@ -3,13 +3,13 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def main() -> None:
     torch.manual_seed(0)
     x = torch.randn(2, 3, 4, 512)
-    result = compile_callable(
+    result = aoto.compile_callable(
         lambda value: (
             torch.nn.functional.softmax(value, dim=-1),
             torch.nn.functional.softmax(value, dim=1),

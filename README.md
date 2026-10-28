@@ -1,4 +1,4 @@
-# Transformer Subgraph Compiler
+# Aotolith
 
 English | [简体中文](README.zh-CN.md)
 
@@ -9,7 +9,7 @@ An experimental Transformer model compiler with native Apple Silicon and Metal s
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#status)
 
-Transformer Subgraph Compiler captures PyTorch models as FX graphs, lowers them through a typed SSA IR, and produces an executable plan backed by generated Metal kernels and MLX fallbacks.
+Aotolith captures PyTorch models as FX graphs, lowers them through a typed SSA IR, and produces an executable plan backed by generated Metal kernels and MLX fallbacks.
 
 > [!IMPORTANT]
 > This project compiles Transformer model computation. Request scheduling, continuous batching, paged KV allocation, sampling, distributed execution, and serving belong to the host runtime.
@@ -30,7 +30,7 @@ The project is usable for static, end-to-end Transformer experiments. It is not 
 | Graph compiler | Typed SSA IR with shape/dtype checks, legalization, layout folding, fusion, and CSE |
 | Storage planning | Computes live intervals, release points, peak live bytes, reusable buffer slots, and a real arena used during execution |
 | Kernel selection | Records a native Metal or MLX implementation and fallback reason for every lowered operation |
-| Executable artifact | Versioned `.tsca` archives contain graphs, kernels, selections, storage metadata, and module state; they load and execute in a fresh process |
+| Executable artifact | Versioned `.aoto` archives contain graphs, kernels, selections, storage metadata, and module state; they load and execute in a fresh process |
 | Autotuning | Opt-in profiling measures native and MLX candidates; measurements and the final selection are stored in the artifact |
 
 The current regression compiles a two-layer HuggingFace Llama from 220 FX operations to 136 lowered operations. Its logits match a PyTorch reference with maximum absolute error `8.941e-08`, and the compiled plan remains executable after the original module is released.
@@ -70,8 +70,8 @@ Versioned artifact → reload and rebuild kernels → Apple GPU
 ## Installation
 
 ```bash
-git clone https://github.com/jaykay233/transformer-subgraph-compiler.git
-cd transformer-subgraph-compiler
+git clone https://github.com/jaykay233/aotolith.git
+cd aotolith
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -88,7 +88,7 @@ The example compiles a small `addmm + SiLU` function. Both the graph and the ker
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def fn(x, weight, bias):
@@ -103,7 +103,7 @@ example_inputs = (
     torch.randn(32),
 )
 
-compiled = compile_callable(fn, example_inputs, codegen_matmul=True)
+compiled = aoto.compile_callable(fn, example_inputs, codegen_matmul=True)
 inputs = tuple(mx.array(value.numpy()) for value in example_inputs)
 output = compiled.plan(*inputs)[0]
 mx.eval(output)
@@ -121,7 +121,7 @@ for selection in compiled.plan.selections:
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from transformer_subgraph_compiler import compile_module
+import aotolith as aoto
 
 
 model = LlamaForCausalLM(
@@ -138,7 +138,7 @@ model = LlamaForCausalLM(
 ).eval()
 
 input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
-compiled = compile_module(
+compiled = aoto.compile_module(
     model,
     (input_ids,),
     example_kwargs={"use_cache": False},
@@ -152,19 +152,19 @@ mx.eval(logits)
 
 ### Command Line And Artifacts
 
-The installed `tsc` command compiles a callable, module, or HuggingFace model. It can also inspect or execute the result without importing the original model.
+The installed `aoto` command compiles a callable, module, or HuggingFace model. It can also inspect or execute the result without importing the original model.
 
 ```bash
-tsc compile \
+aoto compile \
   --module 'my_module:build_model' \
   --input-file inputs.json \
-  --output model.tsca \
+  --output model.aoto \
   --codegen-matmul \
   --autotune
 
-tsc inspect model.tsca
-tsc verify model.tsca --require-device-match
-tsc run model.tsca --input-file inputs.json --output outputs.json
+aoto inspect model.aoto
+aoto verify model.aoto --require-device-match
+aoto run model.aoto --input-file inputs.json --output outputs.json
 ```
 
 `inputs.json` contains positional tensor specifications. Scalars use an empty shape and a one-element data list:
@@ -184,9 +184,9 @@ tsc run model.tsca --input-file inputs.json --output outputs.json
 ]
 ```
 
-Use repeated `--input '<json>'` arguments instead of `--input-file` when convenient. `--callable MODULE:ATTR` traces a function, `--module MODULE:ATTR` accepts an `nn.Module`, class, or factory, and `--hf-model` loads a HuggingFace causal language model. `python -m transformer_subgraph_compiler` provides the same commands when the console script is not on `PATH`.
+Use repeated `--input '<json>'` arguments instead of `--input-file` when convenient. `--callable MODULE:ATTR` traces a function, `--module MODULE:ATTR` accepts an `nn.Module`, class, or factory, and `--hf-model` loads a HuggingFace causal language model. `python -m aotolith` provides the same commands when the console script is not on `PATH`.
 
-Artifacts use format version 3 and ABI version 1.2. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
+Artifacts use format version 4 and ABI version 1.2. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
 
 Strict GPU matching is optional. `--require-device-match` or `require_device_match=True` rejects an artifact compiled for another Apple GPU model; the default allows execution on another Apple Silicon device after rebuilding kernels.
 
@@ -195,7 +195,7 @@ Strict GPU matching is optional. `--require-device-match` or `require_device_mat
 Pointwise operations, softmax, reductions, LayerNorm, and RMSNorm generate Metal kernels by default. Matmul and attention use MLX unless native code generation is enabled:
 
 ```python
-compiled = compile_callable(
+compiled = aoto.compile_callable(
     fn,
     example_inputs,
     codegen_matmul=True,
@@ -258,7 +258,7 @@ First execution includes MLX kernel JIT compilation and GPU dispatch. Timing fro
 ## Repository Layout
 
 ```text
-src/transformer_subgraph_compiler/   Compiler frontend, IR, passes, planner, selection, and Metal backend
+src/aotolith/   Compiler frontend, IR, passes, planner, selection, and Metal backend
 tests/                                IR, lowering, numerical parity, generation, and planner tests
 examples/                             Runnable model, kernel, and static KV-cache examples
 docs/architecture.md                  Detailed implementation notes and known boundaries

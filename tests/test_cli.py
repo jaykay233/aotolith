@@ -22,7 +22,7 @@ def _run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
         python_paths.extend(Path(item) for item in existing.split(os.pathsep))
     environment["PYTHONPATH"] = os.pathsep.join(str(path) for path in python_paths)
     return subprocess.run(
-        [sys.executable, "-m", "transformer_subgraph_compiler", *arguments],
+        [sys.executable, "-m", "aotolith", *arguments],
         cwd=_ROOT,
         env=environment,
         check=True,
@@ -40,7 +40,7 @@ def _input_spec() -> dict[str, object]:
 
 
 def test_cli_compiles_inspects_verifies_and_runs_module(tmp_path: Path) -> None:
-    artifact = tmp_path / "tiny.tsca"
+    artifact = tmp_path / "tiny.aoto"
     input_file = tmp_path / "inputs.json"
     input_file.write_text(json.dumps([_input_spec()]), encoding="utf-8")
 
@@ -60,7 +60,7 @@ def test_cli_compiles_inspects_verifies_and_runs_module(tmp_path: Path) -> None:
 
     inspect_result = _run_cli("inspect", str(artifact))
     manifest = json.loads(inspect_result.stdout)
-    assert manifest["format_version"] == 3
+    assert manifest["format_version"] == 4
     assert manifest["entrypoint"]["input_count"] == 1
     assert [item["name"] for item in manifest["entrypoint"]["state"]] == [
         "weight",
@@ -86,7 +86,7 @@ def test_cli_compiles_inspects_verifies_and_runs_module(tmp_path: Path) -> None:
 
 
 def test_cli_compiles_callable_and_writes_run_output(tmp_path: Path) -> None:
-    artifact = tmp_path / "callable.tsca"
+    artifact = tmp_path / "callable.aoto"
     output_file = tmp_path / "output.json"
     spec = {
         "shape": [2, 2],

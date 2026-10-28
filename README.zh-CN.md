@@ -1,4 +1,4 @@
-# Transformer Subgraph Compiler
+# Aotolith
 
 [English](README.md) | 简体中文
 
@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#当前状态)
 
-Transformer Subgraph Compiler 把 PyTorch 模型捕获成 FX 图，经过带类型和 shape 的 SSA IR，生成由 Metal kernel 和 MLX fallback 共同执行的计算计划。
+Aotolith 把 PyTorch 模型捕获成 FX 图，经过带类型和 shape 的 SSA IR，生成由 Metal kernel 和 MLX fallback 共同执行的计算计划。
 
 > [!IMPORTANT]
 > 这个项目编译 Transformer 模型计算。请求调度、continuous batching、分页 KV 分配、采样、分布式执行和 serving 由外部运行时负责。
@@ -30,7 +30,7 @@ Transformer Subgraph Compiler 把 PyTorch 模型捕获成 FX 图，经过带类�
 | 图编译器 | 使用 typed SSA IR，支持 shape/dtype 校验、合法化、布局折叠、融合和 CSE |
 | 存储规划 | 已生成 live interval、释放点、峰值活跃字节和可复用 buffer slot，执行时使用真实 arena |
 | Kernel 选择 | 为每个 lowered op 记录原生 Metal 或 MLX 实现，以及 fallback 原因 |
-| 编译产物 | 版本化 `.tsca` archive 包含图、kernel、selection、storage metadata 和模型 state，可在新进程加载执行 |
+| 编译产物 | 版本化 `.aoto` archive 包含图、kernel、selection、storage metadata 和模型 state，可在新进程加载执行 |
 | Autotune | 可选的 profile 流程会测量原生 kernel 和 MLX 候选，测量结果与最终选择写入 artifact |
 
 当前回归用例把两层 HuggingFace Llama 从 220 个 FX 算子降到 136 个 lowered op，logits 相对 PyTorch 参考实现的最大绝对误差为 `8.941e-08`。释放原始 module 后，编译计划仍可执行。
@@ -70,8 +70,8 @@ CompiledPlan
 ## 安装
 
 ```bash
-git clone https://github.com/jaykay233/transformer-subgraph-compiler.git
-cd transformer-subgraph-compiler
+git clone https://github.com/jaykay233/aotolith.git
+cd aotolith
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -88,7 +88,7 @@ python -m pip install -e '.[dev]'
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def fn(x, weight, bias):
@@ -103,7 +103,7 @@ example_inputs = (
     torch.randn(32),
 )
 
-compiled = compile_callable(fn, example_inputs, codegen_matmul=True)
+compiled = aoto.compile_callable(fn, example_inputs, codegen_matmul=True)
 inputs = tuple(mx.array(value.numpy()) for value in example_inputs)
 output = compiled.plan(*inputs)[0]
 mx.eval(output)
@@ -121,7 +121,7 @@ for selection in compiled.plan.selections:
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from transformer_subgraph_compiler import compile_module
+import aotolith as aoto
 
 
 model = LlamaForCausalLM(
@@ -138,7 +138,7 @@ model = LlamaForCausalLM(
 ).eval()
 
 input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
-compiled = compile_module(
+compiled = aoto.compile_module(
     model,
     (input_ids,),
     example_kwargs={"use_cache": False},
@@ -152,19 +152,19 @@ mx.eval(logits)
 
 ### 命令行与编译产物
 
-安装后可以用 `tsc` 编译 callable、module 或 HuggingFace 模型。产物也可以在不导入原始模型的情况下检查和执行。
+安装后可以用 `aoto` 编译 callable、module 或 HuggingFace 模型。产物也可以在不导入原始模型的情况下检查和执行。
 
 ```bash
-tsc compile \
+aoto compile \
   --module 'my_module:build_model' \
   --input-file inputs.json \
-  --output model.tsca \
+  --output model.aoto \
   --codegen-matmul \
   --autotune
 
-tsc inspect model.tsca
-tsc verify model.tsca --require-device-match
-tsc run model.tsca --input-file inputs.json --output outputs.json
+aoto inspect model.aoto
+aoto verify model.aoto --require-device-match
+aoto run model.aoto --input-file inputs.json --output outputs.json
 ```
 
 `inputs.json` 是按位置排列的 tensor 规格。标量使用空 shape 和单元素 data：
@@ -184,9 +184,9 @@ tsc run model.tsca --input-file inputs.json --output outputs.json
 ]
 ```
 
-也可以重复传入 `--input '<json>'`，不写输入文件。`--callable MODULE:ATTR` 捕获函数，`--module MODULE:ATTR` 接受 `nn.Module`、类或 factory，`--hf-model` 加载 HuggingFace causal language model。console script 不在 `PATH` 时，用 `python -m transformer_subgraph_compiler` 执行相同命令。
+也可以重复传入 `--input '<json>'`，不写输入文件。`--callable MODULE:ATTR` 捕获函数，`--module MODULE:ATTR` 接受 `nn.Module`、类或 factory，`--hf-model` 加载 HuggingFace causal language model。console script 不在 `PATH` 时，用 `python -m aotolith` 执行相同命令。
 
-artifact 使用 format version 3 和 ABI version 1.2。两张图、kernel table、selection table、storage plan 和每个 state tensor 都有 SHA-256 digest。加载时会校验 ABI、target、图、入口布局、state shape/dtype、序列化 kernel、重新构建的 selection 和 storage plan。kernel 根据校验后的图和已保存的 selection 重建，因此 artifact 不需要原始 Python 模型，加载时也不会重新 autotune。
+artifact 使用 format version 4 和 ABI version 1.2。两张图、kernel table、selection table、storage plan 和每个 state tensor 都有 SHA-256 digest。加载时会校验 ABI、target、图、入口布局、state shape/dtype、序列化 kernel、重新构建的 selection 和 storage plan。kernel 根据校验后的图和已保存的 selection 重建，因此 artifact 不需要原始 Python 模型，加载时也不会重新 autotune。
 
 是否要求 GPU 完全相同由调用方决定。`--require-device-match` 或 `require_device_match=True` 会拒绝为其他 Apple GPU 型号编译的 artifact；默认允许在其他 Apple Silicon 设备上重新构建 kernel 后执行。
 
@@ -195,7 +195,7 @@ artifact 使用 format version 3 和 ABI version 1.2。两张图、kernel table�
 pointwise、softmax、reduction、LayerNorm 和 RMSNorm 默认生成 Metal kernel。matmul 和 attention 默认使用 MLX，开启下面的选项后才生成原生 kernel：
 
 ```python
-compiled = compile_callable(
+compiled = aoto.compile_callable(
     fn,
     example_inputs,
     codegen_matmul=True,
@@ -258,7 +258,7 @@ python examples/metal_attention_benchmark.py
 ## 仓库结构
 
 ```text
-src/transformer_subgraph_compiler/   编译器前端、IR、passes、planner、selection 和 Metal backend
+src/aotolith/   编译器前端、IR、passes、planner、selection 和 Metal backend
 tests/                               IR、lowering、数值对齐、生成和 planner 测试
 examples/                            可运行的模型、kernel 和静态 KV Cache 示例
 docs/architecture.md                 详细实现说明与已知边界

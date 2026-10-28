@@ -22,8 +22,8 @@ from .selection import KernelBenchmark, KernelSelection
 if TYPE_CHECKING:
     from .compiler import CompilationResult, CompiledModulePlan
 
-ARTIFACT_FORMAT = "transformer-subgraph-compiler"
-FORMAT_VERSION = 3
+ARTIFACT_FORMAT = "aotolith"
+FORMAT_VERSION = 4
 ABI_VERSION = "1.2"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _MLX_DTYPES = {
@@ -48,7 +48,7 @@ def save_compiled(
     compiled: CompilationResult | CompiledModulePlan,
     path: str | os.PathLike[str],
 ) -> Path:
-    """Serialize a compiled callable or module into a ``.tsca`` file.
+    """Serialize a compiled callable or module into a ``.aoto`` file.
 
     The archive layout and non-profile payload bytes are canonical. Autotune
     measurements are intentionally data-dependent and can differ between runs.

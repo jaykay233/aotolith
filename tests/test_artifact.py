@@ -10,12 +10,12 @@ from pathlib import Path
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import (
+from aotolith import (
     ABI_VERSION,
     ArtifactCompatibilityError,
     compile_module,
 )
-from transformer_subgraph_compiler.backends.apple_metal import AppleMetalBackend
+from aotolith.backends.apple_metal import AppleMetalBackend
 
 
 class TinyArtifactModule(torch.nn.Module):
@@ -40,7 +40,7 @@ def test_module_artifact_round_trip_and_manifest(tmp_path: Path) -> None:
     with torch.no_grad():
         expected = model(value)
     compiled = compile_module(model, (value,), codegen_matmul=True)
-    artifact_path = compiled.save(tmp_path / "tiny.tsca")
+    artifact_path = compiled.save(tmp_path / "tiny.aoto")
 
     with zipfile.ZipFile(artifact_path) as archive:
         names = set(archive.namelist())
@@ -55,6 +55,8 @@ def test_module_artifact_round_trip_and_manifest(tmp_path: Path) -> None:
         "state/00000.bin",
         "state/00001.bin",
     } <= names
+    assert manifest["format"] == "aotolith"
+    assert manifest["format_version"] == 4
     assert manifest["abi_version"] == ABI_VERSION
     assert manifest["entrypoint"]["kind"] == "module"
     assert [item["name"] for item in manifest["entrypoint"]["state"]] == [
@@ -71,7 +73,7 @@ def test_module_artifact_round_trip_and_manifest(tmp_path: Path) -> None:
     assert manifest["profile"]["device_name"]
 
     loaded = __import__(
-        "transformer_subgraph_compiler", fromlist=["load_compiled_module"]
+        "aotolith", fromlist=["load_compiled_module"]
     ).load_compiled_module(artifact_path)
     assert loaded.state_names == ("weight", "bias")
     actual = loaded(value)[0]
@@ -85,7 +87,7 @@ def test_parameter_free_module_keeps_module_entrypoint_kind(
     model = ParameterFreeArtifactModule().eval()
     value = torch.randn(2, 3)
     artifact_path = compile_module(model, (value,)).save(
-        tmp_path / "parameter-free.tsca"
+        tmp_path / "parameter-free.aoto"
     )
 
     with zipfile.ZipFile(artifact_path) as archive:
@@ -100,13 +102,13 @@ def test_artifact_loads_and_executes_in_a_new_process(tmp_path: Path) -> None:
     value = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     with torch.no_grad():
         expected = model(value)[0].tolist()
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "process.tsca")
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "process.aoto")
 
     script = """
 import json
 import sys
 import mlx.core as mx
-from transformer_subgraph_compiler import load_compiled_module
+from aotolith import load_compiled_module
 compiled = load_compiled_module(sys.argv[1])
 output = compiled(mx.array([[1.0, 2.0, 3.0, 4.0]]))[0]
 mx.eval(output)
@@ -131,8 +133,8 @@ print(json.dumps(output[0].tolist()))
 def test_artifact_rejects_incompatible_abi(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "abi.tsca")
-    tampered_path = tmp_path / "tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "abi.aoto")
+    tampered_path = tmp_path / "tampered.aoto"
 
     with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
         tampered_path, "w"
@@ -147,7 +149,7 @@ def test_artifact_rejects_incompatible_abi(tmp_path: Path) -> None:
                 ).encode()
             destination.writestr(name, payload)
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -160,8 +162,8 @@ def test_artifact_rejects_incompatible_abi(tmp_path: Path) -> None:
 def test_artifact_rejects_unsupported_target(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "target.tsca")
-    tampered_path = tmp_path / "target-tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "target.aoto")
+    tampered_path = tmp_path / "target-tampered.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         manifest = json.loads(archive.read("manifest.json"))
     manifest["target"] = "cuda"
@@ -175,7 +177,7 @@ def test_artifact_rejects_unsupported_target(tmp_path: Path) -> None:
         },
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -188,8 +190,8 @@ def test_artifact_rejects_unsupported_target(tmp_path: Path) -> None:
 def test_artifact_rejects_state_shape_mismatch(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "shape.tsca")
-    tampered_path = tmp_path / "shape-tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "shape.aoto")
+    tampered_path = tmp_path / "shape-tampered.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         manifest = json.loads(archive.read("manifest.json"))
     manifest["entrypoint"]["state"][1]["shape"] = [1, 3]
@@ -203,7 +205,7 @@ def test_artifact_rejects_state_shape_mismatch(tmp_path: Path) -> None:
         },
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -216,8 +218,8 @@ def test_artifact_rejects_state_shape_mismatch(tmp_path: Path) -> None:
 def test_artifact_rejects_state_dtype_mismatch(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "dtype.tsca")
-    tampered_path = tmp_path / "dtype-tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "dtype.aoto")
+    tampered_path = tmp_path / "dtype-tampered.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         manifest = json.loads(archive.read("manifest.json"))
     manifest["entrypoint"]["state"][1]["dtype"] = "int32"
@@ -231,7 +233,7 @@ def test_artifact_rejects_state_dtype_mismatch(tmp_path: Path) -> None:
         },
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -252,7 +254,7 @@ def test_artifact_persists_autotune_measurements(tmp_path: Path) -> None:
         autotune_warmup=1,
         autotune_iterations=2,
     )
-    artifact_path = compiled.save(tmp_path / "autotuned.tsca")
+    artifact_path = compiled.save(tmp_path / "autotuned.aoto")
 
     with zipfile.ZipFile(artifact_path) as archive:
         selections = json.loads(archive.read("selections.json"))
@@ -266,7 +268,7 @@ def test_artifact_persists_autotune_measurements(tmp_path: Path) -> None:
         for benchmark in selection["benchmarks"]
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     original_autotune = AppleMetalBackend._autotune
 
@@ -298,8 +300,8 @@ def _rewrite_artifact(
 def test_artifact_rejects_tampered_kernel_table(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "kernel.tsca")
-    tampered_path = tmp_path / "kernel-tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "kernel.aoto")
+    tampered_path = tmp_path / "kernel-tampered.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         kernels_payload = archive.read("kernels.json")
     _rewrite_artifact(
@@ -308,7 +310,7 @@ def test_artifact_rejects_tampered_kernel_table(tmp_path: Path) -> None:
         {"kernels.json": kernels_payload + b"\n"},
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -321,8 +323,8 @@ def test_artifact_rejects_tampered_kernel_table(tmp_path: Path) -> None:
 def test_artifact_rejects_tampered_state_payload(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "state.tsca")
-    tampered_path = tmp_path / "state-tampered.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "state.aoto")
+    tampered_path = tmp_path / "state-tampered.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         state_payload = bytearray(archive.read("state/00000.bin"))
     state_payload[0] ^= 0xFF
@@ -332,7 +334,7 @@ def test_artifact_rejects_tampered_state_payload(tmp_path: Path) -> None:
         {"state/00000.bin": bytes(state_payload)},
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(tampered_path)
@@ -347,8 +349,8 @@ def test_artifact_strict_device_match_rejects_other_profile(
 ) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)
-    artifact_path = compile_module(model, (value,)).save(tmp_path / "device.tsca")
-    mismatched_path = tmp_path / "device-mismatched.tsca"
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "device.aoto")
+    mismatched_path = tmp_path / "device-mismatched.aoto"
     with zipfile.ZipFile(artifact_path) as archive:
         manifest = json.loads(archive.read("manifest.json"))
     manifest["profile"]["device_name"] = "Definitely not this device"
@@ -362,7 +364,7 @@ def test_artifact_strict_device_match_rejects_other_profile(
         },
     )
 
-    from transformer_subgraph_compiler import load_compiled_module
+    from aotolith import load_compiled_module
 
     try:
         load_compiled_module(mismatched_path, require_device_match=True)

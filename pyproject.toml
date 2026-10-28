@@ -3,8 +3,8 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "transformer-subgraph-compiler"
-version = "0.61.0"
+name = "aotolith"
+version = "0.62.0"
 description = "An Apple Metal-first compiler for Transformer models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,8 +14,13 @@ dependencies = [
   "mlx>=0.32,<0.33",
 ]
 
+[project.urls]
+Homepage = "https://github.com/jaykay233/aotolith"
+Repository = "https://github.com/jaykay233/aotolith"
+Issues = "https://github.com/jaykay233/aotolith/issues"
+
 [project.scripts]
-tsc = "transformer_subgraph_compiler.cli:main"
+aoto = "aotolith.cli:main"
 
 [project.optional-dependencies]
 fx = ["torch>=2.7"]
@@ -23,7 +28,7 @@ hf = ["torch>=2.7", "transformers>=4.57,<5"]
 dev = ["build>=1.2", "pytest>=8", "torch>=2.7", "transformers>=4.57,<5"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/transformer_subgraph_compiler"]
+packages = ["src/aotolith"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

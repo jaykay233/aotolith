@@ -3,9 +3,9 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable, plan_storage
-from transformer_subgraph_compiler.backends import AppleMetalBackend
-from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
+from aotolith import compile_callable, plan_storage
+from aotolith.backends import AppleMetalBackend
+from aotolith.ir import DType, Graph, Operation, TensorType, Value
 
 
 def test_storage_plan_tracks_lifetimes_and_reuses_dead_buffer() -> None:

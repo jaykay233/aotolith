@@ -5,7 +5,7 @@ import time
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def embedding_projection(
@@ -25,7 +25,7 @@ def main() -> None:
         torch.randn(8, 256),
         torch.randn(256, 512),
     )
-    result = compile_callable(embedding_projection, torch_inputs)
+    result = aoto.compile_callable(embedding_projection, torch_inputs)
     print("lowered ops:", [op.op for op in result.lowered_graph.ops])
     for kernel in result.plan.kernels:
         print(f"\n--- {kernel.name} ---\n{kernel.source}")

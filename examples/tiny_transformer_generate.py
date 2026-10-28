@@ -12,7 +12,7 @@ import mlx.core as mx
 import torch
 import torch.nn.functional as F
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 PROMPT_LENGTH = 4
 CACHE_CAPACITY = 8
@@ -356,7 +356,7 @@ def main() -> None:
         ),
         *weights,
     )
-    prefill_result = compile_callable(
+    prefill_result = aoto.compile_callable(
         transformer_prefill,
         prefill_inputs,
         codegen_attention=True,
@@ -381,7 +381,7 @@ def main() -> None:
         *empty_caches,
         *weights,
     )
-    decode_result = compile_callable(
+    decode_result = aoto.compile_callable(
         transformer_decode,
         decode_inputs,
         codegen_attention=True,

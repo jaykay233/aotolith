@@ -3,7 +3,7 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def mlp(x: torch.Tensor, gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor):
@@ -20,7 +20,7 @@ def main() -> None:
         torch.randn(16, 32),
         torch.randn(32, 16),
     )
-    result = compile_callable(mlp, torch_inputs, codegen_matmul=True)
+    result = aoto.compile_callable(mlp, torch_inputs, codegen_matmul=True)
     print("kernels:", [kernel.kind for kernel in result.plan.kernels])
 
     inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)

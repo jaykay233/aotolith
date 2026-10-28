@@ -62,8 +62,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tsc",
-        description="Compile and run Transformer Subgraph Compiler artifacts.",
+        prog="aoto",
+        description="Compile and run Aotolith artifacts.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

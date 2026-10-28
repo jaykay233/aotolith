@@ -3,7 +3,7 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+from aotolith import compile_callable
 
 
 def test_kernel_selection_records_native_and_fallback_ops() -> None:

@@ -19,7 +19,7 @@ from examples.tiny_transformer_generate import (
     transformer_forward,
     transformer_prefill,
 )
-from transformer_subgraph_compiler import compile_callable
+from aotolith import compile_callable
 
 
 def test_cached_prefill_decode_generates_tokens_on_metal() -> None:

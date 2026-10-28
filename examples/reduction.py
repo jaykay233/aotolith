@@ -3,7 +3,7 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def main() -> None:
@@ -18,7 +18,7 @@ def main() -> None:
             torch.sum(value, dim=-1, dtype=torch.float16),
         )
 
-    result = compile_callable(reductions, (x,))
+    result = aoto.compile_callable(reductions, (x,))
     print("lowered ops:", [op.op for op in result.lowered_graph.ops])
     for kernel in result.plan.kernels:
         print("kernel:", kernel.name, kernel.kind)

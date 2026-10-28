@@ -442,7 +442,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ## 14. 编译产物、校验与加载
 
-`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.tsca` archive。当前 archive 使用 format version 3、ABI version 1.2，包含：
+`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 4、ABI version 1.2，包含：
 
 | 文件 | 内容 |
 |---|---|

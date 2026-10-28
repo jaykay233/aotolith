@@ -6,7 +6,7 @@ import time
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -35,8 +35,8 @@ def run_case(label: str, torch_dtype, mlx_dtype) -> None:
         torch.randn(512, 2048, dtype=torch_dtype),
         torch.randn(2048, 512, dtype=torch_dtype),
     )
-    compiled = compile_callable(matmul, torch_inputs, codegen_matmul=True)
-    fallback = compile_callable(matmul, torch_inputs)
+    compiled = aoto.compile_callable(matmul, torch_inputs, codegen_matmul=True)
+    fallback = aoto.compile_callable(matmul, torch_inputs)
     kernel = compiled.plan.kernels[0]
     print(f"\n{label} matmul: {kernel.name}")
 

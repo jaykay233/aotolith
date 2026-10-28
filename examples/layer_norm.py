@@ -3,7 +3,7 @@ from __future__ import annotations
 import mlx.core as mx
 import torch
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 
 def main() -> None:
@@ -11,7 +11,7 @@ def main() -> None:
     x = torch.randn(2, 3, 512)
     weight = torch.randn(512)
     bias = torch.randn(512)
-    result = compile_callable(
+    result = aoto.compile_callable(
         lambda value, scale, shift: torch.nn.functional.layer_norm(
             value, (512,), scale, shift, eps=1e-5
         ),

@@ -4,7 +4,7 @@ import mlx.core as mx
 import torch
 import torch.nn.functional as F
 
-from transformer_subgraph_compiler import compile_callable
+import aotolith as aoto
 
 HIDDEN_SIZE = 32
 NUM_HEADS = 4
@@ -128,7 +128,7 @@ def make_inputs() -> tuple[torch.Tensor, ...]:
 
 def main() -> None:
     inputs = make_inputs()
-    result = compile_callable(
+    result = aoto.compile_callable(
         tiny_transformer,
         inputs,
         codegen_matmul=True,

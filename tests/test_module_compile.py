@@ -7,7 +7,7 @@ import mlx.core as mx
 import pytest
 import torch
 
-from transformer_subgraph_compiler import compile_callable, compile_module
+from aotolith import compile_callable, compile_module
 
 
 def test_compile_module_binds_state_and_does_not_retain_module() -> None:

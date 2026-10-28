@@ -7,7 +7,7 @@ import mlx.core as mx
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from transformer_subgraph_compiler import compile_module
+import aotolith as aoto
 
 
 def main() -> None:
@@ -29,7 +29,7 @@ def main() -> None:
         expected = model(input_ids=input_ids, use_cache=False).logits
     model_ref = weakref.ref(model)
 
-    compiled = compile_module(
+    compiled = aoto.compile_module(
         model,
         (input_ids,),
         example_kwargs={"use_cache": False},
