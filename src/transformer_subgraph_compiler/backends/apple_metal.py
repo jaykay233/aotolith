@@ -2110,6 +2110,10 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"metal::exp({arguments[0]})"
     if op.op == "erf":
         return f"tsc_erf({arguments[0]})"
+    if op.op == "sin":
+        return f"metal::sin({arguments[0]})"
+    if op.op == "cos":
+        return f"metal::cos({arguments[0]})"
     if op.op == "sqrt":
         return f"metal::sqrt({arguments[0]})"
     if op.op == "rsqrt":
@@ -2832,6 +2836,10 @@ def _evaluate_pointwise_mlx(
         return mx.exp(arguments[0])
     if op.op == "erf":
         return mx.erf(arguments[0])
+    if op.op == "sin":
+        return mx.sin(arguments[0])
+    if op.op == "cos":
+        return mx.cos(arguments[0])
     if op.op == "sqrt":
         return mx.sqrt(arguments[0])
     if op.op == "rsqrt":

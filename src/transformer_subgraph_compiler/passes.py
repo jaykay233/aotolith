@@ -21,6 +21,8 @@ POINTWISE_OPS = {
     "relu",
     "exp",
     "erf",
+    "sin",
+    "cos",
     "sqrt",
     "rsqrt",
     "reciprocal",

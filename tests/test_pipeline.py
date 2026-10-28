@@ -2166,6 +2166,49 @@ def test_common_pointwise_chain_is_one_metal_kernel() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("op_name", ["sin", "cos"])
+def test_trigonometric_ops_are_generated_as_metal_kernels(op_name) -> None:
+    operation = getattr(torch, op_name)
+
+    def fn(angle):
+        return operation(angle)
+
+    torch.manual_seed(6)
+    angle = torch.randn(2, 3, 11) * 4.0
+    result = compile_callable(fn, (angle,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert [kernel.kind for kernel in result.plan.kernels] == [op_name]
+    assert f"metal::{op_name}" in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(angle.numpy()))[0]
+    expected = mx.array(fn(angle).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rope_style_trigonometric_region_is_one_metal_kernel() -> None:
+    def fn(x1, x2, angle):
+        return torch.cos(angle) * x1 + torch.sin(angle) * x2
+
+    torch.manual_seed(8)
+    inputs = (
+        torch.randn(2, 3, 8),
+        torch.randn(2, 3, 8),
+        torch.randn(1, 1, 8) * 3.0,
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    source = result.plan.kernels[0].source
+    assert "metal::cos" in source
+    assert "metal::sin" in source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_metal_matmul_and_addmm_codegen() -> None:
     torch.manual_seed(11)
     inputs = (torch.randn(3, 4), torch.randn(4, 5), torch.randn(5))

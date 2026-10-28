@@ -22,7 +22,7 @@ PyTorch FX
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`flip`、`roll`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
-| 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
+| 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sin`、`cos`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
 | 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |

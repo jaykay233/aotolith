@@ -48,6 +48,8 @@ _SUPPORTED_OPS = {
     "aten.relu.default": "relu",
     "aten.exp.default": "exp",
     "aten.erf.default": "erf",
+    "aten.sin.default": "sin",
+    "aten.cos.default": "cos",
     "aten.sqrt.default": "sqrt",
     "aten.rsqrt.default": "rsqrt",
     "aten.reciprocal.default": "reciprocal",
