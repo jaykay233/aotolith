@@ -1,6 +1,6 @@
 # 架构
 
-当前实现是一条最小但可运行的 Apple Metal 编译链。目标不是覆盖完整 Transformer，而是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并持续增加可验证的 lowering。
+当前实现是一条最小但可运行的 Apple Metal 编译链，目标是把前端、IR、融合、Metal codegen 和 runtime 的接口固定下来，并逐步覆盖 Transformer 推理所需的能力。静态、多层 decoder-only forward 已经有端到端验证；KV Cache、生成循环和动态 batching 仍属于后续运行时能力。
 
 ## 1. FX 捕获
 
@@ -409,6 +409,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
+- 没有 KV Cache、prefill/decode 生成循环、采样或 serving 运行时；当前端到端 Transformer 测试验证的是完整序列上的单次 forward
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA

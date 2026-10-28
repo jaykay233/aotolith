@@ -2034,6 +2034,135 @@ def test_multi_head_attention_end_to_end_on_metal() -> None:
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
+def test_two_layer_decoder_transformer_end_to_end_on_metal() -> None:
+    hidden_size = 32
+    num_heads = 4
+    head_dim = 8
+    intermediate_size = 64
+    vocabulary_size = 48
+    batch_size = 2
+    sequence_length = 5
+
+    def rms_norm(value, weight):
+        return torch.nn.functional.rms_norm(
+            value, (hidden_size,), weight, eps=1e-6
+        )
+
+    def apply_rope(value, cosine, sine):
+        half = value.shape[-1] // 2
+        rotated = torch.cat((-value[..., half:], value[..., :half]), dim=-1)
+        return value * cosine + rotated * sine
+
+    def decoder_layer(value, *parameters):
+        (
+            attention_norm,
+            qkv_weight,
+            output_weight,
+            mlp_norm,
+            gate_weight,
+            up_weight,
+            down_weight,
+            cosine,
+            sine,
+        ) = parameters
+        normalized = rms_norm(value, attention_norm)
+        query, key, attention_value = (normalized @ qkv_weight).split(
+            hidden_size, dim=-1
+        )
+        query = query.reshape(
+            batch_size, sequence_length, num_heads, head_dim
+        ).transpose(1, 2)
+        key = key.reshape(
+            batch_size, sequence_length, num_heads, head_dim
+        ).transpose(1, 2)
+        attention_value = attention_value.reshape(
+            batch_size, sequence_length, num_heads, head_dim
+        ).transpose(1, 2)
+        query = apply_rope(query, cosine, sine)
+        key = apply_rope(key, cosine, sine)
+
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, attention_value, is_causal=True
+        )
+        attention_output = attention_output.transpose(1, 2).reshape(
+            batch_size, sequence_length, hidden_size
+        )
+        value = value + attention_output @ output_weight
+
+        normalized = rms_norm(value, mlp_norm)
+        gate = normalized @ gate_weight
+        up = normalized @ up_weight
+        mlp_output = (torch.nn.functional.silu(gate) * up) @ down_weight
+        return value + mlp_output
+
+    def transformer(token_ids, embedding, final_norm, lm_head, *layers):
+        hidden = torch.nn.functional.embedding(token_ids, embedding)
+        parameters_per_layer = 9
+        for layer_index in range(2):
+            start = layer_index * parameters_per_layer
+            hidden = decoder_layer(
+                hidden,
+                *layers[start : start + parameters_per_layer],
+            )
+        return rms_norm(hidden, final_norm) @ lm_head
+
+    torch.manual_seed(123)
+    token_ids = torch.randint(
+        0, vocabulary_size, (batch_size, sequence_length), dtype=torch.int32
+    )
+    inputs = [
+        token_ids,
+        torch.randn(vocabulary_size, hidden_size),
+        torch.randn(hidden_size),
+        torch.randn(hidden_size, vocabulary_size),
+    ]
+
+    frequencies = torch.arange(
+        sequence_length, dtype=torch.float32
+    )[:, None] / torch.pow(
+        torch.tensor(10000.0),
+        torch.arange(0, head_dim, 2, dtype=torch.float32)[None, :] / head_dim,
+    )
+    frequencies = torch.cat((frequencies, frequencies), dim=-1)[None, None]
+    cosine = frequencies.cos()
+    sine = frequencies.sin()
+    for _ in range(2):
+        inputs.extend(
+            (
+                torch.randn(hidden_size),
+                torch.randn(hidden_size, 3 * hidden_size),
+                torch.randn(hidden_size, hidden_size),
+                torch.randn(hidden_size),
+                torch.randn(hidden_size, intermediate_size),
+                torch.randn(hidden_size, intermediate_size),
+                torch.randn(intermediate_size, hidden_size),
+                cosine,
+                sine,
+            )
+        )
+
+    result = compile_callable(
+        transformer,
+        tuple(inputs),
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert lowered_ops.count("attention") == 2
+    assert lowered_ops.count("rms_norm") == 5
+    assert lowered_ops.count("matmul") == 11
+    assert lowered_ops.count("fused_elementwise") == 6
+    assert "embedding" in lowered_ops
+    assert "attention" in {kernel.kind for kernel in result.plan.kernels}
+    assert "matmul" in {kernel.kind for kernel in result.plan.kernels}
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(transformer(*inputs).detach().numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (batch_size, sequence_length, vocabulary_size)
+    assert mx.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
 def test_cat_lowering_preserves_concatenation_order() -> None:
     def rotate_half(x):
         half = x.shape[-1] // 2
