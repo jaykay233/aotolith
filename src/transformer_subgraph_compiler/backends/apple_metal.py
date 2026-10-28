@@ -335,9 +335,12 @@ class AppleMetalBackend:
                 raise ValueError(f"{op.op}.dims must not contain duplicates")
             normalized_dims.append(axis)
         normalized_dims.sort()
-        if normalized_dims != list(range(rank - len(normalized_dims), rank)):
+        first_reduced_dim = normalized_dims[0]
+        if normalized_dims != list(
+            range(first_reduced_dim, first_reduced_dim + len(normalized_dims))
+        ):
             raise NotImplementedError(
-                f"Metal {op.op} currently supports contiguous tail dimensions"
+                f"Metal {op.op} currently supports one contiguous reduction block"
             )
 
         keepdim = op.attrs.get("keepdim")
@@ -345,31 +348,46 @@ class AppleMetalBackend:
             raise ValueError(f"{op.op}.keepdim must be a boolean")
         reduced_rank = len(normalized_dims)
         columns = prod(input_type.shape[axis] for axis in normalized_dims)
-        prefix_shape = input_type.shape[: rank - reduced_rank]
-        expected_output_shape = prefix_shape
+        outer_shape = input_type.shape[:first_reduced_dim]
+        inner_shape = input_type.shape[first_reduced_dim + reduced_rank :]
+        expected_output_shape = outer_shape
         if keepdim:
             expected_output_shape += (1,) * reduced_rank
+        expected_output_shape += inner_shape
         if output_type.shape != expected_output_shape:
             raise ValueError(
                 f"{op.op} output shape {output_type.shape} "
                 f"!= {expected_output_shape}"
             )
 
-        rows = prod(prefix_shape) or 1
+        outer_size = prod(outer_shape) or 1
+        inner_size = prod(inner_shape) or 1
+        output_count = outer_size * inner_size
         threads = _reduction_thread_count(columns)
         reduction_stride = threads // 2
         result_expression = "scratch[0]"
         if op.op == "mean":
             result_expression = f"scratch[0] / {columns}.0f"
+        if inner_size == 1:
+            input_index_source = (
+                f"        uint offset = output_index * {columns}u;"
+            )
+        else:
+            input_index_source = f"""        uint outer_index = output_index / {inner_size}u;
+        uint inner_index = output_index % {inner_size}u;
+        uint offset = outer_index * {columns * inner_size}u + inner_index;"""
+        reduction_offset = (
+            "col" if inner_size == 1 else f"col * {inner_size}u"
+        )
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
-        uint row = threadgroup_position_in_grid.x;
-        uint offset = row * {columns}u;
+        uint output_index = threadgroup_position_in_grid.x;
+{input_index_source}
         threadgroup float scratch[{threads}];
 
         float local_value = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            local_value += float(in_0[offset + col]);
+            local_value += float(in_0[offset + {reduction_offset}]);
         }}
         scratch[tid] = local_value;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -381,7 +399,7 @@ class AppleMetalBackend:
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
         if (tid == 0u) {{
-            out[row] = (T)({result_expression});
+            out[output_index] = (T)({result_expression});
         }}
         """
         name = f"metal_{op.op}_{threads}_{index}"
@@ -391,7 +409,7 @@ class AppleMetalBackend:
             output_names=["out"],
             source=source,
         )
-        grid = (rows * threads, 1, 1)
+        grid = (output_count * threads, 1, 1)
         threadgroup = (threads, 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 

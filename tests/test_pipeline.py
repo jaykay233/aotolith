@@ -711,6 +711,38 @@ def test_mean_reduces_multiple_tail_dimensions() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_mean_reduces_contiguous_interior_dimensions() -> None:
+    torch.manual_seed(93)
+    x = torch.randn(2, 3, 4, 5)
+
+    def fn(value):
+        return torch.mean(value, dim=(1, 2), keepdim=True)
+
+    result = compile_callable(fn, (x,))
+    kernel = result.plan.kernels[0]
+    assert kernel.name == "metal_mean_16_0"
+    assert "col * 5u" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 1, 1, 5)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_sum_reduces_leading_dimension() -> None:
+    torch.manual_seed(95)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(
+        lambda value: torch.sum(value, dim=0), (x,)
+    )
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(torch.sum(x, dim=0).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (4, 5)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mean_supports_low_precision(dtype) -> None:
     torch.manual_seed(97)
@@ -747,13 +779,13 @@ def test_mean_composes_with_matmul() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_reduction_rejects_non_tail_dimensions() -> None:
-    x = torch.randn(3, 5)
+def test_reduction_rejects_non_contiguous_dimensions() -> None:
+    x = torch.randn(2, 3, 4)
     with pytest.raises(
         NotImplementedError,
-        match="currently supports contiguous tail dimensions",
+        match="currently supports one contiguous reduction block",
     ):
-        compile_callable(lambda value: torch.mean(value, dim=0), (x,))
+        compile_callable(lambda value: torch.mean(value, dim=(0, 2)), (x,))
 
 
 def test_reduction_rejects_explicit_dtype_override() -> None:

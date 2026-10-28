@@ -8,12 +8,12 @@ from transformer_subgraph_compiler import compile_callable
 
 def main() -> None:
     torch.manual_seed(0)
-    x = torch.randn(2, 3, 512)
+    x = torch.randn(2, 3, 4, 5)
 
     def reductions(value):
         return (
             torch.sum(value, dim=-1),
-            torch.mean(value, dim=(-2, -1), keepdim=True),
+            torch.mean(value, dim=(1, 2), keepdim=True),
         )
 
     result = compile_callable(reductions, (x,))
