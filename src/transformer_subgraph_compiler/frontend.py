@@ -44,6 +44,11 @@ _SUPPORTED_OPS = {
     "aten.sub.Tensor": "sub",
     "aten.rsub.Scalar": "rsub",
     "aten.div.Tensor": "div",
+    "aten.floor_divide.default": "floor_divide",
+    "aten.floor_divide.Tensor": "floor_divide",
+    "aten.floor_divide.Scalar": "floor_divide",
+    "aten.remainder.Tensor": "remainder",
+    "aten.remainder.Scalar": "remainder",
     "aten.pow.Tensor_Tensor": "pow",
     "aten.pow.Tensor_Scalar": "pow",
     "aten.pow.Scalar": "pow",
@@ -100,13 +105,13 @@ _SUPPORTED_OPS = {
     "aten.logical_or.default": "logical_or",
     "aten.logical_xor.default": "logical_xor",
     "aten.logical_not.default": "logical_not",
-    "aten.bitwise_and.Tensor": "logical_and",
-    "aten.bitwise_and.Scalar": "logical_and",
-    "aten.bitwise_or.Tensor": "logical_or",
-    "aten.bitwise_or.Scalar": "logical_or",
-    "aten.bitwise_xor.Tensor": "logical_xor",
-    "aten.bitwise_xor.Scalar": "logical_xor",
-    "aten.bitwise_not.default": "logical_not",
+    "aten.bitwise_and.Tensor": "bitwise_and",
+    "aten.bitwise_and.Scalar": "bitwise_and",
+    "aten.bitwise_or.Tensor": "bitwise_or",
+    "aten.bitwise_or.Scalar": "bitwise_or",
+    "aten.bitwise_xor.Tensor": "bitwise_xor",
+    "aten.bitwise_xor.Scalar": "bitwise_xor",
+    "aten.bitwise_not.default": "bitwise_not",
     "aten.isnan.default": "isnan",
     "aten.isinf.default": "isinf",
     "aten.masked_fill.Scalar": "masked_fill",
@@ -157,12 +162,15 @@ _NUMERIC_ATTRS = {
 
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
 _LOGICAL_BINARY_OPS = {"logical_and", "logical_or", "logical_xor"}
+_BITWISE_BINARY_OPS = {"bitwise_and", "bitwise_or", "bitwise_xor"}
 _BINARY_OPS = _COMPARISON_OPS | {
     "mul",
     "add",
     "sub",
     "rsub",
     "div",
+    "floor_divide",
+    "remainder",
     "pow",
     "maximum",
     "minimum",
@@ -171,6 +179,9 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "logical_and",
     "logical_or",
     "logical_xor",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
 }
 _REDUCTION_OPS = {"sum", "mean"}
 _DIRECT_ATTENTION_TARGETS = {
@@ -324,9 +335,22 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
             op_name = _SUPPORTED_OPS[target]
-            inputs, scalar_attrs = _operation_inputs(
-                op_name, node.args, node_ids, node.kwargs
-            )
+            if (
+                target == "aten.pow.Tensor_Scalar"
+                and len(node.args) == 2
+                and isinstance(node.args[1], int)
+                and not isinstance(node.args[1], bool)
+                and node.args[1] == 2
+                and _node_type(node).dtype in {DType.I32, DType.I64}
+            ):
+                # make_fx lowers torch.square on integer tensors to pow(x, 2).
+                op_name = "square"
+                inputs = (_argument_ids(node.args[0], node_ids),)
+                scalar_attrs = {}
+            else:
+                inputs, scalar_attrs = _operation_inputs(
+                    op_name, node.args, node_ids, node.kwargs
+                )
             output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
             attrs.update(scalar_attrs)
@@ -1719,7 +1743,7 @@ def _operation_inputs(
                     raise ValueError(
                         f"unsupported clamp {name} at position {position}: {bound!r}"
                     ) from None
-                attrs[name] = float(bound)
+                attrs[name] = bound
             else:
                 attrs[f"{name}_input"] = len(inputs)
                 inputs.append(bound_id)
@@ -1739,7 +1763,7 @@ def _operation_inputs(
                 raise ValueError(
                     f"unsupported {op} {name}: {bound!r}"
                 ) from None
-            attrs[name] = float(bound)
+            attrs[name] = bound
         else:
             attrs[f"{name}_input"] = len(inputs)
             inputs.append(bound_id)
@@ -1788,13 +1812,13 @@ def _operation_inputs(
         raise ValueError(f"{op} expects two arguments, got {len(args)}")
 
     tensor_inputs: list[str] = []
-    scalars: list[tuple[int, bool | float]] = []
+    scalars: list[tuple[int, bool | int | float]] = []
     for position, argument in enumerate(args):
         try:
             tensor_inputs.append(_argument_ids(argument, node_ids))
         except ValueError:
             if isinstance(argument, bool) and op in (
-                _COMPARISON_OPS | _LOGICAL_BINARY_OPS
+                _COMPARISON_OPS | _LOGICAL_BINARY_OPS | _BITWISE_BINARY_OPS
             ):
                 scalars.append((position, argument))
                 continue
@@ -1805,7 +1829,9 @@ def _operation_inputs(
                 raise ValueError(
                     f"unsupported {op} argument at position {position}: {argument!r}"
                 ) from None
-            scalars.append((position, float(argument)))
+            scalars.append(
+                (position, argument if isinstance(argument, int) else float(argument))
+            )
 
     if len(tensor_inputs) == 2:
         return tuple(tensor_inputs), {}

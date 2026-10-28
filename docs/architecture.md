@@ -47,6 +47,8 @@
 | `aten.sub.Tensor` | `sub` |
 | `aten.rsub.Scalar` | `rsub` |
 | `aten.div.Tensor` | `div` |
+| `aten.floor_divide.default`、`aten.floor_divide.Tensor`、`aten.floor_divide.Scalar` | `floor_divide` |
+| `aten.remainder.Tensor`、`aten.remainder.Scalar` | `remainder` |
 | `aten.pow.Tensor_Tensor`、`aten.pow.Tensor_Scalar`、`aten.pow.Scalar` | `pow` |
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
 | `aten.logaddexp.default` | `logaddexp` |
@@ -84,7 +86,8 @@
 | `aten.clamp_min.default`、`aten.clamp_min.Tensor` | `clamp_min` |
 | `aten.clamp_max.default`、`aten.clamp_max.Tensor` | `clamp_max` |
 | `aten.eq`、`aten.ne`、`aten.lt`、`aten.le`、`aten.gt`、`aten.ge` 的 Tensor/Scalar 变体 | `eq`、`ne`、`lt`、`le`、`gt`、`ge` |
-| `aten.logical_and/or/xor/not`，以及 bool tensor 的 `aten.bitwise_and/or/xor/not` Tensor/Scalar 变体 | `logical_and`、`logical_or`、`logical_xor`、`logical_not` |
+| `aten.logical_and/or/xor/not` | `logical_and`、`logical_or`、`logical_xor`、`logical_not` |
+| `aten.bitwise_and/or/xor/not` 的 Tensor/Scalar 变体 | `bitwise_and`、`bitwise_or`、`bitwise_xor`、`bitwise_not`，并按输入 dtype 走 bool 或整数 lowering |
 | `aten.isnan.default`、`aten.isinf.default` | `isnan`、`isinf` |
 | `aten.where.self` | `where` |
 | `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
@@ -96,7 +99,7 @@
 | `aten.split.Tensor`、`aten.split_with_sizes.default` | 在前端展开为多个 `slice` |
 | `aten.unbind.int` | 在前端展开为多个 `slice + squeeze` |
 
-每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。IR 的数值 dtype 包括 FP16、BF16 和 FP32，另外支持 `DType.BOOL` 表示谓词、logical op、bool mask 和 bool 输出；`DType.I32`、`DType.I64` 当前用于 token id 和 embedding indices。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
+每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。IR 的数值 dtype 包括 FP16、BF16 和 FP32，另外支持 `DType.BOOL` 表示谓词、logical/bitwise 结果、bool mask 和 bool 输出；`DType.I32`、`DType.I64` 用于整数常量、整数 pointwise、token id 以及 embedding/index/gather/scatter indices。`bmm` 和 `mm` 统一为 `matmul` IR op，后面的 canonicalization pass 会把 rank-N matmul 被 PyTorch 展开的 `reshape -> bmm -> reshape` 还原成规范形式。Runtime 用同一个 batched matmul 语义执行。
 
 `cat` 保留所有 tensor 输入，并把归一化前的轴写入 `dim` attribute。Backend 要求输入 rank、非拼接轴 shape 和非拼接轴目标 shape 完全一致，且所有输入与输出 dtype 相同；拼接轴长度必须等于各输入该轴长度之和。Runtime 用 `mx.concatenate` 执行，不生成 Metal kernel。
 
@@ -121,6 +124,8 @@
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。如果调用方继续使用 mean 或 rstd，前端会明确拒绝，而不是返回错误语义。
 
 `F.rms_norm` 没有单独的 ATen target，在当前 PyTorch 中会展开成 `pow -> mean -> add_ -> rsqrt -> mul -> optional weight mul`。前端只在中间节点单消费者、reduction 覆盖连续尾维且 shape 吻合时折叠成 `rms_norm`，避免把任意的平方、均值、rsqrt 组合误认为归一化。FP16/BF16 下 `make_fx` 还会插入 float32 `_to_copy`，折叠范围包含这组 cast。
+
+整数 `torch.square` 在 `make_fx` 中会落到 `aten.pow.Tensor_Scalar(x, 2)`，前端将这个特殊形式规范化为 `square` IR op。其他整数 `pow` 仍不在当前支持范围，避免把浮点指数或负数指数的语义差异隐式带入整数路径。
 
 `F.scaled_dot_product_attention` 可能落到通用 ATen op，也可能被拍平成 CPU/CUDA flash 或 efficient attention 的内部 target。这些 target 的参数顺序和输出个数不同，前端按 target 分别读取 `attn_mask`、`dropout_p`、`is_causal`、`scale` 和关键字参数 `enable_gqa`。当前只接受主输出；辅助 logsumexp、debug mask 等输出被使用时直接报错。dropout 非零也会报错。`enable_gqa` 只做布尔校验，实际 head 分组关系由 Q/K/V 的静态 shape 决定；部分 CPU SDPA 路径在 tracing 后会丢掉这个参数并落到 flash target。
 
@@ -216,8 +221,8 @@ input_offset = (elem % 3) * 1
 - grid 大小为 `ceil(输出元素数 / 4)`
 - 每个 thread 依次处理最多 4 个元素
 - threadgroup 最大为 256
-- 数值输入加载为 `float`，bool 输入和中间谓词加载或声明为 `bool`
-- 比较必须产生 bool；logical op 只接受 bool 输入并产生 bool；`where` 的第一个输入必须是 bool condition
+- 输入和中间值按 IR dtype 声明为 `float`、`bool`、`int` 或 `long`；I32/I64 路径不会把大整数转换成 float
+- 比较必须产生 bool；logical op 只接受 bool 输入并产生 bool；bool tensor 的 bitwise op 也走 bool lowering；`where` 的第一个输入必须是 bool condition
 - 普通数值 op 不接受 bool operand；数值分支与 bool condition 可以处于同一个 DAG region
 - 中间临时值和最终结果的 MSL 类型由各自 IR 输出的 dtype 决定，最终写回模板类型 `T`
 - `mx.fast.metal_kernel` 在首次调用时完成 JIT
@@ -234,7 +239,9 @@ input_offset = (elem % 3) * 1
 
 Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异，因此 `tsc_atan2` 显式处理 NaN、`x == ±0`、`y == ±0`、`x`/`y` 为无穷以及 `(-inf, -inf)` 等象限边界，其余有限值回退到系统 `atan2`。这些规则与 `torch.atan2` 的参数顺序一致。
 
-整数常量和 `arange` 不经过这条 float pointwise 路径。Backend 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。`arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。当前不 lowering 浮点 `arange`，因为 PyTorch 使用 double 语义，而 Metal 没有稳定可用的 GPU double 路径。
+整数常量和 `arange` 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。`arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。当前不 lowering 浮点 `arange`，因为 PyTorch 使用 double 语义，而 Metal 没有稳定可用的 GPU double 路径。
+
+I32/I64 pointwise 走同一融合框架，但中间变量使用 `int`/`long`，输入和输出保持原 dtype。tensor 与 Python 整数标量混合时，前端保留标量原始值，backend 再按 tensor 宽度取模并解释为二补码有符号数；因此 I32 的 `2**32 - 1` 等价于 `-1`，I64 的 `2**64 - 1` 也等价于 `-1`，不会先转成 float。加法、减法、乘法和一元负号按二补码回绕。`floor_divide` 先做 C 截断除法，再在余数非零且符号不一致时向负无穷调整；`remainder` 的结果跟除数同号。除数为 `-1` 时单独处理，避免 `INT_MIN / -1` 触发未定义行为，并按 PyTorch 回绕到 `INT_MIN`。
 
 ## 8. Metal softmax reduction
 
@@ -391,7 +398,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流和 list/dict 输出；常量生成支持 `scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 的 float/bool/I32/I64 输出
 - `arange` 目前只支持整数 start/end/step 和 I32/I64 输出；浮点 `arange` 尚未实现
-- bool tensor 只支持比较、logical、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；整数 tensor 可用于 embedding/index_select/gather/scatter indices，但不支持一般整数算术和 bitwise 运算
+- bool tensor 支持比较、logical、bitwise、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；I32/I64 tensor 除作为 embedding/index_select/gather/scatter indices 外，也支持上述整数 pointwise 集合
+- 整数 pointwise 当前要求输入、tensor 边界和输出同宽；I32 与 I64 混合、除 `torch.square` 特殊形式外的整数 `pow`、true division 和不在支持集合内的算子会明确报错。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
 - scatter 只支持默认写入语义，不支持 `reduce`、`scatter_add` 或 `scatter_reduce`
 - softmax 支持任意单轴，但不支持一次对多个轴做 softmax
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖

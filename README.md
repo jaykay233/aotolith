@@ -23,8 +23,9 @@ PyTorch FX
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`softplus`、`mish`、`logsigmoid`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`hardsigmoid`、`threshold`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
 | 一元运算与谓词 | `neg`、`abs`、`exp`、`expm1`、`exp2`、`log`、`log2`、`log10`、`log1p`、`erf`、`sin`、`cos`、`floor`、`ceil`、`round`、`trunc`、`sign`、`square`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
-| 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow`、`maximum`、`minimum`、`logaddexp`、`atan2` |
-| 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
+| 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`floor_divide`、`remainder`、`pow`、`maximum`、`minimum`、`logaddexp`、`atan2` |
+| 整数 pointwise | I32/I64 的 `add`、`sub`、`rsub`、`mul`、`neg`、`abs`、`sign`、`square`、`maximum`、`minimum`、`floor_divide`、`remainder`、`clamp*` 和 `bitwise_*`，支持与整数 tensor、Python int 标量或同宽 tensor 组合 |
+| 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及 bool tensor 的 `bitwise_*` 和 bool scalar 变体 |
 | 常量生成 | `aten.scalar_tensor.default`、`aten.arange.default/start/start_step`、`aten.zeros.default`、`aten.ones.default`、`aten.full.default`、`aten.new_zeros.default`、`aten.new_ones.default`、`aten.new_full.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default`；静态 shape/dtype 来自输出 metadata |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
@@ -48,7 +49,7 @@ PyTorch FX
 - 把 `stack` 展开为每个输入的 `unsqueeze` 加一个 `cat`；把 `flip`、`roll`、`triu`、`tril` 保留为可校验 op，由 MLX 执行而不生成额外 Metal kernel
 - 把 `aten.select.int` 展开为单元素 `slice` 加 `squeeze`，支持负轴和负索引，并能输出 rank-0 scalar
 - 支持 `zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 生成静态 FP16/BF16/FP32/bool 常量；模板 tensor 只用于捕获 shape/dtype，不进入 op 的运行时输入，浮点/bool 常量可与相邻 pointwise op 融合
-- 支持 I32/I64 整数常量，包括精确的 I64 边界值。整数常量使用独立的无输入 Metal kernel，不经过 float 中间值；整数 pointwise 暂不参与融合，避免大整数被静默舍入
+- 支持 I32/I64 整数常量和整数 pointwise 融合，全程使用 `int`/`long` 中间值，不经过 float。Python 整数标量在 lowering 时按 tensor 宽度做二补码回绕，`2**53 + 1` 等大整数仍保持精确；`torch.square` 在 `make_fx` 中产生的 `pow(x, 2)` 会规范化为 `square`。整数 `floor_divide` 向负无穷取整，`remainder` 跟随除数符号，`INT_MIN / -1` 按 PyTorch 语义回绕
 - 支持 `arange(stop)`、`arange(start, stop)` 和 `arange(start, stop, step)`，将三个 FX target 规范化为同一个 IR op，并由无输入 Metal kernel 以 signed 64-bit 算术生成；当前要求 start/end/step 为整数且输出为 I32/I64
 - 把静态 `split`、`chunk` 和 `unbind` 展开为已有的 `slice`/`squeeze` op；Q/K/V 投影结果拆开后仍可共享 layout、CSE 和 pointwise 融合
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive/bool mask、causal mask、显式 scale，以及 GQA/MQA
@@ -65,7 +66,7 @@ PyTorch FX
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 支持 `torch.bool` IR value、比较/logical/NaN/Inf 谓词、`where`、`masked_fill`、标量常量生成，并允许 bool predicate/condition 与 FP16/BF16/FP32 数值分支融合在同一个 kernel
 - 生成每个 thread 处理 4 个元素的 Metal kernel
-- FP16、BF16、FP32 数值计算，bool 中间值和输出，以及供 embedding/index_select/gather/scatter indices 使用的 `int32/int64` 输入
+- FP16、BF16、FP32 数值计算，bool 中间值和输出，以及 I32/I64 pointwise、整数常量和供 embedding/index_select/gather/scatter indices 使用的整数输入
 - 可选的 Metal matmul/addmm codegen，支持 rank-2 和 rank-3/4 的标准右对齐 batch broadcast
 - 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive/bool mask 和 FP16/BF16/FP32
 - matmul shared-memory tiling：`64×64×32` threadgroup block；rank-N batch 映射到 grid 的 y 维，FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile

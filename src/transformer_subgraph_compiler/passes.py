@@ -16,6 +16,8 @@ POINTWISE_OPS = {
     "sub",
     "rsub",
     "div",
+    "floor_divide",
+    "remainder",
     "pow",
     "neg",
     "abs",
@@ -59,6 +61,10 @@ POINTWISE_OPS = {
     "logical_or",
     "logical_xor",
     "logical_not",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_not",
     "isnan",
     "isinf",
     "where",
@@ -420,11 +426,7 @@ def fuse_pointwise(graph: Graph) -> Graph:
 
 
 def _is_pointwise_fusion_candidate(graph: Graph, op: Operation) -> bool:
-    if op.op not in POINTWISE_OPS:
-        return False
-    dtypes = [graph.value(op.outputs[0]).type.dtype]
-    dtypes.extend(graph.value(value_id).type.dtype for value_id in op.inputs)
-    return all(dtype not in {DType.I32, DType.I64} for dtype in dtypes)
+    return op.op in POINTWISE_OPS
 
 
 def eliminate_common_subexpressions(graph: Graph) -> Graph:

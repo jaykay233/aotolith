@@ -207,10 +207,10 @@ def test_boolean_predicates_and_where_fuse_into_one_kernel(dtype) -> None:
         "gt",
         "lt",
         "eq",
-        "logical_and",
-        "logical_or",
-        "logical_xor",
-        "logical_not",
+        "bitwise_and",
+        "bitwise_or",
+        "bitwise_xor",
+        "bitwise_not",
         "where",
     }
     assert expected_ops <= set(input_ops)
@@ -293,6 +293,11 @@ def test_bitwise_boolean_scalars_fuse_with_numeric_selection() -> None:
     torch.manual_seed(19)
     value = torch.randn(29)
     result = compile_callable(fn, (value,))
+    assert [
+        op.op
+        for op in result.input_graph.ops
+        if op.op.startswith("bitwise_")
+    ] == ["bitwise_and", "bitwise_or", "bitwise_xor"]
     assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
     assert len(result.plan.kernels) == 1
 
@@ -3643,33 +3648,183 @@ def test_integer_scalar_constant_preserves_int64_precision(value: int) -> None:
     assert actual.item() == value
 
 
-def test_integer_pointwise_ops_are_not_fused() -> None:
-    tensor_type = TensorType((4,), DType.I32)
-    graph = Graph(
-        ("x",),
-        {
-            "x": Value("x", tensor_type),
-            "sum": Value("sum", tensor_type),
-            "out": Value("out", tensor_type),
-        },
-        (
-            Operation(
-                "add",
-                ("x",),
-                ("sum",),
-                {"scalar": 1.0, "scalar_position": "rhs"},
-            ),
-            Operation(
-                "mul",
-                ("sum",),
-                ("out",),
-                {"scalar": 2.0, "scalar_position": "rhs"},
-            ),
-        ),
-        ("out",),
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_integer_pointwise_ops_fuse_and_wrap(dtype) -> None:
+    info = torch.iinfo(dtype)
+    value = torch.tensor(
+        [info.min, info.max, -7, -1, 0, 1, 7],
+        dtype=dtype,
     )
 
-    assert [op.op for op in fuse_pointwise(graph).ops] == ["add", "mul"]
+    def fn(tensor):
+        return (tensor + 1) * 3
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "fused_elementwise"
+    ]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scalar"),
+    [
+        (torch.int32, 2**32 - 1),
+        (torch.int32, 2**32),
+        (torch.int32, 2**53 + 1),
+        (torch.int64, 2**53 + 1),
+        (torch.int64, 2**64 - 1),
+    ],
+)
+def test_integer_scalar_operands_wrap_without_float_rounding(
+    dtype, scalar: int
+) -> None:
+    value = torch.tensor([-2, -1, 0, 1, 2], dtype=dtype)
+
+    def fn(tensor):
+        return (tensor + scalar) * 3
+
+    result = compile_callable(fn, (value,))
+    assert result.input_graph.ops[0].attrs["scalar"] == scalar
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("divisor", [3, -3])
+def test_integer_floor_divide_and_remainder_match_pytorch(
+    dtype, divisor: int
+) -> None:
+    info = torch.iinfo(dtype)
+    value = torch.tensor(
+        [info.min, info.max, -7, -6, -1, 0, 1, 6, 7],
+        dtype=dtype,
+    )
+
+    def fn(tensor):
+        quotient = torch.floor_divide(tensor, divisor)
+        remainder = torch.remainder(tensor, divisor)
+        return quotient * 100 + remainder
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_integer_minimum_floor_division_by_negative_one_wraps(dtype) -> None:
+    info = torch.iinfo(dtype)
+    value = torch.tensor([info.min], dtype=dtype)
+    result = compile_callable(
+        lambda tensor: torch.floor_divide(tensor, -1),
+        (value,),
+    )
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(torch.floor_divide(value, -1))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_integer_bitwise_ops_fuse_with_tensor_and_scalar_operands(dtype) -> None:
+    left = torch.tensor([-9, -4, -1, 0, 1, 4, 9], dtype=dtype)
+    right = torch.tensor([3, 7, -2, 5, -4, 2, 3], dtype=dtype)
+
+    def fn(lhs, rhs):
+        return ((lhs & rhs) | (lhs ^ 3)) ^ ~rhs
+
+    result = compile_callable(fn, (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(left), _torch_to_mlx(right))[0]
+    expected = _torch_to_mlx(fn(left, right))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_integer_unary_ops_fuse_end_to_end(dtype) -> None:
+    info = torch.iinfo(dtype)
+    value = torch.tensor(
+        [info.min, -9, -4, -1, 0, 1, 4, 9, info.max],
+        dtype=dtype,
+    )
+
+    def fn(tensor):
+        return -tensor + tensor.abs() + tensor.sign() * 3 + torch.square(tensor)
+
+    result = compile_callable(fn, (value,))
+    assert "square" in [op.op for op in result.input_graph.ops]
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_integer_comparison_selection_clamp_and_fill_fuse_end_to_end() -> None:
+    value = torch.tensor([-9, -4, -1, 0, 1, 4, 9], dtype=torch.int64)
+    other = torch.tensor([3, 7, -2, 5, -4, 2, 3], dtype=torch.int64)
+    lower = torch.tensor([-5, -5, -5, -5, -5, -5, -5], dtype=torch.int64)
+    upper = torch.tensor([5, 5, 5, 5, 5, 5, 5], dtype=torch.int64)
+
+    def fn(tensor, rhs, minimum, maximum):
+        selected = torch.where(tensor < rhs, tensor, 0)
+        clipped = torch.clamp(selected, min=minimum, max=maximum)
+        return clipped.masked_fill(selected == 0, -2.9)
+
+    inputs = (value, other, lower, upper)
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(*(_torch_to_mlx(tensor) for tensor in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("operation", ["clamp_min", "clamp_max"])
+def test_integer_one_sided_clamp_uses_neutral_limit(dtype, operation) -> None:
+    info = torch.iinfo(dtype)
+    value = torch.tensor([info.min, -3, 0, 3, info.max], dtype=dtype)
+    operation_fn = torch.clamp_min if operation == "clamp_min" else torch.clamp_max
+    bound = 1 if operation == "clamp_min" else -1
+    result = compile_callable(lambda tensor: operation_fn(tensor, bound), (value,))
+
+    body = result.lowered_graph.ops[0].attrs.get("body")
+    pointwise_op = body[0] if body is not None else result.lowered_graph.ops[0]
+    output_type = result.lowered_graph.value(pointwise_op.outputs[0]).type
+    environment = {"arg0": _torch_to_mlx(value)}
+    actual = metal_backend._evaluate_pointwise_mlx(
+        pointwise_op, environment, output_type
+    )
+    expected = _torch_to_mlx(operation_fn(value, bound))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
 
 
 def test_integer_constants_are_common_subexpressions() -> None:

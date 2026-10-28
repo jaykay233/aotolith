@@ -28,6 +28,12 @@ _LOGICAL_POINTWISE_OPS = {
     "logical_xor",
     "logical_not",
 }
+_BITWISE_POINTWISE_OPS = {
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_not",
+}
 _NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf"}
 _CONSTANT_POINTWISE_OPS = {
     "scalar_tensor",
@@ -42,6 +48,24 @@ _CONSTANT_POINTWISE_OPS = {
     "full_like",
 }
 _INTEGRAL_DTYPES = {DType.I32, DType.I64}
+_INTEGER_POINTWISE_OPS = {
+    "add",
+    "sub",
+    "rsub",
+    "mul",
+    "neg",
+    "abs",
+    "sign",
+    "square",
+    "maximum",
+    "minimum",
+    "floor_divide",
+    "remainder",
+    "clamp",
+    "clamp_min",
+    "clamp_max",
+    *_BITWISE_POINTWISE_OPS,
+}
 _MATMUL_MICROTILE = (4, 4)
 _MATMUL_LARGE_K_MICROTILE = (8, 4)
 _MATMUL_LARGE_K_THRESHOLD = 1024
@@ -132,6 +156,80 @@ inline float tsc_mish(float value) {
     return value > 20.0f
         ? value
         : value * metal::tanh(tsc_softplus(value, 1.0f, 20.0f));
+}
+
+inline int tsc_neg_i32(int value) {
+    return (int)(0u - (uint)value);
+}
+
+inline long tsc_neg_i64(long value) {
+    return (long)((unsigned long)0 - (unsigned long)value);
+}
+
+inline int tsc_add_i32(int left, int right) {
+    return (int)((uint)left + (uint)right);
+}
+
+inline long tsc_add_i64(long left, long right) {
+    return (long)((unsigned long)left + (unsigned long)right);
+}
+
+inline int tsc_sub_i32(int left, int right) {
+    return (int)((uint)left - (uint)right);
+}
+
+inline long tsc_sub_i64(long left, long right) {
+    return (long)((unsigned long)left - (unsigned long)right);
+}
+
+inline int tsc_mul_i32(int left, int right) {
+    return (int)((uint)left * (uint)right);
+}
+
+inline long tsc_mul_i64(long left, long right) {
+    return (long)((unsigned long)left * (unsigned long)right);
+}
+
+inline int tsc_floor_div_i32(int dividend, int divisor) {
+    if (divisor == -1) {
+        return tsc_neg_i32(dividend);
+    }
+    int quotient = dividend / divisor;
+    int remainder = dividend % divisor;
+    bool round_down = remainder != 0 && ((remainder < 0) != (divisor < 0));
+    return quotient - (round_down ? 1 : 0);
+}
+
+inline long tsc_floor_div_i64(long dividend, long divisor) {
+    if (divisor == -1L) {
+        return tsc_neg_i64(dividend);
+    }
+    long quotient = dividend / divisor;
+    long remainder = dividend % divisor;
+    bool round_down = remainder != 0 && ((remainder < 0) != (divisor < 0));
+    return quotient - (round_down ? 1L : 0L);
+}
+
+inline int tsc_remainder_i32(int dividend, int divisor) {
+    if (divisor == -1) {
+        return 0;
+    }
+    int remainder = dividend % divisor;
+    if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+        remainder += divisor;
+    }
+    return remainder;
+}
+
+inline long tsc_remainder_i64(long dividend, long divisor) {
+    if (divisor == -1L) {
+        return 0L;
+    }
+    long remainder = dividend % divisor;
+    if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+        remainder += divisor;
+    }
+    return remainder;
 }
 """
 
@@ -2040,11 +2138,11 @@ def _validate_pointwise_region(
         if op.op in _CONSTANT_POINTWISE_OPS:
             if op.inputs:
                 raise ValueError(f"{op.op} must not have tensor inputs")
-            if output_type.dtype in {DType.I32, DType.I64}:
-                raise ValueError(f"{op.op} does not support integer outputs")
             value = op.attrs.get("value")
             if not isinstance(value, (bool, int, float)):
                 raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
+            if output_type.dtype in _INTEGRAL_DTYPES:
+                _integer_constant_value(op, output_type.dtype)
             continue
 
         if op.op in _COMPARISON_POINTWISE_OPS:
@@ -2073,11 +2171,32 @@ def _validate_pointwise_region(
                 raise ValueError(f"{op.op} requires boolean tensor inputs")
             continue
 
+        if op.op in _BITWISE_POINTWISE_OPS:
+            if output_type.dtype == DType.BOOL:
+                if op.op == "bitwise_not":
+                    expected_inputs = len(input_types) == 1
+                else:
+                    expected_inputs = len(input_types) == 2 or (
+                        len(input_types) == 1
+                        and isinstance(op.attrs.get("scalar"), bool)
+                    )
+                if not expected_inputs:
+                    raise ValueError(f"malformed bitwise op: {op.op}")
+                if any(input_type.dtype != DType.BOOL for input_type in input_types):
+                    raise ValueError(
+                        f"boolean {op.op} requires boolean tensor inputs"
+                    )
+                continue
+            _validate_integer_pointwise_op(op, output_type, input_types)
+            continue
+
         if op.op in _NUMERIC_PREDICATE_POINTWISE_OPS:
             if output_type.dtype != DType.BOOL or len(input_types) != 1:
                 raise ValueError(f"malformed predicate op: {op.op}")
             if input_types[0].dtype == DType.BOOL:
                 raise ValueError(f"{op.op} requires a numeric tensor input")
+            if input_types[0].dtype in _INTEGRAL_DTYPES:
+                raise ValueError(f"{op.op} does not accept integer tensor inputs")
             continue
 
         if op.op == "where":
@@ -2085,6 +2204,14 @@ def _validate_pointwise_region(
                 raise ValueError("where requires condition, input and other tensors")
             if input_types[0].dtype != DType.BOOL:
                 raise ValueError("where condition must be a boolean tensor")
+            if output_type.dtype in _INTEGRAL_DTYPES:
+                if any(
+                    input_type.dtype != output_type.dtype
+                    for input_type in input_types[1:]
+                ):
+                    raise ValueError(
+                        "integer where requires matching integer branch dtypes"
+                    )
             continue
 
         if op.op == "masked_fill":
@@ -2106,11 +2233,11 @@ def _validate_pointwise_region(
             input_type.dtype == DType.BOOL for input_type in input_types
         ):
             raise ValueError(f"{op.op} does not accept boolean tensor operands")
-        if output_type.dtype in {DType.I32, DType.I64} or any(
-            input_type.dtype in {DType.I32, DType.I64}
-            for input_type in input_types
+        if output_type.dtype in _INTEGRAL_DTYPES or any(
+            input_type.dtype in _INTEGRAL_DTYPES for input_type in input_types
         ):
-            raise ValueError(f"{op.op} does not accept integer tensor operands")
+            _validate_integer_pointwise_op(op, output_type, input_types)
+            continue
 
     if graph.value(output_id).type.dtype == DType.BOOL:
         producer = next(
@@ -2119,11 +2246,76 @@ def _validate_pointwise_region(
         if producer is None or producer.op not in (
             _COMPARISON_POINTWISE_OPS
             | _LOGICAL_POINTWISE_OPS
+            | _BITWISE_POINTWISE_OPS
             | _NUMERIC_PREDICATE_POINTWISE_OPS
             | {"where", "masked_fill"}
             | _CONSTANT_POINTWISE_OPS
         ):
             raise ValueError("boolean pointwise region has an unsupported root op")
+
+
+def _validate_integer_pointwise_op(
+    op: Operation,
+    output_type: TensorType,
+    input_types: tuple[TensorType, ...],
+) -> None:
+    if op.op not in _INTEGER_POINTWISE_OPS:
+        raise ValueError(f"{op.op} does not accept integer tensor operands")
+    if output_type.dtype not in _INTEGRAL_DTYPES:
+        raise ValueError(f"{op.op} does not support integer tensor operands")
+    if any(input_type.dtype not in _INTEGRAL_DTYPES for input_type in input_types):
+        raise ValueError(f"{op.op} requires matching integer tensor operands")
+
+    if op.op in {"neg", "abs", "sign", "square", "bitwise_not"}:
+        if len(input_types) != 1 or input_types[0].dtype != output_type.dtype:
+            raise ValueError(f"malformed integer unary op: {op.op}")
+        return
+
+    if op.op in {
+        "add",
+        "sub",
+        "rsub",
+        "mul",
+        "maximum",
+        "minimum",
+        "floor_divide",
+        "remainder",
+        "bitwise_and",
+        "bitwise_or",
+        "bitwise_xor",
+    }:
+        if len(input_types) == 2:
+            if any(
+                input_type.dtype != output_type.dtype for input_type in input_types
+            ):
+                raise ValueError(f"integer {op.op} requires matching input dtypes")
+        elif len(input_types) == 1:
+            scalar = op.attrs.get("scalar")
+            if not isinstance(scalar, int) or isinstance(scalar, bool):
+                raise ValueError(
+                    f"integer {op.op} scalar must be an integer, got {scalar!r}"
+                )
+        else:
+            raise ValueError(f"malformed integer binary op: {op.op}")
+        return
+
+    if op.op in {"clamp", "clamp_min", "clamp_max"}:
+        if not input_types or input_types[0].dtype != output_type.dtype:
+            raise ValueError(f"malformed integer {op.op} op")
+        for input_type in input_types[1:]:
+            if input_type.dtype != output_type.dtype:
+                raise ValueError(f"integer {op.op} requires matching bound dtypes")
+        for name in ("min", "max"):
+            bound = op.attrs.get(name)
+            if bound is not None and (
+                not isinstance(bound, int) or isinstance(bound, bool)
+            ):
+                raise ValueError(
+                    f"integer {op.op}.{name} must be an integer, got {bound!r}"
+                )
+        return
+
+    raise AssertionError(f"unclassified integer pointwise op: {op.op}")
 
 
 def _validate_integer_constant(graph: Graph, op: Operation) -> None:
@@ -2264,11 +2456,7 @@ def _emit_pointwise_source(
         offset = _offset_expression(
             graph.value(value_id).type.shape, output_shape, "elem"
         )
-        ctype = (
-            "bool"
-            if graph.value(value_id).type.dtype == DType.BOOL
-            else "float"
-        )
+        ctype = _pointwise_ctype(graph.value(value_id).type.dtype)
         lines.append(f"    {ctype} {variable} = in_{position}[{offset}];")
         env[value_id] = variable
 
@@ -2285,12 +2473,12 @@ def _emit_pointwise_source(
             env[op.outputs[0]] = existing
             continue
         output = f"temp_{op_index}"
-        expression = _emit_pointwise_expression(op, arguments)
-        ctype = (
-            "bool"
-            if graph.value(op.outputs[0]).type.dtype == DType.BOOL
-            else "float"
+        input_types = tuple(graph.value(value_id).type for value_id in op.inputs)
+        output_type = graph.value(op.outputs[0]).type
+        expression = _emit_pointwise_expression(
+            op, arguments, input_types, output_type.dtype
         )
+        ctype = _pointwise_ctype(output_type.dtype)
         lines.append(f"    {ctype} {output} = {expression};")
         env[op.outputs[0]] = output
         common[key] = output
@@ -2306,7 +2494,40 @@ def _emit_pointwise_source(
     return "\n".join(f"        {line}" for line in lines)
 
 
-def _binary_operands(op: Operation, arguments: list[str]) -> tuple[str, str]:
+def _pointwise_ctype(dtype: DType) -> str:
+    if dtype == DType.BOOL:
+        return "bool"
+    if dtype == DType.I32:
+        return "int"
+    if dtype == DType.I64:
+        return "long"
+    return "float"
+
+
+def _wrap_integer_scalar(value: int, dtype: DType) -> int:
+    bits = 32 if dtype == DType.I32 else 64
+    modulus = 1 << bits
+    wrapped = value % modulus
+    if wrapped >= (1 << (bits - 1)):
+        wrapped -= modulus
+    return wrapped
+
+
+def _checked_integer_scalar(value: int | float, dtype: DType) -> int:
+    converted = int(value)
+    bits = 32 if dtype == DType.I32 else 64
+    lower = -(1 << (bits - 1))
+    upper = (1 << (bits - 1)) - 1
+    if not lower <= converted <= upper:
+        raise ValueError(f"integer scalar {value!r} overflows {dtype.value}")
+    return converted
+
+
+def _binary_operands(
+    op: Operation,
+    arguments: list[str],
+    input_types: tuple[TensorType, ...],
+) -> tuple[str, str]:
     if len(arguments) == 2:
         return arguments[0], arguments[1]
     if len(arguments) != 1 or "scalar" not in op.attrs:
@@ -2314,6 +2535,11 @@ def _binary_operands(op: Operation, arguments: list[str]) -> tuple[str, str]:
     scalar_value = op.attrs["scalar"]
     if isinstance(scalar_value, bool):
         scalar = "true" if scalar_value else "false"
+    elif input_types[0].dtype in _INTEGRAL_DTYPES and isinstance(scalar_value, int):
+        scalar = _msl_integer_literal(
+            _wrap_integer_scalar(scalar_value, input_types[0].dtype),
+            input_types[0].dtype,
+        )
     else:
         scalar = _msl_float_literal(float(scalar_value))
     if op.attrs.get("scalar_position") == "lhs":
@@ -2329,16 +2555,25 @@ def _msl_float_literal(value: float) -> str:
     return repr(value)
 
 
-def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
+def _emit_pointwise_expression(
+    op: Operation,
+    arguments: list[str],
+    input_types: tuple[TensorType, ...],
+    output_dtype: DType,
+) -> str:
     if op.op in _CONSTANT_POINTWISE_OPS:
         value = op.attrs.get("value")
         if isinstance(value, bool):
             return "true" if value else "false"
+        if output_dtype in _INTEGRAL_DTYPES:
+            return _msl_integer_literal(
+                _integer_constant_value(op, output_dtype), output_dtype
+            )
         if isinstance(value, (int, float)):
             return _msl_float_literal(float(value))
         raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
     if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         operator = {
             "eq": "==",
             "ne": "!=",
@@ -2349,16 +2584,30 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         }[op.op]
         return f"({left} {operator} {right})"
     if op.op == "logical_and":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"({left} && {right})"
     if op.op == "logical_or":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"({left} || {right})"
     if op.op == "logical_xor":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"({left} != {right})"
     if op.op == "logical_not":
         return f"(!{arguments[0]})"
+    if op.op in _BITWISE_POINTWISE_OPS:
+        if output_dtype == DType.BOOL:
+            if op.op == "bitwise_not":
+                return f"(!{arguments[0]})"
+            left, right = _binary_operands(op, arguments, input_types)
+            operator = {
+                "bitwise_and": "&",
+                "bitwise_or": "|",
+                "bitwise_xor": "^",
+            }[op.op]
+            return f"({left} {operator} {right})"
+        return _emit_integer_pointwise_expression(
+            op, arguments, input_types, output_dtype
+        )
     if op.op == "isnan":
         return f"metal::isnan({arguments[0]})"
     if op.op == "isinf":
@@ -2369,9 +2618,17 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         value = op.attrs.get("value")
         if isinstance(value, bool):
             fill = "true" if value else "false"
+        elif output_dtype in _INTEGRAL_DTYPES:
+            fill = _msl_integer_literal(
+                _checked_integer_scalar(value, output_dtype), output_dtype
+            )
         else:
             fill = _msl_float_literal(float(value))
         return f"({arguments[1]} ? {fill} : {arguments[0]})"
+    if output_dtype in _INTEGRAL_DTYPES:
+        return _emit_integer_pointwise_expression(
+            op, arguments, input_types, output_dtype
+        )
     if op.op == "silu":
         value = arguments[0]
         return f"{value} / (1.0f + metal::exp(-{value}))"
@@ -2396,14 +2653,14 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
     if op.op == "logsigmoid":
         return f"tsc_logsigmoid({arguments[0]})"
     if op.op in {"mul", "div"}:
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         operator = "*" if op.op == "mul" else "/"
         return f"{left} {operator} {right}"
     if op.op == "pow":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"metal::pow({left}, {right})"
     if op.op in {"maximum", "minimum"}:
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         comparison = "<" if op.op == "maximum" else ">"
         selected = f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
         return (
@@ -2411,13 +2668,13 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
             f"? NAN : {selected})"
         )
     if op.op == "logaddexp":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_logaddexp({left}, {right})"
     if op.op == "atan2":
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_atan2({left}, {right})"
     if op.op in {"add", "sub", "rsub"}:
-        left, right = _binary_operands(op, arguments)
+        left, right = _binary_operands(op, arguments, input_types)
         operator = "+" if op.op == "add" else "-"
         alpha = float(op.attrs.get("alpha", 1.0))
         return f"{left} {operator} {alpha!r} * {right}"
@@ -2505,8 +2762,8 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"1.0f / {arguments[0]}"
     if op.op in {"clamp", "clamp_min", "clamp_max"}:
         value = arguments[0]
-        lower = _clamp_bound_expression(op, arguments, "min")
-        upper = _clamp_bound_expression(op, arguments, "max")
+        lower = _clamp_bound_expression(op, arguments, "min", output_dtype)
+        upper = _clamp_bound_expression(op, arguments, "max", output_dtype)
         if lower is not None and upper is not None:
             clipped = f"metal::min(metal::max({value}, {lower}), {upper})"
         elif lower is not None:
@@ -2527,8 +2784,95 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
     raise NotImplementedError(f"cannot emit fused pointwise op: {op.op}")
 
 
+def _emit_integer_pointwise_expression(
+    op: Operation,
+    arguments: list[str],
+    input_types: tuple[TensorType, ...],
+    output_dtype: DType,
+) -> str:
+    suffix = "i32" if output_dtype == DType.I32 else "i64"
+    ctype = _pointwise_ctype(output_dtype)
+    unsigned_ctype = "uint" if output_dtype == DType.I32 else "unsigned long"
+
+    if op.op == "neg":
+        return f"tsc_neg_{suffix}({arguments[0]})"
+    if op.op == "abs":
+        value = arguments[0]
+        return f"(({value}) < 0 ? tsc_neg_{suffix}({value}) : ({value}))"
+    if op.op == "sign":
+        value = arguments[0]
+        return f"(({value}) > 0 ? 1 : (({value}) < 0 ? -1 : 0))"
+    if op.op == "square":
+        value = arguments[0]
+        return f"tsc_mul_{suffix}({value}, {value})"
+    if op.op == "bitwise_not":
+        value = arguments[0]
+        return f"({ctype})(~({unsigned_ctype})({value}))"
+
+    if op.op in {"add", "sub", "rsub", "mul"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        if op.op == "mul":
+            return f"tsc_mul_{suffix}({left}, {right})"
+        alpha = op.attrs.get("alpha", 1)
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+            raise ValueError(f"integer {op.op}.alpha must be an integer")
+        if isinstance(alpha, float):
+            if not isfinite(alpha) or not alpha.is_integer():
+                raise ValueError(f"integer {op.op}.alpha must be an integer")
+            alpha = int(alpha)
+        if alpha != 1:
+            alpha_literal = _msl_integer_literal(
+                _wrap_integer_scalar(int(alpha), output_dtype), output_dtype
+            )
+            right = f"tsc_mul_{suffix}({right}, {alpha_literal})"
+        function = "tsc_add" if op.op == "add" else "tsc_sub"
+        return f"{function}_{suffix}({left}, {right})"
+
+    if op.op in {"maximum", "minimum"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        comparison = "<" if op.op == "maximum" else ">"
+        return f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
+
+    if op.op in {"floor_divide", "remainder"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        function = "floor_div" if op.op == "floor_divide" else "remainder"
+        return f"tsc_{function}_{suffix}({left}, {right})"
+
+    if op.op in {"bitwise_and", "bitwise_or", "bitwise_xor"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        operator = {
+            "bitwise_and": "&",
+            "bitwise_or": "|",
+            "bitwise_xor": "^",
+        }[op.op]
+        return (
+            f"({ctype})(({unsigned_ctype})({left}) {operator} "
+            f"({unsigned_ctype})({right}))"
+        )
+
+    if op.op in {"clamp", "clamp_min", "clamp_max"}:
+        value = arguments[0]
+        lower = _clamp_bound_expression(op, arguments, "min", output_dtype)
+        upper = _clamp_bound_expression(op, arguments, "max", output_dtype)
+        if lower is not None and upper is not None:
+            return (
+                f"(({value}) > ({upper}) ? ({upper}) : "
+                f"(({value}) < ({lower}) ? ({lower}) : ({value})))"
+            )
+        if lower is not None:
+            return f"(({value}) < ({lower}) ? ({lower}) : ({value}))"
+        if upper is not None:
+            return f"(({value}) > ({upper}) ? ({upper}) : ({value}))"
+        return value
+
+    raise NotImplementedError(f"cannot emit integer pointwise op: {op.op}")
+
+
 def _clamp_bound_expression(
-    op: Operation, arguments: list[str], name: str
+    op: Operation,
+    arguments: list[str],
+    name: str,
+    output_dtype: DType,
 ) -> str | None:
     input_position = op.attrs.get(f"{name}_input")
     if input_position is not None:
@@ -2545,6 +2889,10 @@ def _clamp_bound_expression(
         return None
     if not isinstance(bound, (int, float)) or isinstance(bound, bool):
         raise ValueError(f"clamp.{name} must be a scalar number")
+    if output_dtype in _INTEGRAL_DTYPES:
+        return _msl_integer_literal(
+            _checked_integer_scalar(bound, output_dtype), output_dtype
+        )
     value = float(bound)
     if isnan(value):
         return "NAN"
@@ -3177,6 +3525,17 @@ def _evaluate_pointwise_mlx(
         return mx.logical_xor(left, right)
     if op.op == "logical_not":
         return mx.logical_not(arguments[0])
+    if op.op == "bitwise_and":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.bitwise_and(left, right)
+    if op.op == "bitwise_or":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.bitwise_or(left, right)
+    if op.op == "bitwise_xor":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.bitwise_xor(left, right)
+    if op.op == "bitwise_not":
+        return ~arguments[0]
     if op.op == "isnan":
         return mx.isnan(arguments[0])
     if op.op == "isinf":
@@ -3219,12 +3578,25 @@ def _evaluate_pointwise_mlx(
         value = arguments[0]
         body = mx.minimum(value, 0.0) - mx.log1p(mx.exp(-mx.abs(value)))
         return mx.where(mx.isnan(value), value, body)
-    if op.op in {"mul", "div", "add", "sub", "rsub", "pow"}:
+    if op.op in {
+        "mul",
+        "div",
+        "floor_divide",
+        "remainder",
+        "add",
+        "sub",
+        "rsub",
+        "pow",
+    }:
         left, right = _binary_mx_operands(op, arguments)
         if op.op == "mul":
             return left * right
         if op.op == "div":
             return left / right
+        if op.op == "floor_divide":
+            return mx.floor_divide(left, right)
+        if op.op == "remainder":
+            return mx.remainder(left, right)
         if op.op == "pow":
             return mx.power(left, right)
         alpha = float(op.attrs.get("alpha", 1.0))
@@ -3320,17 +3692,38 @@ def _evaluate_pointwise_mlx(
         return 1.0 / arguments[0]
     if op.op in {"clamp", "clamp_min", "clamp_max"}:
         value = arguments[0]
-        lower: mx.array | float = -float("inf")
-        upper: mx.array | float = float("inf")
+        integral = value.dtype in {mx.int32, mx.int64}
+        integer_min = -(1 << (31 if value.dtype == mx.int32 else 63))
+        integer_max = (1 << (31 if value.dtype == mx.int32 else 63)) - 1
+        lower: mx.array | float = (
+            mx.array(integer_min, dtype=value.dtype)
+            if integral
+            else -float("inf")
+        )
+        upper: mx.array | float = (
+            mx.array(integer_max, dtype=value.dtype)
+            if integral
+            else float("inf")
+        )
         if "min_input" in op.attrs:
             lower = arguments[int(op.attrs["min_input"])]
         elif "min" in op.attrs:
-            lower = float(op.attrs["min"])
+            lower = (
+                mx.array(op.attrs["min"], dtype=value.dtype)
+                if integral
+                else float(op.attrs["min"])
+            )
         if "max_input" in op.attrs:
             upper = arguments[int(op.attrs["max_input"])]
         elif "max" in op.attrs:
-            upper = float(op.attrs["max"])
+            upper = (
+                mx.array(op.attrs["max"], dtype=value.dtype)
+                if integral
+                else float(op.attrs["max"])
+            )
         clipped = mx.minimum(mx.maximum(value, lower), upper)
+        if integral:
+            return clipped
         invalid = mx.isnan(value) | mx.isnan(lower) | mx.isnan(upper)
         return mx.where(invalid, float("nan"), clipped)
     raise NotImplementedError(f"no Apple runtime lowering for {op.op}")
@@ -3344,11 +3737,18 @@ def _binary_mx_operands(
     if len(arguments) != 1 or "scalar" not in op.attrs:
         raise ValueError(f"malformed binary pointwise op: {op.op}")
     scalar_value = op.attrs["scalar"]
-    scalar = (
-        mx.array(scalar_value)
-        if isinstance(scalar_value, bool)
-        else float(scalar_value)
-    )
+    if isinstance(scalar_value, bool):
+        scalar = mx.array(scalar_value)
+    elif isinstance(scalar_value, int) and arguments[0].dtype in {
+        mx.int32,
+        mx.int64,
+    }:
+        dtype = DType.I32 if arguments[0].dtype == mx.int32 else DType.I64
+        scalar = mx.array(
+            _wrap_integer_scalar(scalar_value, dtype), dtype=_MLX_DTYPES[dtype]
+        )
+    else:
+        scalar = float(scalar_value)
     if op.attrs.get("scalar_position") == "lhs":
         return scalar, arguments[0]
     return arguments[0], scalar
