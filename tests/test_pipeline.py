@@ -645,7 +645,7 @@ def test_native_attention_rank4_mha_and_gqa(key_value_heads) -> None:
     ("dtype", "simdgroup_type"),
     [(torch.float16, "half"), (torch.bfloat16, "bfloat")],
 )
-def test_native_attention_uses_simdgroup_qk(dtype, simdgroup_type) -> None:
+def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(query, key, value)
 
@@ -664,7 +664,13 @@ def test_native_attention_uses_simdgroup_qk(dtype, simdgroup_type) -> None:
     assert f"simdgroup_{simdgroup_type}8x8 qk_frag_q" in source
     assert "simdgroup_load(qk_frag_k" in source
     assert f"tile_k + warp * 8u * 64u" in source
+    assert "threadgroup T tile_probabilities_low[256]" in source
+    assert "threadgroup float tile_pv[512]" in source
+    assert "simdgroup_float8x8 pv_accumulator" in source
+    assert f"simdgroup_{simdgroup_type}8x8 pv_frag_probability" in source
+    assert f"simdgroup_{simdgroup_type}8x8 pv_frag_value" in source
     assert "simdgroup_multiply_accumulate" in source
+    assert "tile_k[index] = global_key" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))

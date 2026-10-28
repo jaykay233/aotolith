@@ -246,14 +246,14 @@ kernel 的执行方式：
 
 - Q tile 和当前 K tile 由 threadgroup 协作加载到 shared memory；FP16/BF16 下，4 个 SIMD group 分别计算一个 `8×8` key 分块，拼成完整的 `8×32` QK score tile，FP32 或非 8 对齐的 head dim 回退到 lane 串行点积
 - `simd_max` 和 `simd_sum` 在 warp 内得到 block max 与 block sum，再与 running max、denominator 合并成 online softmax 状态
-- softmax probability 暂存到 shared memory，每个 lane 按 `lane + component * 32` 映射 V head dimension，并在 key tile 上累积
+- softmax probability 暂存到 shared memory；FP16/BF16 且 V head dim 按 8 对齐时，8 个 SIMD group 并行计算 `8×32 @ 32×V_D` 的 PV tile，再把结果合并回每个 query 的 online accumulator
 - key tile 之间只重标定 running sum 和 V accumulator，不物化完整 attention matrix
 - query tile 和 key tile 的尾部用 `-INFINITY` score 或零 probability 补齐，最后一个 tile 不越界读写
 - GQA/MQA 通过静态的 `kv_head = query_head / group_size` 寻址，不展开 K/V head
 - rank-4 additive mask 按 `(batch, head, query, key)` 生成静态 offset，支持 batch/head/query/key 维广播
 - causal mask 在 score 写入 softmax 状态前应用
 
-score 和 online-softmax 状态使用 float，最后写回 FP16、BF16 或 FP32。当前 M5 Pro 测试中，这版 kernel 比最初实现明显更快，但仍比 MLX SDPA 慢约 3.5–9 倍。QK 已在低精度路径使用 SIMD matrix；PV 仍逐 key 累加，也还没有 threadgroup memory 的 V staging、block shape autotune 或 split-key；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
+score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概率与 V fragment，最后写回 FP16、BF16 或 FP32。当前 M5 Pro 测试中，这版 kernel 比最初实现明显更快，但仍比 MLX SDPA 慢约 3–9 倍。QK/PV 已在低精度路径使用 SIMD matrix；还没有 block shape autotune、split-key 或更细的 tile 流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
 ## 13. Runtime
 
@@ -291,8 +291,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
-- 原生 attention 仅在 FP16/BF16 且 Q/K head dim 能被 8 整除时使用 SIMD matrix 计算 QK；PV 仍走标量路径
+- 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；不满足条件的单个阶段回退到标量路径
 - attention tile 固定为 `8×32`，还没有按 sequence、head dim 和 GPU 做 autotune
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 需要用 SIMD matrix 重做 PV，并加入 V staging 和 tile autotune。编译器侧仍可推进布局传播与跨进程 kernel cache。
+下一步可以把低精度 matmul 接到 Metal 4 MPP，继续做 split-K 与 shape autotune；attention 已使用 SIMD matrix 计算 QK/PV，后续重点是 tile autotune、split-key 和更细的流水。编译器侧仍可推进布局传播与跨进程 kernel cache。

@@ -353,6 +353,91 @@ class AppleMetalBackend:
                 score = {score_expression};
             }}
 """
+        use_simdgroup_pv = (
+            output_type.dtype in {DType.F16, DType.BF16}
+            and value_head_dim % 8 == 0
+        )
+        if use_simdgroup_pv:
+            simdgroup_type = {
+                DType.F16: "half",
+                DType.BF16: "bfloat",
+            }[output_type.dtype]
+            pv_steps = "\n".join(
+                f"""                simdgroup_load(pv_frag_probability,
+                    tile_probabilities_low + {tile_key}u, {key_tile}, 0, false);
+                simdgroup_load(pv_frag_value, tile_k
+                    + {tile_key * value_head_dim}u + output_fragment * 8u,
+                    {value_head_dim}, 0, false);
+                simdgroup_multiply_accumulate(
+                    pv_accumulator, pv_frag_probability, pv_frag_value,
+                    pv_accumulator);"""
+                for tile_key in range(0, key_tile, 8)
+            )
+            pv_shared_declaration = f"""
+        threadgroup T tile_probabilities_low[{query_tile * key_tile}];
+        threadgroup float tile_pv[{query_tile * value_head_dim}];"""
+            pv_probability_store = """
+            tile_probabilities_low[warp * 32u + lane] = (T)probability;"""
+            pv_accumulation_source = f"""
+            for (uint index = tid; index < {key_tile * value_head_dim}u;
+                 index += {threads}u) {{
+                uint key_row = index / {value_head_dim}u;
+                uint dimension = index % {value_head_dim}u;
+                uint global_key = key_base + key_row;
+                tile_k[index] = global_key < {key_length}u
+                    ? in_2[({key_value_batch_head} * {key_length}u + global_key)
+                        * {value_head_dim}u + dimension]
+                    : T(0);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint output_fragment = warp;
+                 output_fragment * 8u < {value_head_dim}u;
+                 output_fragment += 8u) {{
+                simdgroup_float8x8 pv_accumulator =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_{simdgroup_type}8x8 pv_frag_probability;
+                simdgroup_{simdgroup_type}8x8 pv_frag_value;
+{pv_steps}
+                simdgroup_store(pv_accumulator,
+                    tile_pv + output_fragment * 8u, {value_head_dim}, 0, false);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint component = 0u;
+                 component < {ceil(value_head_dim / 32)}u; ++component) {{
+                uint dimension = lane + component * 32u;
+                if (query_pos < {query_length}u && dimension < {value_head_dim}u) {{
+                    accumulator[component] = accumulator[component] * alpha
+                        + block_scale
+                            * tile_pv[warp * {value_head_dim}u + dimension];
+                }}
+            }}
+"""
+        else:
+            pv_shared_declaration = ""
+            pv_probability_store = ""
+            pv_accumulation_source = f"""
+            for (uint component = 0u;
+                 component < {ceil(value_head_dim / 32)}u; ++component) {{
+                uint dimension = lane + component * 32u;
+                float tile_accumulator = 0.0f;
+                if (query_pos < {query_length}u && dimension < {value_head_dim}u) {{
+                    for (uint tile_key = 0u; tile_key < {key_tile}u; ++tile_key) {{
+                        uint global_key = key_base + tile_key;
+                        if (global_key < {key_length}u) {{
+                            tile_accumulator = fma(
+                                tile_probabilities[warp * {key_tile}u + tile_key],
+                                float(in_2[({key_value_batch_head} * {key_length}u
+                                    + global_key) * {value_head_dim}u + dimension]),
+                                tile_accumulator);
+                        }}
+                    }}
+                    accumulator[component] = accumulator[component] * alpha
+                        + block_scale * tile_accumulator;
+                }}
+            }}
+"""
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint lane = tid % 32u;
@@ -364,9 +449,9 @@ class AppleMetalBackend:
         uint query_block = query_remainder % {query_blocks}u;
         uint query_pos = query_block * {query_tile}u + warp;
         threadgroup T tile_q[{query_tile * query_head_dim}];
-        threadgroup T tile_k[{key_tile * query_head_dim}];
+        threadgroup T tile_k[{key_tile * max(query_head_dim, value_head_dim)}];
         threadgroup float tile_scores[{query_tile * key_tile}];
-        threadgroup float tile_probabilities[{query_tile * key_tile}];
+        threadgroup float tile_probabilities[{query_tile * key_tile}];{pv_shared_declaration}
 
         for (uint index = tid; index < {query_tile * query_head_dim}u;
              index += {threads}u) {{
@@ -412,28 +497,9 @@ class AppleMetalBackend:
             float block_sum = simd_sum(probability);
             running_sum = running_sum * alpha + block_scale * block_sum;
             running_max = new_max;
-            tile_probabilities[warp * {key_tile}u + lane] = probability;
+            tile_probabilities[warp * {key_tile}u + lane] = probability;{pv_probability_store}
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint component = 0u;
-                 component < {ceil(value_head_dim / 32)}u; ++component) {{
-                uint dimension = lane + component * 32u;
-                float tile_accumulator = 0.0f;
-                if (query_pos < {query_length}u && dimension < {value_head_dim}u) {{
-                    for (uint tile_key = 0u; tile_key < {key_tile}u; ++tile_key) {{
-                        uint global_key = key_base + tile_key;
-                        if (global_key < {key_length}u) {{
-                            tile_accumulator = fma(
-                                tile_probabilities[warp * {key_tile}u + tile_key],
-                                float(in_2[({key_value_batch_head} * {key_length}u
-                                    + global_key) * {value_head_dim}u + dimension]),
-                                tile_accumulator);
-                        }}
-                    }}
-                    accumulator[component] = accumulator[component] * alpha
-                        + block_scale * tile_accumulator;
-                }}
-            }}
+{pv_accumulation_source}
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
