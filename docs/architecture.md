@@ -130,9 +130,9 @@ v4 = fused_elementwise(v1, v2) {
 
 attention 和 pointwise 融合完成后，`eliminate_common_subexpressions` 按 SSA 顺序遍历剩余的纯 op。每个 op 的结构 key 包含 op 类型、已经重映射的输入 ID、输出 shape/dtype 和递归冻结的 attributes。key 相同的后续 op 会被删除，其输出 ID alias 到第一次出现的输出；随后所有 consumer 和 graph output 都改写到保留的 value ID。
 
-输出类型进入 key 是必要的。例如同一输入分别 cast 到 FP32 和 BF16 时，两个 `cast` 的输入和 attributes 相同，但输出 dtype 不同，不能合并。嵌套在 `fused_elementwise.attrs["body"]` 中的 op 也参与稳定序列化，因此相同 region 可以安全比较。CSE 放在 fusion 之后，避免先合并单个 op 再改变 pointwise region 的边界。
+输出类型进入 key 是必要的。例如同一输入分别 cast 到 FP32 和 BF16 时，两个 `cast` 的输入和 attributes 相同，但输出 dtype 不同，不能合并。CSE 放在 fusion 之后，避免先合并单个 op 再改变 pointwise region 的边界。
 
-当前 CSE 不会为两个 `fused_elementwise` region 内部的临时 value 重新编号。因此两个 region 只有在内部 SSA value ID 也一致时才会被识别为同一结构；单个 matmul、attention、norm、cast 等独立 op 的重复消除不受这个限制。
+`fused_elementwise` 的 key 不只递归冻结 body：它把 boundary input 映射为参数序号，把 body 中每个临时输出按 SSA 顺序重新编号，并记录每个中间值的类型和 attributes。这样，即使两个 region 使用了不同的 value ID，只要数据流和算子属性等价，仍然会被合并。CSE 还会在删除上游重复 op 后改写 region body 的 boundary 引用，避免保留的 region 指向已从执行序列中删除的 value。
 
 ## 6. Broadcast 索引
 
@@ -323,7 +323,6 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
 - 没有反向传播和训练支持
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
-- graph CSE 不会规范化两个 fused region 内部的临时 SSA value ID，因此内部 ID 不同的等价 region 未必合并
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V 和 additive mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；64-key tile 仅在同样条件成立时使用 8/16 元素向量加载，不满足条件的单个阶段回退到标量路径

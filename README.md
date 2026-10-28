@@ -41,7 +41,7 @@ PyTorch FX
 - 直接识别 `F.scaled_dot_product_attention` 的 CPU flash、CUDA flash、efficient attention 和通用 ATen target
 - 识别 PyTorch 分解图中 `repeat_kv` 产生的 `unsqueeze -> expand -> reshape`，融合后不再物化复制后的 K/V
 - 把相邻 pointwise op 融合成一个 DAG region
-- 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式，并保持 graph output alias
+- 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式；融合 region 会先对内部 SSA value 做结构化编号，并同步改写上游 alias，因此内部临时 ID 不同的等价 region 也能合并
 - 在 schedule 前校验静态视图和布局变换；未折叠的 layout op 由 Runtime 执行 MLX view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
 - 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，`clamp`/`clamp_min`/`clamp_max` 支持标量和可广播 tensor 边界，并与 `leaky_relu`、`elu`、`hardswish` 一起参与 pointwise 融合

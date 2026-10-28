@@ -243,6 +243,89 @@ def test_common_subexpression_key_preserves_attributes() -> None:
     assert optimized.outputs == ("first", "second")
 
 
+def test_common_subexpression_elimination_normalizes_fused_region_values() -> None:
+    tensor = TensorType((3,), DType.F32)
+    values = {
+        value_id: Value(value_id, tensor)
+        for value_id in ("a", "b", "x", "y", "out0", "out1")
+    }
+    graph = Graph(
+        ("a", "b"),
+        values,
+        (
+            Operation("silu", ("a",), ("x",)),
+            Operation("mul", ("x", "b"), ("out0",)),
+            Operation("silu", ("a",), ("y",)),
+            Operation("mul", ("y", "b"), ("out1",)),
+        ),
+        ("out0", "out1"),
+    )
+
+    optimized = eliminate_common_subexpressions(fuse_pointwise(graph))
+    assert [op.op for op in optimized.ops] == ["fused_elementwise"]
+    assert optimized.outputs == ("out0", "out0")
+
+    result = compile_graph(optimized)
+    torch.manual_seed(45)
+    a = torch.randn(3)
+    b = torch.randn(3)
+    actual = result.plan(mx.array(a.numpy()), mx.array(b.numpy()))
+    expected = mx.array((torch.nn.functional.silu(a) * b).numpy())
+    mx.eval(*actual, expected)
+    assert actual[0] is actual[1]
+    assert mx.allclose(actual[0], expected, atol=1e-5, rtol=1e-5)
+
+
+def test_common_subexpression_elimination_rewrites_fused_region_boundaries() -> None:
+    matrix = TensorType((2, 3), DType.F32)
+    weight = TensorType((3, 4), DType.F32)
+    output = TensorType((2, 4), DType.F32)
+    bias = TensorType((4,), DType.F32)
+    values = {
+        "x": Value("x", matrix),
+        "w": Value("w", weight),
+        "bias": Value("bias", bias),
+        "left": Value("left", output),
+        "right": Value("right", output),
+        "left_activation": Value("left_activation", output),
+        "right_activation": Value("right_activation", output),
+        "out0": Value("out0", output),
+        "out1": Value("out1", output),
+    }
+    graph = Graph(
+        ("x", "w", "bias"),
+        values,
+        (
+            Operation("matmul", ("x", "w"), ("left",)),
+            Operation("silu", ("left",), ("left_activation",)),
+            Operation("mul", ("left_activation", "bias"), ("out0",)),
+            Operation("matmul", ("x", "w"), ("right",)),
+            Operation("silu", ("right",), ("right_activation",)),
+            Operation("mul", ("right_activation", "bias"), ("out1",)),
+        ),
+        ("out0", "out1"),
+    )
+
+    optimized = eliminate_common_subexpressions(fuse_pointwise(graph))
+    assert [op.op for op in optimized.ops] == ["matmul", "fused_elementwise"]
+    assert optimized.outputs == ("out0", "out0")
+    body = optimized.ops[1].attrs["body"]
+    assert body[0].inputs == ("left",)
+    assert all("right" not in body_op.inputs for body_op in body)
+
+    result = compile_graph(optimized)
+    torch.manual_seed(46)
+    inputs = (torch.randn(2, 3), torch.randn(3, 4), torch.randn(4))
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    projected = mx.matmul(
+        mx.array(inputs[0].numpy()), mx.array(inputs[1].numpy())
+    )
+    expected = projected / (1.0 + mx.exp(-projected)) * mx.array(inputs[2].numpy())
+    mx.eval(*actual, expected)
+    assert actual[0] is actual[1]
+    assert mx.allclose(actual[0], expected, atol=1e-5, rtol=1e-5)
+
+
 def test_compiler_eliminates_duplicate_graph_outputs() -> None:
     def fn(x, weight):
         left = x @ weight

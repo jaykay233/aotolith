@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from math import prod
 
 from .ir import DType, Graph, Operation
@@ -382,15 +383,20 @@ def eliminate_common_subexpressions(graph: Graph) -> Graph:
     rewritten: list[Operation] = []
     for op in graph.ops:
         inputs = tuple(resolve(value_id) for value_id in op.inputs)
+        attrs = op.attrs
+        if op.op == "fused_elementwise" and inputs != op.inputs:
+            attrs = _rewrite_fused_region_inputs(op, inputs)
         current = (
-            op if inputs == op.inputs else Operation(op.op, inputs, op.outputs, op.attrs)
+            op
+            if inputs == op.inputs and attrs is op.attrs
+            else Operation(op.op, inputs, op.outputs, attrs)
         )
         output_type = graph.value(op.outputs[0]).type
         key = (
             current.op,
             current.inputs,
             (output_type.shape, output_type.dtype.value),
-            _freeze_attribute(current.attrs),
+            _operation_attribute_key(graph, current, resolve),
         )
         existing = common.get(key)
         if existing is not None:
@@ -1173,6 +1179,84 @@ def _valid_ints(values: tuple[object, ...]) -> bool:
 
 def _valid_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _rewrite_fused_region_inputs(
+    op: Operation, inputs: tuple[str, ...]
+) -> dict[str, object]:
+    renames = dict(zip(op.inputs, inputs, strict=True))
+    attrs = dict(op.attrs)
+    body = op.attrs.get("body")
+    if isinstance(body, (tuple, list)) and all(
+        isinstance(body_op, Operation) for body_op in body
+    ):
+        attrs["body"] = tuple(
+            Operation(
+                body_op.op,
+                tuple(renames.get(value_id, value_id) for value_id in body_op.inputs),
+                body_op.outputs,
+                body_op.attrs,
+            )
+            for body_op in body
+        )
+    return attrs
+
+
+def _operation_attribute_key(
+    graph: Graph,
+    op: Operation,
+    resolve: Callable[[str], str],
+) -> tuple[object, ...]:
+    if op.op == "fused_elementwise":
+        normalized = _normalized_fused_region(graph, op, resolve)
+        if normalized is not None:
+            return ("fused_elementwise", normalized)
+    return _freeze_attribute(op.attrs)
+
+
+def _normalized_fused_region(
+    graph: Graph,
+    op: Operation,
+    resolve: Callable[[str], str],
+) -> tuple[object, ...] | None:
+    body = op.attrs.get("body")
+    if not isinstance(body, (tuple, list)) or not body:
+        return None
+    if not all(isinstance(body_op, Operation) for body_op in body):
+        return None
+
+    boundary = {
+        value_id: ("argument", index)
+        for index, value_id in enumerate(op.inputs)
+    }
+    internal: dict[str, object] = {}
+    normalized_ops: list[object] = []
+    for index, body_op in enumerate(body):
+        normalized_inputs: list[object] = []
+        for value_id in body_op.inputs:
+            if value_id in internal:
+                normalized_inputs.append(internal[value_id])
+            elif value_id in boundary:
+                normalized_inputs.append(boundary[value_id])
+            else:
+                normalized_inputs.append(("external", resolve(value_id)))
+
+        output_name = ("value", index)
+        output_type = graph.value(body_op.outputs[0]).type
+        normalized_ops.append(
+            (
+                body_op.op,
+                tuple(normalized_inputs),
+                (output_type.shape, output_type.dtype.value),
+                _freeze_attribute(body_op.attrs),
+            )
+        )
+        internal[body_op.outputs[0]] = output_name
+
+    root = internal.get(op.outputs[0])
+    if root is None:
+        return None
+    return (tuple(normalized_ops), root)
 
 
 def _freeze_attribute(value: object) -> tuple[object, ...]:
