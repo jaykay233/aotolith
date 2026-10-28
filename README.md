@@ -47,7 +47,7 @@ PyTorch FX
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
-- 可选的 fused Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
+- 可选的 tiled online-softmax Metal attention codegen，支持 rank-3/4、MHA/GQA/MQA、causal mask、additive mask 和 FP16/BF16/FP32
 - matmul shared-memory tiling：`64×64×32` threadgroup block；FP16/BF16 完整块使用 SIMD matrix，其他 shape 用寄存器 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
@@ -69,7 +69,7 @@ matmul kernel 使用 `64×64×32` threadgroup tile。每个 block 先把 A 的 6
 result = compile_callable(fn, example_inputs, codegen_attention=True)
 ```
 
-kernel 为每个 `(batch, query head, query position)` 启动一个 threadgroup，在 threadgroup memory 中完成 QK 点积，再用 online softmax 累积 V。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前实现以正确性为先，还没有针对 MLX SDPA 做性能调优，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
+kernel 每个 threadgroup 处理 8 个 query 和 32 个 key，一个 warp 负责一个 query。Q/K tile 先协作加载到 threadgroup memory，warp 内用 `simd_max`/`simd_sum` 做 online softmax，再由各 lane 累积 V。GQA/MQA 直接按 `kv_head = query_head / group_size` 读取 K/V，不物化重复后的 head。当前路径仍未使用 SIMD matrix 做 QK/PV，也没有 autotune，实测慢于 MLX SDPA，因此默认开关关闭。`head_dim > 256` 或 mask 形式不在原生路径范围内时会自动回退到 MLX。
 
 ## 为什么没有直接改 Triton
 
@@ -107,6 +107,7 @@ python examples/reduction.py
 python examples/layer_norm.py
 python examples/rms_norm.py
 python examples/metal_matmul_benchmark.py
+python examples/metal_attention_benchmark.py
 ```
 
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
@@ -116,6 +117,7 @@ python examples/metal_matmul_benchmark.py
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
 - `examples/metal_matmul_benchmark.py` 对比 FP32 tiled 和 FP16 SIMD matmul kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
+- `examples/metal_attention_benchmark.py` 对比 tiled online-softmax attention kernel 与 MLX SDPA，并检查 PyTorch CPU 数值误差。
 
 示例会打印生成的 MSL 或 kernel 类型。首次执行包含 MLX kernel JIT 和 GPU dispatch，耗时不能当作 steady-state 性能。
 

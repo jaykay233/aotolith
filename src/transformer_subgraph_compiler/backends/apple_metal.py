@@ -254,7 +254,7 @@ class AppleMetalBackend:
     def _compile_attention(
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any] | None:
-        """Emit a correctness-first fused attention kernel for common shapes."""
+        """Emit a FlashAttention-style tiled online-softmax kernel."""
 
         query_type = graph.value(op.inputs[0]).type
         key_type = graph.value(op.inputs[1]).type
@@ -266,8 +266,7 @@ class AppleMetalBackend:
         rank = len(query_shape)
         query_head_dim = query_shape[-1]
         value_head_dim = value_shape[-1]
-        threads = _next_power_of_two(max(query_head_dim, value_head_dim))
-        if threads > 256:
+        if query_head_dim > 256 or value_head_dim > 256:
             return None
 
         has_mask = bool(op.attrs.get("has_mask"))
@@ -279,40 +278,22 @@ class AppleMetalBackend:
         query_heads = query_shape[-3] if rank == 4 else 1
         key_value_heads = key_shape[-3] if rank == 4 else 1
         group_size = query_heads // key_value_heads
-        query_count = batch * query_heads * query_length
+        query_tile = 8
+        key_tile = 32
+        threads = query_tile * key_tile
+        query_blocks = ceil(query_length / query_tile)
+        query_count = batch * query_heads * query_blocks
 
         if rank == 4:
-            query_input_offset = (
-                f"(((batch * {query_heads}u + head) * {query_length}u + query_pos) "
-                f"* {query_head_dim}u + tid)"
-            )
-            key_offset = (
-                f"(((batch * {key_value_heads}u + head / {group_size}u) "
-                f"* {key_length}u + key) * {query_head_dim}u + tid)"
-            )
-            value_offset = (
-                f"(((batch * {key_value_heads}u + head / {group_size}u) "
-                f"* {key_length}u + key) * {value_head_dim}u + tid)"
-            )
-            output_offset = (
-                f"(((batch * {query_heads}u + head) * {query_length}u + query_pos) "
-                f"* {value_head_dim}u + tid)"
+            query_batch_head = f"(batch * {query_heads}u + head)"
+            key_value_batch_head = (
+                f"(batch * {key_value_heads}u + head / {group_size}u)"
             )
         else:
-            query_input_offset = (
-                f"((batch * {query_length}u + query_pos) * {query_head_dim}u + tid)"
-            )
-            key_offset = (
-                f"((batch * {key_length}u + key) * {query_head_dim}u + tid)"
-            )
-            value_offset = (
-                f"((batch * {key_length}u + key) * {value_head_dim}u + tid)"
-            )
-            output_offset = (
-                f"((batch * {query_length}u + query_pos) * {value_head_dim}u + tid)"
-            )
+            query_batch_head = "batch"
+            key_value_batch_head = "batch"
 
-        score_expression = f"partial[0] * {float(op.attrs['scale'])!r}"
+        score_expression = f"dot * {float(op.attrs['scale'])!r}"
         if has_mask:
             mask_offset = _attention_mask_offset_expression(rank, mask_shape)
             score_expression += f" + float(in_3[{mask_offset}])"
@@ -320,73 +301,113 @@ class AppleMetalBackend:
             score_expression = (
                 f"key > query_pos ? -INFINITY : ({score_expression})"
             )
-
-        reduction_stride = threads // 2
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
+        uint lane = tid % 32u;
+        uint warp = tid / 32u;
         uint query_index = threadgroup_position_in_grid.x;
-        uint batch = query_index / {query_heads * query_length}u;
-        uint query_remainder = query_index % {query_heads * query_length}u;
-        uint head = query_remainder / {query_length}u;
-        uint query_pos = query_remainder % {query_length}u;
-        threadgroup float partial[{threads}];
-        threadgroup float state[4];
+        uint batch = query_index / {query_heads * query_blocks}u;
+        uint query_remainder = query_index % {query_heads * query_blocks}u;
+        uint head = query_remainder / {query_blocks}u;
+        uint query_block = query_remainder % {query_blocks}u;
+        uint query_pos = query_block * {query_tile}u + warp;
+        threadgroup T tile_q[{query_tile * query_head_dim}];
+        threadgroup T tile_k[{key_tile * query_head_dim}];
+        threadgroup float tile_probabilities[{query_tile * key_tile}];
 
-        if (tid == 0u) {{
-            state[0] = -INFINITY;
-            state[1] = 0.0f;
+        for (uint index = tid; index < {query_tile * query_head_dim}u;
+             index += {threads}u) {{
+            uint query_row = index / {query_head_dim}u;
+            uint dimension = index % {query_head_dim}u;
+            uint position = query_block * {query_tile}u + query_row;
+            tile_q[index] = position < {query_length}u
+                ? in_0[({query_batch_head} * {query_length}u + position)
+                    * {query_head_dim}u + dimension]
+                : T(0);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float query_value = 0.0f;
-        if (tid < {query_head_dim}u) {{
-            query_value = float(in_0[{query_input_offset}]);
-        }}
-        float accumulator = 0.0f;
+        float accumulator[{ceil(value_head_dim / 32)}] = {{0.0f}};
+        float running_max = -INFINITY;
+        float running_sum = 0.0f;
 
-        for (uint key = 0u; key < {key_length}u; ++key) {{
-            float partial_value = 0.0f;
-            if (tid < {query_head_dim}u) {{
-                partial_value = query_value * float(in_1[{key_offset}]);
+        for (uint key_base = 0u; key_base < {key_length}u;
+             key_base += {key_tile}u) {{
+            for (uint index = tid; index < {key_tile * query_head_dim}u;
+                 index += {threads}u) {{
+                uint key_row = index / {query_head_dim}u;
+                uint dimension = index % {query_head_dim}u;
+                uint key = key_base + key_row;
+                tile_k[index] = key < {key_length}u
+                    ? in_1[({key_value_batch_head} * {key_length}u + key)
+                        * {query_head_dim}u + dimension]
+                    : T(0);
             }}
-            partial[tid] = partial_value;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
-                if (tid < stride) {{
-                    partial[tid] += partial[tid + stride];
+            uint key = key_base + lane;
+            float score = -INFINITY;
+            if (query_pos < {query_length}u && key < {key_length}u) {{
+                float dot = 0.0f;
+                for (uint dimension = 0u; dimension < {query_head_dim}u;
+                     ++dimension) {{
+                    dot = fma(float(tile_q[warp * {query_head_dim}u + dimension]),
+                        float(tile_k[lane * {query_head_dim}u + dimension]), dot);
                 }}
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                score = {score_expression};
             }}
 
-            if (tid == 0u) {{
-                float score = {score_expression};
-                float previous_max = state[0];
-                float new_max = metal::max(previous_max, score);
-                float alpha = previous_max == -INFINITY
-                    ? 0.0f
-                    : metal::exp(previous_max - new_max);
-                float probability = score == -INFINITY
-                    ? 0.0f
-                    : metal::exp(score - new_max);
-                state[0] = new_max;
-                state[1] = state[1] * alpha + probability;
-                state[2] = alpha;
-                state[3] = probability;
-            }}
+            float block_max = simd_max(score);
+            float new_max = metal::max(running_max, block_max);
+            float alpha = running_max == -INFINITY
+                ? 0.0f
+                : metal::exp(running_max - new_max);
+            float block_scale = block_max == -INFINITY
+                ? 0.0f
+                : metal::exp(block_max - new_max);
+            float probability = score == -INFINITY
+                ? 0.0f
+                : metal::exp(score - block_max);
+            float block_sum = simd_sum(probability);
+            running_sum = running_sum * alpha + block_scale * block_sum;
+            running_max = new_max;
+            tile_probabilities[warp * {key_tile}u + lane] = probability;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            if (tid < {value_head_dim}u) {{
-                accumulator = accumulator * state[2]
-                    + state[3] * float(in_2[{value_offset}]);
+            for (uint component = 0u;
+                 component < {ceil(value_head_dim / 32)}u; ++component) {{
+                uint dimension = lane + component * 32u;
+                float tile_accumulator = 0.0f;
+                if (query_pos < {query_length}u && dimension < {value_head_dim}u) {{
+                    for (uint tile_key = 0u; tile_key < {key_tile}u; ++tile_key) {{
+                        uint global_key = key_base + tile_key;
+                        if (global_key < {key_length}u) {{
+                            tile_accumulator = fma(
+                                tile_probabilities[warp * {key_tile}u + tile_key],
+                                float(in_2[({key_value_batch_head} * {key_length}u
+                                    + global_key) * {value_head_dim}u + dimension]),
+                                tile_accumulator);
+                        }}
+                    }}
+                    accumulator[component] = accumulator[component] * alpha
+                        + block_scale * tile_accumulator;
+                }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
-        if (tid < {value_head_dim}u) {{
-            out[{output_offset}] = (T)(state[1] == 0.0f
-                ? 0.0f
-                : accumulator / state[1]);
+        if (query_pos < {query_length}u) {{
+            for (uint component = 0u;
+                 component < {ceil(value_head_dim / 32)}u; ++component) {{
+                uint dimension = lane + component * 32u;
+                if (dimension < {value_head_dim}u) {{
+                    uint output_offset = ({query_batch_head} * {query_length}u
+                        + query_pos) * {value_head_dim}u + dimension;
+                    out[output_offset] = (T)(running_sum == 0.0f
+                        ? 0.0f
+                        : accumulator[component] / running_sum);
+                }}
+            }}
         }}
         """
         input_names = ("in_0", "in_1", "in_2", "in_3") if has_mask else (
@@ -394,7 +415,10 @@ class AppleMetalBackend:
             "in_1",
             "in_2",
         )
-        name = f"metal_attention_{threads}_{index}"
+        name = (
+            f"metal_attention_flash_{query_tile}x{key_tile}_"
+            f"{threads}_{index}"
+        )
         kernel = _metal_kernel(
             name,
             input_names,

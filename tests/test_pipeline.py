@@ -628,7 +628,12 @@ def test_native_attention_rank4_mha_and_gqa(key_value_heads) -> None:
     )
     result = compile_callable(fn, inputs, codegen_attention=True)
     assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
-    assert "threadgroup float partial" in result.plan.kernels[0].source
+    source = result.plan.kernels[0].source
+    assert "metal_attention_flash_8x32" in result.plan.kernels[0].name
+    assert "threadgroup T tile_q[128]" in source
+    assert "threadgroup T tile_k[512]" in source
+    assert "simd_max(score)" in source
+    assert "simd_sum(probability)" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = mx.array(fn(*inputs).numpy())
