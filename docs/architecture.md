@@ -122,17 +122,17 @@ input_offset = (elem % 3) * 1
 
 ## 6. Metal softmax reduction
 
-softmax 当前只支持最后一维。backend 把前面的维度展平为 `rows`，最后一维作为连续的 `columns`：
+softmax 支持任意单个维度。backend 把 softmax 轴之前和之后的维度分别压平为 `outer` 和 `inner`，把 softmax 轴作为 `columns`：
 
-- 每个 threadgroup 处理一行
+- 每个 threadgroup 处理一个 softmax slice
 - threadgroup 线程数是 `next_power_of_two(columns)`，上限为 256
 - 每个线程跨步遍历该行，先在寄存器中得到局部 max
 - threadgroup memory 中做树形 max reduction，再用相同结构做 exp-sum reduction
 - 使用 max 平移保证数值稳定，最终在 float 中归一化并 cast 回 `T`
+- slice 的输入基址由 `outer × columns × inner` 计算，softmax 轴上的元素步长是 `inner`
+- `inner == 1` 时直接按连续尾维寻址，省略除法和取模
 
-grid 大小是 `rows * threads`，每个 threadgroup 的大小固定为 `threads`。当 `columns > 256` 时，每个线程处理多个列；当 `columns` 不是 2 的幂时，线程数向上补齐，全局内存访问由循环条件 `col < columns` 限制。
-
-非最后一维的 softmax 会在 backend 编译阶段抛 `NotImplementedError`，不会静默退化成 MLX。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
+grid 大小是 `outer * inner * threads`，每个 threadgroup 的大小固定为 `threads`。当 `columns > 256` 时，每个线程处理多个列；当 `columns` 不是 2 的幂时，线程数向上补齐，全局内存访问由循环条件 `col < columns` 限制。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
 
 ## 7. Metal sum/mean reduction
 
@@ -199,7 +199,7 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 - 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
-- softmax：调用生成的 last-dim reduction kernel
+- softmax：调用生成的单轴 reduction kernel
 - sum/mean：调用生成的 static reduction kernel
 - layer_norm：调用生成的两遍 mean/variance reduction kernel
 - rms_norm：调用生成的平方和 reduction kernel
@@ -213,7 +213,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
-- softmax 只支持最后一维
+- softmax 支持任意单轴，但不支持一次对多个轴做 softmax
 - sum/mean 支持任意非空维度集合，但不支持 reduction dtype override
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd

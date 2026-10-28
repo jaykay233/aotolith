@@ -242,24 +242,31 @@ class AppleMetalBackend:
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"softmax.dim must be an integer, got {dim!r}")
         axis = dim % rank
-        if axis != rank - 1:
-            raise NotImplementedError(
-                "Metal softmax currently supports only the last dimension"
-            )
-
-        columns = input_type.shape[-1]
-        rows = prod(input_type.shape[:-1]) or 1
+        columns = input_type.shape[axis]
+        outer_size = prod(input_type.shape[:axis]) or 1
+        inner_size = prod(input_type.shape[axis + 1 :]) or 1
+        softmax_count = outer_size * inner_size
         threads = _reduction_thread_count(columns)
         reduction_stride = threads // 2
+        if inner_size == 1:
+            input_base = f"output_index * {columns}u"
+        else:
+            input_base = (
+                f"(output_index / {inner_size}u) * {columns * inner_size}u "
+                f"+ output_index % {inner_size}u"
+            )
+        axis_offset = "col" if inner_size == 1 else f"col * {inner_size}u"
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
-        uint row = threadgroup_position_in_grid.x;
-        uint offset = row * {columns}u;
+        uint output_index = threadgroup_position_in_grid.x;
+        uint offset = {input_base};
         threadgroup float scratch[{threads}];
 
         float local_max = -INFINITY;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            local_max = metal::max(local_max, float(in_0[offset + col]));
+            local_max = metal::max(
+                local_max, float(in_0[offset + ({axis_offset})])
+            );
         }}
         scratch[tid] = local_max;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -275,7 +282,9 @@ class AppleMetalBackend:
 
         float local_sum = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            local_sum += metal::exp(float(in_0[offset + col]) - max_value);
+            local_sum += metal::exp(
+                float(in_0[offset + ({axis_offset})]) - max_value
+            );
         }}
         scratch[tid] = local_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -290,8 +299,9 @@ class AppleMetalBackend:
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
-            out[offset + col] = (T)(
-                metal::exp(float(in_0[offset + col]) - max_value) / sum_value
+            out[offset + ({axis_offset})] = (T)(
+                metal::exp(float(in_0[offset + ({axis_offset})]) - max_value)
+                / sum_value
             );
         }}
         """
@@ -303,7 +313,7 @@ class AppleMetalBackend:
             source,
             "",
         )
-        grid = (rows * threads, 1, 1)
+        grid = (softmax_count * threads, 1, 1)
         threadgroup = (threads, 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 

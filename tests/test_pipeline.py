@@ -404,10 +404,22 @@ def test_metal_softmax_supports_low_precision(dtype) -> None:
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_metal_softmax_rejects_non_last_dimension() -> None:
+@pytest.mark.parametrize("dim, stride", [(0, 12), (1, 4)])
+def test_metal_softmax_supports_non_last_dimension(dim, stride) -> None:
+    torch.manual_seed(39)
     x = torch.randn(2, 3, 4)
-    with pytest.raises(NotImplementedError, match="last dimension"):
-        compile_callable(lambda value: torch.nn.functional.softmax(value, dim=1), (x,))
+    result = compile_callable(
+        lambda value: torch.nn.functional.softmax(value, dim=dim), (x,)
+    )
+    kernel = result.plan.kernels[0]
+    assert f"col * {stride}u" in kernel.source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(
+        torch.nn.functional.softmax(x, dim=dim).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_softmax_and_fused_pointwise_execute_as_separate_kernels() -> None:

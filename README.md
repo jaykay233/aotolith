@@ -21,7 +21,7 @@ PyTorch FX
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
-| Softmax | `aten._softmax.default`，当前仅支持最后一维 |
+| Softmax | `aten._softmax.default`，支持任意单个维度 |
 | Reduction | `sum`、`mean`，支持任意非空维度集合和 `keepdim` |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 | RMSNorm | `F.rms_norm` 的 `pow/mean/add_/rsqrt/mul` 分解，折叠为专用 `rms_norm` |
@@ -37,7 +37,7 @@ PyTorch FX
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
 - matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
-- last-dim softmax reduction：每行一个 threadgroup，在 threadgroup memory 中完成 max 和 sum
+- softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
 - sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
@@ -91,7 +91,7 @@ python examples/metal_matmul_benchmark.py
 
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
 - `examples/metal_mlp.py` 使用小矩阵开启 `codegen_matmul=True`，完整验证 FX、IR、自定义 MSL matmul、融合 pointwise 和 runtime。
-- `examples/softmax.py` 用超过 256 列的输入验证 Metal threadgroup max/sum reduction。
+- `examples/softmax.py` 用超过 256 列的输入验证尾维和中间维的 Metal threadgroup max/sum reduction。
 - `examples/reduction.py` 验证 last-dim sum、连续维 mean、交错维 sum 和 `keepdim` 输出。
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
@@ -126,7 +126,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖最后一维 softmax、任意非空维度集合的 sum/mean、LayerNorm 和 RMSNorm，但不支持动态 shape、控制流、自动微分、layout pass、跨进程 kernel cache 和训练。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 覆盖任意单轴 softmax、任意非空维度集合的 sum/mean、LayerNorm 和 RMSNorm，但不支持动态 shape、控制流、自动微分、layout pass、跨进程 kernel cache 和训练。LayerNorm 只支持主输出，mean/rstd 不能作为图输出使用。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 
