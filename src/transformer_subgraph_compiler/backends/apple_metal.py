@@ -286,19 +286,27 @@ class AppleMetalBackend:
         use_simdgroup_pv = low_precision_attention and value_head_dim % 8 == 0
         query_tile = 8
         if use_simdgroup_qk and use_simdgroup_pv and query_length > 8:
-            candidates = (16,)
+            candidates = ((16, 32),)
             if query_length >= _ATTENTION_LONG_SEQUENCE_THRESHOLD:
-                candidates = (24, 16)
-            for candidate_query_tile in candidates:
+                candidates = ((24, 64), (16, 64), (24, 32), (16, 32))
+            for candidate_query_tile, candidate_key_tile in candidates:
+                candidate_pv_value_tile = (
+                    min(value_head_dim, 64)
+                    if candidate_key_tile == 64
+                    else value_head_dim
+                )
                 shared_bytes = _attention_shared_memory_bytes(
                     candidate_query_tile,
-                    key_tile,
+                    candidate_key_tile,
                     query_head_dim,
                     value_head_dim,
+                    candidate_pv_value_tile,
                 )
                 if shared_bytes <= _ATTENTION_MAX_SHARED_BYTES:
                     query_tile = candidate_query_tile
+                    key_tile = candidate_key_tile
                     break
+        pv_value_tile = min(value_head_dim, 64) if key_tile == 64 else value_head_dim
         threads = query_tile * 32
         query_blocks = ceil(query_length / query_tile)
         query_count = batch * query_heads * query_blocks
@@ -327,7 +335,8 @@ class AppleMetalBackend:
                 DType.BF16: "bfloat",
             }[output_type.dtype]
             query_fragments = query_tile // 8
-            qk_group_count = query_fragments * 4
+            key_fragments = key_tile // 8
+            qk_group_count = query_fragments * key_fragments
             qk_steps = "\n".join(
                 f"""                simdgroup_load(qk_frag_q, tile_q
                     + query_fragment * 8u * {query_head_dim}u + {dimension}u,
@@ -339,10 +348,37 @@ class AppleMetalBackend:
                     qk_accumulator, qk_frag_q, qk_frag_k, qk_accumulator);"""
                 for dimension in range(0, query_head_dim, 8)
             )
+            if key_tile == 32:
+                qk_score_read_source = f"""
+            uint key = key_base + lane;
+            float score = -INFINITY;
+            if (query_pos < {query_length}u && key < {key_length}u) {{
+                float dot = float(tile_scores[warp * {key_tile}u + lane]);
+                score = {score_expression};
+            }}
+"""
+            else:
+                qk_score_read_source = f"""
+            uint key0 = key_base + lane;
+            float score0 = -INFINITY;
+            if (query_pos < {query_length}u && key0 < {key_length}u) {{
+                float dot = float(tile_scores[warp * {key_tile}u + lane]);
+                uint key = key0;
+                score0 = {score_expression};
+            }}
+
+            uint key1 = key0 + 32u;
+            float score1 = -INFINITY;
+            if (query_pos < {query_length}u && key1 < {key_length}u) {{
+                float dot = float(tile_scores[warp * {key_tile}u + lane + 32u]);
+                uint key = key1;
+                score1 = {score_expression};
+            }}
+"""
             qk_score_source = f"""
             if (warp < {qk_group_count}u) {{
-                uint query_fragment = warp / 4u;
-                uint key_fragment = warp % 4u;
+                uint query_fragment = warp / {key_fragments}u;
+                uint key_fragment = warp % {key_fragments}u;
                 simdgroup_float8x8 qk_accumulator =
                     make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 simdgroup_{simdgroup_type}8x8 qk_frag_q;
@@ -354,13 +390,7 @@ class AppleMetalBackend:
                     {key_tile}, 0, false);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            uint key = key_base + lane;
-            float score = -INFINITY;
-            if (query_pos < {query_length}u && key < {key_length}u) {{
-                float dot = tile_scores[warp * {key_tile}u + lane];
-                score = {score_expression};
-            }}
+{qk_score_read_source}
 """
         else:
             qk_score_source = f"""
@@ -383,25 +413,21 @@ class AppleMetalBackend:
             }[output_type.dtype]
             query_fragments = query_tile // 8
             value_fragments = value_head_dim // 8
-            pv_fragment_count = query_fragments * value_fragments
-            pv_steps = "\n".join(
-                f"""                simdgroup_load(pv_frag_probability,
-                    tile_probabilities_low + output_row_fragment * 8u
-                        * {key_tile}u + {tile_key}u, {key_tile}, 0, false);
-                simdgroup_load(pv_frag_value, tile_k
-                    + {tile_key * value_head_dim}u
-                    + output_column_fragment * 8u,
-                    {value_head_dim}, 0, false);
-                simdgroup_multiply_accumulate(
-                    pv_accumulator, pv_frag_probability, pv_frag_value,
-                    pv_accumulator);"""
-                for tile_key in range(0, key_tile, 8)
-            )
             pv_probability_declaration = ""
-            pv_shared_declaration = f"""
+            if key_tile == 64:
+                probability_storage = "tile_probabilities_low"
+                pv_shared_declaration = ""
+                pv_probability_store = f"""
+            tile_probabilities_low[warp * {key_tile}u + lane] =
+                (T)probability0;
+            tile_probabilities_low[warp * {key_tile}u + lane + 32u] =
+                (T)probability1;"""
+            else:
+                probability_storage = "tile_probabilities_low"
+                pv_shared_declaration = f"""
         threadgroup T tile_probabilities_low[{query_tile * key_tile}];
-        threadgroup float tile_pv[{query_tile * value_head_dim}];"""
-            pv_probability_store = f"""
+        threadgroup float tile_pv[{query_tile * pv_value_tile}];"""
+                pv_probability_store = f"""
             tile_probabilities_low[warp * {key_tile}u + lane] = (T)probability;"""
             pv_preload_source = f"""
             for (uint index = tid; index < {key_tile * value_head_dim}u;
@@ -415,7 +441,83 @@ class AppleMetalBackend:
                     : T(0);
             }}
 """
-            pv_accumulation_source = f"""
+            if key_tile == 64:
+                value_fragments_per_chunk = pv_value_tile // 8
+                pv_steps = "\n".join(
+                    f"""                    simdgroup_load(pv_frag_probability,
+                        {probability_storage} + output_row_fragment * 8u
+                            * {key_tile}u + {tile_key}u,
+                        {key_tile}, 0, false);
+                    simdgroup_load(pv_frag_value, tile_k
+                        + {tile_key * value_head_dim}u
+                        + value_chunk_base
+                        + output_column_fragment * 8u,
+                        {value_head_dim}, 0, false);
+                    simdgroup_multiply_accumulate(
+                        pv_accumulator, pv_frag_probability, pv_frag_value,
+                        pv_accumulator);"""
+                    for tile_key in range(0, key_tile, 8)
+                )
+                pv_accumulation_source = f"""
+            for (uint value_chunk_base = 0u;
+                 value_chunk_base < {value_head_dim}u;
+                 value_chunk_base += {pv_value_tile}u) {{
+                uint value_chunk_fragments = metal::min(
+                    {value_fragments_per_chunk}u,
+                    ({value_head_dim}u - value_chunk_base) / 8u);
+                for (uint output_fragment = warp;
+                     output_fragment <
+                         {query_fragments}u * value_chunk_fragments;
+                     output_fragment += {threads // 32}u) {{
+                    uint output_row_fragment =
+                        output_fragment / value_chunk_fragments;
+                    uint output_column_fragment =
+                        output_fragment % value_chunk_fragments;
+                    simdgroup_float8x8 pv_accumulator =
+                        make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                    simdgroup_{simdgroup_type}8x8 pv_frag_probability;
+                    simdgroup_{simdgroup_type}8x8 pv_frag_value;
+{pv_steps}
+                    simdgroup_store(pv_accumulator,
+                        tile_pv + output_row_fragment * 8u * {pv_value_tile}u
+                            + output_column_fragment * 8u,
+                        {pv_value_tile}, 0, false);
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint component = 0u;
+                     component < {ceil(value_head_dim / 32)}u; ++component) {{
+                    uint dimension = lane + component * 32u;
+                    if (query_pos < {query_length}u
+                        && dimension >= value_chunk_base
+                        && dimension < value_chunk_base + {pv_value_tile}u
+                        && dimension < {value_head_dim}u) {{
+                        accumulator[component] = accumulator[component] * alpha
+                            + block_scale * tile_pv[warp * {pv_value_tile}u
+                                + dimension - value_chunk_base];
+                    }}
+                }}
+                if (value_chunk_base + {pv_value_tile}u < {value_head_dim}u) {{
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+            }}
+"""
+            else:
+                pv_fragment_count = query_fragments * value_fragments
+                pv_steps = "\n".join(
+                    f"""                simdgroup_load(pv_frag_probability,
+                    {probability_storage} + output_row_fragment * 8u
+                        * {key_tile}u + {tile_key}u, {key_tile}, 0, false);
+                simdgroup_load(pv_frag_value, tile_k
+                    + {tile_key * value_head_dim}u
+                    + output_column_fragment * 8u,
+                    {value_head_dim}, 0, false);
+                simdgroup_multiply_accumulate(
+                    pv_accumulator, pv_frag_probability, pv_frag_value,
+                    pv_accumulator);"""
+                    for tile_key in range(0, key_tile, 8)
+                )
+                pv_accumulation_source = f"""
             for (uint output_fragment = warp;
                  output_fragment < {pv_fragment_count}u;
                  output_fragment += {query_tile}u) {{
@@ -427,9 +529,9 @@ class AppleMetalBackend:
                 simdgroup_{simdgroup_type}8x8 pv_frag_value;
 {pv_steps}
                 simdgroup_store(pv_accumulator,
-                    tile_pv + output_row_fragment * 8u * {value_head_dim}u
+                    tile_pv + output_row_fragment * 8u * {pv_value_tile}u
                         + output_column_fragment * 8u,
-                    {value_head_dim}, 0, false);
+                    {pv_value_tile}, 0, false);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -439,7 +541,7 @@ class AppleMetalBackend:
                 if (query_pos < {query_length}u && dimension < {value_head_dim}u) {{
                     accumulator[component] = accumulator[component] * alpha
                         + block_scale
-                            * tile_pv[warp * {value_head_dim}u + dimension];
+                            * tile_pv[warp * {pv_value_tile}u + dimension];
                 }}
             }}
 """
@@ -471,6 +573,65 @@ class AppleMetalBackend:
                 }}
             }}
 """
+        if key_tile == 64:
+            probability_float_offset = query_tile * key_tile // 2
+            workspace_floats = max(
+                query_tile * key_tile,
+                probability_float_offset + query_tile * pv_value_tile,
+            )
+            score_storage_declaration = f"""
+        threadgroup float tile_workspace[{workspace_floats}];
+        threadgroup float* tile_scores = tile_workspace;
+        threadgroup T* tile_probabilities_low =
+            (threadgroup T*)tile_workspace;
+        threadgroup float* tile_pv =
+            tile_workspace + {probability_float_offset}u;"""
+        else:
+            score_storage_declaration = (
+                f"threadgroup float tile_scores[{query_tile * key_tile}];"
+            )
+        score_read_barrier = (
+            "\n            threadgroup_barrier(mem_flags::mem_threadgroup);"
+            if key_tile == 64
+            else ""
+        )
+        if key_tile == 32:
+            softmax_source = """
+            float block_max = simd_max(score);
+            float new_max = metal::max(running_max, block_max);
+            float alpha = running_max == -INFINITY
+                ? 0.0f
+                : metal::exp(running_max - new_max);
+            float block_scale = block_max == -INFINITY
+                ? 0.0f
+                : metal::exp(block_max - new_max);
+            float probability = score == -INFINITY
+                ? 0.0f
+                : metal::exp(score - block_max);
+            float block_sum = simd_sum(probability);
+            running_sum = running_sum * alpha + block_scale * block_sum;
+            running_max = new_max;
+"""
+        else:
+            softmax_source = """
+            float block_max = simd_max(metal::max(score0, score1));
+            float new_max = metal::max(running_max, block_max);
+            float alpha = running_max == -INFINITY
+                ? 0.0f
+                : metal::exp(running_max - new_max);
+            float block_scale = block_max == -INFINITY
+                ? 0.0f
+                : metal::exp(block_max - new_max);
+            float probability0 = score0 == -INFINITY
+                ? 0.0f
+                : metal::exp(score0 - block_max);
+            float probability1 = score1 == -INFINITY
+                ? 0.0f
+                : metal::exp(score1 - block_max);
+            float block_sum = simd_sum(probability0 + probability1);
+            running_sum = running_sum * alpha + block_scale * block_sum;
+            running_max = new_max;
+"""
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint lane = tid % 32u;
@@ -483,7 +644,7 @@ class AppleMetalBackend:
         uint query_pos = query_block * {query_tile}u + warp;
         threadgroup T tile_q[{query_tile * query_head_dim}];
         threadgroup T tile_k[{key_tile * max(query_head_dim, value_head_dim)}];
-        threadgroup float tile_scores[{query_tile * key_tile}];{pv_probability_declaration}{pv_shared_declaration}
+        {score_storage_declaration}{pv_probability_declaration}{pv_shared_declaration}
 
         for (uint index = tid; index < {query_tile * query_head_dim}u;
              index += {threads}u) {{
@@ -515,20 +676,8 @@ class AppleMetalBackend:
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 {qk_score_source}{pv_preload_source}
-            float block_max = simd_max(score);
-            float new_max = metal::max(running_max, block_max);
-            float alpha = running_max == -INFINITY
-                ? 0.0f
-                : metal::exp(running_max - new_max);
-            float block_scale = block_max == -INFINITY
-                ? 0.0f
-                : metal::exp(block_max - new_max);
-            float probability = score == -INFINITY
-                ? 0.0f
-                : metal::exp(score - block_max);
-            float block_sum = simd_sum(probability);
-            running_sum = running_sum * alpha + block_scale * block_sum;
-            running_max = new_max;
+{softmax_source}
+{score_read_barrier}
 {pv_probability_store}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 {pv_accumulation_source}
@@ -2038,14 +2187,30 @@ def _attention_shared_memory_bytes(
     key_tile: int,
     query_head_dim: int,
     value_head_dim: int,
+    pv_value_tile: int,
 ) -> int:
     element_bytes = 2
+    if key_tile == 64:
+        score_workspace_bytes = query_tile * key_tile * 4
+        probability_and_pv_bytes = (
+            query_tile * key_tile * element_bytes
+            + query_tile * pv_value_tile * 4
+        )
+        score_and_pv_bytes = max(
+            score_workspace_bytes, probability_and_pv_bytes
+        )
+        probability_bytes = 0
+        pv_bytes = 0
+    else:
+        score_and_pv_bytes = query_tile * key_tile * 4
+        probability_bytes = query_tile * key_tile * element_bytes
+        pv_bytes = query_tile * pv_value_tile * 4
     return (
         query_tile * query_head_dim * element_bytes
         + key_tile * max(query_head_dim, value_head_dim) * element_bytes
-        + query_tile * key_tile * 4
-        + query_tile * key_tile * element_bytes
-        + query_tile * value_head_dim * 4
+        + score_and_pv_bytes
+        + probability_bytes
+        + pv_bytes
     )
 
 

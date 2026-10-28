@@ -713,33 +713,46 @@ def test_native_attention_reuses_query_tile_across_simd_groups(
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
-def test_native_attention_uses_long_sequence_query_tile() -> None:
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
+)
+def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> None:
     def fn(query, key, value):
-        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=True,
+        )
 
     torch.manual_seed(67)
-    inputs = tuple(torch.randn(1, 1, 769, 64, dtype=torch.float16) for _ in range(3))
+    inputs = tuple(
+        torch.randn(1, 1, 769, 128, dtype=dtype) for _ in range(3)
+    )
     result = compile_callable(fn, inputs, codegen_attention=True)
     kernel = result.plan.kernels[0]
     source = kernel.source
 
-    assert "metal_attention_flash_24x32_768" in kernel.name
-    assert "threadgroup T tile_q[1536]" in source
-    assert "threadgroup float tile_scores[768]" in source
-    assert "threadgroup T tile_probabilities_low[768]" in source
-    assert "if (warp < 12u)" in source
+    assert "metal_attention_flash_24x64_768" in kernel.name
+    assert "threadgroup T tile_q[3072]" in source
+    assert "threadgroup float tile_workspace[2304]" in source
+    assert "threadgroup T* tile_probabilities_low" in source
+    assert "float score1 = -INFINITY" in source
+    assert "value_chunk_base" in source
+    assert "if (warp < 24u)" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))
     mx.eval(actual, expected)
-    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize(
     ("shape", "expected_kernel"),
     [
         ((1, 1, 16, 256), "metal_attention_flash_8x32_256"),
-        ((1, 1, 768, 160), "metal_attention_flash_16x32_512"),
+        ((1, 1, 768, 160), "metal_attention_flash_16x64_512"),
     ],
 )
 def test_native_attention_limits_query_tile_by_shared_memory(
@@ -752,6 +765,32 @@ def test_native_attention_limits_query_tile_by_shared_memory(
     result = compile_callable(fn, inputs, codegen_attention=True)
 
     assert expected_kernel in result.plan.kernels[0].name
+
+
+def test_native_attention_long_sequence_partial_value_chunk() -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+        )
+
+    torch.manual_seed(68)
+    inputs = (
+        torch.randn(1, 1, 769, 64, dtype=torch.float16),
+        torch.randn(1, 1, 769, 64, dtype=torch.float16),
+        torch.randn(1, 1, 769, 72, dtype=torch.float16),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    kernel = result.plan.kernels[0]
+
+    assert "metal_attention_flash_24x64_768" in kernel.name
+    assert "value_chunk_fragments" in kernel.source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize(
