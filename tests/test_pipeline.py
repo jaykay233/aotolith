@@ -2465,6 +2465,83 @@ def test_trigonometric_ops_are_generated_as_metal_kernels(op_name) -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("op_name", "values", "source_expression"),
+    [
+        ("log", (0.125, 0.5, 1.0, 2.0, 7.5), "metal::log("),
+        ("log2", (0.125, 0.5, 1.0, 2.0, 7.5), "metal::log2("),
+        ("log10", (0.125, 0.5, 1.0, 2.0, 7.5), "metal::log10("),
+        ("log1p", (0.125, 0.5, 1.0, 2.0, 7.5), "log1p("),
+        ("expm1", (-2.0, -0.5, -0.001, 0.0, 0.001, 0.5, 2.0), "tsc_expm1("),
+        ("floor", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::floor("),
+        ("ceil", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::ceil("),
+        ("round", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::rint("),
+        ("trunc", (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5), "metal::trunc("),
+        ("sign", (-2.0, -0.0, 0.0, 0.5, 3.0), "metal::sign("),
+    ],
+)
+def test_additional_unary_ops_are_generated_as_metal_kernels(
+    op_name, values, source_expression
+) -> None:
+    operation = getattr(torch, op_name)
+
+    def fn(value):
+        return operation(value)
+
+    value = torch.tensor(values, dtype=torch.float32)
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert [kernel.kind for kernel in result.plan.kernels] == [op_name]
+    assert source_expression in result.plan.kernels[0].source
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    expected = mx.array(fn(value).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_square_ir_op_is_generated_as_a_metal_kernel() -> None:
+    tensor_type = TensorType((5,), DType.F32)
+    graph = Graph(
+        ("x",),
+        {
+            "x": Value("x", tensor_type),
+            "out": Value("out", tensor_type),
+        },
+        (Operation("square", ("x",), ("out",)),),
+        ("out",),
+    )
+    result = compile_graph(graph)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["square"]
+    assert "(input_0) * (input_0)" in result.plan.kernels[0].source
+
+    value = mx.array([-2.0, -0.5, 0.0, 0.5, 3.0], dtype=mx.float32)
+    actual = result.plan(value)[0]
+    expected = value * value
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_additional_unary_ops_fuse_with_surrounding_pointwise_ops() -> None:
+    def fn(x, y):
+        return torch.log1p(torch.square(x)) + torch.expm1(torch.sign(y))
+
+    x = torch.tensor([-0.5, 0.0, 0.25, 1.0], dtype=torch.float32)
+    y = torch.tensor([-2.0, -0.0, 0.0, 3.0], dtype=torch.float32)
+    result = compile_callable(fn, (x, y))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
+    source = result.plan.kernels[0].source
+    assert "log1p(" in source
+    assert "tsc_expm1(" in source
+    assert "metal::sign(" in source
+
+    actual = result.plan(mx.array(x.numpy()), mx.array(y.numpy()))[0]
+    expected = mx.array(fn(x, y).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_rope_style_trigonometric_region_is_one_metal_kernel() -> None:
     def fn(x1, x2, angle):
         return torch.cos(angle) * x1 + torch.sin(angle) * x2

@@ -22,7 +22,7 @@ PyTorch FX
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`select`、`flip`、`roll`、`triu`、`tril`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
-| 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sin`、`cos`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
+| 一元运算与谓词 | `neg`、`abs`、`exp`、`expm1`、`log`、`log2`、`log10`、`log1p`、`erf`、`sin`、`cos`、`floor`、`ceil`、`round`、`trunc`、`sign`、`square`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
 | 条件与选择 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`logical_xor`、`logical_not`、`where`、`masked_fill`，以及布尔 tensor 的 `bitwise_*` 和 bool scalar 变体 |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
@@ -55,7 +55,7 @@ PyTorch FX
 - 消除 op、输入、输出 shape/dtype 和 attributes 均相同的公共子表达式；融合 region 会先对内部 SSA value 做结构化编号，并同步改写上游 alias，因此内部临时 ID 不同的等价 region 也能合并
 - 在 schedule 前校验静态视图和布局变换；未折叠的 layout op 由 Runtime 执行 MLX view 语义
 - 支持多头 attention 的 `transpose/reshape/expand/bmm/softmax` 组合
-- 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，`clamp`/`clamp_min`/`clamp_max` 支持标量和可广播 tensor 边界，并与 `leaky_relu`、`elu`、`hardswish` 一起参与 pointwise 融合
+- 按静态 shape 生成 broadcast 索引；`pow` 支持 tensor exponent、标量指数和标量底数，`clamp`/`clamp_min`/`clamp_max` 支持标量和可广播 tensor 边界，并与新增的一元数学算子、`leaky_relu`、`elu`、`hardswish` 一起参与 pointwise 融合
 - 把 tensor 与标量混合的 pointwise 运算编码成 IR attribute
 - 支持 `torch.bool` IR value、比较/logical/NaN/Inf 谓词、`where`、`masked_fill`、标量常量生成，并允许 bool predicate/condition 与 FP16/BF16/FP32 数值分支融合在同一个 kernel
 - 生成每个 thread 处理 4 个元素的 Metal kernel
@@ -169,5 +169,7 @@ mx.eval(output)
 attention 当前要求 Q/K/V dtype 相同、rank 为 3 或 4，mask 可以是同 dtype 的 additive mask 或 bool mask。rank-4 输入支持 GQA/MQA：Q head 数必须是 K/V head 数的整数倍，MQA 是 K/V 只有 1 个 head 的特例。默认 lowering 使用 `mx.fast.scaled_dot_product_attention`；开启 `codegen_attention=True` 后，Q/K 和 V 的 head dim 均不超过 256 的常见 additive-mask 或 bool-mask 形式会使用生成的 MSL attention kernel。bool mask 的 `True` 表示允许该 key 参与 attention，整行都为 `False` 时输出为零。暂不支持 attention dropout，也不会在 softmax 概率被其他节点观察时做激进融合。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
+
+`round` 使用 `metal::rint` 保持 PyTorch 的 ties-to-even 语义。Apple MSL 没有可直接调用的 `expm1`，编译器在 |x| <= 0.5 时使用七阶 Taylor 展开，其他范围使用 `exp(x) - 1`；测试覆盖的输入上最大误差小于 `1e-7`。
 
 架构与实现细节见 [docs/architecture.md](docs/architecture.md)。

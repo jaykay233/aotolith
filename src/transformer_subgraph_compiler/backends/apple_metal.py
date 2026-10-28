@@ -48,6 +48,17 @@ inline float tsc_erf(float value) {
         + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
     return sign * (1.0f - polynomial * metal::exp(-x * x));
 }
+
+inline float tsc_expm1(float value) {
+    if (metal::abs(value) <= 0.5f) {
+        return value * (1.0f + value * (0.5f + value * (
+            0.16666666666666666f + value * (0.041666666666666664f + value * (
+            0.008333333333333333f + value * (
+            0.001388888888888889f + value * (
+            0.0001984126984126984f + value * 0.0000248015873015873f)))))));
+    }
+    return metal::exp(value) - 1.0f;
+}
 """
 
 
@@ -2171,12 +2182,35 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
         return f"(metal::isnan({value}) ? NAN : {body})"
     if op.op == "exp":
         return f"metal::exp({arguments[0]})"
+    if op.op == "expm1":
+        return f"tsc_expm1({arguments[0]})"
+    if op.op == "log":
+        return f"metal::log({arguments[0]})"
+    if op.op == "log2":
+        return f"metal::log2({arguments[0]})"
+    if op.op == "log10":
+        return f"metal::log10({arguments[0]})"
+    if op.op == "log1p":
+        return f"log1p({arguments[0]})"
     if op.op == "erf":
         return f"tsc_erf({arguments[0]})"
     if op.op == "sin":
         return f"metal::sin({arguments[0]})"
     if op.op == "cos":
         return f"metal::cos({arguments[0]})"
+    if op.op == "floor":
+        return f"metal::floor({arguments[0]})"
+    if op.op == "ceil":
+        return f"metal::ceil({arguments[0]})"
+    if op.op == "round":
+        return f"metal::rint({arguments[0]})"
+    if op.op == "trunc":
+        return f"metal::trunc({arguments[0]})"
+    if op.op == "sign":
+        return f"metal::sign({arguments[0]})"
+    if op.op == "square":
+        value = arguments[0]
+        return f"({value}) * ({value})"
     if op.op == "sqrt":
         return f"metal::sqrt({arguments[0]})"
     if op.op == "rsqrt":
@@ -2897,12 +2931,34 @@ def _evaluate_pointwise_mlx(
         return mx.where(mx.isnan(value), float("nan"), body)
     if op.op == "exp":
         return mx.exp(arguments[0])
+    if op.op == "expm1":
+        return mx.expm1(arguments[0])
+    if op.op == "log":
+        return mx.log(arguments[0])
+    if op.op == "log2":
+        return mx.log2(arguments[0])
+    if op.op == "log10":
+        return mx.log10(arguments[0])
+    if op.op == "log1p":
+        return mx.log1p(arguments[0])
     if op.op == "erf":
         return mx.erf(arguments[0])
     if op.op == "sin":
         return mx.sin(arguments[0])
     if op.op == "cos":
         return mx.cos(arguments[0])
+    if op.op == "floor":
+        return mx.floor(arguments[0])
+    if op.op == "ceil":
+        return mx.ceil(arguments[0])
+    if op.op == "round":
+        return mx.round(arguments[0])
+    if op.op == "trunc":
+        return mx.trunc(arguments[0])
+    if op.op == "sign":
+        return mx.sign(arguments[0])
+    if op.op == "square":
+        return mx.square(arguments[0])
     if op.op == "sqrt":
         return mx.sqrt(arguments[0])
     if op.op == "rsqrt":

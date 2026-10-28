@@ -54,9 +54,20 @@
 | `aten.elu.default` | `elu` |
 | `aten.hardswish.default` | `hardswish` |
 | `aten.exp.default` | `exp` |
+| `aten.expm1.default` | `expm1` |
+| `aten.log.default` | `log` |
+| `aten.log2.default` | `log2` |
+| `aten.log10.default` | `log10` |
+| `aten.log1p.default` | `log1p` |
 | `aten.erf.default` | `erf` |
 | `aten.sin.default` | `sin` |
 | `aten.cos.default` | `cos` |
+| `aten.floor.default` | `floor` |
+| `aten.ceil.default` | `ceil` |
+| `aten.round.default` | `round` |
+| `aten.trunc.default` | `trunc` |
+| `aten.sign.default` | `sign` |
+| `aten.square.default` | `square` |
 | `aten.sqrt.default` | `sqrt` |
 | `aten.rsqrt.default` | `rsqrt` |
 | `aten.reciprocal.default` | `reciprocal` |
@@ -203,6 +214,8 @@ input_offset = (elem % 3) * 1
 混合 dtype 融合让 `(x > y) & mask -> where(condition, x + y, x - y)` 仍只生成一个 kernel。bool 输出使用 `mx.bool_` 分配，FP16/BF16/FP32 数值路径仍以 float 计算并 cast 回目标 dtype。
 
 精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
+
+`round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
 
 ## 8. Metal softmax reduction
 
