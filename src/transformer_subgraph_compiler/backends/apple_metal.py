@@ -147,6 +147,28 @@ class CompiledPlan:
                 env[op.outputs[0]] = mx.take_along_axis(
                     source[tuple(source_slices)], indices, axis=axis
                 )
+            elif op.op == "scatter":
+                source, indices = (env[value_id] for value_id in op.inputs[:2])
+                axis = int(op.attrs["dim"])
+                _check_take_indices(indices, source.shape[axis])
+                values = (
+                    mx.array(op.attrs["value"], dtype=source.dtype)
+                    if len(op.inputs) == 2
+                    else env[op.inputs[2]]
+                )
+                if len(op.inputs) == 3:
+                    values = values[tuple(slice(0, size) for size in indices.shape)]
+                source_slices = [
+                    slice(0, indices.shape[dim]) if dim != axis else slice(None)
+                    for dim in range(len(source.shape))
+                ]
+                slices = tuple(source_slices)
+                updated = mx.put_along_axis(
+                    source[slices], indices, values, axis=axis
+                )
+                output = mx.array(source)
+                output[slices] = updated
+                env[op.outputs[0]] = output
             elif op.op in {"triu", "tril"}:
                 diagonal = int(op.attrs["diagonal"])
                 operation = mx.triu if op.op == "triu" else mx.tril
@@ -240,6 +262,8 @@ class AppleMetalBackend:
                 _validate_index_select_op(graph, op)
             elif op.op == "gather":
                 _validate_gather_op(graph, op)
+            elif op.op == "scatter":
+                _validate_scatter_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -3150,6 +3174,76 @@ def _validate_gather_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             f"gather has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
         )
+
+
+def _validate_scatter_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) not in {2, 3}:
+        raise ValueError(f"scatter expects two or three inputs, got {len(op.inputs)}")
+    source_type = graph.value(op.inputs[0]).type
+    indices_type = graph.value(op.inputs[1]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("scatter requires a tensor with rank >= 1")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"scatter.dim must be an integer, got {dim!r}")
+    if dim < 0 or dim >= rank:
+        raise ValueError(f"scatter.dim {dim} is outside rank {rank}")
+    if len(indices_type.shape) != rank:
+        raise ValueError(
+            f"scatter indices must have rank {rank}, got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "scatter indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    for index_axis, (index_dim, source_dim) in enumerate(
+        zip(indices_type.shape, source_type.shape, strict=True)
+    ):
+        if index_axis != dim and index_dim > source_dim:
+            raise ValueError(
+                f"scatter indices shape {indices_type.shape} exceeds source shape "
+                f"{source_type.shape} on non-scatter axis {index_axis}"
+            )
+    if output_type != source_type:
+        raise ValueError(
+            f"scatter output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match input {(source_type.shape, source_type.dtype)}"
+        )
+
+    if len(op.inputs) == 2:
+        if set(op.attrs) != {"dim", "value"}:
+            raise ValueError(
+                f"scatter value op has unexpected attributes: {sorted(op.attrs)}"
+            )
+        value = op.attrs["value"]
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"scatter.value must be a scalar number, got {value!r}")
+    else:
+        if set(op.attrs) != {"dim"}:
+            raise ValueError(
+                f"scatter has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
+            )
+        update_type = graph.value(op.inputs[2]).type
+        if update_type.dtype != source_type.dtype:
+            raise ValueError(
+                "scatter source dtype must match the input dtype, "
+                f"got {update_type.dtype.value} and {source_type.dtype.value}"
+            )
+        if len(update_type.shape) != rank:
+            raise ValueError(
+                f"scatter source must have rank {rank}, got {update_type.shape}"
+            )
+        for update_axis, (update_dim, index_dim) in enumerate(
+            zip(update_type.shape, indices_type.shape, strict=True)
+        ):
+            if update_dim < index_dim:
+                raise ValueError(
+                    f"scatter source shape {update_type.shape} is smaller than "
+                    f"indices shape {indices_type.shape} on axis {update_axis}"
+                )
 
 
 def _validate_triangular_op(graph: Graph, op: Operation) -> None:

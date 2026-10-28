@@ -17,6 +17,7 @@
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
+| `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
 | `aten.permute.default` | `permute` |
@@ -83,6 +84,8 @@
 `index_select` 同样保留为独立 IR op，输入为 `source, indices`，归一化后的轴写入 `dim` attribute。前端要求 source rank 至少为 1，indices rank 为 1 且 dtype 为 `int32/int64`，输出只把 source 的 `dim` 轴替换为 indices 长度，并保持 source dtype。Runtime 映射到 `mx.take(source, indices, axis=dim)`；由于 MLX 会回绕负索引并把越界索引填成零，而 PyTorch 会报错，Runtime 在 gather 前显式检查 `[0, source.shape[dim])`。
 
 `gather` 的输入同样为 `source, indices`，但 indices 必须与 source 同 rank，输出 shape 和 dtype 分别等于 indices shape 和 source dtype。非 gather 轴上，indices 对应维度不能大于 source；gather 轴长度不受此限制，索引值仍须落在 source 该轴范围内。Runtime 先按 indices shape 截取 source 的非 gather 轴，再调用 `mx.take_along_axis`。这样既满足 MLX 对非 gather 轴的严格形状要求，也保留 PyTorch 允许索引子区域的行为。`sparse_grad` 只影响反向传播，推理 lowering 会忽略。
+
+`scatter` 输入为 `source, indices`，`aten.scatter.src` 额外接收 update tensor，`aten.scatter.value` 把 scalar 写入 `value` attribute。source、indices 和 update 必须同 rank；indices 的每个非 scatter 轴不能大于 source；update 的每一维不能小于 indices，与 PyTorch 的 `index.size(d) <= src.size(d)` 约束一致。输出始终保持 source 的 shape 和 dtype。Runtime 检查索引范围，把 update 截到 indices shape，调用 `mx.put_along_axis`，再复制 source 并写回更新区域，因此不会修改输入。重复索引的胜者与 PyTorch 一样不做确定性保证。
 
 `split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 
@@ -334,6 +337,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 - attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`，并对安全 softmax 的整行 mask 补零
 - embedding/index_select：调用带范围检查的 MLX `mx.take`，输出保持 source dtype
 - gather：检查索引范围，截取非 gather 轴后调用 MLX `mx.take_along_axis`
+- scatter：检查索引范围，把 update 截到 indices shape，复制 source 后用 `mx.put_along_axis` 更新
 - `cat`：校验后的 tensor 输入交给 `mx.concatenate`
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
 - cast：调用 MLX `astype`，保留源和目标 dtype、shape
@@ -351,7 +355,8 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流和 list/dict 输出；常量生成只识别前端当前需要的 `scalar_tensor.default`，`ones_like` 等节点尚未支持
-- bool tensor 只支持比较、logical、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；整数 tensor 可用于 embedding/index_select/gather indices，但不支持一般整数算术和 bitwise 运算
+- bool tensor 只支持比较、logical、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；整数 tensor 可用于 embedding/index_select/gather/scatter indices，但不支持一般整数算术和 bitwise 运算
+- scatter 只支持默认写入语义，不支持 `reduce`、`scatter_add` 或 `scatter_reduce`
 - softmax 支持任意单轴，但不支持一次对多个轴做 softmax
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - LayerNorm/RMSNorm 只支持连续尾维 reduction

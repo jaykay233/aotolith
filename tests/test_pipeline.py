@@ -757,6 +757,142 @@ def test_gather_rejects_out_of_range_indices() -> None:
             result.plan(source_mlx, _torch_to_mlx(invalid))
 
 
+@pytest.mark.parametrize(
+    ("dim", "index_dtype", "index_values"),
+    [
+        (1, torch.int32, [[[2, 0], [1, 2]]]),
+        (-1, torch.int64, [[[3, 2], [1, 0], [2, 3]]]),
+    ],
+)
+def test_scatter_src_uses_mlx_without_a_kernel(dim, index_dtype, index_values) -> None:
+    def fn(source, indices, update):
+        return source.scatter(dim, indices, update)
+
+    torch.manual_seed(47)
+    source = torch.randn(2, 3, 4, dtype=torch.float16)
+    indices = torch.tensor(index_values, dtype=index_dtype)
+    update = torch.randn(indices.shape, dtype=torch.float16)
+    result = compile_callable(fn, (source, indices, update))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["scatter"]
+    assert result.lowered_graph.ops[0].attrs["dim"] == dim % source.ndim
+    assert result.plan.kernels == ()
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert actual.shape == source.shape
+    assert actual.dtype == _MLX_DTYPES[source.dtype]
+    assert mx.array_equal(actual, expected)
+
+
+def test_scatter_src_uses_index_shaped_prefix_of_larger_source() -> None:
+    def fn(source, indices, update):
+        return source.scatter(1, indices, update)
+
+    source = torch.zeros(2, 4, dtype=torch.float32)
+    indices = torch.tensor([[1, 3], [0, 2]], dtype=torch.int64)
+    update = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    result = compile_callable(fn, (source, indices, update))
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_scatter_value_uses_mlx_without_a_kernel() -> None:
+    def fn(source, indices):
+        return source.scatter(-1, indices, -1.5)
+
+    source = torch.zeros(2, 4, dtype=torch.float16)
+    indices = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
+    result = compile_callable(fn, (source, indices))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["scatter"]
+    assert result.lowered_graph.ops[0].attrs == {"dim": 1, "value": -1.5}
+    assert result.plan.kernels == ()
+
+    actual = result.plan(_torch_to_mlx(source), _torch_to_mlx(indices))[0]
+    expected = _torch_to_mlx(fn(source, indices))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_scatter_does_not_mutate_the_input_tensor() -> None:
+    def fn(source, indices, update):
+        return source.scatter(0, indices, update)
+
+    source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    indices = torch.tensor([[2, 0], [1, 2]], dtype=torch.int64)
+    update = torch.tensor([[20, 21], [22, 23]], dtype=torch.float32)
+    result = compile_callable(fn, (source, indices, update))
+    source_mlx = _torch_to_mlx(source)
+    original = _torch_to_mlx(source)
+
+    actual = result.plan(
+        source_mlx, _torch_to_mlx(indices), _torch_to_mlx(update)
+    )[0]
+    mx.eval(actual, source_mlx, original)
+    assert mx.array_equal(source_mlx, original)
+    assert mx.array_equal(actual, _torch_to_mlx(fn(source, indices, update)))
+
+
+@pytest.mark.parametrize("invalid", [[-1, 0], [4, 0]])
+def test_scatter_rejects_out_of_range_indices(invalid) -> None:
+    def fn(source, indices):
+        return source.scatter(-1, indices, 1.0)
+
+    source = torch.zeros(3, 4)
+    indices = torch.tensor([[3, 2], [0, 1]], dtype=torch.int64)
+    result = compile_callable(fn, (source, indices))
+    source_mlx = _torch_to_mlx(source)
+
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(
+            source_mlx,
+            _torch_to_mlx(
+                torch.tensor([invalid, [0, 1]], dtype=torch.int64)
+            ),
+        )
+
+
+def test_scatter_rejects_source_smaller_than_indices() -> None:
+    source_type = TensorType((2, 4), DType.F32)
+    index_type = TensorType((2, 3), DType.I64)
+    update_type = TensorType((2, 2), DType.F32)
+    values = {
+        "source": Value("source", source_type),
+        "indices": Value("indices", index_type),
+        "update": Value("update", update_type),
+        "out": Value("out", source_type),
+    }
+    graph = Graph(
+        ("source", "indices", "update"),
+        values,
+        (
+            Operation(
+                "scatter",
+                ("source", "indices", "update"),
+                ("out",),
+                {"dim": 1},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(ValueError, match="source shape .* smaller than indices shape"):
+        compile_graph(graph)
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)

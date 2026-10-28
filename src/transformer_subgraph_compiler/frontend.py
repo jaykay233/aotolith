@@ -98,6 +98,8 @@ _SUPPORTED_OPS = {
     "aten.embedding.default": "embedding",
     "aten.index_select.default": "index_select",
     "aten.gather.default": "gather",
+    "aten.scatter.src": "scatter",
+    "aten.scatter.value": "scatter",
 }
 
 _TORCH_DTYPES = {
@@ -152,6 +154,7 @@ _SEQUENCE_VIEW_TARGETS = {
 }
 
 _STACK_TARGET = "aten.stack.default"
+_SCATTER_TARGETS = {"aten.scatter.src", "aten.scatter.value"}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -219,6 +222,13 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 inputs, attrs, output_type = _gather_operation(node, node_ids)
                 output_id = f"v{len(ops)}"
                 ops.append(Operation("gather", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                continue
+            if target in _SCATTER_TARGETS:
+                inputs, attrs, output_type = _scatter_operation(node, node_ids)
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("scatter", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
@@ -716,6 +726,90 @@ def _gather_operation(
         {"dim": axis},
         output_type,
     )
+
+
+def _scatter_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    if kwargs:
+        raise ValueError(
+            f"scatter received unsupported keyword arguments: {sorted(kwargs)}"
+        )
+    if len(args) != 4:
+        raise ValueError(f"scatter expects four arguments, got {len(args)}")
+
+    source, dim, indices, update = args
+    target = str(getattr(node, "target", ""))
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"scatter.dim must be an integer, got {dim!r}")
+    source_type = _node_type(source)
+    indices_type = _node_type(indices)
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("scatter requires a tensor with rank >= 1")
+    if dim < -rank or dim >= rank:
+        raise ValueError(f"scatter.dim {dim} is outside rank {rank}")
+    axis = dim + rank if dim < 0 else dim
+    if len(indices_type.shape) != rank:
+        raise ValueError(
+            f"scatter indices must have rank {rank}, got {indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "scatter indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    for index_axis, (index_dim, source_dim) in enumerate(
+        zip(indices_type.shape, source_type.shape, strict=True)
+    ):
+        if index_axis != axis and index_dim > source_dim:
+            raise ValueError(
+                f"scatter indices shape {indices_type.shape} exceeds source shape "
+                f"{source_type.shape} on non-scatter axis {index_axis}"
+            )
+
+    attrs: dict[str, object] = {"dim": axis}
+    if target == "aten.scatter.value":
+        if not isinstance(update, (bool, int, float)):
+            raise ValueError(
+                f"scatter.value must be a scalar number, got {update!r}"
+            )
+        attrs["value"] = update
+        inputs = (_argument_ids(source, node_ids), _argument_ids(indices, node_ids))
+    else:
+        update_type = _node_type(update)
+        if update_type.dtype != source_type.dtype:
+            raise ValueError(
+                "scatter source dtype must match the input dtype, "
+                f"got {update_type.dtype.value} and {source_type.dtype.value}"
+            )
+        if len(update_type.shape) != rank:
+            raise ValueError(
+                f"scatter source must have rank {rank}, got {update_type.shape}"
+            )
+        for update_axis, (update_dim, index_dim) in enumerate(
+            zip(update_type.shape, indices_type.shape, strict=True)
+        ):
+            if update_dim < index_dim:
+                raise ValueError(
+                    f"scatter source shape {update_type.shape} is smaller than "
+                    f"indices shape {indices_type.shape} on axis {update_axis}"
+                )
+        inputs = (
+            _argument_ids(source, node_ids),
+            _argument_ids(indices, node_ids),
+            _argument_ids(update, node_ids),
+        )
+
+    output_type = _node_type(node)
+    if output_type != source_type:
+        raise ValueError(
+            f"scatter output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match input {(source_type.shape, source_type.dtype)}"
+        )
+    return inputs, attrs, output_type
 
 
 def _attention_operation(
