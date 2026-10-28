@@ -2075,6 +2075,48 @@ def test_rotary_embedding_rotate_half_compiles_and_runs() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(("dim", "index"), [(1, -1), (-2, 0)])
+def test_select_lowers_to_slice_and_squeeze(dim, index) -> None:
+    def fn(x):
+        return x.select(dim, index)
+
+    torch.manual_seed(80)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(fn, (x,))
+
+    axis = dim % x.ndim
+    resolved_index = index % x.shape[axis]
+    assert [op.op for op in result.lowered_graph.ops] == ["slice", "squeeze"]
+    assert result.lowered_graph.ops[0].attrs == {
+        "dim": axis,
+        "start": resolved_index,
+        "end": resolved_index + 1,
+        "step": 1,
+    }
+    assert result.lowered_graph.ops[1].attrs == {"dim": axis}
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_select_can_produce_a_scalar() -> None:
+    def fn(x):
+        return x.select(0, -2)
+
+    x = torch.arange(3, dtype=torch.float32)
+    result = compile_callable(fn, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["slice", "squeeze"]
+    actual = result.plan(_torch_to_mlx(x))[0]
+    expected = _torch_to_mlx(fn(x))
+    mx.eval(actual, expected)
+    assert actual.shape == ()
+    assert mx.array_equal(actual, expected)
+
+
 def test_chunk_lowering_fuses_qkv_pointwise_region() -> None:
     def qkv_gate(x):
         query, key, value = torch.chunk(x, 3, dim=-1)

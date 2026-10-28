@@ -23,6 +23,7 @@
 | `aten.permute.default` | `permute` |
 | `aten.expand.default` | `expand` |
 | `aten.slice.Tensor` | `slice` |
+| `aten.select.int` | 在前端展开为单元素 `slice + squeeze` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
 | `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |
@@ -86,6 +87,8 @@
 `gather` 的输入同样为 `source, indices`，但 indices 必须与 source 同 rank，输出 shape 和 dtype 分别等于 indices shape 和 source dtype。非 gather 轴上，indices 对应维度不能大于 source；gather 轴长度不受此限制，索引值仍须落在 source 该轴范围内。Runtime 先按 indices shape 截取 source 的非 gather 轴，再调用 `mx.take_along_axis`。这样既满足 MLX 对非 gather 轴的严格形状要求，也保留 PyTorch 允许索引子区域的行为。`sparse_grad` 只影响反向传播，推理 lowering 会忽略。
 
 `scatter` 输入为 `source, indices`，`aten.scatter.src` 额外接收 update tensor，`aten.scatter.value` 把 scalar 写入 `value` attribute。source、indices 和 update 必须同 rank；indices 的每个非 scatter 轴不能大于 source；update 的每一维不能小于 indices，与 PyTorch 的 `index.size(d) <= src.size(d)` 约束一致。输出始终保持 source 的 shape 和 dtype。Runtime 检查索引范围，把 update 截到 indices shape，调用 `mx.put_along_axis`，再复制 source 并写回更新区域，因此不会修改输入。重复索引的胜者与 PyTorch 一样不做确定性保证。
+
+`aten.select.int` 没有独立 IR op。前端把负轴和负索引归一化，校验索引范围，再生成只包含目标元素的 `slice` 和删除该轴的 `squeeze`。输入 rank 为 1 时输出 rank-0 scalar；其他情况下输出 shape 等于输入删除目标轴后的 shape。
 
 `split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 

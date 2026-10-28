@@ -153,6 +153,7 @@ _SEQUENCE_VIEW_TARGETS = {
     "aten.unbind.int",
 }
 
+_SELECT_TARGET = "aten.select.int"
 _STACK_TARGET = "aten.stack.default"
 _SCATTER_TARGETS = {"aten.scatter.src", "aten.scatter.value"}
 
@@ -184,6 +185,13 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             if node in node_ids:
                 continue
             target = str(node.target)
+            if target == _SELECT_TARGET:
+                select_ops = _select_operations(node, node_ids, len(ops))
+                for operation, value in select_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = select_ops[-1][0].outputs[0]
+                continue
             if target in _SEQUENCE_VIEW_TARGETS:
                 sequence_ops = _sequence_view_operations(node, node_ids, len(ops))
                 for operation, value in sequence_ops:
@@ -452,6 +460,80 @@ def _sequence_view_operations(
         node_ids[user] = output_ids[index]
 
     return tuple(operations)
+
+
+def _select_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[Operation, Value], ...]:
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if kwargs:
+        raise ValueError(f"{target} received unsupported keyword arguments: {kwargs!r}")
+    if len(args) != 3:
+        raise ValueError(f"{target} expects three arguments, got {len(args)}")
+
+    input_node, dim, index = args
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise ValueError(f"{target}.index must be an integer, got {index!r}")
+
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+    axis = dim + rank if dim < 0 else dim
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+    resolved_index = index + input_type.shape[axis] if index < 0 else index
+    if resolved_index < 0 or resolved_index >= input_type.shape[axis]:
+        raise ValueError(
+            f"{target}.index {index} is outside axis {axis} with length "
+            f"{input_type.shape[axis]}"
+        )
+
+    sliced_shape = (
+        input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
+    )
+    sliced_id = f"v{first_op_index}"
+    output_id = f"v{first_op_index + 1}"
+    sliced_type = TensorType(sliced_shape, input_type.dtype)
+    output_type = _node_type(node)
+    expected_shape = input_type.shape[:axis] + input_type.shape[axis + 1 :]
+    if output_type.shape != expected_shape or output_type.dtype != input_type.dtype:
+        raise ValueError(
+            f"{target} output metadata {(output_type.shape, output_type.dtype)} does "
+            f"not match expected {(expected_shape, input_type.dtype)}"
+        )
+
+    return (
+        (
+            Operation(
+                "slice",
+                (_argument_ids(input_node, node_ids),),
+                (sliced_id,),
+                {
+                    "dim": axis,
+                    "start": resolved_index,
+                    "end": resolved_index + 1,
+                    "step": 1,
+                },
+            ),
+            Value(sliced_id, sliced_type),
+        ),
+        (
+            Operation(
+                "squeeze",
+                (sliced_id,),
+                (output_id,),
+                {"dim": axis},
+            ),
+            Value(output_id, output_type),
+        ),
+    )
 
 
 def _stack_operations(
