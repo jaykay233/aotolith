@@ -627,6 +627,111 @@ def test_squeeze_identity_and_inverse_are_eliminated() -> None:
     assert mx.array_equal(actual[1], mx.array(x.numpy()))
 
 
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_stack_lowers_to_unsqueeze_and_cat(dim: int) -> None:
+    def fn(left, right):
+        return torch.stack((left, right), dim=dim)
+
+    torch.manual_seed(45)
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    result = compile_callable(fn, inputs)
+
+    axis = dim if dim >= 0 else dim + 3
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "unsqueeze",
+        "unsqueeze",
+        "cat",
+    ]
+    assert [op.attrs["dim"] for op in result.lowered_graph.ops] == [axis] * 3
+    assert result.plan.kernels == ()
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    input_shape = inputs[0].shape
+    assert actual.shape == input_shape[:axis] + (2,) + input_shape[axis:]
+    assert mx.array_equal(actual, expected)
+
+
+def test_flip_lowers_to_mlx_layout_without_a_kernel() -> None:
+    def fn(x):
+        return torch.flip(x, dims=[1, -1])
+
+    torch.manual_seed(46)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["flip"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "roll",
+    [
+        lambda x: torch.roll(x, shifts=1, dims=-1),
+        lambda x: torch.roll(x, shifts=(1, -2), dims=(0, 2)),
+        lambda x: torch.roll(x, shifts=3),
+    ],
+)
+def test_roll_lowers_to_mlx_layout_without_a_kernel(roll) -> None:
+    torch.manual_seed(47)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(roll, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["roll"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(roll(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_inverse_flip_and_roll_layouts_are_eliminated() -> None:
+    def fn(x):
+        flipped = torch.flip(torch.flip(x, dims=[1, -1]), dims=[-1, 1])
+        rolled = torch.roll(
+            torch.roll(x, shifts=(1, -2), dims=(0, 2)),
+            shifts=(-1, 2),
+            dims=(0, 2),
+        )
+        flat_rolled = torch.roll(torch.roll(x, shifts=3), shifts=-3)
+        return flipped, rolled, flat_rolled
+
+    torch.manual_seed(48)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.input_graph.ops] == [
+        "flip",
+        "flip",
+        "roll",
+        "roll",
+        "roll",
+        "roll",
+    ]
+    assert result.lowered_graph.ops == ()
+    assert result.lowered_graph.outputs == ("arg0", "arg0", "arg0")
+
+    actual = result.plan(mx.array(x.numpy()))
+    mx.eval(*actual)
+    for value in actual:
+        assert mx.array_equal(value, mx.array(x.numpy()))
+
+
+def test_singleton_flip_and_zero_roll_are_identities() -> None:
+    def fn(x):
+        return torch.flip(x, dims=[1]), torch.roll(x, shifts=2, dims=1)
+
+    torch.manual_seed(49)
+    x = torch.randn(2, 1, 4)
+    result = compile_callable(fn, (x,))
+    assert result.lowered_graph.ops == ()
+    assert result.lowered_graph.outputs == ("arg0", "arg0")
+
+
 def test_out_of_range_slice_is_not_removed_as_identity() -> None:
     tensor_type = TensorType((4,), DType.F32)
     values = {

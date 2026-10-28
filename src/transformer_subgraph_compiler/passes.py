@@ -53,6 +53,8 @@ LAYOUT_OPS = {
     "permute",
     "expand",
     "slice",
+    "flip",
+    "roll",
     "unsqueeze",
     "squeeze",
     "contiguous",
@@ -458,7 +460,15 @@ def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
     replacements: dict[int, Operation] = {}
 
     for index, op in enumerate(graph.ops):
-        if op.op not in {"reshape", "transpose", "permute", "unsqueeze", "squeeze"}:
+        if op.op not in {
+            "reshape",
+            "transpose",
+            "permute",
+            "flip",
+            "roll",
+            "unsqueeze",
+            "squeeze",
+        }:
             continue
         producer_index = producers.get(op.inputs[0])
         if producer_index is None:
@@ -496,6 +506,27 @@ def _fold_inverse_layouts(graph: Graph) -> tuple[Graph, bool]:
                 continue
             composed = tuple(inner[axis] for axis in outer)
             if composed == tuple(range(rank)):
+                aliases[op.outputs[0]] = producer.inputs[0]
+                removed.update({producer_index, index})
+            continue
+
+        if op.op == "flip" and producer.op == "flip":
+            outer = _normalized_flip_dims(op, rank)
+            inner = _normalized_flip_dims(producer, rank)
+            if outer is not None and inner is not None and set(outer) == set(inner):
+                aliases[op.outputs[0]] = producer.inputs[0]
+                removed.update({producer_index, index})
+            continue
+
+        if op.op == "roll" and producer.op == "roll":
+            outer = _roll_shifts_by_axis(op, input_type.shape)
+            inner = _roll_shifts_by_axis(producer, input_type.shape)
+            if outer is None or inner is None:
+                continue
+            combined = dict(inner)
+            for axis, shift in outer.items():
+                combined[axis] = combined.get(axis, 0) + shift
+            if _roll_shift_is_identity(combined, input_type.shape):
                 aliases[op.outputs[0]] = producer.inputs[0]
                 removed.update({producer_index, index})
             continue
@@ -570,6 +601,18 @@ def _is_identity_layout(graph: Graph, op: Operation) -> bool:
             return False
         normalized = _normalized_dims(op, rank)
         return normalized == tuple(range(rank))
+    if op.op == "flip":
+        if input_type.shape != output_type.shape:
+            return False
+        dims = _normalized_flip_dims(op, rank)
+        return dims is not None and all(input_type.shape[dim] == 1 for dim in dims)
+    if op.op == "roll":
+        if input_type.shape != output_type.shape:
+            return False
+        shifts = _roll_shifts_by_axis(op, input_type.shape)
+        return shifts is not None and _roll_shift_is_identity(
+            shifts, input_type.shape
+        )
     if op.op == "slice":
         dim = op.attrs.get("dim")
         if not _valid_int(dim) or rank == 0 or int(dim) < -rank or int(dim) >= rank:
@@ -1182,6 +1225,53 @@ def _normalized_dims(op: Operation, rank: int) -> tuple[int, ...] | None:
     if any(dim < 0 or dim >= rank for dim in normalized):
         return None
     return normalized
+
+
+def _normalized_flip_dims(op: Operation, rank: int) -> tuple[int, ...] | None:
+    dims = _normalized_dims(op, rank)
+    if dims is None or not dims or len(set(dims)) != len(dims):
+        return None
+    return dims
+
+
+def _roll_shifts_by_axis(
+    op: Operation, shape: tuple[int, ...]
+) -> dict[int | None, int] | None:
+    shifts = op.attrs.get("shifts")
+    if not isinstance(shifts, (tuple, list)) or not shifts:
+        return None
+    if not all(_valid_int(shift) for shift in shifts):
+        return None
+
+    dims = op.attrs.get("dims")
+    if dims is None:
+        if len(shifts) != 1:
+            return None
+        return {0 if len(shape) == 1 else None: int(shifts[0])}
+    if not isinstance(dims, (tuple, list)) or len(dims) != len(shifts):
+        return None
+    if not all(_valid_int(dim) for dim in dims):
+        return None
+
+    rank = len(shape)
+    shifts_by_axis: dict[int | None, int] = {}
+    for shift, dim in zip(shifts, dims, strict=True):
+        axis = int(dim) + rank if int(dim) < 0 else int(dim)
+        if axis < 0 or axis >= rank:
+            return None
+        shifts_by_axis[axis] = shifts_by_axis.get(axis, 0) + int(shift)
+    return shifts_by_axis
+
+
+def _roll_shift_is_identity(
+    shifts_by_axis: dict[int | None, int], shape: tuple[int, ...]
+) -> bool:
+    element_count = prod(shape)
+    for axis, shift in shifts_by_axis.items():
+        dimension = element_count if axis is None else shape[axis]
+        if dimension <= 0 or shift % dimension != 0:
+            return False
+    return True
 
 
 def _valid_int(value: object) -> bool:

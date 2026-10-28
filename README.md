@@ -18,8 +18,8 @@ PyTorch FX
 | 类别 | 节点 |
 |---|---|
 | 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
-| 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
-| 张量拼接 | `aten.cat.default`，校验非拼接轴 shape 和 dtype 后交给 MLX |
+| 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`flip`、`roll`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
+| 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |
 | 激活与边界 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu`、`leaky_relu`、`elu`、`hardswish`、`clamp`、`clamp_min`、`clamp_max`、`hardtanh` |
 | 一元运算与谓词 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal`、`isnan`、`isinf` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
@@ -34,11 +34,12 @@ PyTorch FX
 
 - 用 `make_fx` 捕获静态 shape 的 PyTorch 计算图
 - 构建带 dtype/shape 校验的 SSA IR
-- 消除恒等 layout、连续逆 `transpose/permute` 和 `unsqueeze/squeeze`，折叠相邻 `reshape`
+- 消除恒等 layout、连续逆 `transpose/permute`、`flip`、`roll` 以及 `unsqueeze/squeeze`，折叠相邻 `reshape`
 - 把 PyTorch rank-N matmul 产生的 `reshape -> bmm -> reshape` 恢复为规范 `matmul`
 - 把 `matmul/addmm` 输入侧单消费者的最后一维 `transpose/permute` 折叠为 `transpose_a`/`transpose_b`；Runtime 和生成的 Metal kernel 直接按逻辑布局取数
 - 消除仍能由 matmul batch broadcast 恢复语义的单消费者 `expand`，避免为广播输入生成额外拷贝
 - 支持沿正负轴拼接 tensor，可用于 RoPE 的 `rotate_half`、QKV 拼接等常见结构；`cat` 本身由 MLX runtime 执行，前后 pointwise 子图仍分别融合
+- 把 `stack` 展开为每个输入的 `unsqueeze` 加一个 `cat`；把 `flip`、`roll` 保留为可校验收敛的 layout op，由 MLX 执行而不生成额外 Metal kernel
 - 把静态 `split`、`chunk` 和 `unbind` 展开为已有的 `slice`/`squeeze` op；Q/K/V 投影结果拆开后仍可共享 layout、CSE 和 pointwise 融合
 - 把 `QK^T -> scale/mask -> softmax -> PV` 融合成单个 `attention` op，支持 rank-3/4、additive/bool mask、causal mask、显式 scale，以及 GQA/MQA
 - 识别 PyTorch 低精度 attention 在内部转 FP32、最后转回原 dtype 的 `_to_copy` 链；显式用户 dtype cast 仍保留为独立 IR op

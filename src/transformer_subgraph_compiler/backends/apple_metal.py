@@ -1633,6 +1633,60 @@ def _validate_layout_op(graph: Graph, op: Operation) -> None:
             )
         return
 
+    if op.op == "flip":
+        dims = op.attrs.get("dims")
+        if not isinstance(dims, (tuple, list)) or not dims or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            raise ValueError(f"flip.dims must contain integers, got {dims!r}")
+        normalized = tuple(dim + rank if dim < 0 else dim for dim in dims)
+        if any(dim < 0 or dim >= rank for dim in normalized):
+            raise ValueError(f"flip.dims {dims} exceed rank {rank}")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"flip.dims contains duplicate axes: {dims}")
+        if input_type.shape != output_type.shape:
+            raise ValueError(
+                f"flip output shape {output_type.shape} != {input_type.shape}"
+            )
+        return
+
+    if op.op == "roll":
+        shifts = op.attrs.get("shifts")
+        if not isinstance(shifts, (tuple, list)) or not shifts or not all(
+            isinstance(shift, int) and not isinstance(shift, bool)
+            for shift in shifts
+        ):
+            raise ValueError(f"roll.shifts must contain integers, got {shifts!r}")
+        dims = op.attrs.get("dims")
+        if dims is None:
+            if len(shifts) != 1:
+                raise ValueError(
+                    "roll without dims requires exactly one shift, got "
+                    f"{len(shifts)}"
+                )
+            if input_type.shape != output_type.shape:
+                raise ValueError(
+                    f"roll output shape {output_type.shape} != {input_type.shape}"
+                )
+            return
+        if not isinstance(dims, (tuple, list)) or not dims or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            raise ValueError(f"roll.dims must contain integers, got {dims!r}")
+        if len(dims) != len(shifts):
+            raise ValueError(
+                "roll shifts and dims must have the same length, got "
+                f"{len(shifts)} and {len(dims)}"
+            )
+        normalized = tuple(dim + rank if dim < 0 else dim for dim in dims)
+        if any(dim < 0 or dim >= rank for dim in normalized):
+            raise ValueError(f"roll.dims {dims} exceed rank {rank}")
+        if input_type.shape != output_type.shape:
+            raise ValueError(
+                f"roll output shape {output_type.shape} != {input_type.shape}"
+            )
+        return
+
     if op.op == "unsqueeze":
         dim = op.attrs.get("dim")
         if not isinstance(dim, int) or isinstance(dim, bool):
@@ -2635,6 +2689,21 @@ def _evaluate_layout_mlx(
         start, end, step = slice(start, end, step).indices(value.shape[axis])
         index[axis] = slice(start, end, step)
         return value[tuple(index)]
+
+    if op.op == "flip":
+        dims = tuple(int(dim) for dim in op.attrs["dims"])
+        normalized = tuple(dim + rank if dim < 0 else dim for dim in dims)
+        return mx.flip(value, axis=normalized)
+
+    if op.op == "roll":
+        shifts = tuple(int(shift) for shift in op.attrs["shifts"])
+        dims = op.attrs.get("dims")
+        if dims is None:
+            return mx.roll(value, shift=shifts[0], axis=None)
+        normalized = tuple(
+            int(dim) + rank if int(dim) < 0 else int(dim) for dim in dims
+        )
+        return mx.roll(value, shift=shifts, axis=normalized)
 
     if op.op == "unsqueeze":
         output_rank = rank + 1

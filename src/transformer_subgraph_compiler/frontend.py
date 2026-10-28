@@ -17,6 +17,8 @@ _SUPPORTED_OPS = {
     "aten.permute.default": "permute",
     "aten.expand.default": "expand",
     "aten.slice.Tensor": "slice",
+    "aten.flip.default": "flip",
+    "aten.roll.default": "roll",
     "aten.unsqueeze.default": "unsqueeze",
     "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
@@ -139,6 +141,8 @@ _SEQUENCE_VIEW_TARGETS = {
     "aten.unbind.int",
 }
 
+_STACK_TARGET = "aten.stack.default"
+
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     """Capture a supported callable with make_fx and build the compiler IR."""
@@ -172,6 +176,16 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 for operation, value in sequence_ops:
                     ops.append(operation)
                     values[value.id] = value
+                continue
+            if target == _STACK_TARGET:
+                stack_ops, output_id, output_type = _stack_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in stack_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
                 continue
             rms_norm = _rms_norm_operation(node, node_ids)
             if rms_norm is not None:
@@ -393,6 +407,84 @@ def _sequence_view_operations(
         node_ids[user] = output_ids[index]
 
     return tuple(operations)
+
+
+def _stack_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str, TensorType]:
+    """Expand stack into unsqueeze ops followed by one cat op."""
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) not in {1, 2}:
+        raise ValueError(f"stack expects one or two arguments, got {len(args)}")
+    tensors = args[0]
+    if not isinstance(tensors, (tuple, list)) or not tensors:
+        raise ValueError("stack expects a non-empty tensor sequence")
+    if len(args) == 2:
+        if "dim" in kwargs:
+            raise ValueError("stack received duplicate dim arguments")
+        dim = args[1]
+    else:
+        dim = kwargs.get("dim", 0)
+    unknown_kwargs = set(kwargs) - {"dim"}
+    if unknown_kwargs:
+        raise ValueError(
+            f"stack received unsupported keyword arguments: {sorted(unknown_kwargs)}"
+        )
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"stack.dim must be an integer, got {dim!r}")
+
+    input_types = tuple(_node_type(tensor) for tensor in tensors)
+    first_type = input_types[0]
+    if any(input_type != first_type for input_type in input_types[1:]):
+        raise ValueError(
+            "stack inputs must have identical shapes and dtypes, got "
+            f"{[input_type.shape for input_type in input_types]}"
+        )
+
+    output_type = _node_type(node)
+    output_rank = len(first_type.shape) + 1
+    axis = dim + output_rank if dim < 0 else dim
+    if axis < 0 or axis >= output_rank:
+        raise ValueError(f"stack.dim {dim} exceeds output rank {output_rank}")
+    expected_shape = (
+        first_type.shape[:axis] + (len(tensors),) + first_type.shape[axis:]
+    )
+    if output_type.shape != expected_shape or output_type.dtype != first_type.dtype:
+        raise ValueError(
+            f"stack output metadata {(output_type.shape, output_type.dtype)} does not "
+            f"match expected {(expected_shape, first_type.dtype)}"
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+    expanded_ids: list[str] = []
+    expanded_shape = first_type.shape[:axis] + (1,) + first_type.shape[axis:]
+    for offset, tensor in enumerate(tensors):
+        expanded_id = f"v{first_op_index + offset}"
+        expanded_ids.append(expanded_id)
+        operations.append(
+            (
+                Operation(
+                    "unsqueeze",
+                    (_argument_ids(tensor, node_ids),),
+                    (expanded_id,),
+                    {"dim": axis},
+                ),
+                Value(expanded_id, TensorType(expanded_shape, first_type.dtype)),
+            )
+        )
+
+    output_id = f"v{first_op_index + len(tensors)}"
+    operations.append(
+        (
+            Operation("cat", tuple(expanded_ids), (output_id,), {"dim": axis}),
+            Value(output_id, output_type),
+        )
+    )
+    return tuple(operations), output_id, output_type
 
 
 def _attention_operation(
@@ -899,6 +991,57 @@ def _operation_inputs(
             {"dim": dim, "start": start, "end": end, "step": step},
         )
 
+    if op == "flip":
+        if len(args) != 2:
+            raise ValueError(f"flip expects two arguments, got {len(args)}")
+        input_id, dims = args
+        if not isinstance(dims, (tuple, list)) or not dims or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            raise ValueError(f"flip.dims must contain integers, got {dims!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"dims": tuple(dims)},
+        )
+
+    if op == "roll":
+        if len(args) not in {2, 3}:
+            raise ValueError(f"roll expects two or three arguments, got {len(args)}")
+        input_id, shifts = args[:2]
+        dims = args[2] if len(args) == 3 else kwargs.get("dims")
+        if isinstance(shifts, int) and not isinstance(shifts, bool):
+            normalized_shifts = (shifts,)
+        elif isinstance(shifts, (tuple, list)) and shifts and all(
+            isinstance(shift, int) and not isinstance(shift, bool)
+            for shift in shifts
+        ):
+            normalized_shifts = tuple(shifts)
+        else:
+            raise ValueError(f"roll.shifts must contain integers, got {shifts!r}")
+
+        if dims is None:
+            if len(normalized_shifts) != 1:
+                raise ValueError(
+                    "roll without dims requires exactly one shift, got "
+                    f"{len(normalized_shifts)}"
+                )
+            normalized_dims = None
+        elif isinstance(dims, (tuple, list)) and dims and all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        ):
+            normalized_dims = tuple(dims)
+            if len(normalized_dims) != len(normalized_shifts):
+                raise ValueError(
+                    "roll shifts and dims must have the same length, got "
+                    f"{len(normalized_shifts)} and {len(normalized_dims)}"
+                )
+        else:
+            raise ValueError(f"roll.dims must contain integers, got {dims!r}")
+        return (
+            (_argument_ids(input_id, node_ids),),
+            {"shifts": normalized_shifts, "dims": normalized_dims},
+        )
+
     if op == "unsqueeze":
         if len(args) != 2:
             raise ValueError(f"unsqueeze expects two arguments, got {len(args)}")
@@ -1077,10 +1220,14 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         )
     if op == "cat":
         allowed.add("dim")
+    if op == "flip":
+        allowed.add("dims")
+    if op == "roll":
+        allowed.update({"shifts", "dims"})
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported keyword arguments for {op}: {sorted(unknown)}")
-    if op in {"cast", "scalar_tensor", "cat"}:
+    if op in {"cast", "scalar_tensor", "cat", "flip", "roll"}:
         return {}
 
     attrs: dict[str, object] = {}
