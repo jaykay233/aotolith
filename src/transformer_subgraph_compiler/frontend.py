@@ -24,7 +24,9 @@ _SUPPORTED_OPS = {
     "aten._to_copy.default": "cast",
     "aten._softmax.default": "softmax",
     "aten._safe_softmax.default": "safe_softmax",
+    "aten.sum.default": "sum",
     "aten.sum.dim_IntList": "sum",
+    "aten.mean.default": "mean",
     "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
     "aten.gelu.default": "gelu",
@@ -144,6 +146,10 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
             attrs.update(scalar_attrs)
+            if op_name in _REDUCTION_OPS and "dims" not in attrs:
+                input_type = values[inputs[0]].type
+                attrs["dims"] = tuple(range(len(input_type.shape)))
+                attrs["keepdim"] = False
             op = Operation(op_name, inputs, (output_id,), attrs)
             ops.append(op)
             node_ids[node] = output_id
@@ -689,9 +695,11 @@ def _operation_inputs(
         return ((_argument_ids(args[0], node_ids),), {})
 
     if op in _REDUCTION_OPS:
+        if len(args) == 1:
+            return ((_argument_ids(args[0], node_ids),), {})
         if len(args) not in {2, 3}:
             raise ValueError(
-                f"{op} expects two or three positional arguments, got {len(args)}"
+                f"{op} expects one to three positional arguments, got {len(args)}"
             )
         input_id = args[0]
         dims = args[1]

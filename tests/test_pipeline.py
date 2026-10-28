@@ -2390,6 +2390,44 @@ def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
         assert mx.allclose(actual_value, expected_value, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+@pytest.mark.parametrize("dtype_override", [False, True])
+def test_default_reductions_reduce_all_dimensions(
+    reduction, dtype_override
+) -> None:
+    torch.manual_seed(82)
+    dtype = torch.float16 if dtype_override else torch.float32
+    x = torch.randn(2, 3, 4, dtype=dtype)
+
+    if reduction == "sum":
+        if dtype_override:
+            fn = lambda value: torch.sum(value, dtype=torch.float32)
+        else:
+            fn = torch.sum
+    else:
+        if dtype_override:
+            fn = lambda value: torch.mean(value, dtype=torch.float32)
+        else:
+            fn = torch.mean
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [reduction]
+    assert result.lowered_graph.ops[0].attrs == {
+        "dims": (0, 1, 2),
+        "keepdim": False,
+        **({"dtype": DType.F32} if dtype_override else {}),
+    }
+
+    mlx_dtype = mx.float16 if dtype_override else mx.float32
+    actual = result.plan(
+        mx.array(x.float().numpy(), dtype=mlx_dtype)
+    )[0]
+    expected = mx.array(fn(x).float().numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == ()
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("keepdim", [False, True])
 def test_sum_last_dim_supports_keepdim(keepdim) -> None:
     torch.manual_seed(83)

@@ -24,7 +24,7 @@ PyTorch FX
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div`、`pow` |
 | Softmax | `aten._softmax.default`、`aten._safe_softmax.default`，支持任意单个维度 |
 | Attention | `F.scaled_dot_product_attention`，以及 `QK^T -> scale/mask -> softmax -> PV` 的分解图 |
-| Reduction | `sum`、`mean`，支持任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
+| Reduction | `sum`、`mean`，支持不指定维度的全量归约、任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 | RMSNorm | `F.rms_norm` 的 `pow/mean/add_/rsqrt/mul` 分解，折叠为专用 `rms_norm` |
 
