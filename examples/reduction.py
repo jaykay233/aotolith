@@ -15,6 +15,7 @@ def main() -> None:
             torch.sum(value, dim=-1),
             torch.mean(value, dim=(1, 2), keepdim=True),
             torch.sum(value, dim=(0, 2), keepdim=True),
+            torch.sum(value, dim=-1, dtype=torch.float16),
         )
 
     result = compile_callable(reductions, (x,))
@@ -27,7 +28,12 @@ def main() -> None:
     expected = tuple(mx.array(value.numpy()) for value in reductions(x))
     mx.eval(*actual, *expected)
     for name, actual_value, expected_value in zip(
-        ("sum_last", "mean_contiguous", "sum_interleaved"),
+        (
+            "sum_last",
+            "mean_contiguous",
+            "sum_interleaved",
+            "sum_float16_output",
+        ),
         actual,
         expected,
         strict=True,

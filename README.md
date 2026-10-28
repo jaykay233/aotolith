@@ -22,7 +22,7 @@ PyTorch FX
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
 | Softmax | `aten._softmax.default`，支持任意单个维度 |
-| Reduction | `sum`、`mean`，支持任意非空维度集合和 `keepdim` |
+| Reduction | `sum`、`mean`，支持任意非空维度集合、`keepdim` 和输出 dtype 覆盖 |
 | LayerNorm | `aten.native_layer_norm.default`，当前使用第 0 个输出 |
 | RMSNorm | `F.rms_norm` 的 `pow/mean/add_/rsqrt/mul` 分解，折叠为专用 `rms_norm` |
 
@@ -38,7 +38,7 @@ PyTorch FX
 - 可选的 Metal matmul/addmm codegen
 - matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
 - softmax reduction：每个 softmax slice 一个 threadgroup，在 threadgroup memory 中完成 max 和 sum，尾维走连续寻址 fast path
-- sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
+- sum/mean reduction：每个输出元素一个 threadgroup，在 float 中归约并按请求的输出 dtype 写回；连续 block 使用紧凑寻址，交错维度使用通用静态索引
 - LayerNorm：每行一个 threadgroup，在 float 中做两遍 mean/variance reduction，并支持可选 affine
 - RMSNorm：匹配 FX 分解链并折叠为专用 kernel，在 float 中做平方和 reduction，支持可选 weight
 - 进程内 LRU kernel cache：相同 MSL 规格复用同一个 `mx.fast.metal_kernel` 对象，最多缓存 256 项
@@ -92,7 +92,7 @@ python examples/metal_matmul_benchmark.py
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
 - `examples/metal_mlp.py` 使用小矩阵开启 `codegen_matmul=True`，完整验证 FX、IR、自定义 MSL matmul、融合 pointwise 和 runtime。
 - `examples/softmax.py` 用超过 256 列的输入验证尾维和中间维的 Metal threadgroup max/sum reduction。
-- `examples/reduction.py` 验证 last-dim sum、连续维 mean、交错维 sum 和 `keepdim` 输出。
+- `examples/reduction.py` 验证 last-dim sum、连续维 mean、交错维 sum、`keepdim` 和 FP16 输出 dtype 覆盖。
 - `examples/layer_norm.py` 验证带 affine 参数和多线程跨步归约的 LayerNorm kernel。
 - `examples/rms_norm.py` 验证 FX pattern folding、weight affine 和 RMSNorm reduction kernel。
 - `examples/metal_matmul_benchmark.py` 对比寄存器 tiled kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。

@@ -347,9 +347,11 @@ class AppleMetalBackend:
 
         input_type = graph.value(op.inputs[0]).type
         output_type = graph.value(op.outputs[0]).type
-        if input_type.dtype != output_type.dtype:
-            raise NotImplementedError(
-                f"Metal {op.op} currently requires identical input/output dtypes"
+        requested_dtype = op.attrs.get("dtype")
+        if requested_dtype is not None and requested_dtype != output_type.dtype:
+            raise ValueError(
+                f"{op.op}.dtype {requested_dtype} does not match "
+                f"output dtype {output_type.dtype}"
             )
         if not input_type.shape:
             raise NotImplementedError(f"Metal {op.op} requires a ranked tensor")
@@ -448,7 +450,7 @@ class AppleMetalBackend:
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
         if (tid == 0u) {{
-            out[output_index] = (T)({result_expression});
+            out[output_index] = (O)({result_expression});
         }}
         """
         name = f"metal_{op.op}_{threads}_{index}"
@@ -461,16 +463,17 @@ class AppleMetalBackend:
         )
         grid = (output_count * threads, 1, 1)
         threadgroup = (threads, 1, 1)
-        dtype = _MLX_DTYPES[output_type.dtype]
+        input_dtype = _MLX_DTYPES[input_type.dtype]
+        output_dtype = _MLX_DTYPES[output_type.dtype]
 
         def runtime(*inputs: mx.array) -> mx.array:
             outputs = kernel(
                 inputs=list(inputs),
-                template=[("T", dtype)],
+                template=[("T", input_dtype), ("O", output_dtype)],
                 grid=grid,
                 threadgroup=threadgroup,
                 output_shapes=[output_type.shape],
-                output_dtypes=[dtype],
+                output_dtypes=[output_dtype],
             )
             return outputs[0]
 

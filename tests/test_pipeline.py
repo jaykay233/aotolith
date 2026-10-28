@@ -862,13 +862,50 @@ def test_sum_reduces_interleaved_dimensions_without_keepdim() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_reduction_rejects_explicit_dtype_override() -> None:
-    x = torch.randn(3, 5)
-    with pytest.raises(
-        NotImplementedError,
-        match="currently requires the input dtype",
-    ):
-        compile_callable(
-            lambda value: torch.sum(value, dim=-1, dtype=torch.float32),
-            (x,),
-        )
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_reduction_supports_float32_dtype_override(reduction, dtype) -> None:
+    torch.manual_seed(107)
+    x = torch.randn(2, 3, 300, dtype=dtype)
+    reduce = torch.sum if reduction == "sum" else torch.mean
+
+    def fn(value):
+        return reduce(value, dim=-1, dtype=torch.float32)
+
+    result = compile_callable(fn, (x,))
+    assert result.input_graph.ops[0].attrs == {
+        "dims": (-1,),
+        "keepdim": False,
+        "dtype": DType.F32,
+    }
+    kernel = result.plan.kernels[0]
+    assert kernel.tensor_type.dtype == DType.F32
+    assert "out[output_index] = (O)" in kernel.source
+
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        mx.array(x.float().numpy(), dtype=mlx_dtype)
+    )[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float32
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+def test_reduction_supports_narrower_output_dtype(reduction) -> None:
+    torch.manual_seed(109)
+    x = torch.randn(2, 3, 17)
+    reduce = torch.sum if reduction == "sum" else torch.mean
+
+    def fn(value):
+        return reduce(value, dim=-1, dtype=torch.float16)
+
+    result = compile_callable(fn, (x,))
+    assert result.plan.kernels[0].tensor_type.dtype == DType.F16
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float16
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)

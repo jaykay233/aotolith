@@ -448,10 +448,6 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
     allowed = set(numeric_attrs)
     if op in _REDUCTION_OPS:
         allowed.add("dtype")
-        if kwargs.get("dtype") is not None:
-            raise NotImplementedError(
-                f"Metal {op} currently requires the input dtype"
-            )
     if op == "gelu":
         allowed.add("approximate")
     unknown = set(kwargs) - allowed
@@ -464,6 +460,13 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError(f"{op}.{name} must be a scalar number, got {value!r}")
         attrs[name] = float(value)
+
+    if op in _REDUCTION_OPS and kwargs.get("dtype") is not None:
+        dtype_name = str(kwargs["dtype"])
+        reduction_dtype = _TORCH_DTYPES.get(dtype_name)
+        if reduction_dtype is None:
+            raise ValueError(f"unsupported reduction dtype: {dtype_name}")
+        attrs["dtype"] = reduction_dtype
 
     if op == "gelu":
         approximate = kwargs.get("approximate", "none")
