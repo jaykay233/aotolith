@@ -123,9 +123,20 @@ C[row, col] = sum_k A[row, k] * B[k, col]
 beta * bias + alpha * (A @ B)
 ```
 
-bias 可以为标量、一维或二维，只要它满足到输出 shape 的静态 broadcast 规则。FP16/BF16 输入用 float 累加，最后 cast 回输出 dtype。
+bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 的静态 broadcast 规则。FP16/BF16 输入用 float 累加，最后 cast 回输出 dtype。
 
-当前 matmul kernel 没有 tiling、threadgroup memory、向量化 load 或 split-K。它用于验证完整的自定义 codegen 路径，不作为高性能 GEMM 使用。
+### 寄存器 tiling
+
+每个 thread 计算一个 microtile，而不是只计算一个输出：
+
+- 默认使用 4×4 microtile，即每个 thread 持有 16 个 float accumulator
+- reduction 维达到 1024 时使用 8×4 microtile，增加大 K 下的指令级并行
+- grid 是 `ceil(columns / micro_columns) × ceil(rows / micro_rows)`
+- K 循环里加载 microtile 对应的 A/B 行和列，用 `fma` 更新所有 accumulator
+- row/column 能被 microtile 整除时，step 直接生成无 predicate 的加载和写回
+- 只有尾部 tile 才生成边界检查，避免常见整除 shape 在 K 循环里付分支成本
+
+该实现没有 threadgroup memory、vectorized load、SIMD matrix 或 split-K。它在同一台机器上比旧的一线程一输出 kernel 快约 2–4 倍，但仍明显慢于 MLX，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
 
 ## 7. Runtime
 
@@ -143,8 +154,9 @@ bias 可以为标量、一维或二维，只要它满足到输出 shape 的静�
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
 - reduction、softmax、normalization 尚未 lowering
-- 没有 kernel cache、autotune、tiling、layout propagation
+- 没有 kernel cache、autotune、layout propagation
+- matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是 reduction/normalization lowering、kernel cache，以及为 matmul 增加 tiled kernel。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是 reduction/normalization lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

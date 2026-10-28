@@ -32,6 +32,7 @@ PyTorch FX
 - 生成每个 thread 处理 4 个元素的 Metal kernel
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
+- matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
 
 默认情况下，`matmul` 和 `addmm` 调用 MLX，只有 pointwise 区域由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
 
@@ -39,7 +40,7 @@ PyTorch FX
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
 ```
 
-这条 matmul 路径目前是正确性实现：一个 thread 计算一个输出元素，K 维循环累加，没有 tiling、shared memory 或 autotune。默认开关关闭，是因为 MLX 的矩阵乘实现明显更适合真实模型。
+matmul kernel 现在使用寄存器 tiling：每个 thread 一次计算多个输出，复用 A/B 的加载，用 float 做 FMA 累加。K 小于 1024 时使用 4×4 microtile，K 较大时使用 8×4；完整 tile 走无边界检查快路径，尾部 shape 才生成 predicate。它仍没有 shared memory、SIMD matrix 或 autotune，实测比旧的一线程一输出版本快，但仍慢于 MLX，所以默认开关保持关闭。
 
 ## 为什么没有直接改 Triton
 
@@ -72,10 +73,12 @@ pip install -e '.[dev]'
 python -m pytest -q
 python examples/mlp.py
 python examples/metal_mlp.py
+python examples/metal_matmul_benchmark.py
 ```
 
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
 - `examples/metal_mlp.py` 使用小矩阵开启 `codegen_matmul=True`，完整验证 FX、IR、自定义 MSL matmul、融合 pointwise 和 runtime。
+- `examples/metal_matmul_benchmark.py` 对比寄存器 tiled kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 
 示例会打印生成的 MSL 或 kernel 类型。首次执行包含 MLX kernel JIT 和 GPU dispatch，耗时不能当作 steady-state 性能。
 

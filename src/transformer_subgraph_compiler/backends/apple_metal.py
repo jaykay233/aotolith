@@ -16,6 +16,9 @@ _MLX_DTYPES = {
 }
 
 _ELEMENTS_PER_THREAD = 4
+_MATMUL_MICROTILE = (4, 4)
+_MATMUL_LARGE_K_MICROTILE = (8, 4)
+_MATMUL_LARGE_K_THRESHOLD = 1024
 
 _MSL_HEADER = """
 inline float tsc_erf(float value) {
@@ -229,16 +232,29 @@ class AppleMetalBackend:
         if len(dtypes) != 1:
             raise NotImplementedError("Metal matmul requires identical input/output dtypes")
 
-        source = _emit_matmul_source(op, rows, reduction, columns, graph)
-        name = f"metal_{op.op}_{index}"
+        micro_rows, micro_columns = _select_matmul_microtile(reduction)
+        source = _emit_register_matmul_source(
+            op,
+            rows,
+            reduction,
+            columns,
+            micro_rows,
+            micro_columns,
+            graph,
+        )
+        name = f"metal_{op.op}_{micro_rows}x{micro_columns}_{index}"
         kernel = mx.fast.metal_kernel(
             name=name,
             input_names=[f"in_{position}" for position in range(len(op.inputs))],
             output_names=["out"],
             source=source,
         )
-        grid = (columns, rows, 1)
-        threadgroup = (min(32, columns), min(8, rows), 1)
+        grid = (
+            ceil(columns / micro_columns),
+            ceil(rows / micro_rows),
+            1,
+        )
+        threadgroup = (min(32, grid[0]), min(8, grid[1]), 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
         def runtime(*inputs: mx.array) -> mx.array:
@@ -398,47 +414,110 @@ def _emit_pointwise_expression(op: Operation, arguments: list[str]) -> str:
     raise NotImplementedError(f"cannot emit fused pointwise op: {op.op}")
 
 
-def _emit_matmul_source(
+def _select_matmul_microtile(reduction: int) -> tuple[int, int]:
+    if reduction >= _MATMUL_LARGE_K_THRESHOLD:
+        return _MATMUL_LARGE_K_MICROTILE
+    return _MATMUL_MICROTILE
+
+
+def _emit_register_matmul_source(
     op: Operation,
     rows: int,
     reduction: int,
     columns: int,
+    micro_rows: int,
+    micro_columns: int,
     graph: Graph,
 ) -> str:
     if op.op == "addmm":
         bias_id, _, _ = op.inputs
         bias_type = graph.value(bias_id).type
         output_shape = graph.value(op.outputs[0]).type.shape
-        bias_offset = _offset_expression(bias_type.shape, output_shape, "linear")
         alpha = float(op.attrs.get("alpha", 1.0))
         beta = float(op.attrs.get("beta", 1.0))
-        output_expression = (
-            f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * acc"
-        )
         left_position = 1
         right_position = 2
     else:
-        output_expression = "acc"
+        bias_id = None
+        bias_type = None
+        output_shape = ()
+        alpha = 1.0
+        beta = 1.0
         left_position = 0
         right_position = 1
 
-    return "\n".join(
-        f"        {line}"
-        for line in [
-            "uint col = thread_position_in_grid.x;",
-            "uint row = thread_position_in_grid.y;",
-            f"if (row >= {rows} || col >= {columns}) {{",
-            "    return;",
-            "}",
-            "float acc = 0.0f;",
-            f"for (uint k = 0; k < {reduction}; ++k) {{",
-            f"    acc += float(in_{left_position}[row * {reduction} + k])",
-            f"        * float(in_{right_position}[k * {columns} + col]);",
-            "}",
-            f"uint linear = row * {columns} + col;",
-            f"out[linear] = (T)({output_expression});",
-        ]
-    )
+    exact_tiles = rows % micro_rows == 0 and columns % micro_columns == 0
+    lines = [
+        f"uint row_base = thread_position_in_grid.y * {micro_rows}u;",
+        f"uint col_base = thread_position_in_grid.x * {micro_columns}u;",
+    ]
+    if not exact_tiles:
+        lines.extend(
+            [
+                f"if (row_base >= {rows}u || col_base >= {columns}u) {{",
+                "    return;",
+                "}",
+            ]
+        )
+        for row in range(micro_rows):
+            lines.append(f"bool row_ok_{row} = row_base + {row}u < {rows}u;")
+        for column in range(micro_columns):
+            lines.append(f"bool col_ok_{column} = col_base + {column}u < {columns}u;")
+
+    for row in range(micro_rows):
+        for column in range(micro_columns):
+            lines.append(f"float acc_{row}_{column} = 0.0f;")
+
+    lines.append(f"for (uint k = 0u; k < {reduction}u; ++k) {{")
+    for row in range(micro_rows):
+        load = (
+            f"float(in_{left_position}["
+            f"(row_base + {row}u) * {reduction}u + k])"
+        )
+        if not exact_tiles:
+            load = f"row_ok_{row} ? {load} : 0.0f"
+        lines.append(f"    float av_{row} = {load};")
+    for column in range(micro_columns):
+        load = (
+            f"float(in_{right_position}["
+            f"k * {columns}u + col_base + {column}u])"
+        )
+        if not exact_tiles:
+            load = f"col_ok_{column} ? {load} : 0.0f"
+        lines.append(f"    float bv_{column} = {load};")
+    for row in range(micro_rows):
+        for column in range(micro_columns):
+            lines.append(
+                f"    acc_{row}_{column} = fma("
+                f"av_{row}, bv_{column}, acc_{row}_{column});"
+            )
+    lines.append("}")
+
+    for row in range(micro_rows):
+        for column in range(micro_columns):
+            linear = f"linear_{row}_{column}"
+            if not exact_tiles:
+                lines.append(f"if (row_ok_{row} && col_ok_{column}) {{")
+            indent = "    " if not exact_tiles else ""
+            lines.append(
+                f"{indent}uint {linear} = (row_base + {row}u) * {columns}u "
+                f"+ col_base + {column}u;"
+            )
+            accumulator = f"acc_{row}_{column}"
+            if bias_id is not None:
+                assert bias_type is not None
+                bias_offset = _offset_expression(bias_type.shape, output_shape, linear)
+                value = (
+                    f"{beta!r} * float(in_0[{bias_offset}]) "
+                    f"+ {alpha!r} * {accumulator}"
+                )
+            else:
+                value = accumulator
+            lines.append(f"{indent}out[{linear}] = (T)({value});")
+            if not exact_tiles:
+                lines.append("}")
+
+    return "\n".join(f"        {line}" for line in lines)
 
 
 def _evaluate_pointwise_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:

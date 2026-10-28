@@ -270,3 +270,81 @@ def test_scalar_pointwise_ops_are_fused() -> None:
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_metal_matmul_uses_register_microtile() -> None:
+    torch.manual_seed(23)
+    inputs = (torch.randn(11, 7), torch.randn(7, 13))
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    kernel = result.plan.kernels[0]
+
+    assert kernel.name == "metal_matmul_4x4_0"
+    assert "threadgroup float" not in kernel.source
+    assert "fma(av_0, bv_0, acc_0_0)" in kernel.source
+    assert "acc_3_3" in kernel.source
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array((inputs[0] @ inputs[1]).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_large_k_matmul_uses_8x4_microtile() -> None:
+    inputs = (torch.randn(3, 1024), torch.randn(1024, 5))
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    kernel = result.plan.kernels[0]
+
+    assert kernel.name == "metal_matmul_8x4_0"
+    assert "acc_7_3" in kernel.source
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array((inputs[0] @ inputs[1]).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_matmul_supports_low_precision(dtype) -> None:
+    torch.manual_seed(29)
+    inputs = (
+        torch.randn(5, 7, dtype=dtype),
+        torch.randn(7, 9, dtype=dtype),
+    )
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+    actual = result.plan(
+        *(mx.array(value.float().numpy(), dtype=mlx_dtype) for value in inputs)
+    )[0]
+    expected = mx.array((inputs[0] @ inputs[1]).float().numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("bias_shape", [(5,), (1, 5), (3, 1)])
+def test_addmm_codegen_broadcasts_bias(bias_shape) -> None:
+    torch.manual_seed(31)
+    inputs = (
+        torch.randn(3, 4),
+        torch.randn(4, 5),
+        torch.randn(bias_shape),
+    )
+    result = compile_callable(
+        lambda x, weight, bias: torch.addmm(bias, x, weight, alpha=0.75, beta=1.25),
+        inputs,
+        codegen_matmul=True,
+    )
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(
+        torch.addmm(inputs[2], inputs[0], inputs[1], alpha=0.75, beta=1.25).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_exact_matmul_tiles_skip_boundary_predicates() -> None:
+    inputs = (torch.randn(8, 8), torch.randn(8, 8))
+    result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
+    source = result.plan.kernels[0].source
+
+    assert "row_ok_0" not in source
+    assert "col_ok_0" not in source
+    assert "if (" not in source
