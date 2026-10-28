@@ -117,6 +117,8 @@ class AppleMetalBackend:
                 compiled = self._compile_elementwise(
                     graph, op.inputs, (op,), op.outputs[0], index, op.op
                 )
+            elif op.op == "softmax":
+                compiled = self._compile_softmax(graph, op, index)
             elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
                 compiled = self._compile_matmul(graph, op, index)
 
@@ -185,6 +187,116 @@ class AppleMetalBackend:
             output_id=output_id,
             tensor_type=output_type,
             kind=kind,
+        )
+        return artifact, runtime
+
+    def _compile_softmax(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        if len(op.inputs) != 1:
+            raise ValueError("softmax expects one input")
+
+        input_type = graph.value(op.inputs[0]).type
+        output_type = graph.value(op.outputs[0]).type
+        if input_type.dtype != output_type.dtype:
+            raise NotImplementedError(
+                "Metal softmax requires identical input/output dtypes"
+            )
+        if input_type.shape != output_type.shape:
+            raise ValueError(
+                f"softmax output shape {output_type.shape} != {input_type.shape}"
+            )
+        if not input_type.shape:
+            raise NotImplementedError("Metal softmax requires a ranked tensor")
+
+        rank = len(input_type.shape)
+        dim = op.attrs.get("dim")
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"softmax.dim must be an integer, got {dim!r}")
+        axis = dim % rank
+        if axis != rank - 1:
+            raise NotImplementedError(
+                "Metal softmax currently supports only the last dimension"
+            )
+
+        columns = input_type.shape[-1]
+        rows = prod(input_type.shape[:-1]) or 1
+        threads = min(256, _next_power_of_two(columns))
+        reduction_stride = threads // 2
+        source = f"""
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint offset = row * {columns}u;
+        threadgroup float scratch[{threads}];
+
+        float local_max = -INFINITY;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            local_max = metal::max(local_max, float(in_0[offset + col]));
+        }}
+        scratch[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] = metal::max(scratch[tid], scratch[tid + stride]);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float max_value = scratch[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float local_sum = 0.0f;
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            local_sum += metal::exp(float(in_0[offset + col]) - max_value);
+        }}
+        scratch[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float sum_value = scratch[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint col = tid; col < {columns}u; col += {threads}u) {{
+            out[offset + col] = (T)(
+                metal::exp(float(in_0[offset + col]) - max_value) / sum_value
+            );
+        }}
+        """
+        name = f"metal_softmax_{threads}_{index}"
+        kernel = mx.fast.metal_kernel(
+            name=name,
+            input_names=["in_0"],
+            output_names=["out"],
+            source=source,
+        )
+        grid = (rows * threads, 1, 1)
+        threadgroup = (threads, 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header="",
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="softmax",
         )
         return artifact, runtime
 
@@ -288,6 +400,12 @@ def _can_broadcast(input_shape: tuple[int, ...], output_shape: tuple[int, ...]) 
         input_dim in {1, output_shape[offset + axis]}
         for axis, input_dim in enumerate(input_shape)
     )
+
+
+def _next_power_of_two(value: int) -> int:
+    if value <= 0:
+        raise ValueError(f"expected a positive integer, got {value}")
+    return 1 << (value - 1).bit_length()
 
 
 def _offset_expression(

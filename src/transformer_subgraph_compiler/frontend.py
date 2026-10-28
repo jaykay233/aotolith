@@ -8,6 +8,7 @@ from .ir import DType, Graph, Operation, TensorType, Value
 _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
     "aten.addmm.default": "addmm",
+    "aten._softmax.default": "softmax",
     "aten.silu.default": "silu",
     "aten.gelu.default": "gelu",
     "aten.mul.Tensor": "mul",
@@ -117,6 +118,18 @@ def _operation_inputs(
     args: tuple[object, ...],
     node_ids: dict[object, str],
 ) -> tuple[tuple[str, ...], dict[str, object]]:
+    if op == "softmax":
+        if len(args) != 3:
+            raise ValueError(f"softmax expects three arguments, got {len(args)}")
+        input_id, dim, half_to_float = args
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"softmax.dim must be an integer, got {dim!r}")
+        if not isinstance(half_to_float, bool):
+            raise ValueError(
+                f"softmax.half_to_float must be a boolean, got {half_to_float!r}"
+            )
+        return ((_argument_ids(input_id, node_ids),), {"dim": dim})
+
     if op not in _BINARY_OPS:
         return tuple(_argument_ids(arg, node_ids) for arg in args), {}
 

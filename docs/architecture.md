@@ -12,6 +12,7 @@
 |---|---|
 | `aten.mm.default` | `matmul` |
 | `aten.addmm.default` | `addmm` |
+| `aten._softmax.default` | `softmax` |
 | `aten.silu.default` | `silu` |
 | `aten.gelu.default` | `gelu` |
 | `aten.mul.Tensor` | `mul` |
@@ -32,7 +33,7 @@
 
 每个 placeholder 变成 `argN`，每个计算节点变成 `vN`。shape 和 dtype 从 `node.meta["val"]` 读取，动态维度和空维度会直接报错。
 
-`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha` 和 `gelu` 的 `approximate` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
+`addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`gelu` 的 `approximate` 和 softmax 的 `dim` 会写入 IR attribute。二元 pointwise 支持一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。
 
 ## 2. SSA IR
 
@@ -60,6 +61,8 @@ region root 是满足以下条件之一的 pointwise op：
 - 它有一个非 pointwise consumer
 
 只有单个 pointwise op 时不做 IR fusion，但 Apple backend 仍会为它生成一个独立 Metal kernel。
+
+softmax 是 reduction op，不会被收进 pointwise region。后面的 pointwise 链会单独融合，因此 `softmax -> mul -> add` 仍然产生两个 kernel，而不是把 reduction 和逐元素计算混在同一个表达式里。
 
 融合把 region 内部的中间 value 消掉，只把外部输入放进 `fused_elementwise.inputs`，输出 ID 保持为 root 原来的输出 ID。
 
@@ -109,7 +112,21 @@ input_offset = (elem % 3) * 1
 
 精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
 
-## 6. Metal matmul/addmm codegen
+## 6. Metal softmax reduction
+
+softmax 当前只支持最后一维。backend 把前面的维度展平为 `rows`，最后一维作为连续的 `columns`：
+
+- 每个 threadgroup 处理一行
+- threadgroup 线程数是 `next_power_of_two(columns)`，上限为 256
+- 每个线程跨步遍历该行，先在寄存器中得到局部 max
+- threadgroup memory 中做树形 max reduction，再用相同结构做 exp-sum reduction
+- 使用 max 平移保证数值稳定，最终在 float 中归一化并 cast 回 `T`
+
+grid 大小是 `rows * threads`，每个 threadgroup 的大小固定为 `threads`。当 `columns > 256` 时，每个线程处理多个列；当 `columns` 不是 2 的幂时，线程数向上补齐，全局内存访问由循环条件 `col < columns` 限制。
+
+非最后一维的 softmax 会在 backend 编译阶段抛 `NotImplementedError`，不会静默退化成 MLX。FP16/BF16 输入在 float 中完成 reduction，输出保持输入 dtype。
+
+## 7. Metal matmul/addmm codegen
 
 `codegen_matmul=True` 时，backend 为 rank-2 `matmul` 和 `addmm` 生成独立 Metal kernel：
 
@@ -138,25 +155,26 @@ bias 可以是 rank-0、一维或二维 tensor，只要它满足到输出 shape 
 
 该实现没有 threadgroup memory、vectorized load、SIMD matrix 或 split-K。它在同一台机器上比旧的一线程一输出 kernel 快约 2–4 倍，但仍明显慢于 MLX，因此默认 `codegen_matmul=False`。基准可用 `examples/metal_matmul_benchmark.py` 复现。
 
-## 7. Runtime
+## 8. Runtime
 
 `CompiledPlan` 按 SSA 顺序执行 IR：
 
 - 有生成 kernel 的 op：调用对应的 `mx.fast.metal_kernel`
 - 默认模式下的 `matmul`、`addmm`：调用 MLX
 - 未生成 kernel 的 pointwise op：调用 MLX fallback
+- softmax：调用生成的 last-dim reduction kernel
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 
-## 8. 已知边界
+## 9. 已知边界
 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流、list/dict 输出和 `ones_like` 等常量生成节点
 - pointwise 要求输入输出 dtype 相同
-- reduction、softmax、normalization 尚未 lowering
+- softmax 只支持最后一维，其他 reduction 和 normalization 尚未 lowering
 - 没有 kernel cache、autotune、layout propagation
 - matmul 还没有 shared-memory tile、vectorized load、SIMD matrix 或 split-K
 - 没有反向传播和训练支持
 - NVIDIA Triton/CUDA backend 尚未实现
 
-下一步最有价值的方向是 reduction/normalization lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。
+下一步最有价值的方向是通用 reduction/normalization lowering、kernel cache，以及用 SIMD matrix 或 MPS 路径继续优化 matmul。继续扩大 pointwise 算子覆盖的收益已经开始下降。

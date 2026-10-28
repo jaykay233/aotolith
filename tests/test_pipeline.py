@@ -348,3 +348,67 @@ def test_exact_matmul_tiles_skip_boundary_predicates() -> None:
     assert "row_ok_0" not in source
     assert "col_ok_0" not in source
     assert "if (" not in source
+
+
+@pytest.mark.parametrize("shape", [(7,), (3, 7), (2, 3, 5), (2, 300)])
+def test_metal_softmax_last_dim(shape) -> None:
+    torch.manual_seed(37)
+    x = torch.randn(shape)
+    result = compile_callable(
+        lambda value: torch.nn.functional.softmax(value, dim=-1), (x,)
+    )
+    kernel = result.plan.kernels[0]
+
+    assert kernel.kind == "softmax"
+    assert kernel.tensor_type.shape == shape
+    assert "threadgroup_barrier" in kernel.source
+    assert result.input_graph.ops[0].attrs == {"dim": -1}
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(torch.nn.functional.softmax(x, dim=-1).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_softmax_supports_low_precision(dtype) -> None:
+    torch.manual_seed(41)
+    x = torch.randn(2, 3, 7, dtype=dtype)
+    result = compile_callable(
+        lambda value: torch.nn.functional.softmax(value, dim=-1), (x,)
+    )
+    mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
+
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
+    expected = mx.array(torch.nn.functional.softmax(x.float(), dim=-1).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_metal_softmax_rejects_non_last_dimension() -> None:
+    x = torch.randn(2, 3, 4)
+    with pytest.raises(NotImplementedError, match="last dimension"):
+        compile_callable(lambda value: torch.nn.functional.softmax(value, dim=1), (x,))
+
+
+def test_softmax_and_fused_pointwise_execute_as_separate_kernels() -> None:
+    torch.manual_seed(43)
+    x = torch.randn(3, 7)
+
+    def fn(value):
+        return torch.nn.functional.softmax(value, dim=-1) * 2.0 + 1.0
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "softmax",
+        "fused_elementwise",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == [
+        "softmax",
+        "fused_elementwise",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)

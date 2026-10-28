@@ -5,7 +5,7 @@
 ```text
 PyTorch FX
   -> SSA IR
-  -> pointwise fusion
+  -> pointwise fusion / reduction lowering
   -> Metal Shading Language
   -> mx.fast.metal_kernel
   -> Apple GPU
@@ -21,6 +21,7 @@ PyTorch FX
 | 激活 | `silu`、`gelu`、`sigmoid`、`tanh`、`relu` |
 | 一元运算 | `neg`、`abs`、`exp`、`erf`、`sqrt`、`rsqrt`、`reciprocal` |
 | 二元运算 | `mul`、`add`、`sub`、`rsub`、`div` |
+| Softmax | `aten._softmax.default`，当前仅支持最后一维 |
 
 编译器已经实现：
 
@@ -33,8 +34,9 @@ PyTorch FX
 - FP16、BF16、FP32 输入和输出
 - 可选的 Metal matmul/addmm codegen
 - matmul 寄存器 tiling：小 K 用 4×4，大 K 用 8×4 每线程 microtile
+- last-dim softmax reduction：每行一个 threadgroup，在 threadgroup memory 中完成 max 和 sum
 
-默认情况下，`matmul` 和 `addmm` 调用 MLX，只有 pointwise 区域由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
+默认情况下，`matmul` 和 `addmm` 调用 MLX，pointwise 和 softmax 由本项目生成 MSL。传入 `codegen_matmul=True` 后，矩阵乘和 bias 也会生成自定义 Metal kernel：
 
 ```python
 result = compile_callable(fn, example_inputs, codegen_matmul=True)
@@ -73,11 +75,13 @@ pip install -e '.[dev]'
 python -m pytest -q
 python examples/mlp.py
 python examples/metal_mlp.py
+python examples/softmax.py
 python examples/metal_matmul_benchmark.py
 ```
 
 - `examples/mlp.py` 使用 MLX matmul 和生成的 pointwise kernel，矩阵规模更接近实际 MLP。
 - `examples/metal_mlp.py` 使用小矩阵开启 `codegen_matmul=True`，完整验证 FX、IR、自定义 MSL matmul、融合 pointwise 和 runtime。
+- `examples/softmax.py` 用超过 256 列的输入验证 Metal threadgroup max/sum reduction。
 - `examples/metal_matmul_benchmark.py` 对比寄存器 tiled kernel 与 MLX matmul，并检查 PyTorch CPU 数值误差。
 
 示例会打印生成的 MSL 或 kernel 类型。首次执行包含 MLX kernel JIT 和 GPU dispatch，耗时不能当作 steady-state 性能。
@@ -109,7 +113,7 @@ output = result.plan(*inputs)[0]
 mx.eval(output)
 ```
 
-编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前不支持动态 shape、控制流、自动微分、reduction、layout pass、kernel cache 和训练。
+编译结果是静态的：shape 和 dtype 来自 `example_inputs`，运行时必须匹配。当前 reduction 只覆盖最后一维 softmax，不支持动态 shape、控制流、自动微分、任意轴 reduction、normalization、layout pass、kernel cache 和训练。
 
 精确 GELU 的 `erf` 使用 kernel header 中的数值近似，误差在测试覆盖范围内低于 `1e-6`。模型精度要求更高时应重新评估这个实现。
 
