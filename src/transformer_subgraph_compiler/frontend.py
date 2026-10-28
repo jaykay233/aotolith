@@ -10,6 +10,7 @@ _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
     "aten.bmm.default": "matmul",
     "aten.addmm.default": "addmm",
+    "aten.baddbmm.default": "addmm",
     "aten.view.default": "reshape",
     "aten._unsafe_view.default": "reshape",
     "aten.reshape.default": "reshape",

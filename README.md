@@ -17,7 +17,7 @@ PyTorch FX
 
 | 类别 | 节点 |
 |---|---|
-| 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm` |
+| 矩阵乘 | `aten.mm`、`aten.bmm`、`aten.addmm`、`aten.baddbmm` |
 | Embedding | `aten.embedding.default`，支持 `int32/int64` token id，并由 MLX gather 执行 |
 | 视图、布局与 dtype | `view`、`reshape`、`transpose`、`permute`、`expand`、`slice`、`flip`、`roll`、`split`、`chunk`、`unbind`、`unsqueeze`、`squeeze`、`clone`、`alias`、`_to_copy` |
 | 张量组合 | `aten.cat.default`；`aten.stack.default` 展开为 `unsqueeze + cat`，校验输入 shape/dtype 后交给 MLX |

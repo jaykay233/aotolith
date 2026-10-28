@@ -2229,6 +2229,30 @@ def test_metal_matmul_and_addmm_codegen() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("codegen_matmul", [False, True])
+def test_baddbmm_matches_pytorch_with_broadcast_batches(codegen_matmul) -> None:
+    def fn(bias, left, right):
+        return torch.baddbmm(bias, left, right, beta=0.25, alpha=-1.5)
+
+    torch.manual_seed(12)
+    inputs = (
+        torch.randn(1, 2, 4),
+        torch.randn(3, 2, 5),
+        torch.randn(3, 5, 4),
+    )
+    result = compile_callable(fn, inputs, codegen_matmul=codegen_matmul)
+    assert [op.op for op in result.lowered_graph.ops] == ["addmm"]
+    expected_kind = "addmm" if codegen_matmul else None
+    assert [kernel.kind for kernel in result.plan.kernels] == (
+        [expected_kind] if expected_kind is not None else []
+    )
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
 def test_full_mlp_can_use_only_generated_metal_kernels() -> None:
     def mlp(x, gate_w, up_w, down_w):
         gate = x @ gate_w

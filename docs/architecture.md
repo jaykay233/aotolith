@@ -13,6 +13,7 @@
 | `aten.mm.default` | `matmul` |
 | `aten.bmm.default` | `matmul` |
 | `aten.addmm.default` | `addmm` |
+| `aten.baddbmm.default` | `addmm`，batch 维按 broadcasting 语义执行 |
 | `aten.embedding.default` | `embedding` |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
