@@ -1,3 +1,15 @@
-from .apple_metal import AppleMetalBackend, CompiledPlan, KernelArtifact
+from .apple_metal import (
+    AppleMetalBackend,
+    ArenaAssignment,
+    CompiledPlan,
+    ExecutionStats,
+    KernelArtifact,
+)
 
-__all__ = ["AppleMetalBackend", "CompiledPlan", "KernelArtifact"]
+__all__ = [
+    "AppleMetalBackend",
+    "ArenaAssignment",
+    "CompiledPlan",
+    "ExecutionStats",
+    "KernelArtifact",
+]

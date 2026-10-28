@@ -1,10 +1,10 @@
 # 架构
 
-当前实现是一条最小但可运行的 Apple Metal 模型编译链。项目定位是模型编译器，不是推理引擎：它负责把 Transformer 计算图转换为带 ABI 的执行计划，不负责请求调度、cache 分配、采样策略或 serving。静态、多层 decoder-only forward 和固定容量静态 KV Cache 的 prefill/decode 已经有端到端验证；MLX 在这里既是回退算子提供者，也是编译结果的验证执行底座。
+当前实现是一条可运行的 Apple Metal 模型编译链。项目负责把 Transformer 计算图转换为带 ABI 的执行计划；请求调度、cache 分配、采样策略和 serving 留在外部运行时。静态、多层 decoder-only forward 和固定容量静态 KV Cache 的 prefill/decode 已经有端到端验证。MLX 在这里提供回退算子，也承担编译结果的数值验证执行。
 
 ## 0. 目标与边界
 
-项目的唯一主目标是构建一个 PyTorch Transformer 模型编译器。输入是模型、state 和静态 input spec，输出是版本化、自包含、可重新加载的编译产物。编译产物描述模型计算的 ABI、IR、权重布局、内存计划、backend plan 和 kernel；请求级控制流留在外部推理系统。
+项目目标是构建一个 PyTorch Transformer 模型编译器。输入是模型、state 和静态 input spec，输出是版本化、自包含、可重新加载的编译产物。编译产物描述模型计算的 ABI、IR、权重布局、内存计划、backend plan 和 kernel；请求级控制流留在外部推理系统。
 
 编译器负责：
 
@@ -13,14 +13,14 @@
 - 常量折叠、DCE、CSE、布局传播、算子融合
 - liveness、buffer planning 和静态内存复用
 - backend capability 查询、kernel selection、Metal codegen、fallback 和 autotune
-- manifest、产物版本、序列化/反序列化、跨进程 kernel cache
+- manifest、产物版本、序列化/反序列化、跨进程加载和 kernel 重建
 - 数值对齐、可复现性和编译产物兼容性验证
 
 目标按三个验收门推进：
 
-1. **模型前端**：tiny Llama/Qwen 风格 `nn.Module` 可以直接编译；logits 与 PyTorch 对齐；编译计划不持有或依赖原始 Python 模型对象。
-2. **编译产物**：manifest、图、ABI、权重布局和 kernel 可以落盘，并在新进程中重新加载；版本不兼容时明确失败；同一输入和 compiler version 产生可复现结果。
-3. **编译器质量**：可以查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 的数值行为一致；autotune 保存 profile 依据和最终选择。
+1. 模型前端：tiny Llama/Qwen 风格 `nn.Module` 可以直接编译；logits 与 PyTorch 对齐；编译计划不持有或依赖原始 Python 模型对象。
+2. 编译产物：manifest、图、ABI、权重布局和 kernel 可以落盘，并在新进程中重新加载；版本不兼容时明确失败；同一输入和 compiler version 产生可复现结果。
+3. 编译器质量：可以查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 的数值行为一致；autotune 保存 profile 依据和最终选择。
 
 请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 由外部推理系统负责。EP/MoE 的 rank 放置、expert dispatch、EPLB、通信调度和负载均衡也不是编译器职责；编译器只表达 MoE 计算和静态布局契约。
 
@@ -34,7 +34,7 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 
 HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 尚未提升为图输入，当前只接受可被 tracing 捕获的静态关键字参数。
 
-两周层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
+两层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 
 前端当前处理以下 FX target 和折叠模式：
 
@@ -427,20 +427,42 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 
-backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 kernel name、input/output 参数名、MSL source 和 header 组成，容量为 256。它只避免同一 Python 进程内重复构造相同 kernel，不是跨进程磁盘缓存；MLX 自身的编译缓存行为不由这里控制。
+backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 kernel name、input/output 参数名、MSL source 和 header 组成，容量为 256。该 cache 只避免同一 Python 进程内重复构造相同 kernel，不提供跨进程磁盘缓存。MLX 自身的编译缓存行为不由这里控制。
 
 ### 静态 KV Cache 生成
 
-`examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。这个例子用于验证 KV Cache 的图 ABI，不是编译器提供的生成运行时。batch 和 cache shape 固定，但每个 batch row 可以通过 mask 和 position 使用不同的有效长度。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
+`examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。这个例子用于验证 KV Cache 的图 ABI；生成循环仍由示例代码提供。batch 和 cache shape 固定，但每个 batch row 可以通过 mask 和 position 使用不同的有效长度。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
 
 - prefill 图接收左侧 padding 的 prompt token、RoPE position、逐请求 bool mask，以及模型权重；它把 padded prompt 的 K/V 右对齐写入固定容量 cache。对应的 mask 为 `[B, 1, prompt_len, capacity]`，padding query 被整行 mask，每个有效 query 只能看到本请求有效区域中的 causal prefix。
 - decode 图接收每行一个 token、各自当前位置、`[B, 1, 1, capacity]` mask、每层旧 cache 和权重；它沿 sequence 维把 cache 左移一格，在末尾拼接当前 token 的 K/V，再返回 logits 和全部更新后的 cache。
 - RoPE position 通过 `F.embedding` 从静态 cos/sin 表选行。这个操作已经能被现有 embedding lowering 执行，不需要新增 cache 专用算子。
 - 测试覆盖 `B=1` 和左侧 padding 的 `B=2`，第二个请求的有效 prompt 更短。连续三步 decode 会逐请求对照完整序列 forward 的 logits 和贪心 token，验证 padding、mask、position 和 cache 更新没有改变模型语义。
 
-这个实现特意选择容易验证的布局，不是性能路径。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
+这个实现优先保证布局容易验证。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
 
-## 14. 已知边界
+## 14. 编译产物、校验与加载
+
+`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.tsca` archive。当前 archive 使用 format version 3、ABI version 1.2，包含：
+
+| 文件 | 内容 |
+|---|---|
+| `manifest.json` | format/ABI/compiler version、target、entrypoint、compile options、device profile、payload 路径和 digest |
+| `input_graph.json` | FX 捕获后、优化前的 typed SSA IR |
+| `lowered_graph.json` | legalization、layout folding、fusion、CSE 之后的 IR |
+| `kernels.json` | 生成 kernel 的名称、MSL source/header、输入输出和 tensor type |
+| `selections.json` | 每个 lowered op 的实现、fallback 原因、autotune benchmark samples 和最终选择 |
+| `storage_plan.json` | live interval、slot、release point、峰值活跃字节和 arena 大小 |
+| `state/*.bin` | module 参数和 buffer 的 MLX 原始字节，每个 state entry 记录名称、shape、dtype、nbytes 和 digest |
+
+两张图、kernel table、selection table、storage plan 和每个 state tensor 都使用 SHA-256 digest。`read_artifact_manifest()` 只校验 manifest 中的格式、ABI、target 和可选 device profile；`load_compiled_module()` 还会读取并校验全部 payload，反序列化 IR，检查入口的 public input/state 布局，再根据 lowered graph 和已保存的 selection 重建 kernel。
+
+加载时使用 `autotune=False` 和 `selection_overrides`。这样可以验证序列化 selection 仍与当前 backend 的可重建 plan 一致，同时不重新执行 benchmark。校验内容包括 kernel artifact、selection key、storage plan、state shape/dtype 和 graph inputs/outputs；任一不匹配都会抛出 `ArtifactCompatibilityError`。
+
+默认允许 artifact 在其他 Apple Silicon GPU 上加载，因为 Metal kernel 会从受校验的图和 MSL source 重新构建。`require_device_match=True` 会同时比较编译时和当前设备的 `device_name`、`architecture`，用于必须绑定特定 GPU 型号的场景。当前 target 只有 `apple-metal`。
+
+CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest，`verify` 完整重建并校验 artifact，`run` 加载 artifact 并写出 JSON 结果。Python API 与 CLI 使用同一个 loader。
+
+## 15. 已知边界
 
 - 只支持静态、非空 shape
 - 不支持动态 shape、控制流和 list/dict 输出；常量生成支持 `scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 的 float/bool/I32/I64 输出
@@ -453,24 +475,25 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
-- kernel cache 仅限当前进程，没有跨进程磁盘缓存或 autotune
-- matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP、split-K 或 autotune
+- `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
+- matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP 或 split-K
 - 没有反向传播和训练支持
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；64-key tile 仅在同样条件成立时使用 8/16 元素向量加载，不满足条件的单个阶段回退到标量路径
-- attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择，还没有按实际 GPU 和 profile 做运行时 autotune
+- attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择；autotune 当前比较 op 级别的 Metal/MLX 实现，还没有搜索 tile 参数
+- 共享 parameter storage alias 现在按多个 state entry 序列化；数值正确，但尚未在 state ABI 中去重或保留 alias 关系
+- 当前 artifact target 只有 `apple-metal`，没有跨厂商 target 或 host runtime ABI
 - NVIDIA Triton/CUDA backend 尚未实现
 
-## 15. 编译器路线
+## 16. 编译器路线
 
-模型前端已经打通 tiny Llama/Qwen 风格的 `nn.Module` 编译、参数与 buffer 绑定以及 logits 对齐。后续工作按编译产物链条推进：
+模型前端、静态内存复用、kernel selection、autotune 和 artifact 加载链已经打通。后续工作集中在 ABI 完整性和编译器质量：
 
-1. 增加 liveness 分析、buffer planning 和可检查的静态内存计划。
-2. 建立 backend capability table 和 kernel selection，记录原生 kernel、MLX fallback 及选择原因。
-3. 定义稳定 ABI 和版本化 manifest，把图、权重布局、内存计划、backend plan 和 kernel 序列化到磁盘。
-4. 实现产物加载器，在新进程中恢复执行，并对版本、dtype、shape 和 backend 不兼容明确报错。
-5. 加入 profile 驱动的 autotune，保存候选 kernel、测量结果和最终选择。
-6. 扩展真实模型覆盖与性能回归；符号 shape、控制流和其他 backend 在核心产物链稳定后继续推进。
+1. 在 state ABI 中保留共享 storage alias，并验证 alias 与 buffer lifetime 的组合。
+2. 增加符号 shape 和有限控制流，同时保留静态 shape 路径的严格 verifier。
+3. 把 op 级 autotune 扩展成 shape-aware backend policy，生成可复现的 benchmark report。
+4. 改进原生 matmul、attention 的 tile 和流水，扩大真实模型、dtype、算子与 Apple GPU 覆盖。
+5. 在核心 ABI 稳定后增加其他 backend；当前不为跨厂商兼容性做推测性抽象。

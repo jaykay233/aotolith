@@ -73,6 +73,17 @@ def test_repeated_compilation_reuses_identical_metal_kernel() -> None:
         assert mx.allclose(actual, expected)
 
 
+def test_scalar_tensor_input_is_loaded_without_indexing() -> None:
+    value = torch.randn(2, 3)
+    scale = torch.tensor(2.5)
+    compiled = compile_callable(lambda left, right: left * right + 1.0, (value, scale))
+
+    actual = compiled.plan(mx.array(value.numpy()), mx.array(scale.numpy()))[0]
+    expected = mx.array((value * scale + 1.0).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected)
+
+
 def test_mlp_end_to_end_on_metal() -> None:
     def mlp(x, gate_w, up_w, down_w):
         gate = x @ gate_w

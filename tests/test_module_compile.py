@@ -7,7 +7,7 @@ import mlx.core as mx
 import pytest
 import torch
 
-from transformer_subgraph_compiler import compile_module
+from transformer_subgraph_compiler import compile_callable, compile_module
 
 
 def test_compile_module_binds_state_and_does_not_retain_module() -> None:
@@ -41,6 +41,34 @@ def test_compile_module_binds_state_and_does_not_retain_module() -> None:
     actual = compiled(value)[0]
     mx.eval(actual)
     assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-3, rtol=1e-4)
+
+
+def test_compile_module_binds_registered_buffer_and_does_not_retain_module() -> None:
+    class BufferModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "offset", torch.arange(4, dtype=torch.float32)
+            )
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value + self.offset
+
+    module = BufferModule().eval()
+    value = torch.ones(2, 4)
+    expected = module(value)
+    module_ref = weakref.ref(module)
+
+    compiled = compile_module(module, (value,))
+    assert compiled.state_names == ("offset",)
+
+    del module
+    gc.collect()
+    assert module_ref() is None
+
+    actual = compiled(value)[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array(expected.numpy()))
 
 
 def test_compile_module_supports_cumsum_and_multi_axis_indexing() -> None:
@@ -86,6 +114,16 @@ def test_inplace_add_is_legalized_when_unobserved() -> None:
     actual = compiled()[0]
     mx.eval(actual)
     assert mx.array_equal(actual, mx.array(expected.numpy()))
+
+
+def test_inplace_add_rejects_aliasing_observer() -> None:
+    def forward(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        observed = value + 1
+        value.add_(1)
+        return observed, value
+
+    with pytest.raises(NotImplementedError, match="aliasing observers"):
+        compile_callable(forward, (torch.arange(5, dtype=torch.float32),))
 
 
 def test_tiny_huggingface_llama_logits_match_pytorch() -> None:

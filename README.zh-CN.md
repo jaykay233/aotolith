@@ -12,13 +12,13 @@
 Transformer Subgraph Compiler 把 PyTorch 模型捕获成 FX 图，经过带类型和 shape 的 SSA IR，生成由 Metal kernel 和 MLX fallback 共同执行的计算计划。
 
 > [!IMPORTANT]
-> 这是一个模型编译器，不是推理引擎。请求调度、continuous batching、分页 KV 分配、采样、分布式执行和 serving 由外部运行时负责。
+> 这个项目编译 Transformer 模型计算。请求调度、continuous batching、分页 KV 分配、采样、分布式执行和 serving 由外部运行时负责。
 
 ## 为什么做这个项目
 
 主流 Transformer 编译栈大多围绕 CUDA 和成熟的 NVIDIA kernel 生态构建。这个项目走另一条路：保留与后端无关的图 IR，再把模型计算原生编译到 Apple Silicon，而不是直接把 MLX 当成完整运行时。
 
-编译器负责图捕获、合法化、布局简化、算子融合、公共子表达式消除、tensor 生命周期分析、kernel selection 和 Metal code generation。MLX 提供可靠的 fallback，并在原生覆盖范围扩大前作为数值执行基线。
+编译器负责图捕获、合法化、布局简化、算子融合、公共子表达式消除、tensor 生命周期分析、kernel selection 和 Metal code generation。MLX 提供 fallback 算子，并在原生覆盖范围扩大前作为数值执行基线。
 
 ## 当前状态
 
@@ -28,10 +28,10 @@ Transformer Subgraph Compiler 把 PyTorch 模型捕获成 FX 图，经过带类�
 |---|---|
 | PyTorch 前端 | 可编译静态 shape 的 callable 和 `nn.Module`；模型参数与 buffer 会绑定到执行计划 |
 | 图编译器 | 使用 typed SSA IR，支持 shape/dtype 校验、合法化、布局折叠、融合和 CSE |
-| 存储规划 | 已生成 live interval、释放点、峰值活跃字节和可复用逻辑 buffer slot |
+| 存储规划 | 已生成 live interval、释放点、峰值活跃字节和可复用 buffer slot，执行时使用真实 arena |
 | Kernel 选择 | 为每个 lowered op 记录原生 Metal 或 MLX 实现，以及 fallback 原因 |
-| 编译产物 | 目前只有进程内 `CompiledPlan`；版本化落盘和跨进程重载尚未实现 |
-| Autotune | 尚无 profile 驱动的调优；自定义 matmul 和 attention kernel 默认关闭 |
+| 编译产物 | 版本化 `.tsca` archive 包含图、kernel、selection、storage metadata 和模型 state，可在新进程加载执行 |
+| Autotune | 可选的 profile 流程会测量原生 kernel 和 MLX 候选，测量结果与最终选择写入 artifact |
 
 当前回归用例把两层 HuggingFace Llama 从 220 个 FX 算子降到 136 个 lowered op，logits 相对 PyTorch 参考实现的最大绝对误差为 `8.941e-08`。释放原始 module 后，编译计划仍可执行。
 
@@ -54,8 +54,10 @@ Kernel selection / fallback planning
         ▼
 CompiledPlan
         │
+        ├── save：manifest + 图 + kernel + selection + state
+        │
         ▼
-Apple GPU
+版本化 artifact → 重新加载并构建 kernel → Apple GPU
 ```
 
 ## 环境要求
@@ -148,6 +150,46 @@ logits = compiled(input_ids)[0]
 mx.eval(logits)
 ```
 
+### 命令行与编译产物
+
+安装后可以用 `tsc` 编译 callable、module 或 HuggingFace 模型。产物也可以在不导入原始模型的情况下检查和执行。
+
+```bash
+tsc compile \
+  --module 'my_module:build_model' \
+  --input-file inputs.json \
+  --output model.tsca \
+  --codegen-matmul \
+  --autotune
+
+tsc inspect model.tsca
+tsc verify model.tsca --require-device-match
+tsc run model.tsca --input-file inputs.json --output outputs.json
+```
+
+`inputs.json` 是按位置排列的 tensor 规格。标量使用空 shape 和单元素 data：
+
+```json
+[
+  {
+    "shape": [1, 4],
+    "dtype": "int64",
+    "data": [[1, 2, 3, 4]]
+  },
+  {
+    "shape": [],
+    "dtype": "float32",
+    "data": [1.0]
+  }
+]
+```
+
+也可以重复传入 `--input '<json>'`，不写输入文件。`--callable MODULE:ATTR` 捕获函数，`--module MODULE:ATTR` 接受 `nn.Module`、类或 factory，`--hf-model` 加载 HuggingFace causal language model。console script 不在 `PATH` 时，用 `python -m transformer_subgraph_compiler` 执行相同命令。
+
+artifact 使用 format version 3 和 ABI version 1.2。两张图、kernel table、selection table、storage plan 和每个 state tensor 都有 SHA-256 digest。加载时会校验 ABI、target、图、入口布局、state shape/dtype、序列化 kernel、重新构建的 selection 和 storage plan。kernel 根据校验后的图和已保存的 selection 重建，因此 artifact 不需要原始 Python 模型，加载时也不会重新 autotune。
+
+是否要求 GPU 完全相同由调用方决定。`--require-device-match` 或 `require_device_match=True` 会拒绝为其他 Apple GPU 型号编译的 artifact；默认允许在其他 Apple Silicon 设备上重新构建 kernel 后执行。
+
 ## 原生 Metal Code Generation
 
 pointwise、softmax、reduction、LayerNorm 和 RMSNorm 默认生成 Metal kernel。matmul 和 attention 默认使用 MLX，开启下面的选项后才生成原生 kernel：
@@ -181,9 +223,9 @@ compiled = compile_callable(
 
 - shape 和 dtype 在编译期固定，不支持动态 shape、符号维度和控制流。
 - tensor-valued keyword arguments 目前不会提升为图输入。
-- 执行计划只在当前进程可用，没有稳定 ABI、磁盘 kernel artifact 或跨进程重载。
-- 存储规划目前只有元数据，逻辑 buffer slot 尚未绑定到物理 arena。
-- kernel selection 没有 autotune，也不会持久化 profile 数据。
+- 共享参数 storage alias 目前会按多个 state entry 序列化。数值结果不受影响，但 artifact 还没有去重这些 aliased storage。
+- artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
+- 原生 kernel 的覆盖和性能仍弱于 MLX。当前自定义 matmul、attention 不保证更快，因此 `codegen_matmul` 和 `codegen_attention` 默认关闭。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。
 - 仓库不实现 scheduler、continuous batching、抢占、paged KV cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch、EPLB 或 serving API。
 - 不支持训练和 autograd。
@@ -208,12 +250,10 @@ python examples/metal_attention_benchmark.py
 
 ## Roadmap
 
-1. 定义稳定 ABI 和版本化 manifest，描述图输入输出、state layout 和 kernel metadata。
-2. 把图、存储计划、kernel artifact 和编译选项序列化到磁盘。
-3. 在没有原始 Python 模型的新进程中加载并执行编译产物。
-4. 把逻辑存储 slot 绑定到物理 arena，并验证 alias 和生命周期行为。
-5. 增加 profile 驱动的 kernel autotune，持久化候选和测量结果。
-6. 扩展模型、dtype、算子和 GPU 覆盖，同时继续以 PyTorch 数值对齐作为验收条件。
+1. 在 state ABI 中保留共享 storage alias，而不是重复序列化相同参数的视图。
+2. 增加符号 shape 和有限控制流，同时保留静态 shape 的严格校验。
+3. 把逐 op autotune 扩展成 shape-aware backend policy 和可复现 benchmark report。
+4. 提升原生 matmul、attention 的性能，再扩展模型、dtype、算子和 GPU 覆盖；PyTorch 数值对齐仍是验收条件。
 
 ## 仓库结构
 

@@ -12,13 +12,13 @@ An experimental Transformer model compiler with native Apple Silicon and Metal s
 Transformer Subgraph Compiler captures PyTorch models as FX graphs, lowers them through a typed SSA IR, and produces an executable plan backed by generated Metal kernels and MLX fallbacks.
 
 > [!IMPORTANT]
-> This is a model compiler, not an inference engine. Request scheduling, continuous batching, paged KV allocation, sampling, distributed execution, and serving belong to the host runtime.
+> This project compiles Transformer model computation. Request scheduling, continuous batching, paged KV allocation, sampling, distributed execution, and serving belong to the host runtime.
 
 ## Why This Project
 
 Most Transformer compiler work is built around CUDA and mature NVIDIA kernel ecosystems. This project explores a separate path: keep a backend-independent graph IR, then compile model computation natively for Apple Silicon instead of treating MLX as the whole runtime.
 
-The compiler owns graph capture, legalization, layout simplification, operator fusion, common-subexpression elimination, tensor lifetime analysis, kernel selection, and Metal code generation. MLX provides a reliable fallback and serves as the numerical execution baseline while native coverage grows.
+The compiler owns graph capture, legalization, layout simplification, operator fusion, common-subexpression elimination, tensor lifetime analysis, kernel selection, and Metal code generation. MLX supplies fallback operations and the numerical execution baseline while native coverage grows.
 
 ## Status
 
@@ -28,10 +28,10 @@ The project is usable for static, end-to-end Transformer experiments. It is not 
 |---|---|
 | PyTorch frontend | Compiles static-shape callables and `nn.Module` instances; model parameters and buffers are bound into the plan |
 | Graph compiler | Typed SSA IR with shape/dtype checks, legalization, layout folding, fusion, and CSE |
-| Storage planning | Computes live intervals, release points, peak live bytes, and reusable logical buffer slots |
+| Storage planning | Computes live intervals, release points, peak live bytes, reusable buffer slots, and a real arena used during execution |
 | Kernel selection | Records a native Metal or MLX implementation and fallback reason for every lowered operation |
-| Executable artifact | Available in-process as `CompiledPlan`; versioned on-disk artifacts and cross-process reload are not implemented |
-| Autotuning | No profile-driven tuning yet; custom matmul and attention kernels are opt-in |
+| Executable artifact | Versioned `.tsca` archives contain graphs, kernels, selections, storage metadata, and module state; they load and execute in a fresh process |
+| Autotuning | Opt-in profiling measures native and MLX candidates; measurements and the final selection are stored in the artifact |
 
 The current regression compiles a two-layer HuggingFace Llama from 220 FX operations to 136 lowered operations. Its logits match a PyTorch reference with maximum absolute error `8.941e-08`, and the compiled plan remains executable after the original module is released.
 
@@ -54,8 +54,10 @@ Kernel selection / fallback planning
         ▼
 CompiledPlan
         │
+        ├── save: manifest + graphs + kernels + selections + state
+        │
         ▼
-Apple GPU
+Versioned artifact → reload and rebuild kernels → Apple GPU
 ```
 
 ## Requirements
@@ -148,6 +150,46 @@ logits = compiled(input_ids)[0]
 mx.eval(logits)
 ```
 
+### Command Line And Artifacts
+
+The installed `tsc` command compiles a callable, module, or HuggingFace model. It can also inspect or execute the result without importing the original model.
+
+```bash
+tsc compile \
+  --module 'my_module:build_model' \
+  --input-file inputs.json \
+  --output model.tsca \
+  --codegen-matmul \
+  --autotune
+
+tsc inspect model.tsca
+tsc verify model.tsca --require-device-match
+tsc run model.tsca --input-file inputs.json --output outputs.json
+```
+
+`inputs.json` contains positional tensor specifications. Scalars use an empty shape and a one-element data list:
+
+```json
+[
+  {
+    "shape": [1, 4],
+    "dtype": "int64",
+    "data": [[1, 2, 3, 4]]
+  },
+  {
+    "shape": [],
+    "dtype": "float32",
+    "data": [1.0]
+  }
+]
+```
+
+Use repeated `--input '<json>'` arguments instead of `--input-file` when convenient. `--callable MODULE:ATTR` traces a function, `--module MODULE:ATTR` accepts an `nn.Module`, class, or factory, and `--hf-model` loads a HuggingFace causal language model. `python -m transformer_subgraph_compiler` provides the same commands when the console script is not on `PATH`.
+
+Artifacts use format version 3 and ABI version 1.2. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
+
+Strict GPU matching is optional. `--require-device-match` or `require_device_match=True` rejects an artifact compiled for another Apple GPU model; the default allows execution on another Apple Silicon device after rebuilding kernels.
+
 ## Native Metal Code Generation
 
 Pointwise operations, softmax, reductions, LayerNorm, and RMSNorm generate Metal kernels by default. Matmul and attention use MLX unless native code generation is enabled:
@@ -181,9 +223,9 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 
 - Shapes and dtypes are fixed at compile time. Dynamic shapes, symbolic dimensions, and control flow are not supported.
 - Tensor-valued keyword arguments are not graph inputs yet.
-- The executable plan is process-local. There is no stable serialized ABI, on-disk kernel artifact, or cross-process reload.
-- Storage planning is metadata-only. Logical buffer slots are not yet bound to a physical arena.
-- Kernel selection is not autotuned and does not persist profile data.
+- Shared parameter storage aliases are currently serialized as separate state entries. Correctness is preserved, but the artifact does not yet deduplicate aliased storage.
+- The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
+- Native kernel coverage and performance remain narrower than MLX. `codegen_matmul` and `codegen_attention` are opt-in because the current custom kernels are not consistently faster.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
 - The repository does not implement scheduler, continuous batching, preemption, paged KV cache, prefix cache, sampling policies, PD disaggregation, EP/MoE dispatch, EPLB, or serving APIs.
 - Training and autograd are out of scope.
@@ -208,12 +250,10 @@ First execution includes MLX kernel JIT compilation and GPU dispatch. Timing fro
 
 ## Roadmap
 
-1. Define a stable ABI and versioned manifest for graph inputs, outputs, state layout, and kernel metadata.
-2. Serialize the graph, storage plan, kernel artifacts, and compile options to disk.
-3. Reload and execute the artifact in a fresh process without the original Python model.
-4. Bind logical storage slots to a physical arena and validate alias/lifetime behavior.
-5. Add profile-driven kernel autotuning with persisted candidates and measurements.
-6. Expand model, dtype, operator, and GPU coverage while keeping PyTorch parity tests as the acceptance gate.
+1. Preserve shared storage aliases in the state ABI instead of serializing duplicate parameter views.
+2. Add symbolic shapes and limited control flow without weakening static-shape validation.
+3. Expand autotuning from per-op candidate timing to shape-aware backend policies and reproducible benchmark reports.
+4. Improve native matmul and attention performance, then broaden model, dtype, operator, and GPU coverage while keeping PyTorch parity as the acceptance gate.
 
 ## Repository Layout
 

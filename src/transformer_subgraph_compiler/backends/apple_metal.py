@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import textwrap
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil, isfinite, isinf, isnan, prod
+from statistics import median
 from typing import Any
 
 import mlx.core as mx
 
 from ..ir import DType, Graph, Operation, TensorType
 from ..planning import StoragePlan, plan_storage
-from ..selection import KernelSelection
+from ..selection import KernelBenchmark, KernelSelection
 from ..passes import LAYOUT_OPS, POINTWISE_OPS
 
 _MLX_DTYPES = {
@@ -77,6 +80,8 @@ _MATMUL_BLOCK_REDUCTION = 32
 _METAL_KERNEL_CACHE_SIZE = 256
 _ATTENTION_MAX_SHARED_BYTES = 31 * 1024
 _ATTENTION_LONG_SEQUENCE_THRESHOLD = 768
+_AUTOTUNE_WARMUP = 2
+_AUTOTUNE_ITERATIONS = 7
 
 _MSL_HEADER = """
 inline float tsc_erf(float value) {
@@ -287,6 +292,202 @@ def _check_advanced_index_indices(indices: mx.array, upper_bound: int) -> None:
         raise IndexError("index out of range in self")
 
 
+def _tensor_nbytes(tensor_type: TensorType) -> int:
+    itemsize = {
+        DType.F16: 2,
+        DType.BF16: 2,
+        DType.F32: 4,
+        DType.BOOL: 1,
+        DType.I32: 4,
+        DType.I64: 8,
+    }[tensor_type.dtype]
+    return prod(tensor_type.shape) * itemsize
+
+
+def _evaluate_mlx_op(
+    graph: Graph, op: Operation, env: dict[str, mx.array]
+) -> mx.array:
+    """Evaluate one IR operation with MLX fallback semantics."""
+
+    if op.op == "fused_elementwise":
+        body = op.attrs.get("body")
+        if not isinstance(body, tuple) or not all(
+            isinstance(item, Operation) for item in body
+        ):
+            raise ValueError(
+                "fused_elementwise body must be a tuple of operations"
+            )
+        body_env = dict(env)
+        for item in body:
+            body_env[item.outputs[0]] = _evaluate_mlx_op(
+                graph, item, body_env
+            )
+        return body_env[op.outputs[0]]
+    if op.op == "attention":
+        return _evaluate_attention_mlx(op, env)
+    if op.op == "embedding":
+        weight, indices = (env[value_id] for value_id in op.inputs)
+        return _mlx_take_checked(weight, indices, axis=0)
+    if op.op == "index_select":
+        source, indices = (env[value_id] for value_id in op.inputs)
+        return _mlx_take_checked(source, indices, axis=int(op.attrs["dim"]))
+    if op.op == "index":
+        source = env[op.inputs[0]]
+        indices = tuple(env[value_id] for value_id in op.inputs[1:])
+        axes = tuple(int(axis) for axis in op.attrs["axes"])
+        for axis, index in zip(axes, indices, strict=True):
+            _check_advanced_index_indices(index, source.shape[axis])
+        indexing = (slice(None),) * axes[0] + indices
+        return source[indexing]
+    if op.op == "gather":
+        source, indices = (env[value_id] for value_id in op.inputs)
+        axis = int(op.attrs["dim"])
+        _check_take_indices(indices, source.shape[axis])
+        source_slices = [
+            slice(0, indices.shape[dim]) if dim != axis else slice(None)
+            for dim in range(len(source.shape))
+        ]
+        return mx.take_along_axis(
+            source[tuple(source_slices)], indices, axis=axis
+        )
+    if op.op == "scatter":
+        source, indices = (env[value_id] for value_id in op.inputs[:2])
+        axis = int(op.attrs["dim"])
+        _check_take_indices(indices, source.shape[axis])
+        values = (
+            mx.array(op.attrs["value"], dtype=source.dtype)
+            if len(op.inputs) == 2
+            else env[op.inputs[2]]
+        )
+        if len(op.inputs) == 3:
+            values = values[tuple(slice(0, size) for size in indices.shape)]
+        source_slices = [
+            slice(0, indices.shape[dim]) if dim != axis else slice(None)
+            for dim in range(len(source.shape))
+        ]
+        slices = tuple(source_slices)
+        updated = mx.put_along_axis(
+            source[slices], indices, values, axis=axis
+        )
+        output = mx.array(source)
+        output[slices] = updated
+        return output
+    if op.op == "cumsum":
+        axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
+        value = mx.cumsum(env[op.inputs[0]], axis=axis)
+        output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        return value.astype(output_dtype)
+    if op.op == "cast":
+        return env[op.inputs[0]].astype(
+            _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        )
+    if op.op in {"triu", "tril"}:
+        operation = mx.triu if op.op == "triu" else mx.tril
+        return operation(env[op.inputs[0]], int(op.attrs["diagonal"]))
+    if op.op == "cat":
+        rank = len(env[op.inputs[0]].shape)
+        axis = int(op.attrs["dim"]) % rank
+        return mx.concatenate(
+            [env[value_id] for value_id in op.inputs], axis=axis
+        )
+    if op.op in LAYOUT_OPS:
+        return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
+    if op.op == "matmul":
+        left, right = (env[value_id] for value_id in op.inputs)
+        if op.attrs.get("transpose_a", False):
+            left = mx.swapaxes(left, -1, -2)
+        if op.attrs.get("transpose_b", False):
+            right = mx.swapaxes(right, -1, -2)
+        return mx.matmul(left, right)
+    if op.op == "addmm":
+        bias, left, right = (env[value_id] for value_id in op.inputs)
+        if op.attrs.get("transpose_a", False):
+            left = mx.swapaxes(left, -1, -2)
+        if op.attrs.get("transpose_b", False):
+            right = mx.swapaxes(right, -1, -2)
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+        return beta * bias + alpha * mx.matmul(left, right)
+    return _evaluate_pointwise_mlx(
+        op, env, graph.value(op.outputs[0]).type
+    )
+
+
+def _device_profile() -> tuple[str | None, str | None]:
+    try:
+        info = mx.device_info()
+    except (RuntimeError, ValueError):
+        return None, None
+    return (
+        None if "device_name" not in info else str(info["device_name"]),
+        None
+        if "architecture" not in info
+        else str(info["architecture"]),
+    )
+
+
+def _synthetic_tune_input(tensor_type: TensorType) -> mx.array:
+    dtype = _MLX_DTYPES[tensor_type.dtype]
+    if tensor_type.dtype in {DType.F16, DType.BF16, DType.F32}:
+        return mx.full(tensor_type.shape, 0.25, dtype=dtype)
+    if tensor_type.dtype == DType.BOOL:
+        return mx.ones(tensor_type.shape, dtype=dtype)
+    return mx.zeros(tensor_type.shape, dtype=dtype)
+
+
+def _coerce_tune_input(value: Any, tensor_type: TensorType) -> mx.array:
+    if isinstance(value, mx.array):
+        array = value
+    else:
+        if hasattr(value, "detach") and hasattr(value, "cpu"):
+            host_value = value.detach().cpu()
+            if str(host_value.dtype) == "torch.bfloat16":
+                host_value = host_value.float()
+            array = mx.array(host_value.numpy())
+        else:
+            array = mx.array(value)
+    array = array.astype(_MLX_DTYPES[tensor_type.dtype])
+    if tuple(array.shape) != tensor_type.shape:
+        raise ValueError(
+            f"autotune input has shape {tuple(array.shape)}, "
+            f"expected {tensor_type.shape}"
+        )
+    return array
+
+
+def _outputs_match(
+    actual: mx.array, expected: mx.array, dtype: DType
+) -> bool:
+    if tuple(actual.shape) != tuple(expected.shape) or actual.dtype != expected.dtype:
+        return False
+    if dtype in {DType.BOOL, DType.I32, DType.I64}:
+        result = mx.array_equal(actual, expected)
+    else:
+        # MLX and native kernels can use different accumulation schedules.
+        # Keep the gate aligned with the transformer parity tolerance rather
+        # than rejecting a numerically valid candidate for a few ULPs.
+        atol, rtol = (2e-2, 2e-2)
+        result = mx.allclose(actual, expected, atol=atol, rtol=rtol)
+    mx.eval(result)
+    return bool(result.item())
+
+
+def _time_runtime(
+    runtime: Any,
+    *,
+    warmup_iterations: int,
+    iterations: int,
+) -> tuple[float, ...]:
+    for _ in range(warmup_iterations):
+        mx.eval(runtime())
+    samples: list[float] = []
+    for _ in range(iterations):
+        start = time.perf_counter()
+        mx.eval(runtime())
+        samples.append(time.perf_counter() - start)
+    return tuple(samples)
+
+
 @dataclass(slots=True)
 class CompiledPlan:
     graph: Graph
@@ -296,6 +497,19 @@ class CompiledPlan:
     storage_plan: StoragePlan
 
     def __call__(self, *inputs: Any) -> tuple[mx.array, ...]:
+        outputs, _ = self._execute(inputs, collect_stats=False)
+        return outputs
+
+    def call_with_stats(
+        self, *inputs: Any
+    ) -> tuple[tuple[mx.array, ...], "ExecutionStats"]:
+        """Execute the plan and report how the planned arena was used."""
+
+        return self._execute(inputs, collect_stats=True)
+
+    def _execute(
+        self, inputs: tuple[Any, ...], *, collect_stats: bool
+    ) -> tuple[tuple[mx.array, ...], "ExecutionStats"]:
         if len(inputs) != len(self.graph.inputs):
             raise ValueError(
                 f"expected {len(self.graph.inputs)} inputs, received {len(inputs)}"
@@ -315,109 +529,99 @@ class CompiledPlan:
                 )
             env[value_id] = array
 
+        slot_by_value = {
+            value_id: slot
+            for slot in self.storage_plan.slots
+            for value_id in slot.value_ids
+        }
+        slot_by_id = {slot.slot_id: slot for slot in self.storage_plan.slots}
+        arena = (
+            mx.zeros((self.storage_plan.arena_size_bytes,), dtype=mx.uint8)
+            if self.storage_plan.arena_size_bytes
+            else None
+        )
+        slot_assignments: list[ArenaAssignment] = []
+        assigned_values: dict[int, str] = {}
+
+        def store_result(value_id: str, result: mx.array) -> None:
+            slot = slot_by_value.get(value_id)
+            if slot is None:
+                env[value_id] = result
+                return
+            if arena is None:
+                raise RuntimeError("storage plan assigned a value without an arena")
+
+            value_type = self.graph.value(value_id).type
+            nbytes = _tensor_nbytes(value_type)
+            if nbytes > slot.size_bytes:
+                raise RuntimeError(
+                    f"value {value_id} needs {nbytes} bytes but slot "
+                    f"{slot.slot_id} has {slot.size_bytes}"
+                )
+            raw = mx.view(result.reshape((-1,)), mx.uint8)
+            start = slot.offset_bytes
+            arena[start : start + nbytes] = raw
+            storage = mx.view(
+                arena[start : start + nbytes], _MLX_DTYPES[value_type.dtype]
+            ).reshape(value_type.shape)
+            env[value_id] = storage
+            if collect_stats:
+                previous = assigned_values.get(slot.slot_id)
+                slot_assignments.append(
+                    ArenaAssignment(
+                        value_id=value_id,
+                        slot_id=slot.slot_id,
+                        offset_bytes=slot.offset_bytes,
+                        size_bytes=nbytes,
+                        reused=previous is not None and previous != value_id,
+                    )
+                )
+            assigned_values[slot.slot_id] = value_id
+
         for op_index, op in enumerate(self.graph.ops):
             runtime = self._callables.get(op.outputs[0])
             if runtime is not None:
-                env[op.outputs[0]] = runtime(*(env[value_id] for value_id in op.inputs))
+                result = runtime(*(env[value_id] for value_id in op.inputs))
+                store_result(op.outputs[0], result)
                 for value_id in self.storage_plan.release_after_op[op_index]:
                     env.pop(value_id, None)
                 continue
 
-            if op.op == "attention":
-                env[op.outputs[0]] = _evaluate_attention_mlx(op, env)
-            elif op.op == "embedding":
-                weight, indices = (env[value_id] for value_id in op.inputs)
-                env[op.outputs[0]] = _mlx_take_checked(weight, indices, axis=0)
-            elif op.op == "index_select":
-                source, indices = (env[value_id] for value_id in op.inputs)
-                axis = int(op.attrs["dim"])
-                env[op.outputs[0]] = _mlx_take_checked(source, indices, axis=axis)
-            elif op.op == "index":
-                source = env[op.inputs[0]]
-                indices = tuple(env[value_id] for value_id in op.inputs[1:])
-                axes = tuple(int(axis) for axis in op.attrs["axes"])
-                for axis, index in zip(axes, indices, strict=True):
-                    _check_advanced_index_indices(index, source.shape[axis])
-                indexing = (slice(None),) * axes[0] + indices
-                env[op.outputs[0]] = source[indexing]
-            elif op.op == "gather":
-                source, indices = (env[value_id] for value_id in op.inputs)
-                axis = int(op.attrs["dim"])
-                _check_take_indices(indices, source.shape[axis])
-                source_slices = [
-                    slice(0, indices.shape[dim]) if dim != axis else slice(None)
-                    for dim in range(len(source.shape))
-                ]
-                env[op.outputs[0]] = mx.take_along_axis(
-                    source[tuple(source_slices)], indices, axis=axis
-                )
-            elif op.op == "scatter":
-                source, indices = (env[value_id] for value_id in op.inputs[:2])
-                axis = int(op.attrs["dim"])
-                _check_take_indices(indices, source.shape[axis])
-                values = (
-                    mx.array(op.attrs["value"], dtype=source.dtype)
-                    if len(op.inputs) == 2
-                    else env[op.inputs[2]]
-                )
-                if len(op.inputs) == 3:
-                    values = values[tuple(slice(0, size) for size in indices.shape)]
-                source_slices = [
-                    slice(0, indices.shape[dim]) if dim != axis else slice(None)
-                    for dim in range(len(source.shape))
-                ]
-                slices = tuple(source_slices)
-                updated = mx.put_along_axis(
-                    source[slices], indices, values, axis=axis
-                )
-                output = mx.array(source)
-                output[slices] = updated
-                env[op.outputs[0]] = output
-            elif op.op == "cumsum":
-                axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
-                value = mx.cumsum(env[op.inputs[0]], axis=axis)
-                output_dtype = _MLX_DTYPES[
-                    self.graph.value(op.outputs[0]).type.dtype
-                ]
-                env[op.outputs[0]] = value.astype(output_dtype)
-            elif op.op in {"triu", "tril"}:
-                diagonal = int(op.attrs["diagonal"])
-                operation = mx.triu if op.op == "triu" else mx.tril
-                env[op.outputs[0]] = operation(env[op.inputs[0]], diagonal)
-            elif op.op == "cat":
-                rank = len(env[op.inputs[0]].shape)
-                axis = int(op.attrs["dim"]) % rank
-                env[op.outputs[0]] = mx.concatenate(
-                    [env[value_id] for value_id in op.inputs], axis=axis
-                )
-            elif op.op in LAYOUT_OPS:
-                env[op.outputs[0]] = _evaluate_layout_mlx(
-                    self.graph, op, env[op.inputs[0]]
-                )
-            elif op.op == "matmul":
-                left, right = (env[value_id] for value_id in op.inputs)
-                if op.attrs.get("transpose_a", False):
-                    left = mx.swapaxes(left, -1, -2)
-                if op.attrs.get("transpose_b", False):
-                    right = mx.swapaxes(right, -1, -2)
-                env[op.outputs[0]] = mx.matmul(left, right)
-            elif op.op == "addmm":
-                bias, left, right = (env[value_id] for value_id in op.inputs)
-                if op.attrs.get("transpose_a", False):
-                    left = mx.swapaxes(left, -1, -2)
-                if op.attrs.get("transpose_b", False):
-                    right = mx.swapaxes(right, -1, -2)
-                alpha = float(op.attrs.get("alpha", 1.0))
-                beta = float(op.attrs.get("beta", 1.0))
-                env[op.outputs[0]] = beta * bias + alpha * mx.matmul(left, right)
-            else:
-                env[op.outputs[0]] = _evaluate_pointwise_mlx(
-                    op, env, self.graph.value(op.outputs[0]).type
-                )
+            result = _evaluate_mlx_op(self.graph, op, env)
+            store_result(op.outputs[0], result)
             for value_id in self.storage_plan.release_after_op[op_index]:
                 env.pop(value_id, None)
 
-        return tuple(env[value_id] for value_id in self.graph.outputs)
+        stats = ExecutionStats(
+            arena_size_bytes=self.storage_plan.arena_size_bytes,
+            arena_slot_count=len(slot_by_id),
+            assignments=tuple(slot_assignments),
+            reuse_count=sum(item.reused for item in slot_assignments),
+        )
+        return tuple(env[value_id] for value_id in self.graph.outputs), stats
+
+
+@dataclass(frozen=True, slots=True)
+class ArenaAssignment:
+    value_id: str
+    slot_id: int
+    offset_bytes: int
+    size_bytes: int
+    reused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionStats:
+    arena_size_bytes: int
+    arena_slot_count: int
+    assignments: tuple[ArenaAssignment, ...]
+    reuse_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeCandidate:
+    artifact: KernelArtifact
+    runtime: Any
 
 
 class AppleMetalBackend:
@@ -428,17 +632,32 @@ class AppleMetalBackend:
         *,
         codegen_matmul: bool = False,
         codegen_attention: bool = False,
+        autotune: bool = False,
+        autotune_warmup: int = _AUTOTUNE_WARMUP,
+        autotune_iterations: int = _AUTOTUNE_ITERATIONS,
+        selection_overrides: Mapping[str, str] | None = None,
     ) -> None:
+        if autotune_warmup < 0:
+            raise ValueError("autotune_warmup must be non-negative")
+        if autotune_iterations <= 0:
+            raise ValueError("autotune_iterations must be positive")
         self.codegen_matmul = codegen_matmul
         self.codegen_attention = codegen_attention
+        self.autotune = autotune
+        self.autotune_warmup = autotune_warmup
+        self.autotune_iterations = autotune_iterations
+        self.selection_overrides = dict(selection_overrides or {})
 
-    def compile(self, graph: Graph) -> CompiledPlan:
+    def compile(
+        self,
+        graph: Graph,
+        *,
+        tune_inputs: Sequence[Any] | None = None,
+    ) -> CompiledPlan:
         if not mx.metal.is_available():
             raise RuntimeError("Apple Metal is unavailable in this process")
 
-        kernels: list[KernelArtifact] = []
-        selections: list[KernelSelection] = []
-        callables: dict[str, Any] = {}
+        candidates: dict[str, _NativeCandidate] = {}
         for index, op in enumerate(graph.ops):
             compiled: tuple[KernelArtifact, Any] | None = None
             if op.op == "fused_elementwise":
@@ -473,7 +692,7 @@ class AppleMetalBackend:
                 compiled = self._compile_rms_norm(graph, op, index)
             elif op.op == "attention":
                 _validate_attention_op(graph, op)
-                if self.codegen_attention:
+                if self.codegen_attention or self.autotune or self._wants_native(op):
                     compiled = self._compile_attention(graph, op, index)
             elif op.op == "cat":
                 _validate_cat_op(graph, op)
@@ -493,14 +712,11 @@ class AppleMetalBackend:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
                 _validate_cast_op(graph, op)
-                output_type = graph.value(op.outputs[0]).type
-                dtype = _MLX_DTYPES[output_type.dtype]
-                callables[op.outputs[0]] = (
-                    lambda value, dtype=dtype: value.astype(dtype)
-                )
             elif op.op in LAYOUT_OPS:
                 _validate_layout_op(graph, op)
-            elif self.codegen_matmul and op.op in {"matmul", "addmm"}:
+            elif (
+                self.codegen_matmul or self.autotune or self._wants_native(op)
+            ) and op.op in {"matmul", "addmm"}:
                 left_position = 1 if op.op == "addmm" else 0
                 right_position = 2 if op.op == "addmm" else 1
                 left_type = graph.value(op.inputs[left_position]).type
@@ -517,37 +733,276 @@ class AppleMetalBackend:
 
             if compiled is not None:
                 artifact, runtime = compiled
-                kernels.append(artifact)
-                callables[artifact.output_id] = runtime
-                selections.append(
-                    KernelSelection(
-                        op_index=index,
-                        op=op.op,
-                        output_id=op.outputs[0],
-                        implementation="metal_kernel",
-                        kind=artifact.kind,
-                        reason="native Metal kernel selected",
-                        artifact_name=artifact.name,
-                    )
+                candidates[artifact.output_id] = _NativeCandidate(
+                    artifact, runtime
                 )
-            else:
-                selections.append(
-                    KernelSelection(
-                        op_index=index,
-                        op=op.op,
-                        output_id=op.outputs[0],
-                        implementation="mlx",
-                        kind=op.op,
-                        reason=self._fallback_reason(graph, op),
-                    )
-                )
+
+        if self.autotune and not self.selection_overrides:
+            kernels, selections, callables = self._autotune(
+                graph, candidates, tune_inputs
+            )
+        else:
+            kernels, selections, callables = self._heuristic_select(
+                graph, candidates
+            )
 
         return CompiledPlan(
             graph,
-            tuple(kernels),
-            tuple(selections),
+            kernels,
+            selections,
             callables,
             plan_storage(graph),
+        )
+
+    def _wants_native(self, op: Operation) -> bool:
+        return self.selection_overrides.get(op.outputs[0]) == "metal_kernel"
+
+    def _heuristic_select(
+        self,
+        graph: Graph,
+        candidates: Mapping[str, _NativeCandidate],
+    ) -> tuple[
+        tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]
+    ]:
+        kernels: list[KernelArtifact] = []
+        selections: list[KernelSelection] = []
+        callables: dict[str, Any] = {}
+        device_name, device_architecture = _device_profile()
+        for index, op in enumerate(graph.ops):
+            output_id = op.outputs[0]
+            candidate = candidates.get(output_id)
+            override = self.selection_overrides.get(output_id)
+            if override not in {None, "metal_kernel", "mlx"}:
+                raise ValueError(
+                    f"unknown kernel implementation override {override!r} "
+                    f"for {output_id}"
+                )
+            if override == "metal_kernel" and candidate is None:
+                raise ValueError(
+                    f"artifact selected Metal for unsupported operation {output_id}"
+                )
+            use_native = override == "metal_kernel" or (
+                override is None and candidate is not None
+            )
+            if use_native:
+                assert candidate is not None
+                kernels.append(candidate.artifact)
+                callables[output_id] = candidate.runtime
+                selection = KernelSelection(
+                    op_index=index,
+                    op=op.op,
+                    output_id=output_id,
+                    implementation="metal_kernel",
+                    kind=candidate.artifact.kind,
+                    reason=(
+                        "native Metal kernel selected"
+                        if override is None
+                        else "serialized artifact selected native Metal kernel"
+                    ),
+                    artifact_name=candidate.artifact.name,
+                    device_name=device_name,
+                    device_architecture=device_architecture,
+                )
+            else:
+                selection = KernelSelection(
+                    op_index=index,
+                    op=op.op,
+                    output_id=output_id,
+                    implementation="mlx",
+                    kind=op.op,
+                    reason=(
+                        self._fallback_reason(graph, op)
+                        if override is None
+                        else "serialized artifact selected MLX fallback"
+                    ),
+                    device_name=device_name,
+                    device_architecture=device_architecture,
+                )
+            selections.append(selection)
+        return tuple(kernels), tuple(selections), callables
+
+    def _autotune(
+        self,
+        graph: Graph,
+        candidates: Mapping[str, _NativeCandidate],
+        tune_inputs: Sequence[Any] | None,
+    ) -> tuple[
+        tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]
+    ]:
+        if tune_inputs is None:
+            env = {
+                value_id: _synthetic_tune_input(graph.value(value_id).type)
+                for value_id in graph.inputs
+            }
+        else:
+            if len(tune_inputs) != len(graph.inputs):
+                raise ValueError(
+                    f"autotune expected {len(graph.inputs)} inputs, "
+                    f"received {len(tune_inputs)}"
+                )
+            env = {
+                value_id: _coerce_tune_input(value, graph.value(value_id).type)
+                for value_id, value in zip(
+                    graph.inputs, tune_inputs, strict=True
+                )
+            }
+
+        device_name, device_architecture = _device_profile()
+        kernels: list[KernelArtifact] = []
+        selections: list[KernelSelection] = []
+        callables: dict[str, Any] = {}
+        for index, op in enumerate(graph.ops):
+            output_id = op.outputs[0]
+            output_type = graph.value(output_id).type
+            input_arrays = tuple(env[value_id] for value_id in op.inputs)
+
+            def fallback_runtime() -> mx.array:
+                return _evaluate_mlx_op(graph, op, env)
+
+            fallback_result = fallback_runtime()
+            mx.eval(fallback_result)
+            candidate = candidates.get(output_id)
+            if candidate is None:
+                selections.append(
+                    KernelSelection(
+                        op_index=index,
+                        op=op.op,
+                        output_id=output_id,
+                        implementation="mlx",
+                        kind=op.op,
+                        reason=self._fallback_reason(graph, op),
+                        device_name=device_name,
+                        device_architecture=device_architecture,
+                    )
+                )
+                env[output_id] = fallback_result
+                continue
+
+            mlx_benchmark = self._benchmark(
+                "mlx", None, fallback_runtime
+            )
+            try:
+                native_result = candidate.runtime(*input_arrays)
+                mx.eval(native_result)
+                if not _outputs_match(
+                    native_result, fallback_result, output_type.dtype
+                ):
+                    native_benchmark = KernelBenchmark(
+                        candidate="metal_kernel",
+                        artifact_name=candidate.artifact.name,
+                        warmup_iterations=self.autotune_warmup,
+                        iterations=self.autotune_iterations,
+                        samples_seconds=(),
+                        median_seconds=None,
+                        min_seconds=None,
+                        error="output differs from the MLX reference",
+                    )
+                else:
+                    native_benchmark = self._benchmark(
+                        "metal_kernel",
+                        candidate.artifact.name,
+                        lambda: candidate.runtime(*input_arrays),
+                    )
+            except Exception as exc:
+                native_benchmark = KernelBenchmark(
+                    candidate="metal_kernel",
+                    artifact_name=candidate.artifact.name,
+                    warmup_iterations=self.autotune_warmup,
+                    iterations=self.autotune_iterations,
+                    samples_seconds=(),
+                    median_seconds=None,
+                    min_seconds=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+            native_seconds = native_benchmark.median_seconds
+            mlx_seconds = mlx_benchmark.median_seconds
+            use_native = native_seconds is not None and (
+                mlx_seconds is None or native_seconds <= mlx_seconds
+            )
+            if use_native:
+                kernels.append(candidate.artifact)
+                callables[output_id] = candidate.runtime
+                implementation = "metal_kernel"
+                kind = candidate.artifact.kind
+                artifact_name: str | None = candidate.artifact.name
+                reason = self._measured_reason(
+                    "native Metal kernel", native_seconds, mlx_seconds
+                )
+            else:
+                implementation = "mlx"
+                kind = op.op
+                artifact_name = None
+                reason = self._measured_reason(
+                    "MLX fallback", mlx_seconds, native_seconds
+                )
+
+            selections.append(
+                KernelSelection(
+                    op_index=index,
+                    op=op.op,
+                    output_id=output_id,
+                    implementation=implementation,
+                    kind=kind,
+                    reason=reason,
+                    artifact_name=artifact_name,
+                    benchmarks=(native_benchmark, mlx_benchmark),
+                    autotuned=True,
+                    device_name=device_name,
+                    device_architecture=device_architecture,
+                )
+            )
+            env[output_id] = fallback_result
+
+        return tuple(kernels), tuple(selections), callables
+
+    def _benchmark(
+        self,
+        candidate: str,
+        artifact_name: str | None,
+        runtime: Any,
+    ) -> KernelBenchmark:
+        try:
+            samples = _time_runtime(
+                runtime,
+                warmup_iterations=self.autotune_warmup,
+                iterations=self.autotune_iterations,
+            )
+        except Exception as exc:
+            return KernelBenchmark(
+                candidate=candidate,
+                artifact_name=artifact_name,
+                warmup_iterations=self.autotune_warmup,
+                iterations=self.autotune_iterations,
+                samples_seconds=(),
+                median_seconds=None,
+                min_seconds=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return KernelBenchmark(
+            candidate=candidate,
+            artifact_name=artifact_name,
+            warmup_iterations=self.autotune_warmup,
+            iterations=self.autotune_iterations,
+            samples_seconds=samples,
+            median_seconds=median(samples),
+            min_seconds=min(samples),
+        )
+
+    @staticmethod
+    def _measured_reason(
+        winner: str,
+        winner_seconds: float | None,
+        alternative_seconds: float | None,
+    ) -> str:
+        if winner_seconds is None:
+            return "autotune failed for every candidate; MLX fallback retained"
+        if alternative_seconds is None:
+            return f"autotuned: {winner} was the only valid candidate"
+        return (
+            f"autotuned: {winner} was faster "
+            f"({winner_seconds * 1e3:.4f} ms vs "
+            f"{alternative_seconds * 1e3:.4f} ms median)"
         )
 
     def _fallback_reason(self, graph: Graph, op: Operation) -> str:
@@ -2531,11 +2986,15 @@ def _emit_pointwise_source(
 
     for position, value_id in enumerate(input_ids):
         variable = f"input_{position}"
-        offset = _offset_expression(
-            graph.value(value_id).type.shape, output_shape, "elem"
-        )
-        ctype = _pointwise_ctype(graph.value(value_id).type.dtype)
-        lines.append(f"    {ctype} {variable} = in_{position}[{offset}];")
+        input_type = graph.value(value_id).type
+        ctype = _pointwise_ctype(input_type.dtype)
+        if input_type.shape:
+            offset = _offset_expression(
+                input_type.shape, output_shape, "elem"
+            )
+            lines.append(f"    {ctype} {variable} = in_{position}[{offset}];")
+        else:
+            lines.append(f"    {ctype} {variable} = ({ctype})in_{position};")
         env[value_id] = variable
 
     for op_index, op in enumerate(body):

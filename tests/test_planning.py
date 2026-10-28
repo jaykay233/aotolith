@@ -4,6 +4,7 @@ import mlx.core as mx
 import torch
 
 from transformer_subgraph_compiler import compile_callable, plan_storage
+from transformer_subgraph_compiler.backends import AppleMetalBackend
 from transformer_subgraph_compiler.ir import DType, Graph, Operation, TensorType, Value
 
 
@@ -54,4 +55,43 @@ def test_compiled_plan_exposes_storage_plan_and_releases_intermediates() -> None
     expected = mx.array(fn(value).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected)
+
+
+def test_runtime_arena_reuses_a_planned_slot() -> None:
+    tensor_type = TensorType((4,), DType.F32)
+    values = {
+        value_id: Value(value_id, tensor_type)
+        for value_id in ("x", "y", "first", "out0", "second", "out1")
+    }
+    graph = Graph(
+        ("x", "y"),
+        values,
+        (
+            Operation("add", ("x", "y"), ("first",)),
+            Operation("neg", ("first",), ("out0",)),
+            Operation("add", ("x", "y"), ("second",)),
+            Operation("neg", ("second",), ("out1",)),
+        ),
+        ("out0", "out1"),
+    )
+
+    plan = AppleMetalBackend().compile(graph)
+    assert len(plan.storage_plan.slots) == 1
+    assert plan.storage_plan.slots[0].value_ids == ("first", "second")
+
+    x = mx.array([1.0, 2.0, 3.0, 4.0])
+    y = mx.array([10.0, 20.0, 30.0, 40.0])
+    actual, stats = plan.call_with_stats(x, y)
+    mx.eval(*actual)
+
+    expected = -(x + y)
+    assert mx.allclose(actual[0], expected)
+    assert mx.allclose(actual[1], expected)
+    assert stats.arena_size_bytes == 16
+    assert stats.arena_slot_count == 1
+    assert [(item.value_id, item.reused) for item in stats.assignments] == [
+        ("first", False),
+        ("second", True),
+    ]
+    assert stats.reuse_count == 1
 

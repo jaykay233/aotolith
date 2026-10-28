@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from os import PathLike
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -24,6 +26,16 @@ class CompilationResult:
     plan: CompiledPlan
     input_graph: Graph
     lowered_graph: Graph
+    codegen_matmul: bool = False
+    codegen_attention: bool = False
+    autotune: bool = False
+    autotune_warmup: int = 2
+    autotune_iterations: int = 7
+
+    def save(self, path: str | PathLike[str]) -> Path:
+        from .artifact import save_compiled
+
+        return save_compiled(self, path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +59,11 @@ class CompiledModulePlan:
     def lowered_graph(self) -> Graph:
         return self.compilation.lowered_graph
 
+    def save(self, path: str | PathLike[str]) -> Path:
+        from .artifact import save_compiled
+
+        return save_compiled(self, path)
+
     def __call__(self, *inputs: Any) -> tuple[mx.array, ...]:
         if len(inputs) != self.input_count:
             raise ValueError(
@@ -61,6 +78,10 @@ def compile_graph(
     target: str = "apple-metal",
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
+    autotune: bool = False,
+    autotune_warmup: int = 2,
+    autotune_iterations: int = 7,
+    autotune_inputs: Sequence[Any] | None = None,
 ) -> CompilationResult:
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
@@ -74,8 +95,20 @@ def compile_graph(
     plan = AppleMetalBackend(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
-    ).compile(lowered)
-    return CompilationResult(plan=plan, input_graph=graph, lowered_graph=lowered)
+        autotune=autotune,
+        autotune_warmup=autotune_warmup,
+        autotune_iterations=autotune_iterations,
+    ).compile(lowered, tune_inputs=autotune_inputs)
+    return CompilationResult(
+        plan=plan,
+        input_graph=graph,
+        lowered_graph=lowered,
+        codegen_matmul=codegen_matmul,
+        codegen_attention=codegen_attention,
+        autotune=autotune,
+        autotune_warmup=autotune_warmup,
+        autotune_iterations=autotune_iterations,
+    )
 
 
 def compile_callable(
@@ -85,12 +118,19 @@ def compile_callable(
     target: str = "apple-metal",
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
+    autotune: bool = False,
+    autotune_warmup: int = 2,
+    autotune_iterations: int = 7,
 ) -> CompilationResult:
     return compile_graph(
         capture_fx(fn, example_inputs),
         target=target,
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
+        autotune=autotune,
+        autotune_warmup=autotune_warmup,
+        autotune_iterations=autotune_iterations,
+        autotune_inputs=example_inputs if autotune else None,
     )
 
 
@@ -103,6 +143,9 @@ def compile_module(
     target: str = "apple-metal",
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
+    autotune: bool = False,
+    autotune_warmup: int = 2,
+    autotune_iterations: int = 7,
 ) -> CompiledModulePlan:
     """Compile an ``nn.Module`` and bind its state as immutable plan inputs.
 
@@ -136,6 +179,7 @@ def compile_module(
     state_names = tuple(state)
     state_values = tuple(state.values())
     input_count = len(example_inputs)
+    bound_values = tuple(_torch_tensor_to_mlx(value) for value in state_values)
 
     def functional_forward(*args: Any) -> torch.Tensor:
         inputs = tuple(args[:input_count])
@@ -158,8 +202,13 @@ def compile_module(
         target=target,
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
+        autotune=autotune,
+        autotune_warmup=autotune_warmup,
+        autotune_iterations=autotune_iterations,
+        autotune_inputs=(
+            tuple(example_inputs) + state_values if autotune else None
+        ),
     )
-    bound_values = tuple(_torch_tensor_to_mlx(value) for value in state_values)
     return CompiledModulePlan(
         compilation=result,
         input_count=input_count,
