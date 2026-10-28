@@ -713,16 +713,45 @@ def test_native_attention_reuses_query_tile_across_simd_groups(
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
-def test_native_attention_limits_query_tile_by_shared_memory() -> None:
+def test_native_attention_uses_long_sequence_query_tile() -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(query, key, value)
 
-    inputs = tuple(torch.randn(1, 1, 16, 256, dtype=torch.float16) for _ in range(3))
+    torch.manual_seed(67)
+    inputs = tuple(torch.randn(1, 1, 769, 64, dtype=torch.float16) for _ in range(3))
     result = compile_callable(fn, inputs, codegen_attention=True)
-    source = result.plan.kernels[0].source
+    kernel = result.plan.kernels[0]
+    source = kernel.source
 
-    assert "metal_attention_flash_8x32_256" in result.plan.kernels[0].name
-    assert "threadgroup T tile_q[2048]" in source
+    assert "metal_attention_flash_24x32_768" in kernel.name
+    assert "threadgroup T tile_q[1536]" in source
+    assert "threadgroup float tile_scores[768]" in source
+    assert "threadgroup T tile_probabilities_low[768]" in source
+    assert "if (warp < 12u)" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_kernel"),
+    [
+        ((1, 1, 16, 256), "metal_attention_flash_8x32_256"),
+        ((1, 1, 768, 160), "metal_attention_flash_16x32_512"),
+    ],
+)
+def test_native_attention_limits_query_tile_by_shared_memory(
+    shape, expected_kernel
+) -> None:
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    inputs = tuple(torch.randn(*shape, dtype=torch.float16) for _ in range(3))
+    result = compile_callable(fn, inputs, codegen_attention=True)
+
+    assert expected_kernel in result.plan.kernels[0].name
 
 
 @pytest.mark.parametrize(

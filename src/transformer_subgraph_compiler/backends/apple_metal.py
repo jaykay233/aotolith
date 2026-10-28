@@ -25,7 +25,8 @@ _MATMUL_BLOCK_ROWS = 64
 _MATMUL_BLOCK_COLUMNS = 64
 _MATMUL_BLOCK_REDUCTION = 32
 _METAL_KERNEL_CACHE_SIZE = 256
-_ATTENTION_MAX_SHARED_BYTES = 30 * 1024
+_ATTENTION_MAX_SHARED_BYTES = 31 * 1024
+_ATTENTION_LONG_SEQUENCE_THRESHOLD = 768
 
 _MSL_HEADER = """
 inline float tsc_erf(float value) {
@@ -284,22 +285,20 @@ class AppleMetalBackend:
         use_simdgroup_qk = low_precision_attention and query_head_dim % 8 == 0
         use_simdgroup_pv = low_precision_attention and value_head_dim % 8 == 0
         query_tile = 8
-        if (
-            use_simdgroup_qk
-            and use_simdgroup_pv
-            and query_length > query_tile
-        ):
-            candidate_query_tile = 16
-            element_bytes = 2
-            shared_bytes = (
-                candidate_query_tile * query_head_dim * element_bytes
-                + key_tile * max(query_head_dim, value_head_dim) * element_bytes
-                + candidate_query_tile * key_tile * 4
-                + candidate_query_tile * key_tile * element_bytes
-                + candidate_query_tile * value_head_dim * 4
-            )
-            if shared_bytes <= _ATTENTION_MAX_SHARED_BYTES:
-                query_tile = candidate_query_tile
+        if use_simdgroup_qk and use_simdgroup_pv and query_length > 8:
+            candidates = (16,)
+            if query_length >= _ATTENTION_LONG_SEQUENCE_THRESHOLD:
+                candidates = (24, 16)
+            for candidate_query_tile in candidates:
+                shared_bytes = _attention_shared_memory_bytes(
+                    candidate_query_tile,
+                    key_tile,
+                    query_head_dim,
+                    value_head_dim,
+                )
+                if shared_bytes <= _ATTENTION_MAX_SHARED_BYTES:
+                    query_tile = candidate_query_tile
+                    break
         threads = query_tile * 32
         query_blocks = ceil(query_length / query_tile)
         query_count = batch * query_heads * query_blocks
@@ -2032,6 +2031,22 @@ def _native_attention_mask_supported(
     if query_rank == 3:
         return len(mask_shape) in {2, 3}
     return False
+
+
+def _attention_shared_memory_bytes(
+    query_tile: int,
+    key_tile: int,
+    query_head_dim: int,
+    value_head_dim: int,
+) -> int:
+    element_bytes = 2
+    return (
+        query_tile * query_head_dim * element_bytes
+        + key_tile * max(query_head_dim, value_head_dim) * element_bytes
+        + query_tile * key_tile * 4
+        + query_tile * key_tile * element_bytes
+        + query_tile * value_head_dim * 4
+    )
 
 
 def _attention_mask_offset_expression(
