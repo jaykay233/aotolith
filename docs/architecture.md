@@ -246,7 +246,7 @@ kernel 的执行方式：
 
 - Q tile 和当前 K tile 由 threadgroup 协作加载到 shared memory；FP16/BF16 下，4 个 SIMD group 分别计算一个 `8×8` key 分块，拼成完整的 `8×32` QK score tile，FP32 或非 8 对齐的 head dim 回退到 lane 串行点积
 - `simd_max` 和 `simd_sum` 在 warp 内得到 block max 与 block sum，再与 running max、denominator 合并成 online softmax 状态
-- softmax probability 暂存到 shared memory；FP16/BF16 且 V head dim 按 8 对齐时，8 个 SIMD group 并行计算 `8×32 @ 32×V_D` 的 PV tile，再把结果合并回每个 query 的 online accumulator
+- softmax probability 暂存到 shared memory；FP16/BF16 且 V head dim 按 8 对齐时，V tile 在 QK 完成后加载，并与 probability 写入共用一次同步；随后 8 个 SIMD group 并行计算 `8×32 @ 32×V_D` 的 PV tile，再把结果合并回每个 query 的 online accumulator
 - key tile 之间只重标定 running sum 和 V accumulator，不物化完整 attention matrix
 - query tile 和 key tile 的尾部用 `-INFINITY` score 或零 probability 补齐，最后一个 tile 不越界读写
 - GQA/MQA 通过静态的 `kv_head = query_head / group_size` 寻址，不展开 K/V head

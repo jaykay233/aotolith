@@ -373,12 +373,13 @@ class AppleMetalBackend:
                     pv_accumulator);"""
                 for tile_key in range(0, key_tile, 8)
             )
+            pv_probability_declaration = ""
             pv_shared_declaration = f"""
         threadgroup T tile_probabilities_low[{query_tile * key_tile}];
         threadgroup float tile_pv[{query_tile * value_head_dim}];"""
-            pv_probability_store = """
-            tile_probabilities_low[warp * 32u + lane] = (T)probability;"""
-            pv_accumulation_source = f"""
+            pv_probability_store = f"""
+            tile_probabilities_low[warp * {key_tile}u + lane] = (T)probability;"""
+            pv_preload_source = f"""
             for (uint index = tid; index < {key_tile * value_head_dim}u;
                  index += {threads}u) {{
                 uint key_row = index / {value_head_dim}u;
@@ -389,8 +390,8 @@ class AppleMetalBackend:
                         * {value_head_dim}u + dimension]
                     : T(0);
             }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
+"""
+            pv_accumulation_source = f"""
             for (uint output_fragment = warp;
                  output_fragment * 8u < {value_head_dim}u;
                  output_fragment += 8u) {{
@@ -415,8 +416,12 @@ class AppleMetalBackend:
             }}
 """
         else:
+            pv_probability_declaration = f"""
+        threadgroup float tile_probabilities[{query_tile * key_tile}];"""
             pv_shared_declaration = ""
-            pv_probability_store = ""
+            pv_probability_store = f"""
+            tile_probabilities[warp * {key_tile}u + lane] = probability;"""
+            pv_preload_source = ""
             pv_accumulation_source = f"""
             for (uint component = 0u;
                  component < {ceil(value_head_dim / 32)}u; ++component) {{
@@ -450,8 +455,7 @@ class AppleMetalBackend:
         uint query_pos = query_block * {query_tile}u + warp;
         threadgroup T tile_q[{query_tile * query_head_dim}];
         threadgroup T tile_k[{key_tile * max(query_head_dim, value_head_dim)}];
-        threadgroup float tile_scores[{query_tile * key_tile}];
-        threadgroup float tile_probabilities[{query_tile * key_tile}];{pv_shared_declaration}
+        threadgroup float tile_scores[{query_tile * key_tile}];{pv_probability_declaration}{pv_shared_declaration}
 
         for (uint index = tid; index < {query_tile * query_head_dim}u;
              index += {threads}u) {{
@@ -482,7 +486,7 @@ class AppleMetalBackend:
                     : T(0);
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
-{qk_score_source}
+{qk_score_source}{pv_preload_source}
             float block_max = simd_max(score);
             float new_max = metal::max(running_max, block_max);
             float alpha = running_max == -INFINITY
@@ -497,10 +501,9 @@ class AppleMetalBackend:
             float block_sum = simd_sum(probability);
             running_sum = running_sum * alpha + block_scale * block_sum;
             running_max = new_max;
-            tile_probabilities[warp * {key_tile}u + lane] = probability;{pv_probability_store}
+{pv_probability_store}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 {pv_accumulation_source}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
         if (query_pos < {query_length}u) {{
