@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # Ruff only needs a source tree, so this runs on the cheap Linux runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.17,<0.18"
+      - run: ruff check src tests examples
+
+  test:
+    # Every backend here emits Metal, so the suite needs an Apple Silicon
+    # runner: macos-latest is arm64 and has a usable GPU.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the package the way a user would
+        # An editable install of the dev extra, rather than a bare `pip install
+        # pytest`, so the wheel metadata and package layout are exercised too.
+        run: pip install -e ".[dev]"
+      - name: Run the test suite
+        run: python -m pytest
+      - name: Confirm the distribution builds
+        run: python -m build
