@@ -136,7 +136,6 @@ model = LlamaForCausalLM(
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=16,
-        use_cache=False,
     )
 ).eval()
 
@@ -144,7 +143,6 @@ input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
 compiled = aoto.compile_module(
     model,
     (input_ids,),
-    example_kwargs={"use_cache": False},
     codegen_matmul=True,
     codegen_attention=True,
 )
@@ -152,6 +150,8 @@ compiled = aoto.compile_module(
 logits = compiled(input_ids)[0]
 mx.eval(logits)
 ```
+
+上面的 config 里 `use_cache` 保持默认的 `True`。这是可以编译的：cache 初始为空，而零长度的 concatenate 操作数不贡献任何内容，前端会把它折掉，所以编出来的图和 `use_cache=False` 完全一样。一个 plan 就是一次没有隐藏状态的前向，模型返回的 cache 不属于它；要做带 cache 的 decode 请用下面的静态 cache adapter。
 
 ### 编译 Qwen2.5 静态 KV Cache
 

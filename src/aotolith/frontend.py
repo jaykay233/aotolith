@@ -142,6 +142,21 @@ _SUPPORTED_OPS = {
     "aten.scatter.value": "scatter",
 }
 
+# Copies that carry no arithmetic. When one of these produces an empty tensor it
+# is only ever a KV cache placeholder waiting to be concatenated away, so the
+# frontend skips it rather than requiring an op that cannot be typed.
+_EMPTY_COPY_TARGETS = frozenset(
+    {
+        "aten.lift_fresh_copy.default",
+        "aten.clone.default",
+        "aten.detach.default",
+        "aten.alias.default",
+        "aten._to_copy.default",
+        "aten.contiguous.default",
+        "aten.lift_fresh.default",
+    }
+)
+
 _TORCH_DTYPES = {
     "torch.float16": DType.F16,
     "torch.bfloat16": DType.BF16,
@@ -228,6 +243,11 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     # full CPU matmul and compile time scales with the problem size.
     traced = make_fx(fn, tracing_mode="fake")(*example_inputs)
     _reject_unsupported_attention_dropout(traced.graph)
+    # ``use_cache=True`` models start their KV cache from zero-length tensors,
+    # which make_fx bakes into the graph as constants plus identity copies of
+    # them. They are legal only as concatenation operands, where a zero-length
+    # piece is a no-op, so they are recorded here and folded away below.
+    empty_nodes = _empty_value_nodes(traced)
     values: dict[str, Value] = {}
     input_ids: list[str] = []
     node_ids: dict[object, str] = {}
@@ -240,10 +260,22 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             node_ids[node] = value_id
             input_ids.append(value_id)
             values[value_id] = Value(value_id, _node_type(node))
+        elif node.op == "get_attr":
+            if node in empty_nodes:
+                # Folding happens at the concatenation that consumes it; any
+                # other use reaches ``_argument_ids`` and fails by name.
+                continue
+            raise NotImplementedError(
+                _constant_tensor_message(traced, node)
+            )
         elif node.op == "call_function":
             if node in node_ids:
                 continue
             target = str(node.target)
+            if node in empty_nodes and target in _EMPTY_COPY_TARGETS:
+                # An identity copy of an empty constant carries no arithmetic;
+                # it exists only to be concatenated away.
+                continue
             if target == _MATRIX_TRANSPOSE_TARGET:
                 input_node = node.args[0]
                 input_type = _node_type(input_node)
@@ -374,21 +406,30 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
             if target in _INPLACE_TARGETS:
                 _validate_inplace_legalization(node)
             op_name = _SUPPORTED_OPS[target]
+            call_args = node.args
+            if target == "aten.cat.default" and empty_nodes:
+                call_args = _fold_empty_cat_operands(
+                    node, empty_nodes, node_ids
+                )
+                if call_args is None:
+                    # A concatenation with one surviving operand is that
+                    # operand, so the operation disappears entirely.
+                    continue
             if (
                 target == "aten.pow.Tensor_Scalar"
-                and len(node.args) == 2
-                and isinstance(node.args[1], int)
-                and not isinstance(node.args[1], bool)
-                and node.args[1] == 2
+                and len(call_args) == 2
+                and isinstance(call_args[1], int)
+                and not isinstance(call_args[1], bool)
+                and call_args[1] == 2
                 and _node_type(node).dtype in {DType.I32, DType.I64}
             ):
                 # make_fx lowers torch.square on integer tensors to pow(x, 2).
                 op_name = "square"
-                inputs = (_argument_ids(node.args[0], node_ids),)
+                inputs = (_argument_ids(call_args[0], node_ids),)
                 scalar_attrs = {}
             else:
                 inputs, scalar_attrs = _operation_inputs(
-                    op_name, node.args, node_ids, node.kwargs
+                    op_name, call_args, node_ids, node.kwargs
                 )
             output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
@@ -428,6 +469,72 @@ def _reject_unsupported_attention_dropout(graph: object) -> None:
             raise NotImplementedError(
                 "scaled_dot_product_attention dropout is not supported"
             )
+
+
+def _constant_value(traced: object, node: object) -> object:
+    return getattr(traced, getattr(node, "target", ""), None)
+
+
+def _empty_value_nodes(traced: object) -> set[object]:
+    """Collect FX nodes whose value is an empty tensor.
+
+    A model with ``use_cache=True`` starts its KV cache as zero-length tensors.
+    ``make_fx`` lifts those into graph constants, and an empty tensor cannot be a
+    plan input because the IR requires positive static dimensions. They are only
+    ever concatenated, where a zero-length operand contributes nothing, so they
+    are dropped at the concatenation instead of being given a type.
+    """
+
+    found: set[object] = set()
+    for node in getattr(getattr(traced, "graph", None), "nodes", ()):
+        tensor = getattr(node, "meta", {}).get("val")
+        shape = getattr(tensor, "shape", None)
+        if shape is not None and 0 in tuple(shape):
+            found.add(node)
+    return found
+
+
+def _fold_empty_cat_operands(
+    node: object,
+    empty_nodes: set[object],
+    node_ids: dict[object, str],
+) -> tuple[object, ...] | None:
+    """Drop zero-length operands from a ``cat``.
+
+    Returns the arguments to lower, or ``None`` when a single operand survives
+    and the concatenation is therefore the identity.
+    """
+
+    args = getattr(node, "args", ())
+    if not args:
+        return args
+    operands = args[0]
+    if not isinstance(operands, (tuple, list)):
+        return args
+    kept = tuple(operand for operand in operands if operand not in empty_nodes)
+    if len(kept) == len(operands):
+        return args
+    if not kept:
+        raise ValueError(
+            "cat only concatenates zero-length constants and has no result"
+        )
+    if len(kept) == 1:
+        node_ids[node] = _argument_ids(kept[0], node_ids)
+        return None
+    return (kept, *args[1:])
+
+
+def _constant_tensor_message(traced: object, node: object) -> str:
+    target = getattr(node, "target", "?")
+    value = _constant_value(traced, node)
+    shape = getattr(value, "shape", None)
+    rendered = "?" if shape is None else tuple(shape)
+    return (
+        f"captured graph embeds constant tensor {target!r} of shape {rendered}; "
+        "constant tensors are not plan inputs. A HuggingFace model traced with "
+        "use_cache=True is the usual source: pass "
+        "example_kwargs={'use_cache': False} to keep the cache out of the graph"
+    )
 
 
 def _node_type(node: object) -> TensorType:

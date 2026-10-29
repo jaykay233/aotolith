@@ -674,6 +674,62 @@ def test_stack_lowers_to_unsqueeze_and_cat(dim: int) -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_cat_drops_a_zero_length_constant_operand() -> None:
+    """A zero-length constant is a KV-cache placeholder, not a graph input.
+
+    ``use_cache=True`` models start their cache from ``torch.tensor([])``, which
+    make_fx lifts into a constant. The IR has no type for an empty tensor, but a
+    zero-length concatenation operand contributes nothing, so dropping it must
+    leave both the result and the rest of the graph untouched.
+    """
+
+    def fn(value):
+        return torch.cat((torch.tensor([]), value), dim=0)
+
+    torch.manual_seed(51)
+    value = torch.randn(3, 4)
+    result = compile_callable(fn, (value,))
+
+    # Nothing survives: the concatenation is the identity on its only operand.
+    assert result.lowered_graph.ops == ()
+
+    actual = result.plan(mx.array(value.numpy()))[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(value.numpy()))
+
+
+def test_cat_keeps_the_concatenation_when_two_operands_survive() -> None:
+    def fn(left, right):
+        return torch.cat((torch.tensor([]), left, right), dim=0)
+
+    torch.manual_seed(52)
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    result = compile_callable(fn, inputs)
+
+    assert [op.op for op in result.lowered_graph.ops] == ["cat"]
+    assert [op.attrs["dim"] for op in result.lowered_graph.ops] == [0]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_non_empty_constant_tensor_names_the_use_cache_hint() -> None:
+    """A constant that cannot be folded must explain how it got there."""
+
+    def fn(value):
+        return value * torch.tensor([2.0, 3.0, 4.0])
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        compile_callable(fn, (torch.randn(3),))
+
+    message = str(excinfo.value)
+    assert "_tensor_constant0" in message
+    assert "(3,)" in message
+    assert "use_cache" in message
+
+
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_embedding_uses_mlx_gather_without_a_kernel(index_dtype) -> None:
     def fn(indices, weight):

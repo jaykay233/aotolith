@@ -170,6 +170,45 @@ def test_tiny_huggingface_llama_logits_match_pytorch() -> None:
     assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
 
 
+def test_huggingface_llama_compiles_with_the_default_cache_setting() -> None:
+    """``use_cache=True`` must not make compilation fail.
+
+    It is the default, so it is the first thing anyone tries. The empty cache
+    tensors it puts in the graph are concatenated away rather than reported as
+    an unsupported node kind, and the logits still match PyTorch.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(11)
+    model = transformers.LlamaForCausalLM(config).eval()
+    assert model.config.use_cache is True
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    with torch.no_grad():
+        expected = model(input_ids=input_ids, use_cache=False).logits
+
+    compiled = compile_module(
+        model,
+        (input_ids,),
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+
+    actual = compiled(input_ids)[0]
+    mx.eval(actual)
+    assert actual.shape == expected.shape
+    assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
+
+
 def test_compile_module_supports_multiple_tensor_outputs() -> None:
     class MultiOutputModule(torch.nn.Module):
         def forward(

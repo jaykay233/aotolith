@@ -136,7 +136,6 @@ model = LlamaForCausalLM(
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=16,
-        use_cache=False,
     )
 ).eval()
 
@@ -144,7 +143,6 @@ input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
 compiled = aoto.compile_module(
     model,
     (input_ids,),
-    example_kwargs={"use_cache": False},
     codegen_matmul=True,
     codegen_attention=True,
 )
@@ -152,6 +150,8 @@ compiled = aoto.compile_module(
 logits = compiled(input_ids)[0]
 mx.eval(logits)
 ```
+
+The config above leaves `use_cache` at its default of `True`. That is accepted: the cache starts empty, a zero-length concatenation operand contributes nothing, and the frontend folds it away, so the compiled graph is the same one `use_cache=False` produces. A plan is a single forward pass with no hidden state, so the cache the model returns is not part of it; cached decoding needs the static-cache adapter below.
 
 ### Compile a Qwen2.5 Static KV Cache
 
