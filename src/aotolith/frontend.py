@@ -233,7 +233,6 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     """Capture a supported callable with make_fx and build the compiler IR."""
 
     try:
-        import torch
         from torch.fx.experimental.proxy_tensor import make_fx
     except ImportError as exc:
         raise RuntimeError("PyTorch is required for the FX frontend") from exc

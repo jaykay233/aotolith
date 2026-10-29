@@ -25,7 +25,7 @@ aoto = "aotolith.cli:main"
 [project.optional-dependencies]
 fx = ["torch>=2.7"]
 hf = ["torch>=2.7", "transformers>=4.57,<5"]
-dev = ["build>=1.2", "pytest>=8", "torch>=2.7", "transformers>=4.57,<5"]
+dev = ["build>=1.2", "pytest>=8", "torch>=2.7", "transformers>=4.57,<5", "ruff>=0.17,<0.18"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aotolith"]
@@ -34,3 +34,15 @@ packages = ["src/aotolith"]
 addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+# `.venv-mlx-only` is a second environment used to check the MLX-only install
+# path, and it is not in Ruff's default exclude list.
+extend-exclude = [".venv-mlx-only", "dist", "build"]
+line-length = 88
+
+[tool.ruff.lint]
+# Pyflakes plus syntax errors: the subset that finds broken code rather than
+# disagreeing about formatting. It is what caught an undefined `Callable` in a
+# postponed annotation and several locals that were computed and never used.
+select = ["F", "E9"]

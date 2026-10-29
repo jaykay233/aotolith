@@ -1541,7 +1541,6 @@ def _match_attention(
     consumers: dict[str, list[int]],
     matched: set[int],
 ) -> tuple[int, set[int], Operation] | None:
-    pv = graph.ops[pv_index]
     pv_match = _match_attention_product(
         graph, pv_index, producers, consumers, matched
     )

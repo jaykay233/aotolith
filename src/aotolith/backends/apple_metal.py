@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import textwrap
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
@@ -4332,7 +4332,7 @@ def _emit_thread_rms_norm_prologue(
 
     eps = float(op.attrs["rms_norm_eps"])
     return [
-        f"float norm_square_sum = 0.0f;",
+        "float norm_square_sum = 0.0f;",
         f"for (uint norm_index = 0u; norm_index < {reduction}u; norm_index += 1u) {{",
         f"    float norm_value = float(in_{left_position}"
         f"[{left_batch_prefix}norm_index]);",
@@ -4878,7 +4878,7 @@ def _emit_simdgroup_matmul_source(
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
                 f"                in_{left_position} + {left_batch_prefix}"
                 f"(row_base + local_row) * {reduction}u",
-                f"                    + k_base + local_k);",
+                "                    + k_base + local_k);",
                 "        *destination = *source;",
                 "    }",
                 f"    for (uint vector_index = tid; "
@@ -4894,7 +4894,7 @@ def _emit_simdgroup_matmul_source(
                 f"            reinterpret_cast<const device vec<T, {load_vector_width}>*>(",
                 f"                in_{right_position} + {right_batch_prefix}"
                 f"(k_base + local_k) * {columns}u",
-                f"                    + col_base + local_column);",
+                "                    + col_base + local_column);",
                 "        *destination = *source;",
                 "    }",
             ]
@@ -5122,7 +5122,6 @@ def _emit_mpp_matmul_source(
         left_position = 0
         right_position = 1
 
-    warps = warp_rows * warp_columns
     warp_block_rows = block_rows // warp_rows
     warp_block_columns = block_columns // warp_columns
     row_fragments = warp_block_rows // 16
@@ -5133,8 +5132,6 @@ def _emit_mpp_matmul_source(
 
     full_steps, tail_fragments = divmod(reduction, step)
     tail_fragments //= 16
-    row_blocks = ceil(rows / block_rows)
-    column_blocks = ceil(columns / block_columns)
     guard_rows = rows % block_rows != 0
     guard_columns = columns % block_columns != 0
     left_batch_prefix = f"{left_batch_offset} + " if left_batch_offset else ""
@@ -6485,7 +6482,7 @@ def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
         "uint tid = thread_position_in_threadgroup.x;",
         "uint head = threadgroup_position_in_grid.x;",
         "uint batch = threadgroup_position_in_grid.y;",
-        f"uint query_pos = 0u;",
+        "uint query_pos = 0u;",
         f"uint key_value_head = head / {config.group_size}u;",
         f"const device T* query = in_0 "
         f"+ (batch * {query_heads}u + head) * {query_dim}u;",

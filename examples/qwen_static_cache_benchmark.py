@@ -231,7 +231,6 @@ def main() -> None:
     model_path = snapshot_download(args.model, local_files_only=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     prompt = _prompt_ids(tokenizer, args.prompt_tokens)
-    input_ids = torch.tensor([prompt], dtype=torch.int64)
 
     load_start = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
