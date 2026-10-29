@@ -25,6 +25,15 @@ _MLX_DTYPES = {
     torch.int64: mx.int64,
 }
 
+# MetalPerformancePrimitives tensor ops only exist on newer Apple GPU families.
+# Where the driver cannot load them the backend deliberately emits the simdgroup
+# kernels instead, so tests that assert the tensor-core source have nothing to
+# look at rather than something that regressed.
+requires_tensor_cores = pytest.mark.skipif(
+    not metal_backend._mpp_available(),
+    reason="this GPU cannot load MetalPerformancePrimitives tensor ops",
+)
+
 
 def _torch_to_mlx(value: torch.Tensor) -> mx.array:
     source = value.float().numpy() if value.is_floating_point() else value.numpy()
@@ -1570,6 +1579,7 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
 )
+@requires_tensor_cores
 def test_native_attention_uses_tensor_core_when_query_tile_fits(
     dtype, tolerance
 ) -> None:
@@ -1602,6 +1612,7 @@ def test_native_attention_uses_tensor_core_when_query_tile_fits(
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
+@requires_tensor_cores
 def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
     def fn(query, key, value, mask):
         return torch.nn.functional.scaled_dot_product_attention(
@@ -1639,6 +1650,7 @@ def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
 )
+@requires_tensor_cores
 def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(
@@ -4671,6 +4683,7 @@ def test_metal_matmul_uses_simdgroup_for_complete_blocks(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@requires_tensor_cores
 def test_metal_matmul_uses_tensor_core_tiles(dtype) -> None:
     torch.manual_seed(33)
     inputs = (
@@ -4692,6 +4705,51 @@ def test_metal_matmul_uses_tensor_core_tiles(dtype) -> None:
     expected = _torch_to_mlx(inputs[0] @ inputs[1])
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_backend_falls_back_when_the_gpu_cannot_load_tensor_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GPU without MetalPerformancePrimitives still has to produce results.
+
+    Tensor cores are the fast path, not the only path. Forcing the capability
+    probe off must select the simdgroup kernels and stay numerically correct;
+    otherwise every machine older than the tile tables has no working matmul.
+    """
+
+    monkeypatch.setattr(metal_backend, "_mpp_available", lambda: False)
+
+    torch.manual_seed(35)
+    matmul_inputs = (
+        torch.randn(64, 64, dtype=torch.float16),
+        torch.randn(64, 64, dtype=torch.float16),
+    )
+    matmul = compile_callable(
+        lambda x, weight: x @ weight, matmul_inputs, codegen_matmul=True
+    )
+    assert "tensorcore" not in matmul.plan.kernels[0].name
+
+    actual = matmul.plan(*(_torch_to_mlx(value) for value in matmul_inputs))[0]
+    expected = _torch_to_mlx(matmul_inputs[0] @ matmul_inputs[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+    def attention(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    torch.manual_seed(36)
+    attention_inputs = (
+        torch.randn(1, 2, 17, 64, dtype=torch.float16),
+        torch.randn(1, 2, 40, 64, dtype=torch.float16),
+        torch.randn(1, 2, 40, 64, dtype=torch.float16),
+    )
+    compiled = compile_callable(attention, attention_inputs, codegen_attention=True)
+    assert "tensorcore" not in compiled.plan.kernels[0].name
+
+    actual = compiled.plan(*(_torch_to_mlx(value) for value in attention_inputs))[0]
+    expected = _torch_to_mlx(attention(*attention_inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize(
@@ -4748,6 +4806,7 @@ def test_metal_matmul_codegen_handles_singleton_batch_dimension() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@requires_tensor_cores
 def test_metal_batched_matmul_vectorizes_batch_inputs() -> None:
     torch.manual_seed(44)
     inputs = (
@@ -4955,6 +5014,7 @@ def test_metal_matmul_broadcasts_rank_two_against_rank_four() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@requires_tensor_cores
 def test_metal_matmul_broadcasts_batch_inputs() -> None:
     torch.manual_seed(53)
     inputs = (
@@ -4981,6 +5041,7 @@ def test_metal_matmul_broadcasts_batch_inputs() -> None:
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@requires_tensor_cores
 def test_metal_matmul_codegen_folds_transposed_operand() -> None:
     torch.manual_seed(34)
     inputs = (
@@ -5026,6 +5087,7 @@ def test_metal_addmm_codegen_folds_transposed_operand() -> None:
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
+@requires_tensor_cores
 def test_addmm_tensor_core_applies_broadcast_bias() -> None:
     torch.manual_seed(32)
     inputs = (

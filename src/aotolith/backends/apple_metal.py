@@ -277,6 +277,77 @@ _MPP_HEADER = (
     + "\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
 )
 
+# MetalPerformancePrimitives tensor ops exist only on newer Apple GPU families.
+# On the ones without them the same source still compiles but the metallib
+# refuses to load with "unsupported deferred-static-alloca-size function body",
+# which surfaces to a caller as an opaque `RuntimeError` at the first matmul.
+# Asking the driver costs one tiny kernel and is the only answer that stays
+# correct as Apple extends or retires the feature; parsing `device_info` instead
+# would mean encoding a marketing-name table.
+_MPP_PROBE_SOURCE = """
+        uint lane = thread_position_in_threadgroup.x % 32u;
+        constexpr auto mpp_probe_descriptor = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<mpp_probe_descriptor,
+            metal::execution_simdgroup> mpp_probe_gemm;
+        using mpp_probe_at = decltype(
+            mpp_probe_gemm.get_left_input_cooperative_tensor<T, T, float>());
+        using mpp_probe_bt = decltype(
+            mpp_probe_gemm.get_right_input_cooperative_tensor<T, T, float>());
+        using mpp_probe_ct = decltype(
+            mpp_probe_gemm.get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<mpp_probe_at>,
+                metal::remove_addrspace_t<mpp_probe_bt>, float>());
+        mpp_probe_at mpp_probe_a =
+            mpp_probe_gemm.get_left_input_cooperative_tensor<T, T, float>();
+        mpp_probe_bt mpp_probe_b =
+            mpp_probe_gemm.get_right_input_cooperative_tensor<T, T, float>();
+        mpp_probe_ct mpp_probe_c =
+            mpp_probe_gemm.get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<mpp_probe_at>,
+                metal::remove_addrspace_t<mpp_probe_bt>, float>();
+        mpp_probe_a[0] = in_0[lane];
+        mpp_probe_b[0] = in_1[lane];
+        mpp_probe_c[0] = 0.0f;
+        mpp_probe_gemm.run(mpp_probe_a, mpp_probe_b, mpp_probe_c);
+        if (lane == 0u) { out[0] = (T)mpp_probe_c[0]; }
+"""
+
+
+@lru_cache(maxsize=None)
+def _mpp_available() -> bool:
+    """Return whether this GPU can load a tensor-op kernel at all.
+
+    The probe runs the same constructs the emitted kernels use — a
+    ``matmul2d`` descriptor, the three cooperative tensors and ``run`` — so a
+    GPU that rejects any of them fails here instead of on a real matmul. Any
+    failure means the caller must take the non-tensor-core path: a probe that
+    errors for an unrelated reason should cost throughput, never correctness.
+    """
+
+    try:
+        kernel = _metal_kernel(
+            "aotolith_mpp_probe",
+            ("in_0", "in_1"),
+            ("out",),
+            _MPP_PROBE_SOURCE,
+            _MPP_HEADER,
+        )
+        operand = mx.zeros((32,), dtype=mx.float32)
+        kernel(
+            inputs=[operand, operand],
+            template=[("T", mx.float32)],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(1,)],
+            output_dtypes=[mx.float32],
+        )
+    except Exception:  # noqa: BLE001 - any failure means "do not use MPP".
+        return False
+    return True
+
+
 # Tensor-core (NAX / MXU) GEMM tiles, each
 # (block_rows, block_columns, warp_rows, warp_columns, reduction_step).
 # Swept on Apple M5 (applegpu_g17s) over a shape matrix in both operand
@@ -1514,6 +1585,8 @@ class AppleMetalBackend:
         if not _supports_mpp_attention(
             query_type, key_type, value_type, output_type, mask_shape
         ):
+            return None
+        if not _mpp_available():
             return None
 
         rank = len(query_type.shape)
@@ -2892,7 +2965,7 @@ class AppleMetalBackend:
             )
         elif _supports_mpp_matmul(
             rows, columns, reduction, output_type.dtype
-        ):
+        ) and _mpp_available():
             mpp_config = _select_mpp_gemm_config(
                 rows, columns, reduction, output_type.dtype, transpose_right
             )
