@@ -4835,6 +4835,7 @@ def test_tensor_core_support_is_checked_per_dtype(
     kernel name simulates exactly that asymmetry.
     """
 
+    _require_tensor_cores()
     monkeypatch.setattr(metal_backend, "_TENSOR_CORES_BLOCKED", False)
     monkeypatch.setattr(metal_backend, "_TENSOR_CORE_BLOCK_ERROR", None)
 
