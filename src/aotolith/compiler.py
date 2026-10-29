@@ -16,6 +16,7 @@ from .passes import (
     eliminate_common_subexpressions,
     fuse_attention,
     fuse_activation_epilogue,
+    fuse_gate_up_projection,
     fuse_pointwise,
     fuse_residual_epilogue,
     fuse_rms_norm_epilogue,
@@ -103,6 +104,7 @@ def compile_graph(
     lowered = fuse_rope(lowered)
     lowered = fuse_residual_epilogue(lowered)
     lowered = fuse_pointwise(lowered)
+    lowered = fuse_gate_up_projection(lowered)
     lowered = fuse_activation_epilogue(lowered)
     lowered = eliminate_common_subexpressions(lowered)
     lowered = fuse_rms_norm_epilogue(lowered)

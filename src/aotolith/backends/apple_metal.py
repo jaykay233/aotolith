@@ -530,7 +530,17 @@ def _evaluate_mlx_op(
             left = mx.swapaxes(left, -1, -2)
         if op.attrs.get("transpose_b", False):
             right = mx.swapaxes(right, -1, -2)
-        return _apply_mlx_matmul_epilogue(op, env, mx.matmul(left, right))
+        product = mx.matmul(left, right)
+        if _matmul_epilogue_kind(op) == "silu_mul_paired":
+            paired_position = _matmul_paired_weight_position(op, 1)
+            assert paired_position is not None
+            paired = env[op.inputs[paired_position]]
+            if op.attrs.get("transpose_b", False):
+                paired = mx.swapaxes(paired, -1, -2)
+            return product * (
+                mx.matmul(left, paired) / (1.0 + mx.exp(-product))
+            )
+        return _apply_mlx_matmul_epilogue(op, env, product)
     if op.op == "addmm":
         bias, left, right = (env[value_id] for value_id in op.inputs[:3])
         left = _apply_mlx_matmul_norm(op, env, left)
@@ -2742,6 +2752,7 @@ class AppleMetalBackend:
         expected_inputs = 3 if op.op == "addmm" else 2
         epilogue = _matmul_epilogue_kind(op)
         if epilogue is not None:
+            # Either a gate value to scale by, or a second weight matrix.
             expected_inputs += 1
         norm_position = _matmul_norm_position(op)
         if norm_position is not None:
@@ -3397,9 +3408,17 @@ def _matmul_epilogue_kind(op: Operation) -> str | None:
     kind = op.attrs.get("epilogue")
     if kind is None:
         return None
-    if kind != "silu_mul":
+    if kind not in {"silu_mul", "silu_mul_paired"}:
         raise ValueError(f"unsupported matmul epilogue {kind!r}")
     return kind
+
+
+def _matmul_paired_weight_position(op: Operation, right_position: int) -> int | None:
+    """Return the input slot holding the second projection of a paired epilogue."""
+
+    if _matmul_epilogue_kind(op) != "silu_mul_paired":
+        return None
+    return right_position + 1
 
 
 def _matmul_norm_position(op: Operation) -> int | None:
@@ -3413,8 +3432,13 @@ def _matmul_norm_position(op: Operation) -> int | None:
 def _matmul_epilogue_position(op: Operation) -> int | None:
     """Return the input slot holding the fused epilogue operand, if any."""
 
-    if _matmul_epilogue_kind(op) is None:
+    kind = _matmul_epilogue_kind(op)
+    if kind is None:
         return None
+    if kind == "silu_mul_paired":
+        raise ValueError(
+            "the paired gate/up epilogue is only lowered by the transposed GEMV"
+        )
     return len(op.inputs) - 1 - int(_matmul_norm_position(op) is not None)
 
 
@@ -4499,6 +4523,11 @@ def _emit_transposed_gemv_matmul_source(
     exact_columns = columns % warps == 0
     output_batch_offset = f"batch * {columns}u + " if batch_count > 1 else ""
     output_linear = f"{output_batch_offset}column"
+    paired_position = _matmul_paired_weight_position(op, right_position)
+    if paired_position is not None and reduction % 4 != 0:
+        raise ValueError(
+            "the paired gate/up epilogue needs a reduction that is a multiple of 4"
+        )
     value = "total"
     if bias_id is not None:
         assert bias_type is not None
@@ -4508,7 +4537,14 @@ def _emit_transposed_gemv_matmul_source(
             output_linear,
         )
         value = f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * total"
-    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+    if paired_position is None:
+        value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+    else:
+        # ``silu`` of the gate row scaled by the paired up row, both accumulated
+        # from the same activation in one pass over the two weight rows. The gate
+        # is rounded to the stored element type first, which is exactly the value
+        # the separate projection would have written, so the result is unchanged.
+        value = "(total_up) * (paired_gate / (1.0f + metal::exp(-paired_gate)))"
 
     lines = [
         "uint tid = thread_position_in_threadgroup.x;",
@@ -4545,6 +4581,15 @@ def _emit_transposed_gemv_matmul_source(
             f"{indent}float acc3 = 0.0f;",
         ]
     )
+    if paired_position is not None:
+        lines.extend(
+            [
+                f"{indent}float acc4 = 0.0f;",
+                f"{indent}float acc5 = 0.0f;",
+                f"{indent}float acc6 = 0.0f;",
+                f"{indent}float acc7 = 0.0f;",
+            ]
+        )
     if vectorized:
         lines.extend(
             [
@@ -4558,6 +4603,16 @@ def _emit_transposed_gemv_matmul_source(
                 f"{indent}    uint base = index * 4u;",
             ]
         )
+        if paired_position is not None:
+            lines.extend(
+                [
+                    f"{indent}    const device vec<T, 4>* paired_row = "
+                    "reinterpret_cast<const device vec<T, 4>*>("
+                    f"in_{paired_position} + {right_batch_prefix}"
+                    f"column * {reduction}u);",
+                    f"{indent}    vec<T, 4> paired_weight = paired_row[index];",
+                ]
+            )
         if norm_slot is None:
             for offset in range(4):
                 lines.append(
@@ -4578,6 +4633,12 @@ def _emit_transposed_gemv_matmul_source(
                 f"{indent}    acc{offset} = fma(x{offset}, float(weight[{offset}]), "
                 f"acc{offset});"
             )
+        if paired_position is not None:
+            for offset in range(4):
+                lines.append(
+                    f"{indent}    acc{offset + 4} = fma(x{offset}, "
+                    f"float(paired_weight[{offset}]), acc{offset + 4});"
+                )
         lines.append(f"{indent}}}")
     else:
         def left_term(index: str) -> str:
@@ -4607,9 +4668,14 @@ def _emit_transposed_gemv_matmul_source(
                 f"{indent}}}",
             ]
         )
+    lines.append(f"{indent}float total = simd_sum((acc0 + acc1) + (acc2 + acc3));")
+    if paired_position is not None:
+        lines.append(
+            f"{indent}float total_up = simd_sum((acc4 + acc5) + (acc6 + acc7));"
+        )
+        lines.append(f"{indent}float paired_gate = float((T)total);")
     lines.extend(
         [
-            f"{indent}float total = simd_sum((acc0 + acc1) + (acc2 + acc3));",
             f"{indent}if (lane == 0u) {{",
             f"{indent}    out[{output_linear}] = (T)({value});",
             f"{indent}}}",

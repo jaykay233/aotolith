@@ -185,6 +185,8 @@ print(tokens.tolist())
 
 query、key、value 共享同一份归一化输入，因此适配层把三者按层存成一个打包后的投影并只做一次矩阵乘。拆分结果只需两个 view 操作，却省掉两次 kernel launch：128 行的 key/value 投影对 GPU 来说太小，带宽利用率不到融合后投影的五分之一。
 
+gated MLP 没有可以这样打包的权重，因为 `gate` 和 `up` 是相乘而不是拼接。`fuse_gate_up_projection` 补上了另一半：它识别 `silu(gate) * up`，且两个操作数都回溯到读取同一份激活的投影，然后把这对投影替换成一个带 `silu_mul_paired` epilogue 的矩阵乘。kernel 在同一个循环里流式读取 decode token 的 gate 行和 up 行，一次写出 `silu(gate) * up`，于是 step 读的还是同样的 17.4 MB，但 launch 从两次变成一次。它只在激活只有一行时生效；更高的操作数走 tiled 矩阵乘，那里没有成对 epilogue，两个投影保持独立。gate 在 `silu` 之前先舍入到 BF16，正是独立投影原本会写下的值，所以融合结果是逐位一致的，而不只是接近——保留 FP32 累加精度的版本在 24 token 的 greedy 运行里，第 4 个 token 就翻转了。
+
 仓库内 benchmark 使用相同的 prompt、精度和 `128 + 64` token 参数比较 PyTorch MPS、MLX 和 Aotolith：
 
 ```bash
@@ -195,37 +197,36 @@ python examples/qwen_static_cache_benchmark.py \
   --output /tmp/qwen-aotolith-codegen.json
 ```
 
-`--mlx-baseline` 会在同一个进程里用同一段 prompt 给 `mlx_lm` 自己的 greedy decode 计时，原生基线因此是在跑 benchmark 的这台机器上测出来的，而不是从别处引用。在这台机器上（M5 Pro，MLX 0.32）多次运行读到 **195.5-197.2 token/s**。
+`--mlx-baseline` 会在同一个进程里用同一段 prompt 给 `mlx_lm` 自己的 greedy decode 计时，原生基线因此是在跑 benchmark 的这台机器上测出来的，而不是从别处引用。在这台机器上（M5 Pro，MLX 0.32）多次运行读到 **190.5-195.0 token/s**。
 
 | 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm` |
 | --- | --- | --- | --- | --- |
-| 仅 MLX fallback | 10 146 token/s | 103.3 token/s | 116.2 token/s | 0.59x |
-| `--codegen-matmul` | 13 274 token/s | 178.6 token/s | **232.5 token/s** | **1.18x** |
-| `--codegen-matmul --codegen-attention` | 12 746 token/s | 176.8 token/s | 231.8 token/s | 1.18x |
+| 仅 MLX fallback | 10 000 token/s | 119.0 token/s | **134.6 token/s** | 0.70x |
+| `--codegen-matmul` | 13 000 token/s | 178.4 token/s | **240.1 token/s** | **1.23x** |
+| `--codegen-matmul --codegen-attention` | 12 400 token/s | 176.8 token/s | 233.0 token/s | 1.21x |
 
-（Qwen2.5-0.5B-Instruct、128 prompt token、greedy、batch 1、BF16、11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。同一份构建跑十一次下来，decode 落在 231.4-232.9 token/s、prefill 在 13.0k-13.5k token/s、`mlx_lm` 基线在 195.3-197.2 token/s；加 `--codegen-attention` 后 prefill 降到 12.7k 是 attention kernel 长序列 tile 更慢所致，不是 decode 的代价。）
+（Qwen2.5-0.5B-Instruct、128 prompt token、greedy、batch 1、BF16、11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。这份构建多次运行下来，`--codegen-matmul` 的 decode 落在 240.0-240.2 token/s——这个配置稳定到可以读到小数点后一位——而 `--codegen-attention` 那行在 229.8-238.2 之间波动，prefill 在 11.6k-12.8k 之间波动。不加原生 attention 时 prefill 稳定在 13.0k 左右，加上后降到约 12.4k，这是 attention kernel 在 prefill 形状上 tile 更慢所致，不是 decode 的代价。`mlx_lm` 基线在同样几次运行里读到 190.5-195.0 token/s。）
 
 和 `mlx_lm` 对比应该看 `decode_async`，因为两者都把 host 循环摊到了多个 token 上；`decode_sync_each_step` 每个 token 都要同步一次设备，任何服务循环都不会这么做。异步路径此前落后于同步路径，现在反超，因为每个 step 只强制一次设备同步。
 
-decode 现在受权重带宽限制，而不是受 host 限制。构建一个 step 只需 0.98 ms Python，GPU 需要 4.0 ms，所以 host 完全被异步队列盖住；在 plan 展开之前 host 要 6.2 ms，那时它才是瓶颈。一个 step 要流式读取 991 MB 权重（24 层的 `qkv` 2.07 MB、`o_proj` 1.61 MB、三个 8.72 MB 的 MLP 矩阵，再加 272 MB 的 LM head），按 4.0 ms 算是 248 GB/s。剩下的余量在哪，看下面的单次速率就知道：272 MB 的 LM head 单次能跑到 414 GB/s，而 8.7 MB 的 MLP 单次只有 265-281 GB/s。输出宽度只有 4864 列的一次 launch 填不满这台设备，而 151936 列可以，这就是小分桶落后的具体原因。要明显比现在更快，需要的是少读字节，而不是减少 kernel。
+decode 现在受权重带宽限制，而不是受 host 限制。构建一个 step 只需 0.98 ms Python，GPU 需要约 4.1 ms，所以 host 完全被异步队列盖住；在 plan 展开之前 host 要 6.2 ms，那时它才是瓶颈。一个 step 要流式读取 991 MB 权重（24 层的 `qkv` 2.07 MB、`o_proj` 1.61 MB、一个 17.4 MB 的成对 gate/up 矩阵、8.73 MB 的 `down`，再加 272 MB 的 LM head），按实测 4.17 ms 每个 token 算是 238 GB/s。剩下的余量在哪，看下面的单次速率就知道：272 MB 的 LM head 单次能跑到 412 GB/s，而 8.7 MB 的 MLP 单次只有 268-279 GB/s。输出宽度只有 4864 列的一次 launch 填不满这台设备，而 151936 列可以，这就是小分桶落后的具体原因。要明显比现在更快，只能少读字节。
 
 单个 decode step 的分桶 GPU 开销。测量时把同一组 kernel 连着回放足够多遍，让设备队列一直是满的，于是墙钟时间就是设备时间，host 提交被盖住：
 
 | 分桶 | launch 次数 | 每次搬运 | 单次 GPU 时间 | 带宽 |
 | --- | --- | --- | --- | --- |
-| LM head GEMV | 1 | 272.3 MB | 658 us | 414 GB/s |
-| MLP up GEMV + `silu_mul` | 24 | 8.73 MB | 33.0 us | 265 GB/s |
-| 带残差的 MLP down GEMV | 24 | 8.73 MB | 32.7 us | 267 GB/s |
-| MLP gate GEMV + RMSNorm | 24 | 8.72 MB | 31.0 us | 281 GB/s |
-| 融合 QKV GEMV + RMSNorm | 24 | 2.07 MB | 10.9 us | 190 GB/s |
-| attention（单 query） | 24 | 0.10 MB | 7.7 us | 13 GB/s |
-| 带残差的 o_proj GEMV | 24 | 1.61 MB | 7.7 us | 210 GB/s |
-| RoPE q / k | 48 | 1 KB | 7.5 us | - |
-| 加性 attention mask | 1 | 0.2 KB | 23.6 us | - |
+| LM head GEMV | 1 | 272.3 MB | 662 us | 412 GB/s |
+| 带残差的 MLP down GEMV | 24 | 8.73 MB | 32.6 us | 268 GB/s |
+| MLP gate+up GEMV + RMSNorm + `silu_mul` | 24 | 17.44 MB | 62.5 us | 279 GB/s |
+| 融合 QKV GEMV + RMSNorm | 24 | 2.07 MB | 10.8 us | 193 GB/s |
+| attention（单 query） | 24 | 0.10 MB | 7.3 us | 14 GB/s |
+| 带残差的 o_proj GEMV | 24 | 1.61 MB | 7.8 us | 207 GB/s |
+| RoPE q / k | 48 | 1 KB | 7.8 us | - |
+| 加性 attention mask | 1 | 0.2 KB | 26.6 us | - |
 
-加起来是 4.0 ms 设备时间、991 MB，也就是整个 step。LM head 加三个 MLP 矩阵占了其中 75%，而它们是在搬字节，不是在等 launch；其余四分之一分散在 121 次每次最多搬 2 MB 的 launch 上。一个 step 仍然带着 194 次有依赖的 launch，但几乎不搬数据的那些（RoPE、mask）在真实链条里便宜到删掉也不影响总量。把 query 和 key 的旋转合成一次 16 头旋转正是这个实验：它省掉 24 次 launch 和 24 个图节点，decode 却是 232.9 token/s 对之前的 232.5，落在运行间波动内，所以没有保留。
+加起来是 3.96 ms 设备时间、991 MB，而整个 step 实测 4.17 ms。LM head 加 MLP 矩阵占了其中 74%，而它们是在搬字节，不是在等 launch；其余分散在 121 次每次最多搬 2 MB 的 launch 上。一个 step 带着 170 次有依赖的 launch。删掉便宜的 launch 不影响总量：把 query 和 key 的旋转合成一次 16 头旋转省掉了 24 次 launch 和 24 个图节点，decode 却是 232.9 token/s 对之前的 232.5，落在运行间波动内，所以没有保留。删掉搬运真实数据的 launch 就会影响：把 `gate` 和 `up` 合成一次 launch 读的仍是同样的 17.4 MB，但 launch 从两次变成一次，交替 A/B 测到 1.031x-1.038x。区别在于这次 launch 搬多少，而不在于有多少次。
 
-有两种做法会把这个表测成“什么都没测”，而且看起来都很正常。一是每轮丢掉输出的数组，惰性图在到达设备之前就被释放，墙钟时间只覆盖 host 提交，带宽那一列会算出 1 TB/s 以上。二是传全零权重，驱动可以跳过读取，小分桶因此被抬高。一个分桶必须让每一轮的输出都活着，并且喂真实数值，它的数字才有意义；任何超过 `mx.sum` 读同样字节能达到的读数，测的是 harness 而不是 kernel。
+有三种做法会把这个表测成“什么都没测”，而且看起来都很正常。一是每轮丢掉输出的数组，惰性图在到达设备之前就被释放，墙钟时间只覆盖 host 提交，带宽那一列会算出 1 TB/s 以上。二是传全零权重，驱动可以跳过读取，小分桶因此被抬高。一个分桶必须让每一轮的输出都活着，并且喂真实数值，它的数字才有意义；任何超过 `mx.sum` 读同样字节能达到的读数，测的是 harness 而不是 kernel。三是回放本身会往反方向偏：表里同一个分桶的 24 个实例是连着跑的，而真实 step 里每一层都要等上一层，所以 RoPE 和 attention 的单次数字是上界，整表的和只是近似整个 step。
 
 这个方向上有两个实验被测过并放弃。把新的 key/value 直接写到 slot `positions`、用 mask 挑出有效 slot，读起来比滚动窗口更顺，但 MLX 会把 scatter 降级成对整窗口做一遍下标比较，而 concatenate 只是同样字节数的一次拷贝：每个 step 慢 0.18 ms，所以保留滚动。另外，decode token 的旋转位置是 `valid_length - 1` 而不是 `valid_length`；`Qwen2StaticCacheRuntime.decode_token` 曾把后者写进文档并短暂使用，代价是相对参考实现 0.7 的 logit 最大偏差，token 也无法完全对齐。现在 64 个 token 全部一致。
 

@@ -380,6 +380,14 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 
 向量加载使该 shape 的 kernel 耗时下降约 21%。SIMD 路径仍比 MLX 慢，并且没有使用 Metal 4 MPP、split-K 或 autotune。
 
+### 成对 gate/up epilogue
+
+单 token 的 `matmul` 走 warp-per-column 的 GEMV：一个 warp 负责一个输出列，沿 reduction 维读取该列对应的一行权重。gated MLP 的 `gate` 和 `up` 共享同一个 normalized 输入，于是 `fuse_gate_up_projection` 把它们合成一个 `matmul`，并标记 `epilogue="silu_mul_paired"`。
+
+kernel 在同一个循环里读 gate 行和 up 行（`in_1`、`in_2`），各自累加 4 个 float，最后写出 `silu(gate) * up`。两次乘加共用同一组已归一化的 `x0..x3`，所以第二个权重的带宽开销只是多读 8.72 MB，而 launch 从两次减到一次。gate 在 `silu` 前先 cast 回存储 dtype，得到的正是独立投影原本会写下的那个值，因此结果与未融合版本逐位一致。保留 FP32 累加精度反而会改变结果：在 24 token 的 greedy 运行中，第 4 个 token 就因为这点差异翻转了。
+
+该 epilogue 只由 transposed GEMV 实现。`fuse_gate_up_projection` 只在左侧操作数只有一行、权重物理布局为 `[out, in]`（`transpose_b=True`）、且两个投影的 weight shape/dtype 完全一致时才改写；taller 的操作数走 tiled kernel，两个投影保持独立，`silu_mul` 仍由原有的单向量 epilogue 处理。MLX fallback 用两次 `mx.matmul` 加一次逐元素表达式实现同一语义。
+
 ## 12. Metal attention codegen
 
 `codegen_attention=True` 时，backend 为常见 attention 生成 FlashAttention 风格的 fused MSL kernel。每个 threadgroup 处理同一 `(batch, query_head)` 下的 8、16 或 24 个 query。短序列使用 32-key tile；FP16/BF16 且 QK、PV 都能使用 SIMD matrix 时，query sequence 达到 768 会依次尝试 `24×64`、`16×64`、`24×32`、`16×32` tile。`24×64` 和 `16×64` 分别使用 768 和 512 个 thread；如果估算 shared memory 超过 31 KiB，则继续回退。shared memory 仍不足时使用 `8×32` tile 和 256 个 thread。

@@ -84,6 +84,63 @@ def test_scalar_tensor_input_is_loaded_without_indexing() -> None:
     assert mx.allclose(actual, expected)
 
 
+def test_single_token_mlp_pairs_gate_and_up_into_one_projection() -> None:
+    def mlp(x, gate_w, up_w):
+        gate = torch.nn.functional.linear(x, gate_w)
+        up = torch.nn.functional.linear(x, up_w)
+        return torch.nn.functional.silu(gate) * up
+
+    torch.manual_seed(11)
+    torch_inputs = (
+        torch.randn(1, 16),
+        torch.randn(32, 16),
+        torch.randn(32, 16),
+    )
+    result = compile_callable(mlp, torch_inputs, codegen_matmul=True)
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
+    assert (
+        result.lowered_graph.ops[0].attrs.get("epilogue") == "silu_mul_paired"
+    )
+
+    inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)
+    actual = result.plan(*inputs)[0]
+    gate = mx.matmul(inputs[0], inputs[1].T)
+    up = mx.matmul(inputs[0], inputs[2].T)
+    expected = gate / (1.0 + mx.exp(-gate)) * up
+    mx.eval(actual, expected)
+
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_multi_row_mlp_keeps_gate_and_up_separate() -> None:
+    def mlp(x, gate_w, up_w):
+        gate = torch.nn.functional.linear(x, gate_w)
+        up = torch.nn.functional.linear(x, up_w)
+        return torch.nn.functional.silu(gate) * up
+
+    torch.manual_seed(12)
+    torch_inputs = (
+        torch.randn(3, 16),
+        torch.randn(32, 16),
+        torch.randn(32, 16),
+    )
+    result = compile_callable(mlp, torch_inputs)
+    # A taller operand goes to the tiled multiply, which has no paired form, so
+    # the gate keeps its own projection and the multiply stays in the epilogue.
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul", "matmul"]
+    epilogues = [op.attrs.get("epilogue") for op in result.lowered_graph.ops]
+    assert epilogues == [None, "silu_mul"]
+
+    inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)
+    actual = result.plan(*inputs)[0]
+    gate = mx.matmul(inputs[0], inputs[1].T)
+    up = mx.matmul(inputs[0], inputs[2].T)
+    expected = gate / (1.0 + mx.exp(-gate)) * up
+    mx.eval(actual, expected)
+
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_mlp_end_to_end_on_metal() -> None:
     def mlp(x, gate_w, up_w, down_w):
         gate = x @ gate_w

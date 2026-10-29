@@ -185,6 +185,8 @@ The adapter fixes batch size, prompt length, and maximum generation length and i
 
 Query, key, and value share one normalized input, so the adapter stores them as a single packed projection per layer and multiplies once. Splitting the result costs two view operations and removes two kernel launches: the 128-row key and value projections were far too small to fill the GPU, and each ran at under a fifth of the bandwidth the fused projection reaches.
 
+A gated MLP has no such packed weight, because `gate` and `up` are multiplied rather than concatenated. `fuse_gate_up_projection` supplies the missing half: it recognises `silu(gate) * up` where both operands trace back to a projection over the same activation, and replaces the pair with one multiply carrying a `silu_mul_paired` epilogue. The kernel streams the gate row and the up row of a decode token's weights in the same loop, and writes `silu(gate) * up` once, so the step reads the same 17.4 MB in one launch instead of two. It only fires for a single-row activation; a taller operand goes to the tiled multiply, which has no paired epilogue, and the projections stay separate. The gate is rounded to BF16 before `silu`, which is the value the separate projection would have written, so the fusion is bit-identical rather than merely close — a version that kept the extra precision in the FP32 accumulator flipped a greedy token on step four of a 24-token run.
+
 The repository benchmark uses the same prompt, precision, and `128 + 64` token settings for PyTorch MPS, MLX, and Aotolith:
 
 ```bash
@@ -199,35 +201,34 @@ python examples/qwen_static_cache_benchmark.py \
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 10 146 tok/s | 103.3 tok/s | 116.2 tok/s | 0.59x |
-| `--codegen-matmul` | 13 274 tok/s | 178.6 tok/s | **232.5 tok/s** | **1.18x** |
-| `--codegen-matmul --codegen-attention` | 12 746 tok/s | 176.8 tok/s | 231.8 tok/s | 1.18x |
+| MLX fallback only | 10 000 tok/s | 119.0 tok/s | **134.6 tok/s** | 0.70x |
+| `--codegen-matmul` | 13 000 tok/s | 178.4 tok/s | **240.1 tok/s** | **1.23x** |
+| `--codegen-matmul --codegen-attention` | 12 400 tok/s | 176.8 tok/s | 233.0 tok/s | 1.21x |
 
-(Qwen2.5-0.5B-Instruct, 128 prompt tokens, greedy, batch 1, median of 11 repeats, BF16; the same 64 generated tokens as the PyTorch reference in every row. Across eleven runs of this build, decode lands in 231.4-232.9 tokens/s, prefill in 13.0k-13.5k tokens/s, and the `mlx_lm` baseline in 195.3-197.2 tokens/s; prefill falling to 12.7k with `--codegen-attention` is the attention kernel's slower long-sequence tile, not a decode cost.)
+(Qwen2.5-0.5B-Instruct, 128 prompt tokens, greedy, batch 1, median of 11 repeats, BF16; the same 64 generated tokens as the PyTorch reference in every row. Across runs of this build the `--codegen-matmul` decode lands in 240.0-240.2 tokens/s — that configuration is stable enough to read to a tenth — while the `--codegen-attention` row varies in 229.8-238.2 and its prefill in 11.6k-12.8k. Prefill staying around 13.0k without native attention and dropping to roughly 12.4k with it is the attention kernel's slower tile on prefill shapes, not a decode cost. The `mlx_lm` baseline reads 190.5-195.0 tokens/s across the same runs.)
 
 `decode_async` is the figure to compare against `mlx_lm`, because both amortize the host loop across tokens; `decode_sync_each_step` pays a device sync every token, which no serving loop needs. The async path used to trail the synchronous one and now leads it, because the plan only forces a single device sync per step.
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer.
 
-Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs 4.0 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, and three MLP matrices of 8.72 MB each, plus the 272 MB LM head), which at 4.0 ms is 248 GB/s. Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 414 GB/s, while the 8.7 MB MLP launches sustain 265-281 GB/s. A launch whose output is only 4864 columns wide cannot fill the device the way one with 151936 can, which is the concrete reason the small buckets trail. Going meaningfully faster than this needs fewer bytes read, not fewer kernels.
+Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.1 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at the measured 4.17 ms per token is 238 GB/s. Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 412 GB/s, while the 8.7 MB MLP launches sustain 268-279 GB/s. A launch whose output is only 4864 columns wide cannot fill the device the way one with 151936 can, which is the concrete reason the small buckets trail. Going meaningfully faster than this needs fewer bytes read.
 
 Per-bucket GPU cost for one decode step, measured by replaying each bucket enough times to keep the device queue full, so the wall clock is device time and host submission is hidden:
 
 | bucket | launches | traffic per launch | GPU time per launch | bandwidth |
 | --- | --- | --- | --- | --- |
-| LM head GEMV | 1 | 272.3 MB | 658 us | 414 GB/s |
-| MLP up GEMV + `silu_mul` | 24 | 8.73 MB | 33.0 us | 265 GB/s |
-| MLP down GEMV + residual | 24 | 8.73 MB | 32.7 us | 267 GB/s |
-| MLP gate GEMV + RMSNorm | 24 | 8.72 MB | 31.0 us | 281 GB/s |
-| fused QKV GEMV + RMSNorm | 24 | 2.07 MB | 10.9 us | 190 GB/s |
-| attention, single query | 24 | 0.10 MB | 7.7 us | 13 GB/s |
-| o_proj GEMV + residual | 24 | 1.61 MB | 7.7 us | 210 GB/s |
-| RoPE q / k | 48 | 1 KB | 7.5 us | - |
-| additive attention mask | 1 | 0.2 KB | 23.6 us | - |
+| LM head GEMV | 1 | 272.3 MB | 662 us | 412 GB/s |
+| MLP down GEMV + residual | 24 | 8.73 MB | 32.6 us | 268 GB/s |
+| MLP gate+up GEMV + RMSNorm + `silu_mul` | 24 | 17.44 MB | 62.5 us | 279 GB/s |
+| fused QKV GEMV + RMSNorm | 24 | 2.07 MB | 10.8 us | 193 GB/s |
+| attention, single query | 24 | 0.10 MB | 7.3 us | 14 GB/s |
+| o_proj GEMV + residual | 24 | 1.61 MB | 7.8 us | 207 GB/s |
+| RoPE q / k | 48 | 1 KB | 7.8 us | - |
+| additive attention mask | 1 | 0.2 KB | 26.6 us | - |
 
-That sums to 4.0 ms of device time and 991 MB, which is the whole step. The LM head plus the three MLP matrices are 75% of it, and they are moving bytes rather than waiting on dispatches; the other quarter is spread over 121 launches that each move 2 MB or less. A step still carries 194 dependent launches, but the ones with almost no traffic (RoPE, the mask) are cheap enough in the real chain that removing them does not move the total. Folding the query and key rotary calls into one 16-head rotation is exactly that experiment: it removed 24 launches and 24 graph ops, and decode stayed at 232.9 tokens/s against 232.5 before, inside the run-to-run band, so it was not kept.
+That sums to 3.96 ms of device time and 991 MB, against 4.17 ms measured for the whole step. The LM head plus the MLP matrices are 74% of it, and they are moving bytes rather than waiting on dispatches; the rest is spread over 121 launches that each move 2 MB or less. A step carries 170 dependent launches. Removing one of the cheap ones does not move the total: folding the query and key rotary calls into one 16-head rotation removed 24 launches and 24 graph ops and decode stayed at 232.9 tokens/s against 232.5, inside the run-to-run band, so it was not kept. Removing one that carries real traffic does move it: pairing `gate` and `up` into one launch reads the same 17.4 MB but takes one launch instead of two, and measured 1.031x-1.038x across interleaved A/B runs. The difference is what the launch moves, not how many there are.
 
-Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel.
+Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel. The replay also flatters the tiny buckets for the opposite reason: the 24 instances of a bucket run back to back there, while in the real step each layer waits for the previous one, so per-launch figures for RoPE and attention are upper bounds and the table's sum only approximates the step.
 
 Two experiments in this area were measured and dropped. Writing the new key/value straight into slot `positions` and selecting the live slots with the mask reads better than rolling the window, but MLX lowers a scatter to an index-compare pass over the whole window where the concatenate is a straight copy of the same bytes: 0.18 ms slower per step, so the roll stays. And the rotary position for a decode token is `valid_length - 1`, not `valid_length`; `Qwen2StaticCacheRuntime.decode_token` documented the second and briefly used it, which cost 0.7 in max logit deviation against the reference and broke the exact-token match. It now matches all 64 tokens.
 

@@ -86,6 +86,21 @@ def test_tiny_qwen2_static_cache_matches_pytorch_decode() -> None:
     assert actual_tokens.shape == (1, 6)
     assert actual_tokens.tolist() == [expected_tokens]
 
+    # The gated MLP pairs its two projections into one launch per layer, so the
+    # decode plan carries one fewer kernel per layer than it has projections.
+    paired = [
+        op
+        for op in runtime.decode.plan.graph.ops
+        if op.attrs.get("epilogue") == "silu_mul_paired"
+    ]
+    assert len(paired) == config.num_hidden_layers
+    gated = [
+        op
+        for op in runtime.prefill.plan.graph.ops
+        if op.attrs.get("epilogue") == "silu_mul_paired"
+    ]
+    assert gated == []
+
 
 def test_decode_token_rejects_out_of_vocabulary_token() -> None:
     transformers = pytest.importorskip("transformers")

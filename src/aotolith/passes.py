@@ -685,6 +685,187 @@ def _trace_add_operand_to_matmul(
     return None
 
 
+def fuse_gate_up_projection(graph: Graph) -> Graph:
+    """Project ``gate`` and ``up`` from one launch instead of two.
+
+    A gated MLP feeds the same normalized hidden state to both halves of its
+    projection, so a single-token step streams two weight matrices that are read
+    against one activation and immediately multiplied. Emitting both rows from
+    one kernel removes a launch and a barrier from the per-layer chain without
+    changing how many bytes are read.
+
+    This only fires for the single-token form. A taller left operand goes to the
+    tiled matrix multiply, which has no paired epilogue, so the two projections
+    stay separate and the result is unchanged.
+    """
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    rewrites: dict[int, Operation] = {}
+    removed: set[int] = set()
+
+    for index, op in enumerate(graph.ops):
+        if op.op != "fused_elementwise" or len(op.inputs) != 2:
+            continue
+        body = op.attrs.get("body")
+        if not isinstance(body, tuple) or len(body) != 2:
+            continue
+        activation, multiply = body
+        if not isinstance(activation, Operation) or activation.op != "silu":
+            continue
+        if not isinstance(multiply, Operation) or multiply.op != "mul":
+            continue
+        if multiply.outputs[0] != op.outputs[0]:
+            continue
+        gate_id = activation.inputs[0]
+        other_id = next(
+            (
+                value_id
+                for value_id in multiply.inputs
+                if value_id != activation.outputs[0]
+            ),
+            None,
+        )
+        if other_id is None:
+            continue
+
+        gate = _trace_operand_to_matmul(
+            graph, gate_id, index, producers, consumers, output_set
+        )
+        product = _trace_operand_to_matmul(
+            graph, other_id, index, producers, consumers, output_set
+        )
+        if gate is None or product is None:
+            continue
+        gate_index, gate_chain, gate_source = gate
+        product_index, product_chain, _ = product
+        if gate_index == product_index:
+            continue
+        gate_op = graph.ops[gate_index]
+        product_op = graph.ops[product_index]
+        # A bias term would need its own slot in the paired epilogue, and a
+        # fused normalization is attached after this point, so only the plain
+        # two-operand form qualifies.
+        if gate_op.op != "matmul" or product_op.op != "matmul":
+            continue
+        if len(gate_op.inputs) != 2 or len(product_op.inputs) != 2:
+            continue
+        if gate_op.attrs != product_op.attrs:
+            continue
+        gate_weight = graph.value(gate_op.inputs[1]).type
+        if gate_weight != graph.value(product_op.inputs[1]).type:
+            continue
+        if not _chain_preserves_order(graph, gate_chain):
+            continue
+        if not _chain_preserves_order(graph, product_chain):
+            continue
+        output_type = graph.value(product_op.outputs[0]).type
+        if graph.value(gate_op.outputs[0]).type != output_type:
+            continue
+        consumed_id = (
+            graph.ops[product_chain[-1]].outputs[0]
+            if product_chain
+            else product_op.outputs[0]
+        )
+        if graph.value(op.outputs[0]).type != graph.value(consumed_id).type:
+            continue
+
+        # The pair has to read the same activation, and the transposed layout has
+        # to put the projection columns first for the two rows to be neighbours.
+        gate_left = gate_op.inputs[0]
+        left_type = graph.value(gate_left).type
+        if prod(left_type.shape[:-1]) != 1:
+            continue
+        reduction = left_type.shape[-1]
+        if reduction % 4 != 0:
+            continue
+        if gate_weight.shape != (output_type.shape[-1], reduction):
+            continue
+        if gate_op.attrs.get("transpose_b") is not True:
+            continue
+        # A transposed left operand would be routed to the tiled kernel, which
+        # has no paired form.
+        if gate_op.attrs.get("transpose_a") is True:
+            continue
+        # Both operands are reshapes of one tensor, so either can feed the fused
+        # projection; the product's copy is dropped and the gate's is kept.
+        gate_root, _ = _single_consumer_reshape_chain(
+            graph, gate_left, gate_index, producers, consumers
+        )
+        product_root, product_left_chain = _single_consumer_reshape_chain(
+            graph, product_op.inputs[0], product_index, producers, consumers
+        )
+        if gate_root != product_root:
+            continue
+        if graph.value(product_op.inputs[0]).type != left_type:
+            continue
+        # Dropping the gate projection is only sound when nothing else reads it.
+        gate_readers = [gate_chain[0]] if gate_chain else [index]
+        if consumers.get(gate_source) != gate_readers:
+            continue
+
+        attrs = dict(gate_op.attrs)
+        attrs["epilogue"] = "silu_mul_paired"
+        rewrites[product_index] = Operation(
+            "matmul",
+            (gate_left, gate_op.inputs[1], product_op.inputs[1]),
+            product_op.outputs if product_chain else (op.outputs[0],),
+            attrs,
+        )
+        if product_chain:
+            last = product_chain[-1]
+            rewrites[last] = Operation(
+                "reshape",
+                (graph.ops[last].inputs[0],),
+                (op.outputs[0],),
+                {"shape": graph.value(op.outputs[0]).type.shape},
+            )
+        removed.add(index)
+        removed.add(gate_index)
+        removed.update(gate_chain)
+        removed.update(product_left_chain)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in removed:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def _single_consumer_reshape_chain(
+    graph: Graph,
+    value_id: str,
+    consumer_index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+) -> tuple[str, tuple[int, ...]]:
+    """Walk back through reshapes that exist only to feed one consumer."""
+
+    chain: list[int] = []
+    current = value_id
+    while True:
+        producer = producers.get(current)
+        if producer is None:
+            break
+        candidate = graph.ops[producer]
+        if candidate.op != "reshape" or len(candidate.inputs) != 1:
+            break
+        if consumers.get(current) != [consumer_index]:
+            break
+        chain.append(producer)
+        consumer_index = producer
+        current = candidate.inputs[0]
+    return current, tuple(chain)
+
+
 def fuse_activation_epilogue(graph: Graph) -> Graph:
     """Fold ``silu(gate) * up`` into the projection that produces ``up``.
 
