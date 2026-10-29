@@ -211,7 +211,9 @@ python examples/qwen_static_cache_benchmark.py \
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer.
 
-Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.1 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at the measured 4.17 ms per token is 238 GB/s. Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 412 GB/s, while the 8.7 MB MLP launches sustain 268-279 GB/s. A launch whose output is only 4864 columns wide cannot fill the device the way one with 151936 can, which is the concrete reason the small buckets trail. Going meaningfully faster than this needs fewer bytes read.
+Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.1 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at the measured 4.17 ms per token is 238 GB/s.
+
+Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 412 GB/s, while the 17.4 MB MLP launches sustain 279. An earlier version of this section blamed the narrow grid — a 4864-wide output supposedly cannot fill the device the way a 151936-wide one can. That explanation does not survive measurement; see [why the small buckets cannot be fixed](#why-the-small-buckets-cannot-be-fixed) below.
 
 Per-bucket GPU cost for one decode step, measured by replaying each bucket enough times to keep the device queue full, so the wall clock is device time and host submission is hidden:
 
@@ -231,6 +233,40 @@ That sums to 3.96 ms of device time and 991 MB, against 4.17 ms measured for the
 Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel. The replay also flatters the tiny buckets for the opposite reason: the 24 instances of a bucket run back to back there, while in the real step each layer waits for the previous one, so per-launch figures for RoPE and attention are upper bounds and the table's sum only approximates the step.
 
 Two experiments in this area were measured and dropped. Writing the new key/value straight into slot `positions` and selecting the live slots with the mask reads better than rolling the window, but MLX lowers a scatter to an index-compare pass over the whole window where the concatenate is a straight copy of the same bytes: 0.18 ms slower per step, so the roll stays. And the rotary position for a decode token is `valid_length - 1`, not `valid_length`; `Qwen2StaticCacheRuntime.decode_token` documented the second and briefly used it, which cost 0.7 in max logit deviation against the reference and broke the exact-token match. It now matches all 64 tokens.
+
+### Why the small buckets cannot be fixed
+
+Three measurements agree that the MLP buckets are not leaving anything on the table, and each rules out a different explanation.
+
+The first is the threadgroup size. If a 4864-wide output were too narrow to fill the device, giving it more, smaller threadgroups would help. Sweeping the same compiled plan from 64 to 1024 threads per threadgroup moves that bucket by 2%:
+
+| threads per threadgroup | 4864×896 | 151936×896 |
+| --- | ---: | ---: |
+| 1024 (selected for narrow buckets) | 284 GB/s | 395 GB/s |
+| 256 | 286 GB/s | 413 GB/s |
+| 128 | 289 GB/s | 410 GB/s |
+| 64 | 284 GB/s | 408 GB/s |
+| 128, with 64 for the wide bucket | 282 GB/s | 291 GB/s |
+
+The 4864 bucket is flat while the 151936 bucket moves by 30% in the other direction: it wants 128-thread groups, and the 1024-thread setting that the narrow buckets use costs it a third of its bandwidth. So occupancy is a real effect, but it is not what separates the two buckets.
+
+The second is MLX's own reduction. `mx.sum` over the same bytes follows the same curve, and a lower one:
+
+| bytes read | `mx.sum` | this GEMV |
+| --- | ---: | ---: |
+| 8 MB | 82 GB/s | 268 GB/s (8.7 MB) |
+| 17.4 MB | 180 GB/s | 279 GB/s |
+| 35 MB | 225 GB/s | — |
+| 140 MB | 295 GB/s | — |
+| 280 MB | 296 GB/s | 412 GB/s (272 MB) |
+
+The projection beats MLX's reduction at every size, so this is not an implementation artifact of this kernel.
+
+The third is the controlled comparison inside one table above: the same warp-per-column kernel reaches 412 GB/s on a 272 MB matrix and 279 GB/s on a 17.4 MB one. Only the bytes differ.
+
+What all three show is that the rate a launch reaches depends on how many bytes it reads, not on how its grid is shaped. To run the whole step at 412 GB/s its 991 MB would have to arrive in launches of hundreds of megabytes, but every layer is cut into five strictly dependent projections — `qkv`, `o_proj`, paired gate/up, `down` — and the largest is 17.4 MB, because the nonlinearity between them is a real barrier. Pairing `gate` and `up` is exactly the move that exploits this, and it is why that one change measured 1.03x while removing 24 launches of 1 KB measured nothing. 4.17 ms per token is therefore the BF16 floor on this device: going meaningfully faster needs fewer bytes, which means quantized weights, not a better kernel.
+
+Autotuning is not an escape either, and until now it could not even run on a model like this one. `--autotune` evaluated the MLX fallback for every operation in order to have a reference to compare against, but normalization, rotary, and attention only ever lower to generated kernels, so compiling a transformer raised `NotImplementedError` at the first standalone `rms_norm`. It now measures such an operation against itself, records the single benchmark, and notes in the selection reason that the kernel was the only valid candidate.
 
 ### Command Line And Artifacts
 

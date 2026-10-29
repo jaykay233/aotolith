@@ -1201,10 +1201,21 @@ class AppleMetalBackend:
             def fallback_runtime() -> mx.array:
                 return _evaluate_mlx_op(graph, op, env)
 
-            fallback_result = fallback_runtime()
-            mx.eval(fallback_result)
             candidate = candidates.get(output_id)
+            try:
+                fallback_result = fallback_runtime()
+                mx.eval(fallback_result)
+            except NotImplementedError:
+                # Some ops only ever lower to a generated kernel: normalization,
+                # rotary and attention have no MLX equivalent once they are
+                # fused. There is nothing to compare against, so the kernel is
+                # measured on its own and its own output feeds the next op.
+                if candidate is None:
+                    raise
+                fallback_result = None
+
             if candidate is None:
+                assert fallback_result is not None
                 selections.append(
                     KernelSelection(
                         op_index=index,
@@ -1220,15 +1231,43 @@ class AppleMetalBackend:
                 env[output_id] = fallback_result
                 continue
 
-            mlx_benchmark = self._benchmark(
-                "mlx", None, fallback_runtime
-            )
-            try:
+            if fallback_result is None:
                 native_result = candidate.runtime(*input_arrays)
                 mx.eval(native_result)
-                if not _outputs_match(
-                    native_result, fallback_result, output_type.dtype
-                ):
+                native_benchmark = self._benchmark(
+                    "metal_kernel",
+                    candidate.artifact.name,
+                    lambda: candidate.runtime(*input_arrays),
+                )
+                mlx_benchmark = None
+                env[output_id] = native_result
+            else:
+                mlx_benchmark = self._benchmark(
+                    "mlx", None, fallback_runtime
+                )
+                try:
+                    native_result = candidate.runtime(*input_arrays)
+                    mx.eval(native_result)
+                    if not _outputs_match(
+                        native_result, fallback_result, output_type.dtype
+                    ):
+                        native_benchmark = KernelBenchmark(
+                            candidate="metal_kernel",
+                            artifact_name=candidate.artifact.name,
+                            warmup_iterations=self.autotune_warmup,
+                            iterations=self.autotune_iterations,
+                            samples_seconds=(),
+                            median_seconds=None,
+                            min_seconds=None,
+                            error="output differs from the MLX reference",
+                        )
+                    else:
+                        native_benchmark = self._benchmark(
+                            "metal_kernel",
+                            candidate.artifact.name,
+                            lambda: candidate.runtime(*input_arrays),
+                        )
+                except Exception as exc:
                     native_benchmark = KernelBenchmark(
                         candidate="metal_kernel",
                         artifact_name=candidate.artifact.name,
@@ -1237,28 +1276,14 @@ class AppleMetalBackend:
                         samples_seconds=(),
                         median_seconds=None,
                         min_seconds=None,
-                        error="output differs from the MLX reference",
+                        error=f"{type(exc).__name__}: {exc}",
                     )
-                else:
-                    native_benchmark = self._benchmark(
-                        "metal_kernel",
-                        candidate.artifact.name,
-                        lambda: candidate.runtime(*input_arrays),
-                    )
-            except Exception as exc:
-                native_benchmark = KernelBenchmark(
-                    candidate="metal_kernel",
-                    artifact_name=candidate.artifact.name,
-                    warmup_iterations=self.autotune_warmup,
-                    iterations=self.autotune_iterations,
-                    samples_seconds=(),
-                    median_seconds=None,
-                    min_seconds=None,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+                env[output_id] = fallback_result
 
             native_seconds = native_benchmark.median_seconds
-            mlx_seconds = mlx_benchmark.median_seconds
+            mlx_seconds = (
+                None if mlx_benchmark is None else mlx_benchmark.median_seconds
+            )
             use_native = native_seconds is not None and (
                 mlx_seconds is None or native_seconds <= mlx_seconds
             )
@@ -1278,7 +1303,11 @@ class AppleMetalBackend:
                 reason = self._measured_reason(
                     "MLX fallback", mlx_seconds, native_seconds
                 )
+                env[output_id] = fallback_result
 
+            benchmarks = (native_benchmark,)
+            if mlx_benchmark is not None:
+                benchmarks = (native_benchmark, mlx_benchmark)
             selections.append(
                 KernelSelection(
                     op_index=index,
@@ -1288,13 +1317,12 @@ class AppleMetalBackend:
                     kind=kind,
                     reason=reason,
                     artifact_name=artifact_name,
-                    benchmarks=(native_benchmark, mlx_benchmark),
+                    benchmarks=benchmarks,
                     autotuned=True,
                     device_name=device_name,
                     device_architecture=device_architecture,
                 )
             )
-            env[output_id] = fallback_result
 
         return tuple(kernels), tuple(selections), callables
 

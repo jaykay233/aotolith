@@ -252,3 +252,44 @@ def test_decode_step_writes_only_the_newest_slot() -> None:
         first_cache[..., : runtime.prompt_length - 1, :],
         cache[..., 1 : runtime.prompt_length, :],
     )
+
+def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() -> None:
+    """Autotune must skip the MLX comparison, not fail, when there is none.
+
+    The prefill graph keeps standalone normalization because a 128-row operand
+    cannot absorb the RMS scale into its projection prologue, and normalization
+    only ever lowers to a generated kernel. Autotune used to evaluate the MLX
+    fallback for every op in order to have a reference, which raised
+    ``NotImplementedError`` before reaching the first projection.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    runtime = compile_qwen2_static_cache(
+        _tiny_model(transformers, 37),
+        prompt_length=4,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+        autotune=True,
+    )
+
+    assert runtime.prefill.plan.selections
+    normalized = [
+        selection
+        for selection in runtime.prefill.plan.selections
+        if selection.op == "rms_norm"
+    ]
+    assert normalized
+    for selection in normalized:
+        # No MLX reference exists, so only the kernel is benchmarked.
+        assert selection.is_native
+        assert [item.candidate for item in selection.benchmarks] == [
+            "metal_kernel"
+        ]
+        assert "only valid candidate" in selection.reason
+
+    tokens = runtime.greedy_generate(
+        [[1, 2, 3, 4]], max_new_tokens=6, sync_each_step=False
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 6)
