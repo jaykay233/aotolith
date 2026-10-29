@@ -375,7 +375,7 @@ ruff check src tests examples
 python examples/tiny_llama_compile.py
 ```
 
-CI runs exactly that on every push and pull request: `ruff` on Linux, and on an Apple Silicon macOS runner an editable install of the `dev` extra, the suite, and `python -m build`. The hosted runners have a paravirtual GPU that cannot load the tensor-core kernels, so `compile` falls back to simdgroup kernels there and those tests skip themselves — `pytest -rs` prints why, and a green run covers the simdgroup paths only.
+CI runs exactly that on every push and pull request: `ruff` on Linux, and on an Apple Silicon macOS runner an editable install of the `dev` extra, the suite, the Llama example, and `python -m build`. The hosted runners have a paravirtual GPU that cannot load the tensor-core kernels, so `compile` falls back to simdgroup kernels there and those tests skip themselves — `pytest -rs` prints why, and a green run covers the simdgroup paths only.
 
 
 Additional examples cover embeddings, MLP and matmul kernels, softmax, reductions, normalization, attention, and static KV-cache generation:

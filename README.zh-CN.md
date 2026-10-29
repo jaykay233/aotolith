@@ -373,7 +373,7 @@ ruff check src tests examples
 python examples/tiny_llama_compile.py
 ```
 
-CI 在每次 push 和 pull request 上跑的就是这些：`ruff` 跑在 Linux 上；Apple Silicon 的 macOS runner 上则做 `dev` extra 的可编辑安装、跑测试、再跑 `python -m build`。托管 runner 的 GPU 是半虚拟化的，装不上 tensor-core kernel，所以那里的 `compile` 会回退到 simdgroup 路径，相关测试也会自行跳过——`pytest -rs` 会打印原因，绿灯只覆盖 simdgroup 路径。
+CI 在每次 push 和 pull request 上跑的就是这些：`ruff` 跑在 Linux 上；Apple Silicon 的 macOS runner 上则做 `dev` extra 的可编辑安装、跑测试、跑 Llama 示例、再跑 `python -m build`。托管 runner 的 GPU 是半虚拟化的，装不上 tensor-core kernel，所以那里的 `compile` 会回退到 simdgroup 路径，相关测试也会自行跳过——`pytest -rs` 会打印原因，绿灯只覆盖 simdgroup 路径。
 
 
 其他示例覆盖 embedding、MLP、matmul kernel、softmax、reduction、normalization、attention 和静态 KV Cache 生成：

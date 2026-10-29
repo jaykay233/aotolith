@@ -44,5 +44,9 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run the test suite
         run: python -m pytest -rs
+      - name: Run the Llama example end to end
+        # Exercises the path a user takes — HuggingFace module, capture,
+        # lowering, execution — and fails if the logits drift past 1e-4.
+        run: python examples/tiny_llama_compile.py
       - name: Confirm the distribution builds
         run: python -m build
