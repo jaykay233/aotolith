@@ -25,14 +25,23 @@ _MLX_DTYPES = {
     torch.int64: mx.int64,
 }
 
-# MetalPerformancePrimitives tensor ops only exist on newer Apple GPU families.
-# Where the driver cannot load them the backend deliberately emits the simdgroup
-# kernels instead, so tests that assert the tensor-core source have nothing to
-# look at rather than something that regressed.
-requires_tensor_cores = pytest.mark.skipif(
-    not metal_backend._mpp_available(),
-    reason="this GPU cannot load MetalPerformancePrimitives tensor ops",
-)
+_IR_DTYPES = {torch.float16: DType.F16, torch.bfloat16: DType.BF16}
+
+
+def _require_tensor_cores(dtype: torch.dtype = torch.float16) -> None:
+    """Skip when this GPU cannot load tensor-op kernels of ``dtype``.
+
+    MetalPerformancePrimitives tensor ops are not available uniformly: older
+    GPU families lack them, and half-precision cooperative tensors are packed
+    two per register, so a GPU can take the float variant and reject these. The
+    backend falls back to simdgroup kernels there, which leaves tests that
+    assert tensor-core source with nothing to look at rather than something
+    that regressed.
+    """
+
+    ir_dtype = _IR_DTYPES[dtype]
+    if not metal_backend._mpp_supports(ir_dtype):
+        pytest.skip(f"this GPU cannot load MPP {ir_dtype.name} kernels")
 
 
 def _torch_to_mlx(value: torch.Tensor) -> mx.array:
@@ -1579,10 +1588,10 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
 )
-@requires_tensor_cores
 def test_native_attention_uses_tensor_core_when_query_tile_fits(
     dtype, tolerance
 ) -> None:
+    _require_tensor_cores(dtype)
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(query, key, value)
 
@@ -1612,8 +1621,8 @@ def test_native_attention_uses_tensor_core_when_query_tile_fits(
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
-@requires_tensor_cores
 def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
+    _require_tensor_cores()
     def fn(query, key, value, mask):
         return torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=mask, enable_gqa=True
@@ -1650,8 +1659,8 @@ def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
 )
-@requires_tensor_cores
 def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> None:
+    _require_tensor_cores(dtype)
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(
             query,
@@ -4683,8 +4692,8 @@ def test_metal_matmul_uses_simdgroup_for_complete_blocks(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@requires_tensor_cores
 def test_metal_matmul_uses_tensor_core_tiles(dtype) -> None:
+    _require_tensor_cores(dtype)
     torch.manual_seed(33)
     inputs = (
         torch.randn(64, 64, dtype=dtype),
@@ -4717,7 +4726,7 @@ def test_backend_falls_back_when_the_gpu_cannot_load_tensor_ops(
     otherwise every machine older than the tile tables has no working matmul.
     """
 
-    monkeypatch.setattr(metal_backend, "_mpp_available", lambda: False)
+    monkeypatch.setattr(metal_backend, "_mpp_supports", lambda dtype: False)
 
     torch.manual_seed(35)
     matmul_inputs = (
@@ -4750,6 +4759,45 @@ def test_backend_falls_back_when_the_gpu_cannot_load_tensor_ops(
     expected = _torch_to_mlx(attention(*attention_inputs))
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_tensor_core_probe_agrees_with_what_the_device_can_load(
+    dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The capability probe has to match the hardware in both directions.
+
+    Reporting support a GPU lacks makes the backend emit a kernel that dies at
+    the first matmul; denying support it has silently abandons the fast path.
+    Neither shows up as a failure, so this test compiles a real tensor-core
+    matmul with the probe forced on and compares whether it actually loads
+    against what the probe claims.
+    """
+
+    claims_support = metal_backend._mpp_supports(_IR_DTYPES[dtype])
+
+    monkeypatch.setattr(metal_backend, "_mpp_supports", lambda _dtype: True)
+    torch.manual_seed(37)
+    inputs = (
+        torch.randn(64, 64, dtype=dtype),
+        torch.randn(64, 64, dtype=dtype),
+    )
+    result = compile_callable(
+        lambda x, weight: x @ weight, inputs, codegen_matmul=True
+    )
+    assert "tensorcore" in result.plan.kernels[0].name
+
+    try:
+        result.plan(*(_torch_to_mlx(value) for value in inputs))
+    except RuntimeError:
+        loads = False
+    else:
+        loads = True
+
+    assert claims_support is loads, (
+        f"probe reported support={claims_support} for {dtype} but the device "
+        f"load={'succeeded' if loads else 'failed'}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -4806,8 +4854,8 @@ def test_metal_matmul_codegen_handles_singleton_batch_dimension() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@requires_tensor_cores
 def test_metal_batched_matmul_vectorizes_batch_inputs() -> None:
+    _require_tensor_cores()
     torch.manual_seed(44)
     inputs = (
         torch.randn(2, 3, 64, 32, dtype=torch.float16),
@@ -5014,8 +5062,8 @@ def test_metal_matmul_broadcasts_rank_two_against_rank_four() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@requires_tensor_cores
 def test_metal_matmul_broadcasts_batch_inputs() -> None:
+    _require_tensor_cores()
     torch.manual_seed(53)
     inputs = (
         torch.randn(2, 1, 64, 32, dtype=torch.float16),
@@ -5041,8 +5089,8 @@ def test_metal_matmul_broadcasts_batch_inputs() -> None:
     assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
 
 
-@requires_tensor_cores
 def test_metal_matmul_codegen_folds_transposed_operand() -> None:
+    _require_tensor_cores()
     torch.manual_seed(34)
     inputs = (
         torch.randn(64, 64, dtype=torch.float16),
@@ -5087,8 +5135,8 @@ def test_metal_addmm_codegen_folds_transposed_operand() -> None:
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
-@requires_tensor_cores
 def test_addmm_tensor_core_applies_broadcast_bias() -> None:
+    _require_tensor_cores()
     torch.manual_seed(32)
     inputs = (
         torch.randn(1, 64, dtype=torch.float16),

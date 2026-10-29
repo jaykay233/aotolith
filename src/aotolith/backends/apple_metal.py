@@ -316,32 +316,39 @@ _MPP_PROBE_SOURCE = """
 
 
 @lru_cache(maxsize=None)
-def _mpp_available() -> bool:
-    """Return whether this GPU can load a tensor-op kernel at all.
+def _mpp_supports(dtype: DType) -> bool:
+    """Return whether this GPU can load a tensor-op kernel of ``dtype``.
 
-    The probe runs the same constructs the emitted kernels use — a
-    ``matmul2d`` descriptor, the three cooperative tensors and ``run`` — so a
-    GPU that rejects any of them fails here instead of on a real matmul. Any
-    failure means the caller must take the non-tensor-core path: a probe that
-    errors for an unrelated reason should cost throughput, never correctness.
+    The probe runs the same constructs the emitted kernels use — a ``matmul2d``
+    descriptor, the three cooperative tensors and ``run``, in the same
+    single-simdgroup scope — so a GPU that rejects any of them fails here
+    instead of on a real matmul. Any failure means the caller must take the
+    non-tensor-core path: a probe that errors for an unrelated reason should
+    cost throughput, never correctness.
+
+    It is keyed on the dtype because support is not uniform: half and bfloat16
+    cooperative tensors are packed two per register, and a GPU can load the
+    float variant while rejecting those. Probing with one dtype and then
+    emitting another reports support the hardware does not have.
     """
 
+    element = _MLX_DTYPES[dtype]
     try:
         kernel = _metal_kernel(
-            "aotolith_mpp_probe",
+            f"aotolith_mpp_probe_{dtype.name.lower()}",
             ("in_0", "in_1"),
             ("out",),
             _MPP_PROBE_SOURCE,
             _MPP_HEADER,
         )
-        operand = mx.zeros((32,), dtype=mx.float32)
+        operand = mx.zeros((32,), dtype=element)
         kernel(
             inputs=[operand, operand],
-            template=[("T", mx.float32)],
+            template=[("T", element)],
             grid=(32, 1, 1),
             threadgroup=(32, 1, 1),
             output_shapes=[(1,)],
-            output_dtypes=[mx.float32],
+            output_dtypes=[element],
         )
     except Exception:  # noqa: BLE001 - any failure means "do not use MPP".
         return False
@@ -1586,7 +1593,7 @@ class AppleMetalBackend:
             query_type, key_type, value_type, output_type, mask_shape
         ):
             return None
-        if not _mpp_available():
+        if not _mpp_supports(query_type.dtype):
             return None
 
         rank = len(query_type.shape)
@@ -2965,7 +2972,7 @@ class AppleMetalBackend:
             )
         elif _supports_mpp_matmul(
             rows, columns, reduction, output_type.dtype
-        ) and _mpp_available():
+        ) and _mpp_supports(output_type.dtype):
             mpp_config = _select_mpp_gemm_config(
                 rows, columns, reduction, output_type.dtype, transpose_right
             )
