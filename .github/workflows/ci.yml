@@ -22,8 +22,14 @@ jobs:
       - run: ruff check src tests examples
 
   test:
-    # Every backend here emits Metal, so the suite needs an Apple Silicon
-    # runner: macos-latest is arm64 and has a usable GPU.
+    # Backends here emit Metal, so the suite needs an Apple Silicon runner.
+    #
+    # Those runners are virtualised, and their GPU is an "Apple Paravirtual
+    # device": it reports `__HAVE_TENSOR__` and then refuses to load the
+    # tensor-core kernels with "unsupported deferred-static-alloca-size function
+    # body". Tests that need those kernels skip themselves here after trying to
+    # load one, which is why `-rs` matters — a green run on this runner does not
+    # cover the tensor-core paths, only the simdgroup ones every GPU takes.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,73 +40,7 @@ jobs:
         # An editable install of the dev extra, rather than a bare `pip install
         # pytest`, so the wheel metadata and package layout are exercised too.
         run: pip install -e ".[dev]"
-      - name: Diagnose tensor-op support
-        run: |
-          python - <<'PY'
-          import platform
-
-          import mlx.core as mx
-          import torch
-
-          from aotolith import compile_callable
-
-          print("macOS", platform.mac_ver()[0], "| mlx", mx.__version__)
-          print("device_info", mx.device_info())
-
-          source = """
-              out[0] = 0;
-          #if __HAVE_TENSOR__
-              out[0] = 1;
-          #endif
-          """
-          kernel = mx.fast.metal_kernel(
-              name="diag_have_tensor",
-              input_names=[],
-              output_names=["out"],
-              source=source,
-              header="",
-          )
-          try:
-              result = kernel(
-                  inputs=[],
-                  grid=(1, 1, 1),
-                  threadgroup=(1, 1, 1),
-                  output_shapes=[(1,)],
-                  output_dtypes=[mx.int32],
-              )[0]
-              mx.eval(result)
-              print("HAVE_TENSOR =", int(result.item()))
-          except Exception as error:
-              print("HAVE_TENSOR probe failed:", type(error).__name__, error)
-
-          from aotolith.backends.apple_metal import _mpp_supports
-          from aotolith.ir import DType
-
-          for dtype in (DType.F16, DType.BF16, DType.F32):
-              print("probe", dtype.name, _mpp_supports(dtype))
-
-          for torch_dtype in (torch.float16, torch.bfloat16, torch.float32):
-              inputs = (
-                  torch.randn(64, 64, dtype=torch_dtype),
-                  torch.randn(64, 64, dtype=torch_dtype),
-              )
-              compiled = compile_callable(
-                  lambda x, weight: x @ weight, inputs, codegen_matmul=True
-              )
-              name = compiled.plan.kernels[0].name
-              try:
-                  compiled.plan(*(mx.array(a.float().numpy()).astype(
-                      {torch.float16: mx.float16,
-                       torch.bfloat16: mx.bfloat16,
-                       torch.float32: mx.float32}[torch_dtype]
-                  ) for a in inputs))
-              except Exception as error:
-                  print("real kernel", torch_dtype, name, "FAILED:",
-                        str(error).split("error:")[-1][:160])
-              else:
-                  print("real kernel", torch_dtype, name, "loaded")
-          PY
       - name: Run the test suite
-        run: python -m pytest
+        run: python -m pytest -rs
       - name: Confirm the distribution builds
         run: python -m build

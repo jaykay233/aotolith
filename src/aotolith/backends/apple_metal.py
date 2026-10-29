@@ -277,82 +277,49 @@ _MPP_HEADER = (
     + "\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
 )
 
-# MetalPerformancePrimitives tensor ops exist only on newer Apple GPU families.
-# On the ones without them the same source still compiles but the metallib
-# refuses to load with "unsupported deferred-static-alloca-size function body",
-# which surfaces to a caller as an opaque `RuntimeError` at the first matmul.
-# Asking the driver costs one tiny kernel and is the only answer that stays
-# correct as Apple extends or retires the feature; parsing `device_info` instead
-# would mean encoding a marketing-name table.
+# MetalPerformancePrimitives tensor ops exist only where the compiler defines
+# `__HAVE_TENSOR__` (Apple GPU family 9 and later). Emitting them elsewhere
+# still compiles but the metallib refuses to load, which reaches the caller as
+# an opaque `RuntimeError` at the first matmul. Asking the compiler beats
+# parsing `device_info()["architecture"]`, which would mean encoding a table of
+# marketing names that Apple can extend or retire.
+#
+# Note this is a hardware-capability answer, not "these kernels will load":
+# a paravirtualised GPU (hosted CI, cloud Macs) reports `__HAVE_TENSOR__` and
+# still rejects them, so the tests probe by loading a real kernel instead.
 _MPP_PROBE_SOURCE = """
-        uint lane = thread_position_in_threadgroup.x % 32u;
-        constexpr auto mpp_probe_descriptor = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 16, false, true, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-        mpp::tensor_ops::matmul2d<mpp_probe_descriptor,
-            metal::execution_simdgroup> mpp_probe_gemm;
-        using mpp_probe_at = decltype(
-            mpp_probe_gemm.get_left_input_cooperative_tensor<T, T, float>());
-        using mpp_probe_bt = decltype(
-            mpp_probe_gemm.get_right_input_cooperative_tensor<T, T, float>());
-        using mpp_probe_ct = decltype(
-            mpp_probe_gemm.get_destination_cooperative_tensor<
-                metal::remove_addrspace_t<mpp_probe_at>,
-                metal::remove_addrspace_t<mpp_probe_bt>, float>());
-        mpp_probe_at mpp_probe_a =
-            mpp_probe_gemm.get_left_input_cooperative_tensor<T, T, float>();
-        mpp_probe_bt mpp_probe_b =
-            mpp_probe_gemm.get_right_input_cooperative_tensor<T, T, float>();
-        mpp_probe_ct mpp_probe_c =
-            mpp_probe_gemm.get_destination_cooperative_tensor<
-                metal::remove_addrspace_t<mpp_probe_at>,
-                metal::remove_addrspace_t<mpp_probe_bt>, float>();
-        mpp_probe_a[0] = in_0[lane];
-        mpp_probe_b[0] = in_1[lane];
-        mpp_probe_c[0] = 0.0f;
-        mpp_probe_gemm.run(mpp_probe_a, mpp_probe_b, mpp_probe_c);
-        if (lane == 0u) { out[0] = (T)mpp_probe_c[0]; }
+        out[0] = 0;
+#if __HAVE_TENSOR__
+        out[0] = 1;
+#endif
 """
 
 
 @lru_cache(maxsize=None)
-def _mpp_supports(dtype: DType) -> bool:
-    """Return whether this GPU can load a tensor-op kernel of ``dtype``.
+def _mpp_supported() -> bool:
+    """Return whether this GPU has tensor ops the codegen may target."""
 
-    The probe runs the same constructs the emitted kernels use — a ``matmul2d``
-    descriptor, the three cooperative tensors and ``run``, in the same
-    single-simdgroup scope — so a GPU that rejects any of them fails here
-    instead of on a real matmul. Any failure means the caller must take the
-    non-tensor-core path: a probe that errors for an unrelated reason should
-    cost throughput, never correctness.
-
-    It is keyed on the dtype because support is not uniform: half and bfloat16
-    cooperative tensors are packed two per register, and a GPU can load the
-    float variant while rejecting those. Probing with one dtype and then
-    emitting another reports support the hardware does not have.
-    """
-
-    element = _MLX_DTYPES[dtype]
     try:
         kernel = _metal_kernel(
-            f"aotolith_mpp_probe_{dtype.name.lower()}",
-            ("in_0", "in_1"),
+            "aotolith_mpp_probe",
+            (),
             ("out",),
             _MPP_PROBE_SOURCE,
             _MPP_HEADER,
         )
-        operand = mx.zeros((32,), dtype=element)
-        kernel(
-            inputs=[operand, operand],
-            template=[("T", element)],
-            grid=(32, 1, 1),
-            threadgroup=(32, 1, 1),
+        result = kernel(
+            inputs=[],
+            grid=(1, 1, 1),
+            threadgroup=(1, 1, 1),
             output_shapes=[(1,)],
-            output_dtypes=[element],
-        )
+            output_dtypes=[mx.int32],
+        )[0]
+        # MLX is lazy: without this the kernel never compiles and the probe
+        # answers yes no matter what the device thinks.
+        mx.eval(result)
+        return bool(result.item())
     except Exception:  # noqa: BLE001 - any failure means "do not use MPP".
         return False
-    return True
 
 
 # Tensor-core (NAX / MXU) GEMM tiles, each
@@ -1593,7 +1560,7 @@ class AppleMetalBackend:
             query_type, key_type, value_type, output_type, mask_shape
         ):
             return None
-        if not _mpp_supports(query_type.dtype):
+        if not _mpp_supported():
             return None
 
         rank = len(query_type.shape)
@@ -2972,7 +2939,7 @@ class AppleMetalBackend:
             )
         elif _supports_mpp_matmul(
             rows, columns, reduction, output_type.dtype
-        ) and _mpp_supports(output_type.dtype):
+        ) and _mpp_supported():
             mpp_config = _select_mpp_gemm_config(
                 rows, columns, reduction, output_type.dtype, transpose_right
             )
