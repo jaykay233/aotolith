@@ -3,6 +3,7 @@ from __future__ import annotations
 import textwrap
 import time
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil, isfinite, isinf, isnan, prod
@@ -26,6 +27,14 @@ _MLX_DTYPES = {
 }
 
 _ELEMENTS_PER_THREAD = 4
+_DTYPE_ITEMSIZE = {
+    DType.F16: 2,
+    DType.BF16: 2,
+    DType.F32: 4,
+    DType.BOOL: 1,
+    DType.I32: 4,
+    DType.I64: 8,
+}
 _COMPARISON_POINTWISE_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
 _LOGICAL_POINTWISE_OPS = {
     "logical_and",
@@ -77,6 +86,28 @@ _MATMUL_LARGE_K_THRESHOLD = 1024
 _MATMUL_BLOCK_ROWS = 64
 _MATMUL_BLOCK_COLUMNS = 64
 _MATMUL_BLOCK_REDUCTION = 32
+_MATMUL_GEMV_THREADS = 256
+# One warp owns one output column, so more columns means more blocks.  Wide
+# outputs need narrow blocks to keep the grid large; narrow outputs need fat
+# blocks so each one streams enough contiguous weights to saturate memory.
+_MATMUL_GEMV_NARROW_COLUMNS = 8192
+_MATMUL_GEMV_THREADS_NARROW = 1024
+_MATMUL_GEMV_THREADS_WIDE = 128
+
+
+def _gemv_threads(columns: int, transpose_right: bool) -> int:
+    """Pick the GEMV threadgroup size for one output width.
+
+    The transposed path runs one warp per output column, so the block size
+    trades block count against per-block streaming width and the best value
+    flips once the output is wide enough to fill the GPU on its own.
+    """
+
+    if transpose_right:
+        if columns <= _MATMUL_GEMV_NARROW_COLUMNS:
+            return _MATMUL_GEMV_THREADS_NARROW
+        return _MATMUL_GEMV_THREADS_WIDE
+    return _MATMUL_GEMV_THREADS
 _METAL_KERNEL_CACHE_SIZE = 256
 _ATTENTION_MAX_SHARED_BYTES = 31 * 1024
 _ATTENTION_LONG_SEQUENCE_THRESHOLD = 768
@@ -241,6 +272,56 @@ inline long tsc_remainder_i64(long dividend, long divisor) {
 """
 
 
+_MPP_HEADER = (
+    _MSL_HEADER
+    + "\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+)
+
+# Tensor-core (NAX / MXU) GEMM tiles, each
+# (block_rows, block_columns, warp_rows, warp_columns, reduction_step).
+# Swept on Apple M5 (applegpu_g17s) over a shape matrix in both operand
+# layouts; the selection logic below encodes the measured regimes rather than a
+# single compromise tile.  A transposed right operand is K-contiguous and
+# rewards wide column blocks, while a row-major right operand strides through
+# K and instead rewards a taller reduction step.
+_MPP_GEMM_TILE_TINY = (32, 32, 1, 1, 32)
+_MPP_GEMM_TILE_SMALL_K = (64, 64, 2, 2, 32)
+_MPP_GEMM_TILE_SKINNY_LONG_K = (128, 32, 4, 1, 32)
+# Right operand transposed (N x K) and right operand row-major (K x N).
+_MPP_GEMM_TILE_TRANSPOSED_WIDE = (64, 128, 2, 4, 64)
+_MPP_GEMM_TILE_ROW_MAJOR_WIDE = (64, 256, 1, 8, 32)
+_MPP_GEMM_TILE_ROW_MAJOR = (128, 64, 2, 2, 32)
+_MPP_GEMM_TILE_TALL = (128, 128, 2, 4, 32)
+# fp32 accumulation over a deep reduction stays on the 2x2 warp tile.
+_MPP_GEMM_TILE_F32 = _MPP_GEMM_TILE_ROW_MAJOR
+# Progressively smaller tiles; the selector walks this list so that a block
+# never exceeds the problem size (which would waste tensor-core work and force
+# boundary predication on exact shapes).
+_MPP_GEMM_TILE_LADDER = (
+    _MPP_GEMM_TILE_ROW_MAJOR_WIDE,
+    _MPP_GEMM_TILE_TALL,
+    _MPP_GEMM_TILE_TRANSPOSED_WIDE,
+    _MPP_GEMM_TILE_ROW_MAJOR,
+    _MPP_GEMM_TILE_SKINNY_LONG_K,
+    (64, 64, 2, 2, 64),
+    _MPP_GEMM_TILE_SMALL_K,
+    (64, 32, 2, 1, 64),
+    _MPP_GEMM_TILE_TINY,
+)
+# Above this many output elements the wide tile wins on reuse and warp count.
+_MPP_GEMM_WIDE_ELEMENTS = 3_000_000
+# Fewer than this many columns per block makes the kernel re-stream the left
+# operand once per column block, which dominates for tall-skinny products.
+_MPP_GEMM_MIN_WIDE_COLUMNS = 8192
+# Past this width a row-major right operand is re-read too many times per row
+# block, so the tall square tile wins on left-operand reuse instead.
+_MPP_GEMM_MAX_WIDE_COLUMNS = 32768
+# Long reductions only favour the skinny tile while the row count stays small;
+# past that the block count drops below the core count and the wide tile wins.
+_MPP_GEMM_SKINNY_MAX_ROWS = 256
+_MPP_GEMM_SKINNY_MAX_COLUMNS = 2048
+
+
 @lru_cache(maxsize=_METAL_KERNEL_CACHE_SIZE)
 def _metal_kernel(
     name: str,
@@ -271,13 +352,64 @@ class KernelArtifact:
     kind: str
 
 
+_PENDING_INDEX_CHECKS: ContextVar[list[tuple[mx.array, int, bool]] | None] = (
+    ContextVar("aotolith_pending_index_checks", default=None)
+)
+
+# A bounds check needs the index values, so a device-resident index forces a
+# sync. Callers that already know the indices are in range can turn the check
+# off for one execution instead of paying for the drain every step.
+_INDEX_CHECKS_ENABLED: ContextVar[bool] = ContextVar(
+    "aotolith_index_checks_enabled", default=True
+)
+
+
+def _defer_index_check(
+    indices: mx.array, upper_bound: int, *, allow_negative: bool
+) -> bool:
+    """Queue a bounds check so a plan run pays for at most one device sync.
+
+    Returns ``True`` when the check was queued and the caller must not sync.
+    """
+
+    if not _INDEX_CHECKS_ENABLED.get():
+        return True
+    pending = _PENDING_INDEX_CHECKS.get()
+    if pending is None:
+        return False
+    pending.append((indices, upper_bound, allow_negative))
+    return True
+
+
+def _flush_index_checks(
+    pending: list[tuple[mx.array, int, bool]]
+) -> None:
+    """Collapse every queued bounds check into a single reduction and sync."""
+
+    if not pending:
+        return
+    if not _INDEX_CHECKS_ENABLED.get():
+        pending.clear()
+        return
+    violation: mx.array | None = None
+    for indices, upper_bound, allow_negative in pending:
+        low = -upper_bound if allow_negative else 0
+        if indices.size == 0:
+            continue
+        bad = mx.logical_or(indices < low, indices >= upper_bound)
+        violation = bad if violation is None else mx.logical_or(violation, bad)
+    if violation is None:
+        return
+    if bool(mx.any(violation).item()):
+        raise IndexError("index out of range in self")
+
+
 def _check_take_indices(indices: mx.array, upper_bound: int) -> None:
     """Match PyTorch gather bounds instead of MLX's wrap-and-fill behavior."""
 
-    if bool(mx.any(indices < 0).item()) or bool(
-        mx.any(indices >= upper_bound).item()
-    ):
-        raise IndexError("index out of range in self")
+    if _defer_index_check(indices, upper_bound, allow_negative=False):
+        return
+    _flush_index_checks([(indices, upper_bound, False)])
 
 
 def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.array:
@@ -286,21 +418,13 @@ def _mlx_take_checked(source: mx.array, indices: mx.array, axis: int) -> mx.arra
 
 
 def _check_advanced_index_indices(indices: mx.array, upper_bound: int) -> None:
-    if bool(mx.any(indices < -upper_bound).item()) or bool(
-        mx.any(indices >= upper_bound).item()
-    ):
-        raise IndexError("index out of range in self")
+    if _defer_index_check(indices, upper_bound, allow_negative=True):
+        return
+    _flush_index_checks([(indices, upper_bound, True)])
 
 
 def _tensor_nbytes(tensor_type: TensorType) -> int:
-    itemsize = {
-        DType.F16: 2,
-        DType.BF16: 2,
-        DType.F32: 4,
-        DType.BOOL: 1,
-        DType.I32: 4,
-        DType.I64: 8,
-    }[tensor_type.dtype]
+    itemsize = _DTYPE_ITEMSIZE[tensor_type.dtype]
     return prod(tensor_type.shape) * itemsize
 
 
@@ -325,6 +449,13 @@ def _evaluate_mlx_op(
         return body_env[op.outputs[0]]
     if op.op == "attention":
         return _evaluate_attention_mlx(op, env)
+    if op.op == "rope":
+        value, cosine, sine = (env[value_id] for value_id in op.inputs)
+        half = value.shape[-1] // 2
+        rotated = mx.concatenate(
+            (-value[..., half:], value[..., :half]), axis=-1
+        )
+        return value * cosine + rotated * sine
     if op.op == "embedding":
         weight, indices = (env[value_id] for value_id in op.inputs)
         return _mlx_take_checked(weight, indices, axis=0)
@@ -393,24 +524,55 @@ def _evaluate_mlx_op(
     if op.op in LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
     if op.op == "matmul":
-        left, right = (env[value_id] for value_id in op.inputs)
+        left, right = (env[value_id] for value_id in op.inputs[:2])
+        left = _apply_mlx_matmul_norm(op, env, left)
         if op.attrs.get("transpose_a", False):
             left = mx.swapaxes(left, -1, -2)
         if op.attrs.get("transpose_b", False):
             right = mx.swapaxes(right, -1, -2)
-        return mx.matmul(left, right)
+        return _apply_mlx_matmul_epilogue(op, env, mx.matmul(left, right))
     if op.op == "addmm":
-        bias, left, right = (env[value_id] for value_id in op.inputs)
+        bias, left, right = (env[value_id] for value_id in op.inputs[:3])
+        left = _apply_mlx_matmul_norm(op, env, left)
         if op.attrs.get("transpose_a", False):
             left = mx.swapaxes(left, -1, -2)
         if op.attrs.get("transpose_b", False):
             right = mx.swapaxes(right, -1, -2)
         alpha = float(op.attrs.get("alpha", 1.0))
         beta = float(op.attrs.get("beta", 1.0))
-        return beta * bias + alpha * mx.matmul(left, right)
+        return _apply_mlx_matmul_epilogue(
+            op, env, beta * bias + alpha * mx.matmul(left, right)
+        )
     return _evaluate_pointwise_mlx(
         op, env, graph.value(op.outputs[0]).type
     )
+
+
+def _apply_mlx_matmul_norm(
+    op: Operation, env: dict[str, Any], left: Any
+) -> Any:
+    """Normalize a fused RMS-norm operand before the fallback matrix multiply."""
+
+    position = _matmul_norm_position(op)
+    if position is None:
+        return left
+    weight = env[op.inputs[position]]
+    eps = float(op.attrs["rms_norm_eps"])
+    normalized = left.astype(mx.float32)
+    scale = mx.rsqrt(mx.mean(normalized * normalized, axis=-1, keepdims=True) + eps)
+    return (normalized * scale * weight.astype(mx.float32)).astype(left.dtype)
+
+
+def _apply_mlx_matmul_epilogue(
+    op: Operation, env: dict[str, Any], product: Any
+) -> Any:
+    kind = op.attrs.get("epilogue")
+    if kind is None:
+        return product
+    if kind != "silu_mul":
+        raise ValueError(f"unsupported matmul epilogue {kind!r}")
+    gate = env[op.inputs[_matmul_epilogue_position(op)]]
+    return product * (gate / (1.0 + mx.exp(-gate)))
 
 
 def _device_profile() -> tuple[str | None, str | None]:
@@ -488,6 +650,139 @@ def _time_runtime(
     return tuple(samples)
 
 
+def _validate_plan_inputs(
+    graph: Graph, inputs: tuple[Any, ...]
+) -> list[mx.array]:
+    """Validate the caller's arrays against the graph signature."""
+
+    if len(inputs) != len(graph.inputs):
+        raise ValueError(
+            f"expected {len(graph.inputs)} inputs, received {len(inputs)}"
+        )
+    values: list[mx.array] = []
+    for value_id, value in zip(graph.inputs, inputs, strict=True):
+        array = value if isinstance(value, mx.array) else mx.array(value)
+        expected = graph.value(value_id).type
+        if tuple(array.shape) != expected.shape:
+            raise ValueError(
+                f"input {value_id} has shape {tuple(array.shape)}, "
+                f"expected {expected.shape}"
+            )
+        if array.dtype != _MLX_DTYPES[expected.dtype]:
+            raise TypeError(
+                f"input {value_id} has dtype {array.dtype}, "
+                f"expected {expected.dtype.value}"
+            )
+        values.append(array)
+    return values
+
+
+def _bind_plan_op(
+    graph: Graph, op: Operation, runtime: Any
+) -> Callable[..., mx.array] | None:
+    """Return a positional evaluator for one operation of a compiled plan.
+
+    The generic interpreter resolves operands through a value-id dictionary.
+    A compiled runner already knows the operand order, so the frequently used
+    fallbacks get a positional closure and only the rare kinds fall back to the
+    dictionary adapter.
+    """
+
+    if runtime is not None:
+        return runtime
+    kind = op.op
+    if kind in LAYOUT_OPS:
+        return lambda value, _op=op, _graph=graph: _evaluate_layout_mlx(
+            _graph, _op, value
+        )
+    if kind == "cat":
+        rank = len(graph.value(op.inputs[0]).type.shape)
+        axis = int(op.attrs["dim"]) % rank
+        return lambda *values, _axis=axis: mx.concatenate(values, axis=_axis)
+    if kind == "embedding":
+        return lambda weight, indices: _mlx_take_checked(weight, indices, axis=0)
+    operand_ids = op.inputs
+
+    def generic(*values: mx.array) -> mx.array:
+        return _evaluate_mlx_op(graph, op, dict(zip(operand_ids, values)))
+
+    return generic
+
+
+def _compile_plan_runner(plan: CompiledPlan) -> Callable[..., Any] | None:
+    """Turn the plan interpreter into straight-line Python, or return ``None``.
+
+    Interpreting a thousand operations costs more than the kernels they launch:
+    a decode step spent about a millisecond per token resolving value ids.
+    Unrolling the graph once at first use replaces that bookkeeping with local
+    variable assignments, and the kernels keep their original call signatures.
+    """
+
+    graph = plan.graph
+    ops = graph.ops
+    if any(len(op.outputs) != 1 for op in ops):
+        return None
+
+    names: dict[str, str] = {
+        value_id: f"i{position}"
+        for position, value_id in enumerate(graph.inputs)
+    }
+    namespace: dict[str, Any] = {}
+    body: list[str] = []
+    for index, op in enumerate(ops):
+        arguments: list[str] = []
+        for value_id in op.inputs:
+            name = names.get(value_id)
+            if name is None:
+                return None
+            arguments.append(name)
+        thunk = _bind_plan_op(graph, op, plan._callables.get(op.outputs[0]))
+        if thunk is None:
+            return None
+        thunk_name = f"t{index}"
+        namespace[thunk_name] = thunk
+        target = f"v{index}"
+        names[op.outputs[0]] = target
+        body.append(f"    {target} = {thunk_name}({', '.join(arguments)})")
+
+    returned: list[str] = []
+    for value_id in graph.outputs:
+        name = names.get(value_id)
+        if name is None:
+            return None
+        returned.append(name)
+    body.append(f"    return ({', '.join(returned)},)")
+
+    parameters = ", ".join(f"i{position}" for position in range(len(graph.inputs)))
+    source = f"def run({parameters}):\n" + "\n".join(body) + "\n"
+    exec(compile(source, f"<aotolith-plan-{len(ops)}>", "exec"), namespace)
+    generated = namespace["run"]
+
+    def runner(
+        inputs: tuple[Any, ...], *, verify_index_bounds: bool = True
+    ) -> tuple[mx.array, ...]:
+        values = _validate_plan_inputs(graph, inputs)
+        # Unlike the interpreter, the unrolled body keeps every intermediate
+        # alive until it returns. That is the lifetime the async executor needs
+        # anyway, so the storage plan's early releases only apply to the
+        # statistics path, which still runs through ``_execute``.
+        pending: list[tuple[mx.array, int, bool]] = []
+        check_token = _PENDING_INDEX_CHECKS.set(pending)
+        enabled_token = _INDEX_CHECKS_ENABLED.set(verify_index_bounds)
+        try:
+            outputs = generated(*values)
+        finally:
+            _INDEX_CHECKS_ENABLED.reset(enabled_token)
+            _PENDING_INDEX_CHECKS.reset(check_token)
+        _flush_index_checks(pending)
+        return outputs
+
+    return runner
+
+
+_NO_RUNNER = object()
+
+
 @dataclass(slots=True)
 class CompiledPlan:
     graph: Graph
@@ -495,10 +790,24 @@ class CompiledPlan:
     selections: tuple[KernelSelection, ...]
     _callables: dict[str, Any]
     storage_plan: StoragePlan
+    _runner: Any = None
 
-    def __call__(self, *inputs: Any) -> tuple[mx.array, ...]:
-        outputs, _ = self._execute(inputs, collect_stats=False)
-        return outputs
+    def __call__(
+        self, *inputs: Any, verify_index_bounds: bool = True
+    ) -> tuple[mx.array, ...]:
+        runner = self._runner
+        if runner is None:
+            compiled = _compile_plan_runner(self)
+            self._runner = _NO_RUNNER if compiled is None else compiled
+            runner = compiled
+        if runner is None or runner is _NO_RUNNER:
+            outputs, _ = self._execute(
+                inputs,
+                collect_stats=False,
+                verify_index_bounds=verify_index_bounds,
+            )
+            return outputs
+        return runner(inputs, verify_index_bounds=verify_index_bounds)
 
     def call_with_stats(
         self, *inputs: Any
@@ -508,42 +817,43 @@ class CompiledPlan:
         return self._execute(inputs, collect_stats=True)
 
     def _execute(
-        self, inputs: tuple[Any, ...], *, collect_stats: bool
+        self,
+        inputs: tuple[Any, ...],
+        *,
+        collect_stats: bool,
+        verify_index_bounds: bool = True,
     ) -> tuple[tuple[mx.array, ...], "ExecutionStats"]:
-        if len(inputs) != len(self.graph.inputs):
-            raise ValueError(
-                f"expected {len(self.graph.inputs)} inputs, received {len(inputs)}"
+        env = dict(
+            zip(
+                self.graph.inputs,
+                _validate_plan_inputs(self.graph, inputs),
+                strict=True,
             )
+        )
 
-        env: dict[str, mx.array] = {}
-        for value_id, value in zip(self.graph.inputs, inputs, strict=True):
-            array = value if isinstance(value, mx.array) else mx.array(value)
-            expected = self.graph.value(value_id).type
-            if tuple(array.shape) != expected.shape:
-                raise ValueError(
-                    f"input {value_id} has shape {tuple(array.shape)}, expected {expected.shape}"
-                )
-            if array.dtype != _MLX_DTYPES[expected.dtype]:
-                raise TypeError(
-                    f"input {value_id} has dtype {array.dtype}, expected {expected.dtype.value}"
-                )
-            env[value_id] = array
-
-        slot_by_value = {
-            value_id: slot
-            for slot in self.storage_plan.slots
-            for value_id in slot.value_ids
-        }
+        slot_by_value = (
+            {
+                value_id: slot
+                for slot in self.storage_plan.slots
+                for value_id in slot.value_ids
+            }
+            if collect_stats
+            else {}
+        )
         slot_by_id = {slot.slot_id: slot for slot in self.storage_plan.slots}
         arena = (
             mx.zeros((self.storage_plan.arena_size_bytes,), dtype=mx.uint8)
-            if self.storage_plan.arena_size_bytes
+            if collect_stats and self.storage_plan.arena_size_bytes
             else None
         )
         slot_assignments: list[ArenaAssignment] = []
         assigned_values: dict[int, str] = {}
+        pending_index_checks: list[tuple[mx.array, int, bool]] = []
 
         def store_result(value_id: str, result: mx.array) -> None:
+            if not collect_stats:
+                env[value_id] = result
+                return
             slot = slot_by_value.get(value_id)
             if slot is None:
                 env[value_id] = result
@@ -578,19 +888,28 @@ class CompiledPlan:
                 )
             assigned_values[slot.slot_id] = value_id
 
-        for op_index, op in enumerate(self.graph.ops):
-            runtime = self._callables.get(op.outputs[0])
-            if runtime is not None:
-                result = runtime(*(env[value_id] for value_id in op.inputs))
+        check_token = _PENDING_INDEX_CHECKS.set(pending_index_checks)
+        enabled_token = _INDEX_CHECKS_ENABLED.set(verify_index_bounds)
+        try:
+            for op_index, op in enumerate(self.graph.ops):
+                runtime = self._callables.get(op.outputs[0])
+                if runtime is not None:
+                    result = runtime(*(env[value_id] for value_id in op.inputs))
+                    store_result(op.outputs[0], result)
+                    for value_id in self.storage_plan.release_after_op[op_index]:
+                        env.pop(value_id, None)
+                    continue
+
+                result = _evaluate_mlx_op(self.graph, op, env)
                 store_result(op.outputs[0], result)
                 for value_id in self.storage_plan.release_after_op[op_index]:
                     env.pop(value_id, None)
-                continue
+        finally:
+            _INDEX_CHECKS_ENABLED.reset(enabled_token)
+            _PENDING_INDEX_CHECKS.reset(check_token)
 
-            result = _evaluate_mlx_op(self.graph, op, env)
-            store_result(op.outputs[0], result)
-            for value_id in self.storage_plan.release_after_op[op_index]:
-                env.pop(value_id, None)
+        _flush_index_checks(pending_index_checks)
+
 
         stats = ExecutionStats(
             arena_size_bytes=self.storage_plan.arena_size_bytes,
@@ -690,10 +1009,23 @@ class AppleMetalBackend:
                 compiled = self._compile_layer_norm(graph, op, index)
             elif op.op == "rms_norm":
                 compiled = self._compile_rms_norm(graph, op, index)
+            elif op.op == "rope":
+                _validate_rope_op(graph, op)
+                # The vectorized kernel owns four neighbouring columns, so both
+                # the head dimension and its half must be multiples of four.
+                if graph.value(op.outputs[0]).type.shape[-1] % 8 == 0:
+                    compiled = self._compile_rope(graph, op, index)
             elif op.op == "attention":
                 _validate_attention_op(graph, op)
                 if self.codegen_attention or self.autotune or self._wants_native(op):
                     compiled = self._compile_attention(graph, op, index)
+                else:
+                    # A single-query attention needs one threadgroup per head
+                    # and no online rescaling, so it beats the generic runtime
+                    # kernel without the prefill-oriented codegen switch.
+                    compiled = self._compile_decode_attention(
+                        graph, op, index
+                    )
             elif op.op == "cat":
                 _validate_cat_op(graph, op)
             elif op.op == "embedding":
@@ -1131,10 +1463,166 @@ class AppleMetalBackend:
         )
         return artifact, runtime
 
+    def _compile_mpp_attention(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any] | None:
+        query_type = graph.value(op.inputs[0]).type
+        key_type = graph.value(op.inputs[1]).type
+        value_type = graph.value(op.inputs[2]).type
+        output_type = graph.value(op.outputs[0]).type
+        has_mask = bool(op.attrs.get("has_mask"))
+        mask_type = graph.value(op.inputs[3]).type if has_mask else None
+        mask_shape = mask_type.shape if mask_type is not None else None
+        if not _supports_mpp_attention(
+            query_type, key_type, value_type, output_type, mask_shape
+        ):
+            return None
+
+        rank = len(query_type.shape)
+        query_length = query_type.shape[-2]
+        key_length = key_type.shape[-2]
+        query_heads = query_type.shape[-3] if rank == 4 else 1
+        key_value_heads = key_type.shape[-3] if rank == 4 else 1
+        query_head_dim = query_type.shape[-1]
+        value_head_dim = value_type.shape[-1]
+        warps = _select_mpp_attention_warps(query_length)
+        query_tile = warps * 16
+        query_blocks = ceil(query_length / query_tile)
+        batch = query_type.shape[0]
+        threads = warps * 32
+        mask_is_boolean = mask_type is not None and mask_type.dtype == DType.BOOL
+
+        source = _emit_mpp_attention_source(
+            query_length=query_length,
+            key_length=key_length,
+            query_heads=query_heads,
+            key_value_heads=key_value_heads,
+            query_head_dim=query_head_dim,
+            value_head_dim=value_head_dim,
+            warps=warps,
+            scale=float(op.attrs.get("scale", 1.0)),
+            has_mask=has_mask,
+            mask_shape=mask_shape,
+            mask_is_boolean=mask_is_boolean,
+            causal=bool(op.attrs.get("causal")),
+            rank=rank,
+        )
+
+        input_names = (
+            ("in_0", "in_1", "in_2", "in_3")
+            if has_mask
+            else ("in_0", "in_1", "in_2")
+        )
+        name = (
+            f"metal_attention_tensorcore_{query_tile}x{_MPP_ATTENTION_KEY_TILE}_"
+            f"{threads}_{index}"
+        )
+        kernel = _metal_kernel(
+            name,
+            input_names,
+            ("out",),
+            source,
+            _MPP_HEADER,
+        )
+        query_count = batch * query_heads * query_blocks
+        grid = (query_count * threads, 1, 1)
+        threadgroup = (threads, 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+        template = [("T", dtype)]
+        output_shapes = [output_type.shape]
+        output_dtypes = [dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            return kernel(
+                inputs=inputs,
+                template=template,
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+            )[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header=_MPP_HEADER,
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="attention",
+        )
+        return artifact, runtime
+
+    def _compile_decode_attention(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any] | None:
+        """Emit the single-query attention kernel when the shape allows it."""
+
+        config = _decode_attention_config(graph, op)
+        if config is None:
+            return None
+        output_type = graph.value(op.outputs[0]).type
+        source = _emit_decode_attention_source(config)
+        name = (
+            f"metal_decode_attention_{config.query_heads}"
+            f"_{config.key_value_heads}_{config.key_length}"
+            f"_{config.query_head_dim}_{config.value_head_dim}_{index}"
+        )
+        input_names = tuple(
+            f"in_{position}" for position in range(len(op.inputs))
+        )
+        kernel = _metal_kernel(
+            name,
+            input_names,
+            ("out",),
+            source,
+            _MSL_HEADER,
+        )
+        dtype = _MLX_DTYPES[config.dtype]
+        # One threadgroup per (head, batch) pair: grid.y is the batch count, not
+        # batch * threads, otherwise the runtime launches threads duplicate
+        # threadgroups that write past the end of the output buffer.
+        grid = (
+            config.query_heads * config.threads,
+            config.batch,
+            1,
+        )
+        threadgroup = (config.threads, 1, 1)
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header=_MSL_HEADER,
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="attention",
+        )
+        return artifact, runtime
+
     def _compile_attention(
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any] | None:
         """Emit a FlashAttention-style tiled online-softmax kernel."""
+
+        decode = self._compile_decode_attention(graph, op, index)
+        if decode is not None:
+            return decode
+
+        tensor_core = self._compile_mpp_attention(graph, op, index)
+        if tensor_core is not None:
+            return tensor_core
 
         query_type = graph.value(op.inputs[0]).type
         key_type = graph.value(op.inputs[1]).type
@@ -1162,9 +1650,17 @@ class AppleMetalBackend:
         group_size = query_heads // key_value_heads
         key_tile = 32
         low_precision_attention = output_type.dtype in {DType.F16, DType.BF16}
-        use_simdgroup_qk = low_precision_attention and query_head_dim % 8 == 0
-        use_simdgroup_pv = low_precision_attention and value_head_dim % 8 == 0
-        query_tile = 8
+        use_simdgroup_qk = (
+            low_precision_attention
+            and query_head_dim % 8 == 0
+            and query_length >= 8
+        )
+        use_simdgroup_pv = (
+            low_precision_attention
+            and value_head_dim % 8 == 0
+            and query_length >= 8
+        )
+        query_tile = 1 if query_length == 1 else 8
         if use_simdgroup_qk and use_simdgroup_pv and query_length > 8:
             candidates = ((16, 32),)
             if query_length >= _ATTENTION_LONG_SEQUENCE_THRESHOLD:
@@ -1993,6 +2489,58 @@ class AppleMetalBackend:
     ) -> tuple[KernelArtifact, Any]:
         return self._compile_normalization(graph, op, index, kind="rms_norm")
 
+    def _compile_rope(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any]:
+        _, cosine_id, sine_id = op.inputs
+        output_type = graph.value(op.outputs[0]).type
+        cosine_type = graph.value(cosine_id).type
+        sine_type = graph.value(sine_id).type
+        columns = output_type.shape[-1]
+        half = columns // 2
+        source = _emit_rope_source(
+            columns,
+            half,
+            output_type.shape,
+            cosine_type.shape,
+            sine_type.shape,
+        )
+        name = f"metal_rope_{columns}_{index}"
+        kernel = _metal_kernel(
+            name,
+            ("in_0", "in_1", "in_2"),
+            ("out",),
+            source,
+            _MSL_HEADER,
+        )
+        element_count = prod(output_type.shape)
+        groups = element_count // _ELEMENTS_PER_THREAD
+        grid = (groups, 1, 1)
+        threadgroup = (min(256, groups), 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header=_MSL_HEADER,
+            input_ids=op.inputs,
+            output_id=op.outputs[0],
+            tensor_type=output_type,
+            kind="rope",
+        )
+        return artifact, runtime
+
     def _compile_normalization(
         self,
         graph: Graph,
@@ -2067,28 +2615,28 @@ class AppleMetalBackend:
                     f"!= {normalized_shape}"
                 )
 
+
         columns = prod(normalized_shape)
         rows = prod(input_type.shape[:-normalized_rank]) or 1
         threads = _reduction_thread_count(columns)
-        reduction_stride = threads // 2
         eps = float(op.attrs.get("eps", 1e-5))
 
         if kind == "layer_norm":
-            reduction_source = textwrap.dedent(f"""
+            reduction_source = (
+                textwrap.dedent(
+                    f"""
         float local_sum = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
             local_sum += float(in_0[offset + col]);
         }}
-        scratch[tid] = local_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
-            if (tid < stride) {{
-                scratch[tid] += scratch[tid + stride];
-            }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }}
-        float mean_value = scratch[0] / {columns}.0f;
+        """
+                ).strip()
+                + "\n"
+                + _emit_threadgroup_reduction(threads, "local_sum", "total_sum")
+                + "\n"
+                + textwrap.dedent(
+                    f"""
+        float mean_value = total_sum / {columns}.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float local_squared_deviation = 0.0f;
@@ -2096,37 +2644,35 @@ class AppleMetalBackend:
             float centered = float(in_0[offset + col]) - mean_value;
             local_squared_deviation += centered * centered;
         }}
-        scratch[tid] = local_squared_deviation;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
-            if (tid < stride) {{
-                scratch[tid] += scratch[tid + stride];
-            }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }}
-        float variance = scratch[0] / {columns}.0f;
-            """).strip()
+        """
+                ).strip()
+                + "\n"
+                + _emit_threadgroup_reduction(
+                    threads, "local_squared_deviation", "total_deviation"
+                )
+                + "\n"
+                + f"        float variance = total_deviation / {columns}.0f;"
+            )
             reduction_result = "variance"
             centered_expression = "current - mean_value"
         else:
-            reduction_source = textwrap.dedent(f"""
+            reduction_source = (
+                textwrap.dedent(
+                    f"""
         float local_square_sum = 0.0f;
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
             float current = float(in_0[offset + col]);
             local_square_sum += current * current;
         }}
-        scratch[tid] = local_square_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = {reduction_stride}u; stride > 0u; stride >>= 1) {{
-            if (tid < stride) {{
-                scratch[tid] += scratch[tid + stride];
-            }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }}
-        float mean_square = scratch[0] / {columns}.0f;
-            """).strip()
+        """
+                ).strip()
+                + "\n"
+                + _emit_threadgroup_reduction(
+                    threads, "local_square_sum", "total_square_sum"
+                )
+                + "\n"
+                + f"        float mean_square = total_square_sum / {columns}.0f;"
+            )
             reduction_result = "mean_square"
             centered_expression = "current"
 
@@ -2194,14 +2740,30 @@ class AppleMetalBackend:
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any]:
         expected_inputs = 3 if op.op == "addmm" else 2
+        epilogue = _matmul_epilogue_kind(op)
+        if epilogue is not None:
+            expected_inputs += 1
+        norm_position = _matmul_norm_position(op)
+        if norm_position is not None:
+            expected_inputs += 1
         if len(op.inputs) != expected_inputs:
             raise ValueError(f"{op.op} expects {expected_inputs} inputs")
 
+        if norm_position is not None:
+            norm_type = graph.value(op.inputs[norm_position]).type
+            left_position = 1 if op.op == "addmm" else 0
+            left_type = graph.value(op.inputs[left_position]).type
+            if norm_type.shape != (left_type.shape[-1],):
+                raise ValueError(
+                    f"fused rms_norm weight shape {norm_type.shape} does not match "
+                    f"the reduction dimension {left_type.shape[-1]}"
+                )
+
         if op.op == "addmm":
-            bias_id, left_id, right_id = op.inputs
+            bias_id, left_id, right_id = op.inputs[:3]
         else:
             bias_id = None
-            left_id, right_id = op.inputs
+            left_id, right_id = op.inputs[:2]
 
         left_type = graph.value(left_id).type
         right_type = graph.value(right_id).type
@@ -2255,7 +2817,86 @@ class AppleMetalBackend:
 
         row_blocks = ceil(rows / _MATMUL_BLOCK_ROWS)
         column_blocks = ceil(columns / _MATMUL_BLOCK_COLUMNS)
-        if _supports_simdgroup_matmul(rows, columns, output_type.dtype):
+        header = ""
+        mpp_grid: tuple[int, int, int] | None = None
+        if norm_position is not None and not _supports_gemv_matmul(
+            rows,
+            output_type.dtype,
+            transpose_left,
+            transpose_right,
+        ):
+            raise NotImplementedError(
+                "fused rms_norm requires the Metal GEMV matmul path"
+            )
+        if _supports_gemv_matmul(
+            rows,
+            output_type.dtype,
+            transpose_left,
+            transpose_right,
+        ):
+            source = _emit_gemv_matmul_source(
+                op,
+                reduction,
+                columns,
+                graph,
+                batch_count,
+                left_batch_offset,
+                right_batch_offset,
+                transpose_right,
+            )
+            threads = _gemv_threads(columns, transpose_right)
+            batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
+            layout = "transposed" if transpose_right else "row_major"
+            name = (
+                f"metal_{op.op}_gemv_{layout}_{threads}"
+                f"{batch_suffix}_{index}"
+            )
+        elif _supports_mpp_matmul(
+            rows, columns, reduction, output_type.dtype
+        ):
+            mpp_config = _select_mpp_gemm_config(
+                rows, columns, reduction, output_type.dtype, transpose_right
+            )
+            (
+                mpp_block_rows,
+                mpp_block_columns,
+                mpp_warp_rows,
+                mpp_warp_columns,
+                mpp_step,
+            ) = mpp_config
+            source = _emit_mpp_matmul_source(
+                op,
+                rows,
+                reduction,
+                columns,
+                graph,
+                output_type.dtype,
+                transpose_left,
+                transpose_right,
+                batch_count,
+                left_batch_offset,
+                right_batch_offset,
+                mpp_config,
+            )
+            header = _MPP_HEADER
+            threads = mpp_warp_rows * mpp_warp_columns * 32
+            mpp_grid = (
+                ceil(columns / mpp_block_columns) * threads,
+                ceil(rows / mpp_block_rows),
+                batch_count,
+            )
+            batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
+            orientation = (
+                ("t" if transpose_left else "n")
+                + ("t" if transpose_right else "n")
+            )
+            name = (
+                f"metal_{op.op}_tensorcore_{orientation}_"
+                f"{mpp_block_rows}x{mpp_block_columns}x{mpp_step}"
+                f"_{mpp_warp_rows}x{mpp_warp_columns}"
+                f"{batch_suffix}_{index}"
+            )
+        elif _supports_simdgroup_matmul(rows, columns, output_type.dtype):
             source = _emit_simdgroup_matmul_source(
                 op,
                 rows,
@@ -2308,13 +2949,30 @@ class AppleMetalBackend:
             tuple(f"in_{position}" for position in range(len(op.inputs))),
             ("out",),
             source,
-            "",
+            header,
         )
-        grid = (
-            row_blocks * column_blocks * threads,
-            batch_count,
-            1,
-        )
+        if mpp_grid is not None:
+            grid = mpp_grid
+        elif _supports_gemv_matmul(
+            rows,
+            output_type.dtype,
+            transpose_left,
+            transpose_right,
+        ):
+            columns_per_group = (
+                threads // 32 if transpose_right else threads
+            )
+            grid = (
+                ceil(columns / columns_per_group) * threads,
+                batch_count,
+                1,
+            )
+        else:
+            grid = (
+                row_blocks * column_blocks * threads,
+                batch_count,
+                1,
+            )
         threadgroup = (threads, 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
@@ -2332,7 +2990,7 @@ class AppleMetalBackend:
         artifact = KernelArtifact(
             name=name,
             source=source,
-            header="",
+            header=header,
             input_ids=op.inputs,
             output_id=op.outputs[0],
             tensor_type=output_type,
@@ -2638,6 +3296,150 @@ def _reduction_offset_expression(
 
 def _reduction_thread_count(columns: int) -> int:
     return min(256, _next_power_of_two(columns))
+
+
+def _emit_threadgroup_reduction(
+    threads: int,
+    accumulator: str,
+    label: str,
+) -> str:
+    """Reduce ``accumulator`` across the threadgroup and publish it in ``label``.
+
+    A normalization row is often shorter than the threadgroup, so the classic
+    barrier tree spends its time in synchronization rather than arithmetic. When
+    the threadgroup covers whole SIMD groups the partial sums collapse with one
+    shuffle reduction per group and a single cross-group step, which needs two
+    barriers instead of ``log2(threads)``.
+    """
+
+    if threads >= 32:
+        groups = threads // 32
+        return textwrap.dedent(
+            f"""
+        {accumulator} = metal::simd_sum({accumulator});
+        if ((tid & 31u) == 0u) {{
+            scratch[tid >> 5u] = {accumulator};
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {accumulator} = (tid < {groups}u) ? scratch[tid] : 0.0f;
+        {accumulator} = metal::simd_sum({accumulator});
+        if (tid == 0u) {{
+            scratch[0] = {accumulator};
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float {label} = scratch[0];
+        """
+        ).strip()
+
+    return textwrap.dedent(
+        f"""
+        scratch[tid] = {accumulator};
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = {threads // 2}u; stride > 0u; stride >>= 1) {{
+            if (tid < stride) {{
+                scratch[tid] += scratch[tid + stride];
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float {label} = scratch[0];
+        """
+    ).strip()
+
+
+def _emit_rope_source(
+    columns: int,
+    half: int,
+    output_shape: tuple[int, ...],
+    cosine_shape: tuple[int, ...],
+    sine_shape: tuple[int, ...],
+) -> str:
+    """Emit the rotary embedding kernel for one contiguous output tensor.
+
+    ``out = x * cos + rotate_half(x) * sin`` and ``rotate_half`` pairs element
+    ``d`` of the head with element ``d ^ half``, negating the first half. One
+    thread owns four neighbouring columns; because the head dimension and the
+    half both divide by four, a group never straddles that boundary, so the
+    partner loads stay contiguous and vectorizable.
+    """
+
+    vectorized = columns % 4 == 0 and half % 4 == 0
+    if not vectorized:
+        raise NotImplementedError(
+            "Metal rope requires a head dimension divisible by four"
+        )
+    lines = [
+        "uint group = thread_position_in_grid.x;",
+        "uint base = group * 4u;",
+        f"uint column = base % {columns}u;",
+        "uint row = base - column;",
+        f"uint partner = row + (column < {half}u ? column + {half}u : column - {half}u);",
+        f"float sign = column < {half}u ? -1.0f : 1.0f;",
+        "vec<T, 4> current = *(const device vec<T, 4>*)(in_0 + base);",
+        "vec<T, 4> rotated = *(const device vec<T, 4>*)(in_0 + partner);",
+        "vec<T, 4> result;",
+    ]
+    for offset in range(4):
+        element = f"(base + {offset}u)"
+        cosine_offset = _offset_expression(cosine_shape, output_shape, element)
+        sine_offset = _offset_expression(sine_shape, output_shape, element)
+        lines.append(
+            f"result[{offset}] = (T)(float(current[{offset}]) "
+            f"* float(in_1[{cosine_offset}]) "
+            f"+ sign * float(rotated[{offset}]) * float(in_2[{sine_offset}]));"
+        )
+    lines.append("*(device vec<T, 4>*)(out + base) = result;")
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _matmul_epilogue_kind(op: Operation) -> str | None:
+    """Return the fused activation epilogue attached to a matrix multiply."""
+
+    kind = op.attrs.get("epilogue")
+    if kind is None:
+        return None
+    if kind != "silu_mul":
+        raise ValueError(f"unsupported matmul epilogue {kind!r}")
+    return kind
+
+
+def _matmul_norm_position(op: Operation) -> int | None:
+    """Return the input slot holding a fused RMS-norm weight, if any."""
+
+    if op.attrs.get("rms_norm_eps") is None:
+        return None
+    return len(op.inputs) - 1
+
+
+def _matmul_epilogue_position(op: Operation) -> int | None:
+    """Return the input slot holding the fused epilogue operand, if any."""
+
+    if _matmul_epilogue_kind(op) is None:
+        return None
+    return len(op.inputs) - 1 - int(_matmul_norm_position(op) is not None)
+
+
+def _matmul_epilogue_value(
+    value: str,
+    op: Operation,
+    graph: Graph,
+    output_shape: tuple[int, ...],
+    linear: str,
+) -> str:
+    """Apply the fused activation epilogue to one accumulated output element.
+
+    ``silu_mul`` multiplies the accumulation by ``silu`` of the gate tensor that
+    the activation would have consumed, so the multiply that followed the
+    projection disappears into this kernel.
+    """
+
+    position = _matmul_epilogue_position(op)
+    if position is None:
+        return value
+    gate_id = op.inputs[position]
+    gate_type = graph.value(gate_id).type
+    gate_offset = _offset_expression(gate_type.shape, output_shape, linear)
+    gate = f"float(in_{position}[{gate_offset}])"
+    return f"({value}) * ({gate} / (1.0f + metal::exp(-{gate})))"
 
 
 def _offset_expression(
@@ -3452,6 +4254,372 @@ def _supports_simdgroup_matmul(rows: int, columns: int, dtype: DType) -> bool:
     )
 
 
+def _supports_gemv_matmul(
+    rows: int,
+    dtype: DType,
+    transpose_left: bool,
+    transpose_right: bool,
+) -> bool:
+    """Return whether the one-row matmul can use the bandwidth-oriented GEMV."""
+
+    return (
+        rows == 1
+        and dtype in {DType.F16, DType.BF16, DType.F32}
+        and not transpose_left
+    )
+
+
+def _emit_thread_rms_norm_prologue(
+    op: Operation,
+    norm_position: int,
+    left_position: int,
+    reduction: int,
+    left_batch_prefix: str,
+) -> list[str]:
+    """Emit an RMS scale computed by one thread over the whole reduction."""
+
+    eps = float(op.attrs["rms_norm_eps"])
+    return [
+        f"float norm_square_sum = 0.0f;",
+        f"for (uint norm_index = 0u; norm_index < {reduction}u; norm_index += 1u) {{",
+        f"    float norm_value = float(in_{left_position}"
+        f"[{left_batch_prefix}norm_index]);",
+        "    norm_square_sum = fma(norm_value, norm_value, norm_square_sum);",
+        "}",
+        f"float norm_scale = metal::rsqrt(norm_square_sum / {reduction}.0f + {eps!r});",
+    ]
+
+
+def _emit_warp_rms_norm_prologue(
+    op: Operation,
+    norm_position: int,
+    left_position: int,
+    reduction: int,
+    left_batch_prefix: str,
+) -> list[str]:
+    """Emit a warp-wide RMS scale that every lane of the warp can read back."""
+
+    eps = float(op.attrs["rms_norm_eps"])
+    vectors = reduction // 4
+    return [
+        "const device vec<T, 4>* norm_source = "
+        "reinterpret_cast<const device vec<T, 4>*>("
+        f"in_{left_position} + {left_batch_prefix}0u);",
+        "const device vec<T, 4>* norm_weight_values = "
+        "reinterpret_cast<const device vec<T, 4>*>("
+        f"in_{norm_position});",
+        "float norm_square_sum = 0.0f;",
+        f"for (uint norm_index = lane; norm_index < {vectors}u; norm_index += 32u) {{",
+        "    vec<T, 4> current = norm_source[norm_index];",
+        "    norm_square_sum = fma(float(current[0]), float(current[0]), norm_square_sum);",
+        "    norm_square_sum = fma(float(current[1]), float(current[1]), norm_square_sum);",
+        "    norm_square_sum = fma(float(current[2]), float(current[2]), norm_square_sum);",
+        "    norm_square_sum = fma(float(current[3]), float(current[3]), norm_square_sum);",
+        "}",
+        f"float norm_scale = metal::rsqrt(simd_sum(norm_square_sum) / {reduction}.0f + {eps!r});",
+    ]
+
+
+def _emit_gemv_matmul_source(
+    op: Operation,
+    reduction: int,
+    columns: int,
+    graph: Graph,
+    batch_count: int,
+    left_batch_offset: str,
+    right_batch_offset: str,
+    transpose_right: bool,
+) -> str:
+    """Emit a GEMV with coalesced weight loads for either right-hand layout."""
+
+    if op.op == "addmm":
+        bias_id = op.inputs[0]
+        bias_type = graph.value(bias_id).type
+        output_shape = graph.value(op.outputs[0]).type.shape
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+        left_position = 1
+        right_position = 2
+    else:
+        bias_id = None
+        bias_type = None
+        output_shape = graph.value(op.outputs[0]).type.shape
+        alpha = 1.0
+        beta = 1.0
+        left_position = 0
+        right_position = 1
+
+    threads = _gemv_threads(columns, False)
+    block_columns = threads
+    exact_columns = columns % block_columns == 0
+    left_batch_prefix = f"{left_batch_offset} + " if left_batch_offset else ""
+    right_batch_prefix = f"{right_batch_offset} + " if right_batch_offset else ""
+    if transpose_right:
+        return _emit_transposed_gemv_matmul_source(
+            op,
+            graph,
+            reduction,
+            columns,
+            bias_id,
+            bias_type,
+            output_shape,
+            alpha,
+            beta,
+            left_position,
+            right_position,
+            batch_count,
+            left_batch_prefix,
+            right_batch_prefix,
+        )
+
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+    ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    norm_slot = _matmul_norm_position(op)
+    if norm_slot is not None:
+        lines.extend(
+            _emit_thread_rms_norm_prologue(
+                op, norm_slot, left_position, reduction, left_batch_prefix
+            )
+        )
+    lines.extend(
+        [
+            f"uint column = threadgroup_index * {block_columns}u + tid;",
+            "float acc0 = 0.0f;",
+            "float acc1 = 0.0f;",
+            "float acc2 = 0.0f;",
+            "float acc3 = 0.0f;",
+            "uint k = 0u;",
+            f"for (; k + 3u < {reduction}u; k += 4u) {{",
+        ]
+    )
+    if norm_slot is None:
+        lines.extend(
+            [
+                f"    float x0 = float(in_{left_position}[{left_batch_prefix}k]);",
+                f"    float x1 = float(in_{left_position}[{left_batch_prefix}k + 1u]);",
+                f"    float x2 = float(in_{left_position}[{left_batch_prefix}k + 2u]);",
+                f"    float x3 = float(in_{left_position}[{left_batch_prefix}k + 3u]);",
+            ]
+        )
+    else:
+        for offset in range(4):
+            lines.append(
+                f"    float x{offset} = float((T)(norm_scale * "
+                f"float(in_{left_position}[{left_batch_prefix}k + {offset}u]) * "
+                f"float(in_{norm_slot}[k + {offset}u])));"
+            )
+    if not exact_columns:
+        lines.append(f"    if (column < {columns}u) {{")
+    indent = "        " if not exact_columns else "    "
+    lines.extend(
+        [
+            f"{indent}acc0 = fma(x0, float(in_{right_position}["
+            f"{right_batch_prefix}k * {columns}u + column]), acc0);",
+            f"{indent}acc1 = fma(x1, float(in_{right_position}["
+            f"{right_batch_prefix}(k + 1u) * {columns}u + column]), acc1);",
+            f"{indent}acc2 = fma(x2, float(in_{right_position}["
+            f"{right_batch_prefix}(k + 2u) * {columns}u + column]), acc2);",
+            f"{indent}acc3 = fma(x3, float(in_{right_position}["
+            f"{right_batch_prefix}(k + 3u) * {columns}u + column]), acc3);",
+        ]
+    )
+    if not exact_columns:
+        lines.append("    }")
+    lines.extend(
+        [
+            "}",
+            f"for (; k < {reduction}u; ++k) {{",
+        ]
+    )
+    if norm_slot is None:
+        lines.append(f"    float x = float(in_{left_position}[{left_batch_prefix}k]);")
+    else:
+        lines.append(
+            f"    float x = float((T)(norm_scale * "
+            f"float(in_{left_position}[{left_batch_prefix}k]) * "
+            f"float(in_{norm_slot}[k])));"
+        )
+    if not exact_columns:
+        lines.append(f"    if (column < {columns}u) {{")
+    indent = "        " if not exact_columns else "    "
+    lines.append(
+        f"{indent}acc0 = fma(x, float(in_{right_position}["
+        f"{right_batch_prefix}k * {columns}u + column]), acc0);"
+    )
+    if not exact_columns:
+        lines.append("    }")
+    lines.append("}")
+    if not exact_columns:
+        lines.append(f"if (column < {columns}u) {{")
+    indent = "    " if not exact_columns else ""
+    output_batch_offset = f"batch * {columns}u + " if batch_count > 1 else ""
+    output_linear = f"{output_batch_offset}column"
+    value = "((acc0 + acc1) + (acc2 + acc3))"
+    if bias_id is not None:
+        assert bias_type is not None
+        bias_offset = _offset_expression(
+            bias_type.shape,
+            output_shape,
+            output_linear,
+        )
+        value = f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * {value}"
+    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+    lines.append(
+        f"{indent}out[{output_linear}] = (T)({value});"
+    )
+    if not exact_columns:
+        lines.append("}")
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _emit_transposed_gemv_matmul_source(
+    op: Operation,
+    graph: Graph,
+    reduction: int,
+    columns: int,
+    bias_id: str | None,
+    bias_type: TensorType | None,
+    output_shape: tuple[int, ...],
+    alpha: float,
+    beta: float,
+    left_position: int,
+    right_position: int,
+    batch_count: int,
+    left_batch_prefix: str,
+    right_batch_prefix: str,
+) -> str:
+    """Emit warp-per-column GEMV for a physical ``[columns, reduction]`` weight."""
+
+    threads = _gemv_threads(columns, True)
+    warps = threads // 32
+    exact_columns = columns % warps == 0
+    output_batch_offset = f"batch * {columns}u + " if batch_count > 1 else ""
+    output_linear = f"{output_batch_offset}column"
+    value = "total"
+    if bias_id is not None:
+        assert bias_type is not None
+        bias_offset = _offset_expression(
+            bias_type.shape,
+            output_shape,
+            output_linear,
+        )
+        value = f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * total"
+    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint lane = tid % 32u;",
+        "uint warp = tid / 32u;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+    ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    lines.extend(
+        [
+            f"uint column = threadgroup_index * {warps}u + warp;",
+        ]
+    )
+    norm_slot = _matmul_norm_position(op)
+    if norm_slot is not None:
+        lines.extend(
+            _emit_warp_rms_norm_prologue(
+                op, norm_slot, left_position, reduction, left_batch_prefix
+            )
+        )
+    if not exact_columns:
+        lines.append(f"if (column < {columns}u) {{")
+    indent = "    " if not exact_columns else ""
+    # Vectorized fast path: one lane owns four consecutive weights of its row,
+    # so a warp moves 256 bytes per load instruction instead of 64.  Pure
+    # scalar loads cap the streaming rate well below what the GPU can sustain.
+    vectorized = reduction % 4 == 0
+    lines.extend(
+        [
+            f"{indent}float acc0 = 0.0f;",
+            f"{indent}float acc1 = 0.0f;",
+            f"{indent}float acc2 = 0.0f;",
+            f"{indent}float acc3 = 0.0f;",
+        ]
+    )
+    if vectorized:
+        lines.extend(
+            [
+                f"{indent}const device vec<T, 4>* row = "
+                "reinterpret_cast<const device vec<T, 4>*>("
+                f"in_{right_position} + {right_batch_prefix}"
+                f"column * {reduction}u);",
+                f"{indent}constexpr uint vectors = {reduction // 4}u;",
+                f"{indent}for (uint index = lane; index < vectors; index += 32u) {{",
+                f"{indent}    vec<T, 4> weight = row[index];",
+                f"{indent}    uint base = index * 4u;",
+            ]
+        )
+        if norm_slot is None:
+            for offset in range(4):
+                lines.append(
+                    f"{indent}    float x{offset} = float(in_{left_position}"
+                    f"[{left_batch_prefix}base + {offset}u]);"
+                )
+        else:
+            lines.append(f"{indent}    vec<T, 4> norm_source_value = norm_source[index];")
+            lines.append(f"{indent}    vec<T, 4> norm_weight_value = norm_weight_values[index];")
+            for offset in range(4):
+                lines.append(
+                    f"{indent}    float x{offset} = float((T)(norm_scale * "
+                    f"float(norm_source_value[{offset}]) * "
+                    f"float(norm_weight_value[{offset}])));"
+                )
+        for offset in range(4):
+            lines.append(
+                f"{indent}    acc{offset} = fma(x{offset}, float(weight[{offset}]), "
+                f"acc{offset});"
+            )
+        lines.append(f"{indent}}}")
+    else:
+        def left_term(index: str) -> str:
+            if norm_slot is None:
+                return f"float(in_{left_position}[{left_batch_prefix}{index}])"
+            return (
+                f"float((T)(norm_scale * float(in_{left_position}"
+                f"[{left_batch_prefix}{index}]) * float(in_{norm_slot}[{index}])))"
+            )
+
+        lines.extend(
+            [
+                f"{indent}uint k = lane;",
+                f"{indent}for (; k + 96u < {reduction}u; k += 128u) {{",
+                f"{indent}    acc0 = fma({left_term('k')}, float(in_{right_position}["
+                f"{right_batch_prefix}column * {reduction}u + k]), acc0);",
+                f"{indent}    acc1 = fma({left_term('k + 32u')}, float(in_{right_position}["
+                f"{right_batch_prefix}column * {reduction}u + k + 32u]), acc1);",
+                f"{indent}    acc2 = fma({left_term('k + 64u')}, float(in_{right_position}["
+                f"{right_batch_prefix}column * {reduction}u + k + 64u]), acc2);",
+                f"{indent}    acc3 = fma({left_term('k + 96u')}, float(in_{right_position}["
+                f"{right_batch_prefix}column * {reduction}u + k + 96u]), acc3);",
+                f"{indent}}}",
+                f"{indent}for (; k < {reduction}u; k += 32u) {{",
+                f"{indent}    acc0 = fma({left_term('k')}, float(in_{right_position}["
+                f"{right_batch_prefix}column * {reduction}u + k]), acc0);",
+                f"{indent}}}",
+            ]
+        )
+    lines.extend(
+        [
+            f"{indent}float total = simd_sum((acc0 + acc1) + (acc2 + acc3));",
+            f"{indent}if (lane == 0u) {{",
+            f"{indent}    out[{output_linear}] = (T)({value});",
+            f"{indent}}}",
+        ]
+    )
+    if not exact_columns:
+        lines.append("}")
+    return "\n".join(f"        {line}" for line in lines)
+
+
 def _matmul_batch_shape(
     left_shape: tuple[int, ...], right_shape: tuple[int, ...]
 ) -> tuple[int, ...] | None:
@@ -3532,7 +4700,7 @@ def _emit_simdgroup_matmul_source(
         raise ValueError("simdgroup matmul requires complete 64x64 output blocks")
 
     if op.op == "addmm":
-        bias_id, _, _ = op.inputs
+        bias_id = op.inputs[0]
         bias_type = graph.value(bias_id).type
         output_shape = graph.value(op.outputs[0]).type.shape
         alpha = float(op.attrs.get("alpha", 1.0))
@@ -3542,7 +4710,7 @@ def _emit_simdgroup_matmul_source(
     else:
         bias_id = None
         bias_type = None
-        output_shape = ()
+        output_shape = graph.value(op.outputs[0]).type.shape
         alpha = 1.0
         beta = 1.0
         left_position = 0
@@ -3751,6 +4919,7 @@ def _emit_simdgroup_matmul_source(
             f"{beta!r} * float(in_0[{bias_offset}]) "
             f"+ {alpha!r} * {value}"
         )
+    value = _matmul_epilogue_value(value, op, graph, output_shape, "linear")
     lines.extend(
         [
             f"    out[linear] = (T)({value});",
@@ -3758,6 +4927,768 @@ def _emit_simdgroup_matmul_source(
         ]
     )
     return "\n".join(f"        {line}" for line in lines)
+
+
+def _supports_mpp_matmul(
+    rows: int,
+    columns: int,
+    reduction: int,
+    dtype: DType,
+) -> bool:
+    """Return whether the tensor-core (MPP ``matmul2d``) path applies.
+
+    The reduction must be a multiple of the 16-wide MMA fragment so that every
+    cooperative-tensor load stays fully in bounds; everything else is handled
+    by predicated stores and clamped input reads.
+    """
+
+    return (
+        dtype in {DType.F16, DType.BF16, DType.F32}
+        and rows >= 16
+        and columns >= 16
+        and reduction >= 16
+        and reduction % 16 == 0
+    )
+
+
+def _select_mpp_gemm_config(
+    rows: int,
+    columns: int,
+    reduction: int,
+    dtype: DType,
+    transposed_right: bool = True,
+) -> tuple[int, int, int, int, int]:
+    """Pick the tensor-core block tile for one concrete matmul shape."""
+
+    wide = (
+        _MPP_GEMM_TILE_TRANSPOSED_WIDE
+        if transposed_right
+        else _MPP_GEMM_TILE_ROW_MAJOR_WIDE
+    )
+    if dtype == DType.F32:
+        preferred = _MPP_GEMM_TILE_F32
+    elif not transposed_right and columns >= _MPP_GEMM_MAX_WIDE_COLUMNS:
+        preferred = _MPP_GEMM_TILE_TALL
+    elif reduction >= 2048 and rows <= _MPP_GEMM_SKINNY_MAX_ROWS:
+        preferred = (
+            _MPP_GEMM_TILE_SKINNY_LONG_K
+            if columns <= _MPP_GEMM_SKINNY_MAX_COLUMNS
+            else wide
+        )
+    elif rows * columns >= _MPP_GEMM_WIDE_ELEMENTS or (
+        rows <= _MPP_GEMM_SKINNY_MAX_ROWS
+        and columns >= _MPP_GEMM_MIN_WIDE_COLUMNS
+    ):
+        preferred = wide
+    elif transposed_right or rows < _MPP_GEMM_TILE_ROW_MAJOR[0]:
+        preferred = _MPP_GEMM_TILE_SMALL_K
+    else:
+        preferred = _MPP_GEMM_TILE_ROW_MAJOR
+    row_bound = max(16, ceil(rows / 16) * 16)
+    column_bound = max(32, ceil(columns / 32) * 32)
+    for config in _MPP_GEMM_TILE_LADDER[
+        _MPP_GEMM_TILE_LADDER.index(preferred) :
+    ]:
+        if config[0] <= row_bound and config[1] <= column_bound:
+            return config
+    return _MPP_GEMM_TILE_TINY
+
+
+def _emit_mpp_matmul_source(
+    op: Operation,
+    rows: int,
+    reduction: int,
+    columns: int,
+    graph: Graph,
+    dtype: DType,
+    transpose_left: bool,
+    transpose_right: bool,
+    batch_count: int,
+    left_batch_offset: str,
+    right_batch_offset: str,
+    config: tuple[int, int, int, int, int],
+) -> str:
+    """Emit a ``mpp::tensor_ops::matmul2d`` GEMM for Apple tensor cores."""
+
+    block_rows, block_columns, warp_rows, warp_columns, step = config
+    if op.op == "addmm":
+        bias_id = op.inputs[0]
+        bias_type = graph.value(bias_id).type
+        output_shape = graph.value(op.outputs[0]).type.shape
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+        left_position = 1
+        right_position = 2
+    else:
+        bias_id = None
+        bias_type = None
+        output_shape = graph.value(op.outputs[0]).type.shape
+        alpha = 1.0
+        beta = 1.0
+        left_position = 0
+        right_position = 1
+
+    warps = warp_rows * warp_columns
+    warp_block_rows = block_rows // warp_rows
+    warp_block_columns = block_columns // warp_columns
+    row_fragments = warp_block_rows // 16
+    column_pairs = warp_block_columns // 32
+    step_fragments = step // 16
+    if row_fragments < 1 or column_pairs < 1:
+        raise ValueError("MPP matmul requires at least one 16x32 warp tile")
+
+    full_steps, tail_fragments = divmod(reduction, step)
+    tail_fragments //= 16
+    row_blocks = ceil(rows / block_rows)
+    column_blocks = ceil(columns / block_columns)
+    guard_rows = rows % block_rows != 0
+    guard_columns = columns % block_columns != 0
+    left_batch_prefix = f"{left_batch_offset} + " if left_batch_offset else ""
+    right_batch_prefix = f"{right_batch_offset} + " if right_batch_offset else ""
+    output_batch_prefix = f"batch * {rows * columns}u + " if batch_count > 1 else ""
+
+    lines: list[str] = []
+    append = lines.append
+    append("uint tid = thread_position_in_threadgroup.x;")
+    append("uint lane = tid % 32u;")
+    append("uint sg = tid / 32u;")
+    append("uint qid = lane >> 2u;")
+    append("uint fm = (qid & 4u) | ((lane >> 1u) & 3u);")
+    append("uint fn = ((qid & 2u) | (lane & 1u)) * 4u;")
+    if batch_count > 1:
+        append("uint batch = threadgroup_position_in_grid.z;")
+    append(
+        f"uint row_base = threadgroup_position_in_grid.y * {block_rows}u"
+        f" + (sg / {warp_columns}u) * {warp_block_rows}u;"
+    )
+    append(
+        f"uint col_base = threadgroup_position_in_grid.x * {block_columns}u"
+        f" + (sg % {warp_columns}u) * {warp_block_columns}u;"
+    )
+    append(
+        "constexpr auto tsc_gemm_descriptor = "
+        "mpp::tensor_ops::matmul2d_descriptor("
+    )
+    append("    16, 32, 16, false, true, true,")
+    append(
+        "    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);"
+    )
+    append(
+        "mpp::tensor_ops::matmul2d<tsc_gemm_descriptor, "
+        "metal::execution_simdgroup> tsc_gemm;"
+    )
+    append(
+        "using tsc_at = decltype("
+        "tsc_gemm.get_left_input_cooperative_tensor<T, T, float>());"
+    )
+    append(
+        "using tsc_bt = decltype("
+        "tsc_gemm.get_right_input_cooperative_tensor<T, T, float>());"
+    )
+    append(
+        "using tsc_ct = decltype(tsc_gemm.get_destination_cooperative_tensor<"
+        "metal::remove_addrspace_t<tsc_at>, "
+        "metal::remove_addrspace_t<tsc_bt>, float>());"
+    )
+    for row_fragment in range(row_fragments):
+        for column_pair in range(column_pairs):
+            name = f"tsc_acc_{row_fragment}_{column_pair}"
+            append(f"tsc_ct {name} = tsc_gemm.get_destination_cooperative_tensor<")
+            append(
+                "    metal::remove_addrspace_t<tsc_at>, "
+                "metal::remove_addrspace_t<tsc_bt>, float>();"
+            )
+            append(f"for (uint e = 0u; e < 16u; ++e) {name}[e] = 0.0f;")
+
+    def row_expression(row_fragment: int, row_offset: int) -> str:
+        expression = f"row_base + {row_fragment * 16 + row_offset}u + fm"
+        if guard_rows:
+            return f"metal::min({expression}, {rows - 1}u)"
+        return expression
+
+    def column_load_expression(column_fragment: int, column_offset: int) -> str:
+        # The right cooperative tensor indexes its ``n`` rows with ``fm``.
+        expression = f"col_base + {column_fragment * 16 + column_offset}u + fm"
+        if guard_columns:
+            return f"metal::min({expression}, {columns - 1}u)"
+        return expression
+
+    def column_store_expression(column_fragment: int, column_offset: int) -> str:
+        # The destination cooperative tensor indexes its columns with ``fn``.
+        expression = f"col_base + {column_fragment * 16 + column_offset}u + fn"
+        return expression
+
+    def k_expression(origin: str | int, offset: int) -> str:
+        # Every lane owns ``fn`` of the 16-wide reduction fragment.
+        if isinstance(origin, int):
+            return f"{origin + offset}u + fn"
+        return f"{origin} + {offset}u + fn"
+
+    def emit_declarations(
+        fragments: int, prefix: str, indent: str
+    ) -> list[str]:
+        emitted: list[str] = []
+        for row_fragment in range(row_fragments):
+            for fragment in range(fragments):
+                emitted.append(
+                    f"{indent}tsc_at {prefix}ca_{row_fragment}_{fragment} ="
+                    " tsc_gemm.get_left_input_cooperative_tensor<T, T, float>();"
+                )
+        for column_pair in range(column_pairs):
+            for fragment in range(fragments):
+                emitted.append(
+                    f"{indent}tsc_bt {prefix}cb_{fragment}_{column_pair} ="
+                    " tsc_gemm.get_right_input_cooperative_tensor<T, T, float>();"
+                )
+        return emitted
+
+    def emit_body(
+        origin: str | int, fragments: int, prefix: str, indent: str
+    ) -> list[str]:
+        emitted: list[str] = []
+        for row_fragment in range(row_fragments):
+            for fragment in range(fragments):
+                for half in range(2):
+                    for element in range(4):
+                        k = k_expression(origin, fragment * 16 + element)
+                        target = f"{prefix}ca_{row_fragment}_{fragment}"
+                        if transpose_left:
+                            index = (
+                                f"{left_batch_prefix}({k})"
+                                f" * {rows}u + ({row_expression(row_fragment, half * 8)})"
+                            )
+                        else:
+                            index = (
+                                f"{left_batch_prefix}"
+                                f"({row_expression(row_fragment, half * 8)})"
+                                f" * {reduction}u + ({k})"
+                            )
+                        emitted.append(
+                            f"{indent}{target}[{half * 4 + element}] ="
+                            f" in_{left_position}[{index}];"
+                        )
+        for column_pair in range(column_pairs):
+            for fragment in range(fragments):
+                for half in range(2):
+                    for nf in range(2):
+                        column_fragment = column_pair * 2 + nf
+                        for element in range(4):
+                            k = k_expression(origin, fragment * 16 + element)
+                            target = f"{prefix}cb_{fragment}_{column_pair}"
+                            if transpose_right:
+                                index = (
+                                    f"{right_batch_prefix}"
+                                    f"({column_load_expression(column_fragment, half * 8)})"
+                                    f" * {reduction}u + ({k})"
+                                )
+                            else:
+                                index = (
+                                    f"{right_batch_prefix}({k})"
+                                    f" * {columns}u"
+                                    f" + ({column_load_expression(column_fragment, half * 8)})"
+                                )
+                            emitted.append(
+                                f"{indent}{target}[{nf * 8 + half * 4 + element}] ="
+                                f" in_{right_position}[{index}];"
+                            )
+        for row_fragment in range(row_fragments):
+            for column_pair in range(column_pairs):
+                for fragment in range(fragments):
+                    emitted.append(
+                        f"{indent}tsc_gemm.run({prefix}ca_{row_fragment}_{fragment},"
+                        f" {prefix}cb_{fragment}_{column_pair},"
+                        f" tsc_acc_{row_fragment}_{column_pair});"
+                    )
+        return emitted
+
+    if full_steps > 0:
+        lines.extend(emit_declarations(step_fragments, "loop_", ""))
+        append(
+            f"for (uint k0 = 0u; k0 < {full_steps * step}u; k0 += {step}u) {{"
+        )
+        lines.extend(emit_body("k0", step_fragments, "loop_", "    "))
+        append("}")
+    if tail_fragments > 0:
+        lines.extend(emit_declarations(tail_fragments, "tail_", ""))
+        lines.extend(emit_body(full_steps * step, tail_fragments, "tail_", ""))
+
+    for row_fragment in range(row_fragments):
+        for column_pair in range(column_pairs):
+            for nf in range(2):
+                column_fragment = column_pair * 2 + nf
+                for half in range(2):
+                    for element in range(4):
+                        row = row_expression(row_fragment, half * 8)
+                        column = column_store_expression(column_fragment, element)
+                        linear = f"({row}) * {columns}u + ({column})"
+                        value = f"float(tsc_acc_{row_fragment}_{column_pair}[{nf * 8 + half * 4 + element}])"
+                        if bias_id is not None:
+                            assert bias_type is not None
+                            bias_index = _offset_expression(
+                                bias_type.shape, output_shape, linear
+                            )
+                            value = (
+                                f"{beta!r} * float(in_0[{bias_index}])"
+                                f" + {alpha!r} * {value}"
+                            )
+                        elif alpha != 1.0:
+                            value = f"{alpha!r} * {value}"
+                        value = _matmul_epilogue_value(
+                            value, op, graph, output_shape, linear
+                        )
+                        conditions = []
+                        if guard_rows:
+                            conditions.append(
+                                f"row_base + {row_fragment * 16 + half * 8}u"
+                                f" + fm < {rows}u"
+                            )
+                        if guard_columns:
+                            conditions.append(
+                                f"col_base + {column_fragment * 16 + element}u"
+                                f" + fn < {columns}u"
+                            )
+                        guard = (
+                            f"if ({' && '.join(conditions)}) " if conditions else ""
+                        )
+                        append(
+                            f"{guard}out[{output_batch_prefix}{linear}] = (T)({value});"
+                        )
+    return "\n".join(lines)
+
+
+_MPP_ATTENTION_KEY_TILE = 32
+_MPP_ATTENTION_MAX_HEAD_DIM = 128
+_MPP_ATTENTION_MIN_QUERY_LENGTH = 16
+_MPP_ATTENTION_MAX_WARPS = 2
+
+
+def _supports_mpp_attention(
+    query_type: TensorType,
+    key_type: TensorType,
+    value_type: TensorType,
+    output_type: TensorType,
+    mask_shape: tuple[int, ...] | None,
+) -> bool:
+    """Tensor-core attention needs 16-row query fragments and 32-wide values."""
+
+    if query_type.dtype not in {DType.F16, DType.BF16}:
+        return False
+    for tensor_type in (key_type, value_type, output_type):
+        if tensor_type.dtype != query_type.dtype:
+            return False
+    rank = len(query_type.shape)
+    if rank not in {3, 4}:
+        return False
+    if len(key_type.shape) != rank or len(value_type.shape) != rank:
+        return False
+    query_head_dim = query_type.shape[-1]
+    value_head_dim = value_type.shape[-1]
+    if (
+        query_head_dim % 16 != 0
+        or not 16 <= query_head_dim <= _MPP_ATTENTION_MAX_HEAD_DIM
+    ):
+        return False
+    if (
+        value_head_dim % 32 != 0
+        or not 32 <= value_head_dim <= _MPP_ATTENTION_MAX_HEAD_DIM
+    ):
+        return False
+    if output_type.shape[-1] != value_head_dim:
+        return False
+    if query_type.shape[-2] < _MPP_ATTENTION_MIN_QUERY_LENGTH:
+        return False
+    if key_type.shape[-2] <= 0:
+        return False
+    if mask_shape is not None and not _native_attention_mask_supported(
+        rank, mask_shape
+    ):
+        return False
+    batch_axis = -3 if rank == 4 else -2
+    batch_shape = query_type.shape[:batch_axis]
+    if key_type.shape[:batch_axis] != batch_shape:
+        return False
+    if value_type.shape[:batch_axis] != batch_shape:
+        return False
+    query_heads = query_type.shape[-3] if rank == 4 else 1
+    key_value_heads = key_type.shape[-3] if rank == 4 else 1
+    if key_value_heads <= 0 or query_heads % key_value_heads != 0:
+        return False
+    return True
+
+
+def _select_mpp_attention_warps(query_length: int) -> int:
+    return max(
+        1,
+        min(_MPP_ATTENTION_MAX_WARPS, query_length // 16),
+    )
+
+
+def _emit_mpp_attention_source(
+    *,
+    query_length: int,
+    key_length: int,
+    query_heads: int,
+    key_value_heads: int,
+    query_head_dim: int,
+    value_head_dim: int,
+    warps: int,
+    scale: float,
+    has_mask: bool,
+    mask_shape: tuple[int, ...] | None,
+    mask_is_boolean: bool,
+    causal: bool,
+    rank: int,
+) -> str:
+    """Emit a register-resident FlashAttention pass on Apple tensor cores.
+
+    Each simdgroup owns a 16-row query fragment and the full value width, so the
+    online-softmax accumulators never leave registers. ``Q`` is staged once in
+    threadgroup memory; ``K``/``V`` stream straight from device memory.
+    """
+
+    query_tile = warps * 16
+    key_tile = _MPP_ATTENTION_KEY_TILE
+    dimension_fragments = query_head_dim // 16
+    value_pairs = value_head_dim // 32
+    query_blocks = ceil(query_length / query_tile)
+    group_size = query_heads // key_value_heads
+    threads = warps * 32
+    scores_per_half = 4
+
+    if rank == 4:
+        query_batch_head = f"(batch * {query_heads}u + head)"
+        key_value_batch_head = (
+            f"(batch * {key_value_heads}u + head / {group_size}u)"
+        )
+        output_batch_head = query_batch_head
+    else:
+        query_batch_head = "batch"
+        key_value_batch_head = "batch"
+        output_batch_head = "batch"
+
+    lines: list[str] = []
+    append = lines.append
+    append("uint tid = thread_position_in_threadgroup.x;")
+    append("uint lane = tid % 32u;")
+    append("uint sg = tid / 32u;")
+    append("uint qid = lane >> 2u;")
+    append("uint fm = (qid & 4u) | ((lane >> 1u) & 3u);")
+    append("uint fn = ((qid & 2u) | (lane & 1u)) * 4u;")
+    append("uint query_index = threadgroup_position_in_grid.x;")
+    append(
+        f"uint batch = query_index / {query_heads * query_blocks}u;"
+    )
+    append(
+        f"uint batch_index = query_index % {query_heads * query_blocks}u;"
+    )
+    append(f"uint head = batch_index / {query_blocks}u;")
+    append(f"uint query_block = batch_index % {query_blocks}u;")
+    append(
+        f"threadgroup T tile_q[{query_tile * query_head_dim}];"
+    )
+    append(
+        f"for (uint index = tid; index < {query_tile * query_head_dim}u;"
+        f" index += {threads}u) {{"
+    )
+    append(f"    uint row = index / {query_head_dim}u;")
+    append(f"    uint dimension = index % {query_head_dim}u;")
+    append(
+        f"    uint position = metal::min(query_block * {query_tile}u + row,"
+        f" {query_length - 1}u);"
+    )
+    append(
+        f"    tile_q[index] = in_0[({query_batch_head} * {query_length}u"
+        f" + position) * {query_head_dim}u + dimension];"
+    )
+    append("}")
+    append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+    # The descriptor always declares the transposed right operand; the physical
+    # row-major layout is absorbed by the per-operand index expressions.
+    for tag in ("qk", "pv"):
+        append(
+            f"constexpr auto tsc_{tag}_descriptor = "
+            "mpp::tensor_ops::matmul2d_descriptor("
+        )
+        append("    16, 32, 16, false, true, true,")
+        append(
+            "    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);"
+        )
+        append(
+            f"mpp::tensor_ops::matmul2d<tsc_{tag}_descriptor,"
+            " metal::execution_simdgroup> tsc_"
+            f"{tag};"
+        )
+        append(
+            f"using tsc_{tag}_at = decltype("
+            f"tsc_{tag}.get_left_input_cooperative_tensor<T, T, float>());"
+        )
+        append(
+            f"using tsc_{tag}_bt = decltype("
+            f"tsc_{tag}.get_right_input_cooperative_tensor<T, T, float>());"
+        )
+        append(
+            f"using tsc_{tag}_ct = decltype(tsc_{tag}."
+            f"get_destination_cooperative_tensor<metal::remove_addrspace_t<tsc_{tag}_at>,"
+            f" metal::remove_addrspace_t<tsc_{tag}_bt>, float>());"
+        )
+
+    for pair in range(value_pairs):
+        append(
+            f"tsc_pv_ct tsc_acc_{pair} = tsc_pv."
+            "get_destination_cooperative_tensor<"
+            "metal::remove_addrspace_t<tsc_pv_at>,"
+            " metal::remove_addrspace_t<tsc_pv_bt>, float>();"
+        )
+        append(f"for (uint e = 0u; e < 16u; ++e) {{ tsc_acc_{pair}[e] = 0.0f; }}")
+
+    for half in range(2):
+        append(f"float running_max_{half} = -INFINITY;")
+        append(f"float running_sum_{half} = 0.0f;")
+
+    if causal:
+        append(
+            f"uint key_limit = metal::min({key_length}u,"
+            f" query_block * {query_tile}u + {query_tile}u);"
+        )
+    else:
+        append(f"uint key_limit = {key_length}u;")
+
+    append(f"for (uint key_base = 0u; key_base < key_limit; key_base += {key_tile}u) {{")
+    append(
+        f"    const device T* key_head = in_1 + {key_value_batch_head}"
+        f" * {key_length * query_head_dim}u;"
+    )
+    append(
+        f"    const device T* value_head = in_2 + {key_value_batch_head}"
+        f" * {key_length * value_head_dim}u;"
+    )
+
+    # --- Q @ K^T ---------------------------------------------------------
+    append(
+        "    tsc_qk_ct tsc_scores = tsc_qk."
+        "get_destination_cooperative_tensor<"
+        "metal::remove_addrspace_t<tsc_qk_at>,"
+        " metal::remove_addrspace_t<tsc_qk_bt>, float>();"
+    )
+    append("    for (uint e = 0u; e < 16u; ++e) { tsc_scores[e] = 0.0f; }")
+    for half in range(2):
+        append(
+            f"    uint query_row_{half} = sg * 16u + {half * 8}u + fm;"
+        )
+        append(
+            f"    uint query_pos_{half} = query_block * {query_tile}u"
+            f" + query_row_{half};"
+        )
+    for row in range(4):
+        expression = (
+            f"metal::min(key_base + {row * 8}u + fm, {key_length - 1}u)"
+        )
+        if key_length % key_tile == 0:
+            expression = f"key_base + {row * 8}u + fm"
+        append(f"    uint key_row_{row} = {expression};")
+    append("    vec<T, 4> tsc_vector;")
+    for fragment in range(dimension_fragments):
+        append("    {")
+        append("        tsc_qk_at tsc_q; tsc_qk_bt tsc_k;")
+        for half in range(2):
+            append(
+                "        tsc_vector = *reinterpret_cast<"
+                f"const threadgroup vec<T, 4>*>(tile_q + query_row_{half}"
+                f" * {query_head_dim}u + {fragment * 16}u + fn);"
+            )
+            for element in range(4):
+                append(
+                    f"        tsc_q[{half * 4 + element}] = tsc_vector[{element}];"
+                )
+        for nf in range(2):
+            for half in range(2):
+                row = nf * 2 + half
+                append(
+                    "        tsc_vector = *reinterpret_cast<"
+                    f"const device vec<T, 4>*>(key_head + key_row_{row}"
+                    f" * {query_head_dim}u + {fragment * 16}u + fn);"
+                )
+                for element in range(4):
+                    append(
+                        f"        tsc_k[{nf * 8 + half * 4 + element}]"
+                        f" = tsc_vector[{element}];"
+                    )
+        append("        tsc_qk.run(tsc_q, tsc_k, tsc_scores);")
+        append("    }")
+
+    # --- scale, mask, causal --------------------------------------------
+    mask_offset_expression = (
+        _attention_mask_offset_expression(rank, mask_shape)
+        if has_mask and mask_shape is not None
+        else ""
+    )
+    append("    float scores[16];")
+    for half in range(2):
+        if has_mask and mask_shape is not None:
+            append(
+                f"    uint mask_row_{half} = metal::min(query_pos_{half},"
+                f" {query_length - 1}u);"
+            )
+    for element in range(16):
+        nf = element >> 3
+        half = (element >> 2) & 1
+        offset = element & 3
+        append(
+            f"    scores[{element}] = tsc_scores[{element}] * {float(scale)!r};"
+        )
+        if has_mask and mask_shape is not None:
+            mask_offset = mask_offset_expression.replace(
+                "query_pos", f"mask_row_{half}"
+            )
+            append("    {")
+            append(f"        uint key = key_base + {nf * 16 + offset}u + fn;")
+            if mask_is_boolean:
+                append(
+                    f"        if (!in_3[{mask_offset}])"
+                    f" {{ scores[{element}] = -INFINITY; }}"
+                )
+            else:
+                append(f"        scores[{element}] += float(in_3[{mask_offset}]);")
+            append("    }")
+    if key_length % key_tile != 0:
+        append(f"    if (key_base + {key_tile}u > {key_length}u) {{")
+        for element in range(16):
+            nf = element >> 3
+            offset = element & 3
+            append(
+                f"        if (key_base + {nf * 16 + offset}u + fn"
+                f" >= {key_length}u) {{ scores[{element}] = -INFINITY; }}"
+            )
+        append("    }")
+    if causal:
+        append(
+            f"    if (key_base + {key_tile}u > query_block * {query_tile}u"
+            f" + sg * 16u) {{"
+        )
+        for element in range(16):
+            nf = element >> 3
+            half = (element >> 2) & 1
+            offset = element & 3
+            append(
+                f"        if (key_base + {nf * 16 + offset}u + fn"
+                f" > query_pos_{half}) {{ scores[{element}] = -INFINITY; }}"
+            )
+        append("    }")
+
+    # --- online softmax --------------------------------------------------
+    for half in range(2):
+        elements = [
+            nf * 8 + half * scores_per_half + offset
+            for nf in range(2)
+            for offset in range(scores_per_half)
+        ]
+        local_max = f"scores[{elements[0]}]"
+        for element in elements[1:]:
+            local_max = f"metal::max({local_max}, scores[{element}])"
+        append(f"    float block_max_{half} = {local_max};")
+        append(
+            f"    block_max_{half} = metal::max(block_max_{half},"
+            f" simd_shuffle(block_max_{half}, (uint)(lane ^ 1u)));"
+        )
+        append(
+            f"    block_max_{half} = metal::max(block_max_{half},"
+            f" simd_shuffle(block_max_{half}, (uint)(lane ^ 8u)));"
+        )
+        append(
+            f"    float new_max_{half} ="
+            f" metal::max(running_max_{half}, block_max_{half});"
+        )
+        append(
+            f"    float alpha_{half} = running_max_{half} == -INFINITY"
+            f" ? 0.0f : metal::fast::exp(running_max_{half} - new_max_{half});"
+        )
+        append(f"    float block_sum_{half} = 0.0f;")
+        for element in elements:
+            append(
+                f"    {{ float p = scores[{element}] == -INFINITY ? 0.0f"
+                f" : metal::fast::exp(scores[{element}] - new_max_{half});"
+                f" scores[{element}] = p; block_sum_{half} += p; }}"
+            )
+        append(
+            f"    block_sum_{half} += simd_shuffle(block_sum_{half},"
+            f" (uint)(lane ^ 1u));"
+        )
+        append(
+            f"    block_sum_{half} += simd_shuffle(block_sum_{half},"
+            f" (uint)(lane ^ 8u));"
+        )
+        append(
+            f"    running_sum_{half} = running_sum_{half} * alpha_{half}"
+            f" + block_sum_{half};"
+        )
+        append(f"    running_max_{half} = new_max_{half};")
+
+    append("    if (alpha_0 != 1.0f || alpha_1 != 1.0f) {")
+    for pair in range(value_pairs):
+        for element in range(16):
+            half = (element >> 2) & 1
+            append(f"        tsc_acc_{pair}[{element}] *= alpha_{half};")
+    append("    }")
+
+    # --- P @ V -----------------------------------------------------------
+    for fragment in range(2):
+        append("    {")
+        append("        tsc_pv_at tsc_p;")
+        for half in range(2):
+            for element in range(4):
+                append(
+                    f"        tsc_p[{half * 4 + element}] = (T)scores["
+                    f"{fragment * 8 + half * 4 + element}];"
+                )
+        for pair in range(value_pairs):
+            append("        {")
+            append("            tsc_pv_bt tsc_v;")
+            for half in range(2):
+                for nf in range(2):
+                    for element in range(4):
+                        append(
+                            f"            tsc_v[{nf * 8 + half * 4 + element}]"
+                            f" = value_head[metal::min(key_base +"
+                            f" {fragment * 16 + element}u + fn,"
+                            f" {key_length - 1}u) * {value_head_dim}u"
+                            f" + {pair * 32 + nf * 16 + half * 8}u + fm];"
+                        )
+            append(
+                f"            tsc_pv.run(tsc_p, tsc_v, tsc_acc_{pair});"
+            )
+            append("        }")
+        append("    }")
+
+    append("}")
+
+    # --- normalize and store --------------------------------------------
+    for half in range(2):
+        append("if (")
+        append(
+            f"    query_block * {query_tile}u + sg * 16u + {half * 8}u + fm"
+            f" < {query_length}u) {{"
+        )
+        append(
+            f"    float inverse_sum = running_sum_{half} == 0.0f"
+            " ? 0.0f : 1.0f / running_sum_"
+            f"{half};"
+        )
+        append(
+            f"    uint output_row = (({output_batch_head} * {query_length}u"
+            f" + query_block * {query_tile}u + sg * 16u + {half * 8}u + fm)"
+            f" * {value_head_dim}u);"
+        )
+        for pair in range(value_pairs):
+            for nf in range(2):
+                for element in range(4):
+                    index = nf * 8 + half * 4 + element
+                    append(
+                        f"    out[output_row + {pair * 32 + nf * 16 + element}u"
+                        f" + fn] = (T)(tsc_acc_{pair}[{index}] * inverse_sum);"
+                    )
+        append("}")
+    return "\n".join(lines)
 
 
 def _emit_tiled_matmul_source(
@@ -3775,7 +5706,7 @@ def _emit_tiled_matmul_source(
     right_batch_offset: str,
 ) -> str:
     if op.op == "addmm":
-        bias_id, _, _ = op.inputs
+        bias_id = op.inputs[0]
         bias_type = graph.value(bias_id).type
         output_shape = graph.value(op.outputs[0]).type.shape
         alpha = float(op.attrs.get("alpha", 1.0))
@@ -3785,7 +5716,7 @@ def _emit_tiled_matmul_source(
     else:
         bias_id = None
         bias_type = None
-        output_shape = ()
+        output_shape = graph.value(op.outputs[0]).type.shape
         alpha = 1.0
         beta = 1.0
         left_position = 0
@@ -3935,6 +5866,7 @@ def _emit_tiled_matmul_source(
                 )
             else:
                 value = accumulator
+            value = _matmul_epilogue_value(value, op, graph, output_shape, linear)
             lines.append(f"{indent}out[{linear}] = (T)({value});")
             if not exact_tiles:
                 lines.append("}")
@@ -4356,6 +6288,232 @@ def _attention_mask_offset_expression(
     return " + ".join(terms) if terms else "0u"
 
 
+_DECODE_ATTENTION_THREADS = 128
+_DECODE_ATTENTION_MAX_KEYS = 4096
+_DECODE_ATTENTION_DTYPES = frozenset({DType.F16, DType.BF16, DType.F32})
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodeAttentionConfig:
+    """Static description of one single-query attention launch."""
+
+    threads: int
+    batch: int
+    query_heads: int
+    key_value_heads: int
+    group_size: int
+    key_length: int
+    query_head_dim: int
+    value_head_dim: int
+    scale: float
+    mask_shape: tuple[int, ...] | None
+    mask_is_boolean: bool
+    dtype: DType
+
+
+def _decode_attention_config(
+    graph: Graph, op: Operation
+) -> _DecodeAttentionConfig | None:
+    """Return a launch plan when a one-query attention can use one kernel.
+
+    Prefill attention needs the tiled online-softmax path. A decode step asks
+    every head for a single output row, so the whole head fits in one
+    threadgroup: scores live in threadgroup memory, the softmax is a two-level
+    reduction, and the value accumulation has no online rescaling. That removes
+    the per-layer gather/spread work the generic kernels need for a one-row
+    query.
+    """
+
+    query_type = graph.value(op.inputs[0]).type
+    key_type = graph.value(op.inputs[1]).type
+    value_type = graph.value(op.inputs[2]).type
+    output_type = graph.value(op.outputs[0]).type
+    if len(query_type.shape) != 4 or output_type.dtype not in _DECODE_ATTENTION_DTYPES:
+        return None
+    batch, query_heads, query_length, query_head_dim = query_type.shape
+    key_value_heads, key_length = key_type.shape[1], key_type.shape[2]
+    value_head_dim = value_type.shape[-1]
+    if query_length != 1 or op.attrs.get("causal"):
+        return None
+    if key_length < 1 or key_length > _DECODE_ATTENTION_MAX_KEYS:
+        return None
+    if query_head_dim > 256 or value_head_dim > 256:
+        return None
+    if batch < 1 or query_heads < 1 or key_value_heads < 1:
+        return None
+    if query_heads % key_value_heads != 0:
+        return None
+    has_mask = bool(op.attrs.get("has_mask"))
+    mask_shape: tuple[int, ...] | None = None
+    mask_is_boolean = False
+    if has_mask:
+        mask_type = graph.value(op.inputs[3]).type
+        mask_shape = mask_type.shape
+        mask_is_boolean = mask_type.dtype == DType.BOOL
+        if not mask_is_boolean and mask_type.dtype != query_type.dtype:
+            return None
+        if len(mask_shape) > 4:
+            return None
+    threads = _DECODE_ATTENTION_THREADS
+    shared_bytes = (
+        4 * key_length + 4 * threads + 4 * query_head_dim
+    )
+    if shared_bytes > _ATTENTION_MAX_SHARED_BYTES:
+        return None
+    return _DecodeAttentionConfig(
+        threads=threads,
+        batch=batch,
+        query_heads=query_heads,
+        key_value_heads=key_value_heads,
+        group_size=query_heads // key_value_heads,
+        key_length=key_length,
+        query_head_dim=query_head_dim,
+        value_head_dim=value_head_dim,
+        scale=float(op.attrs["scale"]),
+        mask_shape=mask_shape,
+        mask_is_boolean=mask_is_boolean,
+        dtype=output_type.dtype,
+    )
+
+
+def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
+    """Emit the one-query attention kernel body for a static head shape."""
+
+    threads = config.threads
+    key_length = config.key_length
+    query_dim = config.query_head_dim
+    value_dim = config.value_head_dim
+    query_heads = config.query_heads
+    key_value_heads = config.key_value_heads
+    splits = threads // value_dim if threads % value_dim == 0 else 1
+    indent = "    "
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint head = threadgroup_position_in_grid.x;",
+        "uint batch = threadgroup_position_in_grid.y;",
+        f"uint query_pos = 0u;",
+        f"uint key_value_head = head / {config.group_size}u;",
+        f"const device T* query = in_0 "
+        f"+ (batch * {query_heads}u + head) * {query_dim}u;",
+        f"const device T* key_base = in_1 "
+        f"+ (batch * {key_value_heads}u + key_value_head) "
+        f"* {key_length * query_dim}u;",
+        f"const device T* value_base = in_2 "
+        f"+ (batch * {key_value_heads}u + key_value_head) "
+        f"* {key_length * value_dim}u;",
+        f"threadgroup float scores[{key_length}];",
+        f"threadgroup float scratch[{threads}];",
+        f"threadgroup float query_shared[{query_dim}];",
+        f"for (uint dimension = tid; dimension < {query_dim}u; "
+        f"dimension += {threads}u) {{",
+        f"{indent}query_shared[dimension] = float(query[dimension]);",
+        "}",
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
+        f"{indent}const device T* row = key_base + key * {query_dim}u;",
+        f"{indent}float dot = 0.0f;",
+        f"{indent}for (uint dimension = 0u; dimension < {query_dim}u; "
+        "++dimension) {",
+        f"{indent * 2}dot = fma(query_shared[dimension], "
+        "float(row[dimension]), dot);",
+        f"{indent}}}",
+        f"{indent}float score = dot * float({config.scale!r});",
+    ]
+    if config.mask_shape is not None:
+        mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+        if config.mask_is_boolean:
+            lines.append(
+                f"{indent}score = in_3[{mask_offset}] ? score : -INFINITY;"
+            )
+        else:
+            lines.append(f"{indent}score += float(in_3[{mask_offset}]);")
+    lines.extend(
+        [
+            f"{indent}scores[key] = score;",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "float local_max = -INFINITY;",
+            f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
+            f"{indent}local_max = metal::max(local_max, scores[key]);",
+            "}",
+            "scratch[tid] = local_max;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"for (uint stride = {threads // 2}u; stride > 0u; stride >>= 1) {{",
+            f"{indent}if (tid < stride) {{",
+            f"{indent * 2}scratch[tid] = metal::max(scratch[tid], "
+            "scratch[tid + stride]);",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+            # A fully masked head has no finite maximum; shifting by zero keeps
+            # every exponential underflowing to zero instead of producing NaN.
+            "float row_max = metal::isinf(scratch[0]) ? 0.0f : scratch[0];",
+            # Every thread must read the reduction result before the scratch
+            # buffer is reused for the softmax sum, otherwise a leading thread
+            # can overwrite it while its peers are still loading the maximum.
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "float local_sum = 0.0f;",
+            f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
+            f"{indent}local_sum += metal::exp(scores[key] - row_max);",
+            "}",
+            "scratch[tid] = local_sum;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"for (uint stride = {threads // 2}u; stride > 0u; stride >>= 1) {{",
+            f"{indent}if (tid < stride) {{",
+            f"{indent * 2}scratch[tid] += scratch[tid + stride];",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+            "float inv_total = scratch[0] > 0.0f ? 1.0f / scratch[0] : 0.0f;",
+            f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
+            f"{indent}scores[key] = metal::exp(scores[key] - row_max) "
+            "* inv_total;",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+    )
+    if splits > 1:
+        lines.extend(
+            [
+                f"uint part = tid / {value_dim}u;",
+                f"uint dimension = tid - part * {value_dim}u;",
+                f"uint begin = ({key_length}u * part) / {splits}u;",
+                f"uint end = ({key_length}u * (part + 1u)) / {splits}u;",
+                "float accumulator = 0.0f;",
+                "for (uint key = begin; key < end; ++key) {",
+                f"{indent}accumulator = fma(scores[key], float(value_base[key * "
+                f"{value_dim}u + dimension]), accumulator);",
+                "}",
+                "scratch[tid] = accumulator;",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+                f"if (tid < {value_dim}u) {{",
+                f"{indent}float total = 0.0f;",
+                f"{indent}for (uint split = 0u; split < {splits}u; ++split) {{",
+                f"{indent * 2}total += scratch[split * {value_dim}u + tid];",
+                f"{indent}}}",
+                f"{indent}out[(batch * {query_heads}u + head) * {value_dim}u "
+                "+ tid] = (T)total;",
+                "}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"for (uint dimension = tid; dimension < {value_dim}u; "
+                f"dimension += {threads}u) {{",
+                f"{indent}float accumulator = 0.0f;",
+                f"{indent}for (uint key = 0u; key < {key_length}u; ++key) {{",
+                f"{indent * 2}accumulator = fma(scores[key], float(value_base[key "
+                f"* {value_dim}u + dimension]), accumulator);",
+                f"{indent}}}",
+                f"{indent}out[(batch * {query_heads}u + head) * {value_dim}u "
+                "+ dimension] = (T)accumulator;",
+                "}",
+            ]
+        )
+    return "\n".join(f"        {line}" for line in lines)
+
+
 def _validate_cat_op(graph: Graph, op: Operation) -> None:
     if not op.inputs:
         raise ValueError("cat expects at least one input tensor")
@@ -4389,6 +6547,40 @@ def _validate_cat_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             f"cat output shape {output_type.shape} != {tuple(expected_shape)}"
         )
+
+
+def _validate_rope_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 3:
+        raise ValueError(f"rope expects three inputs, got {len(op.inputs)}")
+    source_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    if source_type != output_type:
+        raise ValueError(
+            f"rope must preserve shape and dtype, got {source_type} -> {output_type}"
+        )
+    if output_type.dtype not in {DType.F16, DType.BF16, DType.F32}:
+        raise ValueError(
+            f"rope requires floating point, got {output_type.dtype.value}"
+        )
+    if output_type.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"rope head dimension must be even, got {output_type.shape[-1]}"
+        )
+    columns = output_type.shape[-1]
+    for value_id in op.inputs[1:]:
+        table_type = graph.value(value_id).type
+        if table_type.dtype != output_type.dtype:
+            raise ValueError("rope table dtype must match the source dtype")
+        if not _can_broadcast(table_type.shape, output_type.shape):
+            raise ValueError(
+                f"rope table {table_type.shape} cannot broadcast "
+                f"to {output_type.shape}"
+            )
+        if table_type.shape[-1] not in (1, columns):
+            raise ValueError(
+                f"rope table last dimension must be 1 or {columns}, "
+                f"got {table_type.shape[-1]}"
+            )
 
 
 def _validate_embedding_op(graph: Graph, op: Operation) -> None:

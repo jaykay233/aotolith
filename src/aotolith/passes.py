@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from math import prod
 
-from .ir import DType, Graph, Operation
+from .ir import DType, Graph, Operation, TensorType, Value
 
 POINTWISE_OPS = {
     "silu",
@@ -332,6 +332,619 @@ def fuse_attention(graph: Graph) -> Graph:
         elif index not in matched:
             rewritten.append(op)
     return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def fuse_rope(graph: Graph) -> Graph:
+    """Fold rotary positional embedding into one ``rope`` operation.
+
+    PyTorch writes RoPE as ``x * cos + rotate_half(x) * sin``, and
+    ``rotate_half`` alone is two slices, a negation and a concatenation. For one
+    decode token each of those operates on a few hundred elements, so every one
+    of them costs a kernel launch and nothing else. Rewriting the whole pattern
+    into a single op removes the launches and the intermediate tensors.
+    """
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    rewrites: dict[int, Operation] = {}
+    removed: set[int] = set()
+
+    for index, op in enumerate(graph.ops):
+        if op.op != "add" or len(op.inputs) != 2 or index in removed:
+            continue
+        match = _match_rope(graph, index, producers, consumers, output_set)
+        if match is None:
+            continue
+        internal, rope = match
+        rewrites[index] = rope
+        removed.update(internal)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in removed:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def _match_rope(
+    graph: Graph,
+    index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    output_set: set[str],
+) -> tuple[set[int], Operation] | None:
+    """Match ``x * cos + rotate_half(x) * sin`` rooted at one ``add``."""
+
+    add = graph.ops[index]
+    if add.attrs.get("alpha", 1.0) != 1.0:
+        return None
+    output_id = add.outputs[0]
+    if len(add.outputs) != 1:
+        return None
+    output_type = graph.value(output_id).type
+    rank = len(output_type.shape)
+    if rank == 0 or output_type.dtype not in {DType.F16, DType.BF16, DType.F32}:
+        return None
+
+    products: list[tuple[int, Operation]] = []
+    for value_id in add.inputs:
+        producer = producers.get(value_id)
+        if producer is None:
+            return None
+        product = graph.ops[producer]
+        if product.op != "mul" or len(product.inputs) != 2:
+            return None
+        if consumers.get(value_id) != [index]:
+            return None
+        if graph.value(value_id).type != output_type:
+            return None
+        products.append((producer, product))
+
+    rotate_products = [
+        entry
+        for entry in products
+        if any(
+            producers.get(value_id) is not None
+            and graph.ops[producers[value_id]].op == "cat"
+            for value_id in entry[1].inputs
+        )
+    ]
+    if len(rotate_products) != 1:
+        return None
+    rotate_index, rotate_product = rotate_products[0]
+    data_index, data_product = next(
+        entry for entry in products if entry[0] != rotate_index
+    )
+
+    rotated_id = next(
+        value_id
+        for value_id in rotate_product.inputs
+        if graph.ops[producers[value_id]].op == "cat"
+    )
+    sine_id = next(
+        value_id for value_id in rotate_product.inputs if value_id != rotated_id
+    )
+    cat_index = producers[rotated_id]
+    cat = graph.ops[cat_index]
+    if len(cat.inputs) != 2 or len(cat.outputs) != 1:
+        return None
+    cat_dim = cat.attrs.get("dim")
+    if not isinstance(cat_dim, int) or cat_dim % rank != rank - 1:
+        return None
+    if graph.value(rotated_id).type != output_type:
+        return None
+    if consumers.get(rotated_id) != [rotate_index]:
+        return None
+
+    columns = output_type.shape[-1]
+    if columns % 2 != 0:
+        return None
+    half = columns // 2
+
+    sliced: list[int] = []
+    sources: set[str] = set()
+    neg_index: int | None = None
+    for position, (expected_start, expected_end) in enumerate(
+        ((half, columns), (0, half))
+    ):
+        piece_id = cat.inputs[position]
+        producer = producers.get(piece_id)
+        if producer is None:
+            return None
+        piece = graph.ops[producer]
+        if len(piece.outputs) != 1:
+            return None
+        piece_type = graph.value(piece_id).type
+        if piece_type.shape != output_type.shape[:-1] + (half,):
+            return None
+        if piece_type.dtype != output_type.dtype:
+            return None
+        if position == 0:
+            if piece.op != "neg" or len(piece.inputs) != 1:
+                return None
+            if consumers.get(piece_id) != [cat_index]:
+                return None
+            neg_index = producer
+            slice_id = piece.inputs[0]
+            slice_index = producers.get(slice_id)
+            if slice_index is None:
+                return None
+            if consumers.get(slice_id) != [neg_index]:
+                return None
+        else:
+            slice_id = piece_id
+            slice_index = producer
+            if consumers.get(slice_id) != [cat_index]:
+                return None
+        piece_slice = graph.ops[slice_index]
+        if piece_slice.op != "slice" or len(piece_slice.inputs) != 1:
+            return None
+        sliced.append(slice_index)
+        if piece_slice.attrs.get("dim", 0) % rank != rank - 1:
+            return None
+        if piece_slice.attrs.get("step", 1) != 1:
+            return None
+        start = piece_slice.attrs.get("start", 0)
+        end = piece_slice.attrs.get("end")
+        if start != expected_start:
+            return None
+        if not isinstance(end, int) or end < expected_end:
+            return None
+        sources.add(piece_slice.inputs[0])
+
+    if len(sources) != 1:
+        return None
+    source_id = sources.pop()
+    if source_id not in data_product.inputs:
+        return None
+    if source_id in output_set:
+        return None
+    source_type = graph.value(source_id).type
+    if source_type != output_type:
+        return None
+
+    cosine_id = next(
+        value_id for value_id in data_product.inputs if value_id != source_id
+    )
+    for table_id in (cosine_id, sine_id):
+        table_type = graph.value(table_id).type
+        if table_type.dtype != output_type.dtype:
+            return None
+        if not _can_broadcast_to(table_type.shape, output_type.shape):
+            return None
+        if table_type.shape[-1] not in (1, columns):
+            return None
+
+    internal = {
+        data_index,
+        rotate_index,
+        cat_index,
+    }
+    if neg_index is not None:
+        internal.add(neg_index)
+    internal.update(sliced)
+    rope = Operation(
+        "rope",
+        (source_id, cosine_id, sine_id),
+        (output_id,),
+        {},
+    )
+    return internal, rope
+
+
+def fuse_residual_epilogue(graph: Graph) -> Graph:
+    """Fold a residual add into the matrix multiply that feeds it.
+
+    ``hidden = hidden + delta``, where ``delta`` comes from a projection, costs a
+    whole kernel launch for a single output row and reads the result back from
+    memory only to write it again. Expressing it as ``addmm`` with the residual
+    as the bias lets the projection accumulate it in the epilogue, and every
+    matmul path already supports a broadcast bias. The projection is usually
+    followed by a shape-only view, so the match walks back through layout
+    operations and re-points the last one at the add's output value.
+    """
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    rewrites: dict[int, Operation] = {}
+    retargets: dict[int, tuple[str, ...]] = {}
+    removed: set[int] = set()
+    inserted: dict[int, list[Operation]] = {}
+    extra_values: dict[str, Value] = {}
+
+    for index, op in enumerate(graph.ops):
+        if op.op != "add" or len(op.inputs) != 2:
+            continue
+        if op.attrs.get("alpha", 1.0) != 1.0:
+            continue
+        output_id = op.outputs[0]
+        output_type = graph.value(output_id).type
+        match = _trace_add_operand_to_matmul(
+            graph, index, producers, consumers, output_set
+        )
+        if match is None:
+            continue
+        product_index, chain, residual_id = match
+        if graph.value(residual_id).type != output_type:
+            continue
+        # The residual has to be available before the projection runs; otherwise
+        # replacing the projection would delete its own input.
+        residual_producer = producers.get(residual_id)
+        if residual_producer is not None and residual_producer >= product_index:
+            continue
+        product = graph.ops[product_index]
+        # The epilogue adds the residual to the projection's own output, so the
+        # residual has to line up with it. Rank differences are singleton-only
+        # here, and a reshape is a free view, so one is inserted when needed.
+        product_shape = graph.value(product.outputs[0]).type.shape
+        residual_type = graph.value(residual_id).type
+        if not _can_broadcast_to(residual_type.shape, product_shape):
+            if prod(residual_type.shape) != prod(product_shape):
+                continue
+            view_id = _fresh_value_id(f"{residual_id}_epilogue", graph, extra_values)
+            extra_values[view_id] = Value(
+                view_id, TensorType(product_shape, residual_type.dtype)
+            )
+            inserted.setdefault(product_index, []).append(
+                Operation("reshape", (residual_id,), (view_id,), {"shape": product_shape})
+            )
+            residual_id = view_id
+        left_id, right_id = product.inputs
+        attrs = dict(product.attrs)
+        attrs["alpha"] = 1.0
+        attrs["beta"] = 1.0
+        created = Operation(
+            "addmm",
+            (residual_id, left_id, right_id),
+            (product.outputs[0] if chain else output_id,),
+            attrs,
+        )
+        rewrites[product_index] = created
+        if chain:
+            retargets[chain[-1]] = (output_id,)
+        removed.add(index)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.extend(inserted.get(index, ()))
+            rewritten.append(replacement)
+            continue
+        retarget = retargets.get(index)
+        if retarget is not None:
+            rewritten.append(Operation(op.op, op.inputs, retarget, op.attrs))
+            continue
+        if index not in removed:
+            rewritten.append(op)
+    values = dict(graph.values)
+    values.update(extra_values)
+    result = Graph(graph.inputs, values, tuple(rewritten), graph.outputs)
+    result.validate()
+    return result
+
+
+def _fresh_value_id(
+    prefix: str, graph: Graph, extra_values: dict[str, Value]
+) -> str:
+    candidate = prefix
+    suffix = 0
+    while candidate in graph.values or candidate in extra_values:
+        suffix += 1
+        candidate = f"{prefix}_{suffix}"
+    return candidate
+
+
+
+def _trace_add_operand_to_matmul(
+    graph: Graph,
+    index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    output_set: set[str],
+) -> tuple[int, tuple[int, ...], str] | None:
+    """Return ``(matmul, layout_chain, residual)`` for one residual ``add``."""
+
+    add = graph.ops[index]
+    for position in (0, 1):
+        chain_reversed: list[int] = []
+        current = add.inputs[position]
+        while True:
+            producer = producers.get(current)
+            if producer is None:
+                break
+            candidate = graph.ops[producer]
+            if candidate.op == "matmul":
+                if current in output_set:
+                    break
+                if len(chain_reversed) > 2:
+                    break
+                chain = tuple(reversed(chain_reversed))
+                return producer, chain, add.inputs[1 - position]
+            if candidate.op not in LAYOUT_OPS or len(candidate.inputs) != 1:
+                break
+            if consumers.get(current) != [index] and not (
+                chain_reversed and consumers.get(current) == [chain_reversed[-1]]
+            ):
+                break
+            chain_reversed.append(producer)
+            current = candidate.inputs[0]
+    return None
+
+
+def fuse_activation_epilogue(graph: Graph) -> Graph:
+    """Fold ``silu(gate) * up`` into the projection that produces ``up``.
+
+    The gated MLP activation runs on a wide but short tensor once per layer, so a
+    standalone pass over it is another launch and another round trip through
+    memory. The projection already has both operands live, and ``silu`` of the
+    gate is elementwise, so the multiply moves into its epilogue.
+    """
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    rewrites: dict[int, Operation] = {}
+    removed: set[int] = set()
+
+    for index, op in enumerate(graph.ops):
+        if op.op != "fused_elementwise" or len(op.inputs) != 2:
+            continue
+        body = op.attrs.get("body")
+        if not isinstance(body, tuple) or len(body) != 2:
+            continue
+        activation, multiply = body
+        if not isinstance(activation, Operation) or activation.op != "silu":
+            continue
+        if not isinstance(multiply, Operation) or multiply.op != "mul":
+            continue
+        if multiply.outputs[0] != op.outputs[0]:
+            continue
+        gate_id = activation.inputs[0]
+        other_id = next(
+            (value_id for value_id in multiply.inputs if value_id != activation.outputs[0]),
+            None,
+        )
+        if other_id is None:
+            continue
+        gate = _trace_operand_to_matmul(
+            graph, gate_id, index, producers, consumers, output_set
+        )
+        product = _trace_operand_to_matmul(
+            graph, other_id, index, producers, consumers, output_set
+        )
+        if gate is None or product is None:
+            continue
+        gate_index, gate_chain, gate_source = gate
+        product_index, product_chain, _ = product
+        gate_op = graph.ops[gate_index]
+        product_op = graph.ops[product_index]
+        if graph.value(gate_op.outputs[0]).type != graph.value(
+            product_op.outputs[0]
+        ).type:
+            continue
+        # The epilogue reads the gate at the projection's own output index, so
+        # the two chains must be pure reshapes that preserve element order.
+        if not _chain_preserves_order(graph, gate_chain):
+            continue
+        if not _chain_preserves_order(graph, product_chain):
+            continue
+        attrs = dict(product_op.attrs)
+        attrs["epilogue"] = "silu_mul"
+        rewrites[product_index] = Operation(
+            product_op.op,
+            product_op.inputs + (gate_source,),
+            (op.outputs[0],) if not product_chain else product_op.outputs,
+            attrs,
+        )
+        if product_chain:
+            removed.add(index)
+            rewrites[product_chain[-1]] = Operation(
+                "reshape",
+                (graph.ops[product_chain[-1]].inputs[0],),
+                (op.outputs[0],),
+                {"shape": graph.value(op.outputs[0]).type.shape},
+            )
+        else:
+            removed.add(index)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in removed:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def _trace_operand_to_matmul(
+    graph: Graph,
+    value_id: str,
+    consumer_index: int,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
+    output_set: set[str],
+) -> tuple[int, tuple[int, ...], str] | None:
+    """Walk back from ``value_id`` through shape-only views to a matrix multiply."""
+
+    chain_reversed: list[int] = []
+    current = value_id
+    while True:
+        producer = producers.get(current)
+        if producer is None:
+            return None
+        candidate = graph.ops[producer]
+        if candidate.op in {"matmul", "addmm"}:
+            if current in output_set:
+                return None
+            return producer, tuple(reversed(chain_reversed)), current
+        if candidate.op not in LAYOUT_OPS or len(candidate.inputs) != 1:
+            return None
+        downstream = [consumer_index] if not chain_reversed else [chain_reversed[-1]]
+        if consumers.get(current) != downstream:
+            return None
+        chain_reversed.append(producer)
+        current = candidate.inputs[0]
+
+
+def _chain_preserves_order(graph: Graph, chain: tuple[int, ...]) -> bool:
+    for index in chain:
+        if graph.ops[index].op != "reshape":
+            return False
+    return True
+
+
+def fuse_rms_norm_epilogue(graph: Graph) -> Graph:
+    """Fold ``rms_norm(x) @ w`` into the projection's GEMV prologue.
+
+    A single-token projection already streams the whole weight matrix and
+    reads the normalized activation once per output column, so recomputing the
+    RMS scale inside that kernel costs one extra pass over a cache-resident
+    vector and removes a launch, a barrier, and a memory round trip.
+    """
+
+    graph.validate()
+    consumers = _consumers(graph)
+    output_set = set(graph.outputs)
+    rewrites: dict[int, Operation] = {}
+    removable: set[int] = set()
+
+    for norm_index, norm in enumerate(graph.ops):
+        if norm.op != "rms_norm":
+            continue
+        plan = _match_rms_norm_consumers(
+            graph, norm_index, norm, consumers, output_set
+        )
+        if plan is None:
+            continue
+        projection_rewrites, layout_rewrites = plan
+        rewrites.update(layout_rewrites)
+        rewrites.update(projection_rewrites)
+        removable.add(norm_index)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index not in removable:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
+
+
+def _match_rms_norm_consumers(
+    graph: Graph,
+    norm_index: int,
+    norm: Operation,
+    consumers: dict[str, list[int]],
+    output_set: set[str],
+) -> tuple[dict[int, Operation], dict[int, Operation]] | None:
+    """Return projection rewrites plus layout rewrites fed by one norm."""
+
+    if norm.outputs[0] in output_set:
+        return None
+    if norm.attrs.get("has_weight") is not True:
+        return None
+    normalized_shape = norm.attrs.get("normalized_shape")
+    if not isinstance(normalized_shape, tuple) or len(normalized_shape) != 1:
+        return None
+    if len(norm.inputs) != 2:
+        return None
+    eps = norm.attrs.get("eps")
+    if not isinstance(eps, float):
+        return None
+    source_id, weight_id = norm.inputs
+    source_type = graph.value(source_id).type
+    weight_type = graph.value(weight_id).type
+    reduction = normalized_shape[0]
+    if weight_type.shape != normalized_shape:
+        return None
+    if source_type.shape[-1] != reduction or prod(source_type.shape) != reduction:
+        return None
+    if reduction % 8 != 0:
+        return None
+
+    # Walk the layout chain; every leaf must be a projection that can absorb
+    # the normalization, otherwise the standalone kernel has to stay.
+    layout_rewrites: dict[int, Operation] = {}
+    projections: list[int] = []
+    frontier = [norm.outputs[0]]
+    while frontier:
+        next_frontier: list[str] = []
+        for value_id in frontier:
+            for consumer in consumers.get(value_id, []):
+                candidate = graph.ops[consumer]
+                if candidate.op in {"matmul", "addmm"}:
+                    projections.append(consumer)
+                elif candidate.op == "reshape":
+                    layout_rewrites[consumer] = _retarget_input(
+                        candidate, value_id, source_id
+                    )
+                    next_frontier.extend(candidate.outputs)
+                else:
+                    return None
+        frontier = next_frontier
+
+    if not projections:
+        return None
+
+    rewrites: dict[int, Operation] = {}
+    for projection_index in projections:
+        projection = graph.ops[projection_index]
+        left_position = 1 if projection.op == "addmm" else 0
+        left_id = projection.inputs[left_position]
+        left_type = graph.value(left_id).type
+        output_type = graph.value(projection.outputs[0]).type
+        if left_type.dtype != source_type.dtype:
+            return None
+        if weight_type.dtype != source_type.dtype:
+            return None
+        if prod(left_type.shape[:-1]) != 1:
+            return None
+        if projection.attrs.get("rms_norm_eps") is not None:
+            return None
+        if output_type.shape[:-2] != left_type.shape[:-2]:
+            return None
+        attrs = dict(projection.attrs)
+        attrs["rms_norm_eps"] = eps
+        inputs = projection.inputs
+        if left_id == norm.outputs[0]:
+            # ``rms_norm`` preserves shape, so the raw source can stand in.
+            inputs = (
+                inputs[:left_position] + (source_id,) + inputs[left_position + 1 :]
+            )
+        rewrites[projection_index] = Operation(
+            projection.op, inputs + (weight_id,), projection.outputs, attrs
+        )
+    return rewrites, layout_rewrites
+
+
+def _retarget_input(op: Operation, previous: str, replacement: str) -> Operation:
+    inputs = tuple(
+        replacement if value_id == previous else value_id for value_id in op.inputs
+    )
+    return Operation(op.op, inputs, op.outputs, op.attrs)
 
 
 def fuse_pointwise(graph: Graph) -> Graph:

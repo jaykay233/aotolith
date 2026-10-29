@@ -15,7 +15,11 @@ from .passes import (
     canonicalize_batched_matmul,
     eliminate_common_subexpressions,
     fuse_attention,
+    fuse_activation_epilogue,
     fuse_pointwise,
+    fuse_residual_epilogue,
+    fuse_rms_norm_epilogue,
+    fuse_rope,
     fold_matmul_input_layouts,
     simplify_layouts,
 )
@@ -64,12 +68,18 @@ class CompiledModulePlan:
 
         return save_compiled(self, path)
 
-    def __call__(self, *inputs: Any) -> tuple[mx.array, ...]:
+    def __call__(
+        self, *inputs: Any, verify_index_bounds: bool = True
+    ) -> tuple[mx.array, ...]:
         if len(inputs) != self.input_count:
             raise ValueError(
                 f"expected {self.input_count} inputs, received {len(inputs)}"
             )
-        return self.plan(*inputs, *self._state_values)
+        return self.plan(
+            *inputs,
+            *self._state_values,
+            verify_index_bounds=verify_index_bounds,
+        )
 
 
 def compile_graph(
@@ -90,8 +100,12 @@ def compile_graph(
     lowered = canonicalize_batched_matmul(lowered)
     lowered = fuse_attention(lowered)
     lowered = fold_matmul_input_layouts(lowered)
+    lowered = fuse_rope(lowered)
+    lowered = fuse_residual_epilogue(lowered)
     lowered = fuse_pointwise(lowered)
+    lowered = fuse_activation_epilogue(lowered)
     lowered = eliminate_common_subexpressions(lowered)
+    lowered = fuse_rms_norm_epilogue(lowered)
     plan = AppleMetalBackend(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
@@ -181,7 +195,7 @@ def compile_module(
     input_count = len(example_inputs)
     bound_values = tuple(_torch_tensor_to_mlx(value) for value in state_values)
 
-    def functional_forward(*args: Any) -> torch.Tensor:
+    def functional_forward(*args: Any) -> Any:
         inputs = tuple(args[:input_count])
         bound_state = dict(zip(state_names, args[input_count:], strict=True))
         with torch.no_grad():
@@ -241,13 +255,22 @@ def _select_module_output(output: Any, output_key: str | None) -> Any:
             selected = output.logits
         elif isinstance(output, Mapping) and len(output) == 1:
             selected = next(iter(output.values()))
-        elif isinstance(output, (tuple, list)) and len(output) == 1:
-            selected = output[0]
+        elif isinstance(output, (tuple, list)):
+            selected = tuple(output)
 
+    if isinstance(selected, (tuple, list)):
+        if not selected or not all(
+            isinstance(value, torch.Tensor) for value in selected
+        ):
+            raise ValueError(
+                "module sequence outputs must be a non-empty tuple or list "
+                "of tensors"
+            )
+        return tuple(selected)
     if not isinstance(selected, torch.Tensor):
         raise ValueError(
-            "module output must be a tensor or expose a tensor selected by "
-            "output_key"
+            "module output must be a tensor, a tuple/list of tensors, or "
+            "expose a tensor selected by output_key"
         )
     return selected
 

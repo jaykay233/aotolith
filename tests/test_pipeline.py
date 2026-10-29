@@ -101,9 +101,10 @@ def test_mlp_end_to_end_on_metal() -> None:
     assert [op.op for op in result.lowered_graph.ops] == [
         "matmul",
         "matmul",
-        "fused_elementwise",
         "matmul",
     ]
+    # silu(gate) * up is folded into the up-projection's epilogue.
+    assert result.lowered_graph.ops[1].attrs.get("epilogue") == "silu_mul"
 
     inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)
     actual = result.plan(*inputs)[0]
@@ -124,11 +125,12 @@ def test_pointwise_region_scheduled_after_interleaved_producer() -> None:
     torch.manual_seed(41)
     inputs = (torch.randn(3, 8), torch.randn(8, 16), torch.randn(8, 16))
     result = compile_callable(fn, inputs)
-    assert [op.op for op in result.lowered_graph.ops] == [
-        "matmul",
-        "matmul",
-        "fused_elementwise",
-    ]
+    lowered_ops = [op.op for op in result.lowered_graph.ops]
+    assert lowered_ops == ["matmul", "matmul"]
+    # The activation and the multiply land in the second projection's epilogue
+    # instead of a separate pointwise kernel.
+    assert "fused_elementwise" not in lowered_ops
+    assert result.lowered_graph.ops[-1].attrs.get("epilogue") == "silu_mul"
 
     mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
     actual = result.plan(*mlx_inputs)[0]
@@ -729,6 +731,33 @@ def test_index_select_rejects_out_of_range_indices() -> None:
     for invalid in (torch.tensor([3, 0]), torch.tensor([-1, 0])):
         with pytest.raises(IndexError, match="index out of range"):
             result.plan(source_mlx, _torch_to_mlx(invalid))
+
+
+def test_deferred_bounds_checks_cover_every_lookup() -> None:
+    """Queued bounds checks must all run, not just the first one."""
+
+    def fn(left, left_indices, right, right_indices):
+        return torch.nn.functional.embedding(
+            left_indices, left
+        ) + torch.nn.functional.embedding(right_indices, right)
+
+    left = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    right = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    left_indices = torch.tensor([0, 3], dtype=torch.int64)
+    right_indices = torch.tensor([0, 1], dtype=torch.int64)
+    result = compile_callable(
+        fn, (left, left_indices, right, right_indices)
+    )
+
+    valid_inputs = (left, left_indices, right, right_indices)
+    actual = result.plan(*(_torch_to_mlx(value) for value in valid_inputs))[0]
+    expected = _torch_to_mlx(fn(*valid_inputs))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+    overflowing = (left, left_indices, right, torch.tensor([0, 6]))
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(*(_torch_to_mlx(value) for value in overflowing))
 
 
 @pytest.mark.parametrize(
@@ -1395,7 +1424,7 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
 
     torch.manual_seed(64)
     inputs = (
-        torch.randn(2, 2, 5, 64, dtype=dtype),
+        torch.randn(2, 2, 8, 64, dtype=dtype),
         torch.randn(2, 2, 7, 64, dtype=dtype),
         torch.randn(2, 2, 7, 64, dtype=dtype),
     )
@@ -1428,7 +1457,7 @@ def test_native_attention_uses_simdgroup_qk_and_pv(dtype, simdgroup_type) -> Non
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
 )
-def test_native_attention_reuses_query_tile_across_simd_groups(
+def test_native_attention_uses_tensor_core_when_query_tile_fits(
     dtype, tolerance
 ) -> None:
     def fn(query, key, value):
@@ -1444,18 +1473,53 @@ def test_native_attention_reuses_query_tile_across_simd_groups(
     kernel = result.plan.kernels[0]
     source = kernel.source
 
-    assert "metal_attention_flash_16x32_512" in kernel.name
+    assert "metal_attention_tensorcore_16x32_32" in kernel.name
     assert "threadgroup T tile_q[1024]" in source
-    assert "threadgroup float tile_scores[512]" in source
-    assert "threadgroup T tile_probabilities_low[512]" in source
-    assert "if (warp < 8u)" in source
-    assert "uint query_fragment = warp / 4u" in source
-    assert "uint key_fragment = warp % 4u" in source
+    assert "16, 32, 16, false, true, true," in source
+    assert "tsc_qk.run(tsc_q, tsc_k, tsc_scores)" in source
+    assert "tsc_pv.run(tsc_p, tsc_v, tsc_acc_" in source
+    assert "simd_shuffle(block_max_0" in source
+    assert "simd_shuffle(block_sum_0" in source
+    assert "simdgroup_multiply_accumulate" not in source
+    assert "threadgroup float tile_scores" not in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
+    def fn(query, key, value, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, enable_gqa=True
+        )
+
+    torch.manual_seed(69)
+    mask = torch.zeros(1, 8, 64, 80, dtype=torch.float16)
+    mask[..., 3::4] = float("-inf")
+    mask[:, :, 5, :] = float("-inf")
+    inputs = (
+        torch.randn(1, 8, 64, 64, dtype=torch.float16),
+        torch.randn(1, 2, 80, 64, dtype=torch.float16),
+        torch.randn(1, 2, 80, 64, dtype=torch.float16),
+        mask,
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    kernel = result.plan.kernels[0]
+    source = kernel.source
+
+    assert "metal_attention_tensorcore_32x32_64" in kernel.name
+    assert "head / 4u" in source
+    assert source.count("in_3[") == 16
+    assert "if (key_base + 32u > 80u)" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    empty_row = mx.zeros((1, 8, 64), dtype=mx.float16)
+    mx.eval(actual, expected, empty_row)
+    assert mx.array_equal(actual[:, :, 5, :], empty_row)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize(
@@ -1479,15 +1543,14 @@ def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> Non
     kernel = result.plan.kernels[0]
     source = kernel.source
 
-    assert "metal_attention_flash_24x64_768" in kernel.name
-    assert "threadgroup T tile_q[3072]" in source
-    assert "alignas(32) threadgroup T tile_q[3072]" in source
-    assert "threadgroup float tile_workspace[2304]" in source
-    assert "threadgroup T* tile_probabilities_low" in source
-    assert "float score1 = -INFINITY" in source
-    assert "value_chunk_base" in source
-    assert "if (warp < 24u)" in source
-    assert "vec<T, 16>" in source
+    assert "metal_attention_tensorcore_32x32_64" in kernel.name
+    assert "threadgroup T tile_q[4096]" in source
+    assert "uint query_row_0 = sg * 16u + 0u + fm" in source
+    assert "uint key_row_3 = metal::min(key_base + 24u + fm, 768u)" in source
+    assert "metal::fast::exp(" in source
+    assert "if (key_base + 32u > query_block * 32u + sg * 16u)" in source
+    assert "if (key_base + 32u > 769u)" in source
+    assert "if (alpha_0 != 1.0f || alpha_1 != 1.0f)" in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(fn(*inputs))
@@ -1872,11 +1935,11 @@ def test_native_attention_rank3_direct_ir_supports_broadcast_masks(mask_shape) -
 def test_native_attention_rank3_boolean_mask_on_simd_path() -> None:
     dtype = DType.F16
     values = {
-        "query": Value("query", TensorType((2, 5, 16), dtype)),
+        "query": Value("query", TensorType((2, 8, 16), dtype)),
         "key": Value("key", TensorType((2, 7, 16), dtype)),
         "value": Value("value", TensorType((2, 7, 16), dtype)),
-        "mask": Value("mask", TensorType((5, 7), DType.BOOL)),
-        "output": Value("output", TensorType((2, 5, 16), dtype)),
+        "mask": Value("mask", TensorType((8, 7), DType.BOOL)),
+        "output": Value("output", TensorType((2, 8, 16), dtype)),
     }
     graph = Graph(
         ("query", "key", "value", "mask"),
@@ -1896,10 +1959,10 @@ def test_native_attention_rank3_boolean_mask_on_simd_path() -> None:
     assert "tile_probabilities_low" in result.plan.kernels[0].source
 
     torch.manual_seed(76)
-    mask = torch.rand(5, 7) > 0.25
+    mask = torch.rand(8, 7) > 0.25
     mask[1, :] = False
     inputs = (
-        torch.randn(2, 5, 16, dtype=torch.float16),
+        torch.randn(2, 8, 16, dtype=torch.float16),
         torch.randn(2, 7, 16, dtype=torch.float16),
         torch.randn(2, 7, 16, dtype=torch.float16),
         mask,
@@ -1914,6 +1977,92 @@ def test_native_attention_rank3_boolean_mask_on_simd_path() -> None:
     mx.eval(actual, expected, empty_row)
     assert mx.array_equal(actual[:, 1, :], empty_row)
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_native_decode_attention_launches_one_threadgroup_per_head(
+    batch, monkeypatch
+) -> None:
+    head_dim = 8
+    heads = 4
+    key_length = 8
+    dtype = DType.F32
+    values = {
+        "query": Value("query", TensorType((batch, heads, 1, head_dim), dtype)),
+        "key": Value("key", TensorType((batch, heads, key_length, head_dim), dtype)),
+        "value": Value(
+            "value", TensorType((batch, heads, key_length, head_dim), dtype)
+        ),
+        "mask": Value("mask", TensorType((batch, 1, 1, key_length), DType.BOOL)),
+        "output": Value("output", TensorType((batch, heads, 1, head_dim), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {"scale": head_dim**-0.5, "has_mask": True, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+
+    launches: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    cached_kernel = metal_backend._metal_kernel
+
+    def recording_kernel(name, input_names, output_names, source, header):
+        kernel = cached_kernel(name, input_names, output_names, source, header)
+
+        def launch(**kwargs):
+            launches.append((tuple(kwargs["grid"]), tuple(kwargs["threadgroup"])))
+            return kernel(**kwargs)
+
+        return launch
+
+    monkeypatch.setattr(metal_backend, "_metal_kernel", recording_kernel)
+    result = compile_graph(graph, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+    assert "threadgroup float scores[8]" in result.plan.kernels[0].source
+
+    torch.manual_seed(11)
+    query = torch.randn(batch, heads, 1, head_dim)
+    key = torch.randn(batch, heads, key_length, head_dim)
+    value = torch.randn(batch, heads, key_length, head_dim)
+    reference_query = query.double()
+    reference_key = key.double()
+    reference_value = value.double()
+    for valid_lengths in ((key_length, key_length), (1, key_length), (5, 2)):
+        valid_lengths = valid_lengths[:batch]
+        mask = torch.zeros(batch, 1, 1, key_length, dtype=torch.bool)
+        for row, valid_length in enumerate(valid_lengths):
+            mask[row, 0, 0, key_length - valid_length :] = True
+        scores = reference_query @ reference_key.transpose(-1, -2)
+        scores = scores * (head_dim**-0.5)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = torch.softmax(scores, dim=-1)
+        expected = (weights @ reference_value).to(torch.float32)
+
+        actual = result.plan(
+            *(
+                mx.array(tensor.numpy())
+                for tensor in (query, key, value, mask)
+            )
+        )[0]
+        mx.eval(actual)
+        assert mx.isfinite(actual).all().item()
+        assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-4, rtol=1e-4)
+
+    assert len(launches) == 3
+    for grid, threadgroup in launches:
+        threadgroups = tuple(
+            -(-size // block) for size, block in zip(grid, threadgroup, strict=True)
+        )
+        # One threadgroup per (head, batch) pair: extra threadgroups would run
+        # the same head twice and write past the end of the output buffer.
+        assert threadgroups == (heads, batch, 1)
 
 
 def test_native_attention_falls_back_above_threadgroup_limit() -> None:
@@ -2161,11 +2310,21 @@ def test_two_layer_decoder_transformer_end_to_end_on_metal() -> None:
     lowered_ops = [op.op for op in result.lowered_graph.ops]
     assert lowered_ops.count("attention") == 2
     assert lowered_ops.count("rms_norm") == 5
-    assert lowered_ops.count("matmul") == 11
-    assert lowered_ops.count("fused_elementwise") == 6
+    assert lowered_ops.count("matmul") == 7
+    assert lowered_ops.count("addmm") == 4
+    assert "add" not in lowered_ops
+    assert lowered_ops.count("rope") == 4
+    assert lowered_ops.count("fused_elementwise") == 0
+    assert lowered_ops.count("silu") == 0
+    assert "mul" not in lowered_ops
+    epilogue_ops = [
+        op for op in result.lowered_graph.ops if op.attrs.get("epilogue") == "silu_mul"
+    ]
+    assert len(epilogue_ops) == 2
     assert "embedding" in lowered_ops
     assert "attention" in {kernel.kind for kernel in result.plan.kernels}
     assert "matmul" in {kernel.kind for kernel in result.plan.kernels}
+    assert "rope" in {kernel.kind for kernel in result.plan.kernels}
 
     actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
     expected = mx.array(transformer(*inputs).detach().numpy())
@@ -2193,6 +2352,211 @@ def test_cat_lowering_preserves_concatenation_order() -> None:
     assert mx.allclose(actual, expected)
 
 
+@pytest.mark.parametrize("head_dim", [8, 12, 6])
+def test_rope_matches_rotate_half_reference(head_dim) -> None:
+    """Fused rope must match the composite form, natively or via MLX."""
+
+    def apply_rotary_embedding(x, cosine, sine):
+        half = x.shape[-1] // 2
+        rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+        return x * cosine + rotated * sine
+
+    torch.manual_seed(91)
+    inputs = (
+        torch.randn(2, 3, head_dim),
+        torch.randn(1, 1, head_dim),
+        torch.randn(1, 1, head_dim),
+    )
+    result = compile_callable(apply_rotary_embedding, inputs)
+    assert [op.op for op in result.lowered_graph.ops] == ["rope"]
+    native = head_dim % 8 == 0
+    assert [kernel.kind for kernel in result.plan.kernels] == (
+        ["rope"] if native else []
+    )
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(apply_rotary_embedding(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rope_keeps_shared_source_for_following_uses() -> None:
+    """Fusing rope must not drop a source tensor that other ops still read."""
+
+    def fn(x, cosine, sine):
+        half = x.shape[-1] // 2
+        rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+        rotated_input = x * cosine + rotated * sine
+        return rotated_input, x.sum(dim=-1)
+
+    torch.manual_seed(92)
+    inputs = (
+        torch.randn(2, 3, 8),
+        torch.randn(1, 1, 8),
+        torch.randn(1, 1, 8),
+    )
+    result = compile_callable(fn, inputs)
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    expected = fn(*inputs)
+    mx.eval(*actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert mx.allclose(got, mx.array(want.numpy()), atol=1e-6, rtol=1e-6)
+
+
+def test_residual_add_folds_into_projection_epilogue() -> None:
+    """``hidden + hidden @ w`` should become one ``addmm``, not an add kernel."""
+
+    def block(hidden, weight):
+        return hidden + hidden @ weight
+
+    torch.manual_seed(93)
+    hidden = torch.randn(2, 3, 8)
+    weight = torch.randn(8, 8)
+    result = compile_callable(block, (hidden, weight), codegen_matmul=True)
+    lowered = [op.op for op in result.lowered_graph.ops]
+    assert "add" not in lowered
+    assert lowered.count("addmm") == 1
+    assert "addmm" in {kernel.kind for kernel in result.plan.kernels}
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in (hidden, weight)))[0]
+    expected = mx.array(block(hidden, weight).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_residual_add_survives_rank_changing_view() -> None:
+    """A squeeze between the projection and the add must still fold."""
+
+    def block(hidden, weight):
+        projected = (hidden @ weight).reshape(hidden.shape[0], hidden.shape[1], -1)
+        return hidden + projected
+
+    torch.manual_seed(94)
+    hidden = torch.randn(1, 1, 16)
+    weight = torch.randn(16, 16)
+    result = compile_callable(block, (hidden, weight), codegen_matmul=True)
+    lowered = [op.op for op in result.lowered_graph.ops]
+    assert "add" not in lowered
+    assert lowered.count("addmm") == 1
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in (hidden, weight)))[0]
+    expected = mx.array(block(hidden, weight).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_residual_add_keeps_shared_projection_output() -> None:
+    """Folding must not fire when the projection output has other consumers."""
+
+    def block(hidden, weight):
+        projected = hidden @ weight
+        return hidden + projected, projected.sum()
+
+    torch.manual_seed(95)
+    hidden = torch.randn(1, 1, 16)
+    weight = torch.randn(16, 16)
+    result = compile_callable(block, (hidden, weight), codegen_matmul=True)
+    lowered = [op.op for op in result.lowered_graph.ops]
+    assert "add" in lowered
+    assert "addmm" not in lowered
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in (hidden, weight)))
+    expected = block(hidden, weight)
+    mx.eval(*actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert mx.allclose(got, mx.array(want.numpy()), atol=1e-5, rtol=1e-5)
+
+
+def test_activation_folds_into_projection_epilogue() -> None:
+    """``silu(x @ gate) * (x @ up)`` should be one epilogue matmul, not two."""
+
+    def mlp(x, gate_weight, up_weight):
+        return torch.nn.functional.silu(x @ gate_weight) * (x @ up_weight)
+
+    torch.manual_seed(96)
+    inputs = (torch.randn(2, 3, 8), torch.randn(8, 16), torch.randn(8, 16))
+    result = compile_callable(mlp, inputs, codegen_matmul=True)
+    lowered = [op.op for op in result.lowered_graph.ops]
+    assert "fused_elementwise" not in lowered
+    assert "silu" not in lowered
+    assert lowered.count("matmul") == 2
+    epilogue_matmuls = [
+        op
+        for op in result.lowered_graph.ops
+        if op.op == "matmul" and op.attrs.get("epilogue") == "silu_mul"
+    ]
+    assert len(epilogue_matmuls) == 1
+    assert [kernel.kind for kernel in result.plan.kernels] == ["matmul", "matmul"]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(mlp(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_activation_folds_through_reshape_chain() -> None:
+    """The epilogue must survive a pure reshape between projection and multiply."""
+
+    def mlp(x, gate_weight, up_weight):
+        gate = torch.nn.functional.silu(x @ gate_weight)
+        up = (x @ up_weight).reshape(2, 48).reshape(2, 3, 16)
+        return gate * up
+
+    torch.manual_seed(97)
+    inputs = (torch.randn(2, 3, 8), torch.randn(8, 16), torch.randn(8, 16))
+    result = compile_callable(mlp, inputs, codegen_matmul=True)
+    lowered = [op.op for op in result.lowered_graph.ops]
+    assert "fused_elementwise" not in lowered
+    assert any(op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops)
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(mlp(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_activation_epilogue_requires_single_use_gate() -> None:
+    """A gate with another consumer keeps the standalone activation for now."""
+
+    def mlp(x, gate_weight, up_weight):
+        gate = x @ gate_weight
+        activated = torch.nn.functional.silu(gate)
+        return activated * (x @ up_weight), gate.sum()
+
+    torch.manual_seed(98)
+    inputs = (torch.randn(1, 1, 8), torch.randn(8, 16), torch.randn(8, 16))
+    result = compile_callable(mlp, inputs, codegen_matmul=True)
+    assert not any(
+        op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops
+    )
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
+    expected = mlp(*inputs)
+    mx.eval(*actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert mx.allclose(got, mx.array(want.numpy()), atol=1e-5, rtol=1e-5)
+
+
+def test_activation_epilogue_skips_non_projection_operand() -> None:
+    """Both operands must trace back to a projection for the fold to apply."""
+
+    def mlp(x, gate_weight, bias):
+        return torch.nn.functional.silu(x @ gate_weight) * bias
+
+    torch.manual_seed(99)
+    inputs = (torch.randn(2, 3, 8), torch.randn(8, 16), torch.randn(2, 3, 16))
+    result = compile_callable(mlp, inputs, codegen_matmul=True)
+    assert not any(
+        op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops
+    )
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(mlp(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_rotary_embedding_rotate_half_compiles_and_runs() -> None:
     def apply_rotary_embedding(x, cosine, sine):
         half = x.shape[-1] // 2
@@ -2207,12 +2571,8 @@ def test_rotary_embedding_rotate_half_compiles_and_runs() -> None:
     )
     result = compile_callable(apply_rotary_embedding, inputs)
     lowered_ops = [op.op for op in result.lowered_graph.ops]
-    assert "cat" in lowered_ops
-    assert "fused_elementwise" in lowered_ops
-    assert [kernel.kind for kernel in result.plan.kernels] == [
-        "neg",
-        "fused_elementwise",
-    ]
+    assert lowered_ops == ["rope"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["rope"]
 
     actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
     expected = mx.array(apply_rotary_embedding(*inputs).numpy())
@@ -2393,7 +2753,9 @@ def test_transformer_decoder_block_compiles_and_runs() -> None:
     assert op_names.count("rms_norm") == 3
     assert lowered_ops.count("attention") == 1
     assert "softmax" not in lowered_ops
-    assert {"matmul", "rms_norm", "fused_elementwise"} <= set(lowered_ops)
+    assert {"matmul", "rms_norm"} <= set(lowered_ops)
+    assert "fused_elementwise" not in lowered_ops
+    assert any(op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops)
 
     mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
     actual = result.plan(*mlx_inputs)[0]
@@ -3137,7 +3499,6 @@ def test_full_mlp_can_use_only_generated_metal_kernels() -> None:
     assert [kernel.kind for kernel in result.plan.kernels] == [
         "matmul",
         "matmul",
-        "fused_elementwise",
         "matmul",
     ]
 
@@ -4197,18 +4558,22 @@ def test_metal_matmul_uses_simdgroup_for_complete_blocks(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_metal_matmul_simdgroup_vectorizes_complete_tiles(dtype) -> None:
+def test_metal_matmul_uses_tensor_core_tiles(dtype) -> None:
     torch.manual_seed(33)
     inputs = (
         torch.randn(64, 64, dtype=dtype),
         torch.randn(64, 64, dtype=dtype),
     )
     result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
-    source = result.plan.kernels[0].source
+    kernel = result.plan.kernels[0]
+    source = kernel.source
 
-    assert "alignas(16) threadgroup T tile_a[2048]" in source
-    assert "alignas(16) threadgroup T tile_b[2048]" in source
-    assert "vec<T, 8>" in source
+    assert kernel.name == "metal_matmul_tensorcore_nn_64x64x32_2x2_0"
+    assert "mpp::tensor_ops::matmul2d_descriptor(" in source
+    assert "mpp::tensor_ops::matmul2d<" in source
+    assert "get_left_input_cooperative_tensor" in source
+    assert "get_destination_cooperative_tensor" in source
+    assert "MetalPerformancePrimitives" in kernel.header
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(inputs[0] @ inputs[1])
@@ -4270,7 +4635,7 @@ def test_metal_matmul_codegen_handles_singleton_batch_dimension() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_metal_batched_simdgroup_matmul_vectorizes_batch_inputs() -> None:
+def test_metal_batched_matmul_vectorizes_batch_inputs() -> None:
     torch.manual_seed(44)
     inputs = (
         torch.randn(2, 3, 64, 32, dtype=torch.float16),
@@ -4283,10 +4648,9 @@ def test_metal_batched_simdgroup_matmul_vectorizes_batch_inputs() -> None:
     )
     kernel = result.plan.kernels[0]
 
-    assert kernel.name == "metal_matmul_simdgroup_64x64x32_batch6_0"
-    assert "vec<T, 8>" in kernel.source
-    assert "in_0 + batch * 2048u" in kernel.source
-    assert "in_1 + batch * 2048u" in kernel.source
+    assert kernel.name == "metal_matmul_tensorcore_nn_64x64x32_2x2_batch6_0"
+    assert "threadgroup_position_in_grid.z" in kernel.source
+    assert "batch * 2048u" in kernel.source
     assert "batch * 4096u" in kernel.source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
@@ -4478,7 +4842,7 @@ def test_metal_matmul_broadcasts_rank_two_against_rank_four() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_metal_simdgroup_matmul_broadcasts_batch_inputs() -> None:
+def test_metal_matmul_broadcasts_batch_inputs() -> None:
     torch.manual_seed(53)
     inputs = (
         torch.randn(2, 1, 64, 32, dtype=torch.float16),
@@ -4491,7 +4855,7 @@ def test_metal_simdgroup_matmul_broadcasts_batch_inputs() -> None:
     )
 
     assert result.plan.kernels[0].name == (
-        "metal_matmul_simdgroup_64x64x32_batch6_0"
+        "metal_matmul_tensorcore_nn_64x64x32_2x2_batch6_0"
     )
     source = result.plan.kernels[0].source
     assert "((batch / 3u) % 2u) * 2048u" in source
@@ -4517,8 +4881,10 @@ def test_metal_matmul_codegen_folds_transposed_operand() -> None:
     )
 
     assert result.lowered_graph.ops[0].attrs == {"transpose_b": True}
-    source = result.plan.kernels[0].source
-    assert "(col_base + local_column) * 64u + k_base + local_k" in source
+    kernel = result.plan.kernels[0]
+    source = kernel.source
+    assert kernel.name == "metal_matmul_tensorcore_nt_64x64x32_2x2_0"
+    assert "(col_base + 0u + fm) * 64u" in source
     assert "vec<T, 8>" not in source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
@@ -4547,7 +4913,7 @@ def test_metal_addmm_codegen_folds_transposed_operand() -> None:
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
-def test_simdgroup_addmm_applies_broadcast_bias() -> None:
+def test_addmm_tensor_core_applies_broadcast_bias() -> None:
     torch.manual_seed(32)
     inputs = (
         torch.randn(1, 64, dtype=torch.float16),
@@ -4560,7 +4926,8 @@ def test_simdgroup_addmm_applies_broadcast_bias() -> None:
 
     result = compile_callable(addmm, inputs, codegen_matmul=True)
     kernel = result.plan.kernels[0]
-    assert kernel.name == "metal_addmm_simdgroup_64x64x32_0"
+    assert kernel.name == "metal_addmm_tensorcore_nn_64x64x32_2x2_0"
+    assert "0.75" in kernel.source and "1.25" in kernel.source
 
     actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
     expected = _torch_to_mlx(addmm(*inputs))

@@ -223,7 +223,10 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     except ImportError as exc:
         raise RuntimeError("PyTorch is required for the FX frontend") from exc
 
-    traced = make_fx(fn)(*example_inputs)
+    # Fake tracing keeps capture shape-only: the default "real" mode executes
+    # every operator on the example inputs, so tracing a large matmul costs a
+    # full CPU matmul and compile time scales with the problem size.
+    traced = make_fx(fn, tracing_mode="fake")(*example_inputs)
     _reject_unsupported_attention_dropout(traced.graph)
     values: dict[str, Value] = {}
     input_ids: list[str] = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import pytest
 import torch
 
 from aotolith import compile_callable, plan_storage
@@ -55,6 +56,61 @@ def test_compiled_plan_exposes_storage_plan_and_releases_intermediates() -> None
     expected = mx.array(fn(value).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected)
+
+
+def test_unrolled_runner_agrees_with_the_interpreter() -> None:
+    """The unrolled fast path must match the interpreted execution exactly."""
+
+    def fn(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        hidden = torch.relu(value + 1.0)
+        normalized = hidden / hidden.sum(dim=-1, keepdim=True)
+        return torch.cat((normalized, hidden), dim=-1) * scale
+
+    value = torch.randn(4, 6)
+    scale = torch.randn(12)
+    result = compile_callable(fn, (value, scale))
+    assert result.plan._runner is None
+
+    inputs = (mx.array(value.numpy()), mx.array(scale.numpy()))
+    unrolled = result.plan(*inputs)[0]
+    interpreted, _ = result.plan.call_with_stats(*inputs)
+    mx.eval(unrolled, *interpreted)
+    assert result.plan._runner is not None
+    assert mx.array_equal(unrolled, interpreted[0])
+    assert mx.allclose(unrolled, mx.array(fn(value, scale).numpy()))
+
+
+def test_unrolled_runner_keeps_the_index_bounds_contract() -> None:
+    def fn(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding(indices, source)
+
+    table = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    indices = torch.tensor([0, 5], dtype=torch.int64)
+    result = compile_callable(fn, (table, indices))
+
+    # Build the unrolled runner on valid indices first.
+    valid = result.plan(
+        mx.array(table.numpy()), mx.array(indices.numpy())
+    )[0]
+    mx.eval(valid)
+    assert result.plan._runner is not None
+
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(
+            mx.array(table.numpy()),
+            mx.array([0, 6], dtype=mx.int64),
+        )
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(
+            mx.array(table.numpy()),
+            mx.array([-1, 0], dtype=mx.int64),
+        )
+    skipped = result.plan(
+        mx.array(table.numpy()),
+        mx.array([0, 6], dtype=mx.int64),
+        verify_index_bounds=False,
+    )[0]
+    mx.eval(skipped)
 
 
 def test_runtime_arena_reuses_a_planned_slot() -> None:

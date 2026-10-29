@@ -168,3 +168,26 @@ def test_tiny_huggingface_llama_logits_match_pytorch() -> None:
     mx.eval(actual)
     assert actual.shape == expected.shape
     assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
+
+
+def test_compile_module_supports_multiple_tensor_outputs() -> None:
+    class MultiOutputModule(torch.nn.Module):
+        def forward(
+            self, value: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return value + 1, value * 2
+
+    module = MultiOutputModule().eval()
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    actual = compiled(value)
+    mx.eval(*actual)
+
+    assert len(actual) == 2
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert mx.allclose(
+            actual_value,
+            mx.array(expected_value.numpy()),
+        )
