@@ -336,7 +336,7 @@ matmul kernel 用 MPP tensor-core 的 `matmul2d` 跑分块操作数。分块配�
 
 attention kernel 是寄存器驻留的 FlashAttention：一个 simdgroup 负责 16 行 query 片段和整个 value 宽度，online-softmax 的累加器始终留在寄存器里，`Q` 只在开头暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 流式读取。长序列上能跑到 16.8 TFLOPS，但在 prefill 形态上仍比 MLX 的 SDPA 慢约 20%。decode 是另一个问题：单行 query 用不上分块 online softmax，所以后端会另外发射一个单 query kernel，把整个 head 的分数留在 threadgroup memory 里，用两级归约求 `max` 和 `sum(exp)`，再做 value 累加而不需要重新缩放。因此 `--codegen-attention` 不再损失 decode 吞吐：它每层只有一次 launch、覆盖 192 个 cache slot，与 MLX 的 SDPA 落在同一噪声范围内，而不是慢 20%。对分块 prefill kernel 而言，把 `K`/`V` 暂存进 threadgroup memory 实测慢 3 倍：这份 tile 只有两个 simdgroup 共享，而每个 tile 的 barrier 代价超过它省下的重复 device 读取。`CompiledPlan.selections` 会记录每个算子实际使用的路径以及 fallback 原因。两个 kernel 都只覆盖 FP16/BF16，其他精度走 MLX。
 
-tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路径都以编译器自己的 `__HAVE_TENSOR__` 宏为准。更早的机型（M1、M2）以及任何虚拟化环境都走 simdgroup 路径——也就是 fallback 测试里会和 PyTorch 对拍的那份代码——而不是发射一个装不上的 kernel。这里还有一个真实的缺口：半虚拟化 GPU 会报告 `__HAVE_TENSOR__`，却仍然以 `unsupported deferred-static-alloca-size function body` 拒绝该 metallib。正因如此，CI 会跳过 tensor-core 相关断言并打印原因：托管 runner 上的绿灯只覆盖 simdgroup 路径。
+tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路径都以编译器自己的 `__HAVE_TENSOR__` 宏为准。更早的机型（M1、M2）以及任何虚拟化环境都走 simdgroup 路径——也就是 fallback 测试里会和 PyTorch 对拍的那份代码——而不是发射一个装不上的 kernel。只看这个宏还不够：半虚拟化 GPU（托管 CI、云 Mac）会定义它，却仍然以 `unsupported deferred-static-alloca-size function body` 拒绝该 metallib，最终变成用户第一次 matmul 时一句看不懂的 `RuntimeError`。因此 `compile` 在选路之前会真正加载并求值一个已生成的 tensor-core kernel；设备拒绝时就把整张图重新 lower 一次改走 simdgroup，并把原因记进 `plan.selections`。代价是多一次 launch（kernel 已缓存时约 0.25 ms），且只在确实生成了 tensor-core kernel 时才付。
 
 
 ## 支持范围
@@ -373,7 +373,7 @@ ruff check src tests examples
 python examples/tiny_llama_compile.py
 ```
 
-CI 在每次 push 和 pull request 上跑的就是这些：`ruff` 跑在 Linux 上；Apple Silicon 的 macOS runner 上则做 `dev` extra 的可编辑安装、跑测试、再跑 `python -m build`。托管 runner 的 GPU 是半虚拟化的，装不上 tensor-core kernel，所以那些测试会在尝试加载一个真实 kernel 之后自行跳过——`pytest -rs` 会打印原因，绿灯只覆盖 simdgroup 路径。
+CI 在每次 push 和 pull request 上跑的就是这些：`ruff` 跑在 Linux 上；Apple Silicon 的 macOS runner 上则做 `dev` extra 的可编辑安装、跑测试、再跑 `python -m build`。托管 runner 的 GPU 是半虚拟化的，装不上 tensor-core kernel，所以那里的 `compile` 会回退到 simdgroup 路径，相关测试也会自行跳过——`pytest -rs` 会打印原因，绿灯只覆盖 simdgroup 路径。
 
 
 其他示例覆盖 embedding、MLP、matmul kernel、softmax、reduction、normalization、attention 和静态 KV Cache 生成：

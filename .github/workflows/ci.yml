@@ -27,9 +27,11 @@ jobs:
     # Those runners are virtualised, and their GPU is an "Apple Paravirtual
     # device": it reports `__HAVE_TENSOR__` and then refuses to load the
     # tensor-core kernels with "unsupported deferred-static-alloca-size function
-    # body". Tests that need those kernels skip themselves here after trying to
-    # load one, which is why `-rs` matters — a green run on this runner does not
-    # cover the tensor-core paths, only the simdgroup ones every GPU takes.
+    # body". `compile` catches that by loading a real kernel and re-lowering
+    # without tensor cores, so plans here are valid but simdgroup-only. Tests
+    # that assert tensor-core source skip themselves for that reason, which is
+    # why `-rs` matters — a green run on this runner does not cover the
+    # tensor-core paths, only the ones every GPU takes.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

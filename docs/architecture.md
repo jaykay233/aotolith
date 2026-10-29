@@ -378,9 +378,18 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 | scalar load | 0.437 ms |
 | `vec<T, 8>` load | 0.344 ms |
 
-向量加载使该 shape 的 kernel 耗时下降约 21%。SIMD 路径仍比 MLX 慢，并且没有使用 Metal 4 MPP、split-K 或 autotune。
+向量加载使该 shape 的 kernel 耗时下降约 21%。这条 SIMD 路径本身没有 tile autotune，也没有 split-K；更快的 MPP 路径见下一节。
 
-### 成对 gate/up epilogue
+### Tensor-core fast path（MPP）
+
+`matmul`、`addmm` 的 GEMM 和 prefill attention 各有一条 `mpp::tensor_ops::matmul2d` 路径，用 Apple 的 tensor core 取代 `simdgroup_float8x8`：
+
+- GEMM 的 block tile 按输出 shape 和右操作数布局从测量得到的 tile 阶梯里选：右操作数转置时 K 连续，偏好宽的 column block；右操作数 row-major 时沿 K 跨步，偏好更高的 reduction step。warp 内用三个 cooperative tensor 分别承接左右操作数和 FP32 累加器，epilogue（bias、alpha/beta、`silu_mul`）在写回时执行
+- attention 用一个 simdgroup 负责 `16` 行 query fragment，`Q` 只暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 读进 cooperative tensor，online softmax 的 `max`/`sum` 仍在寄存器里用 `simd_shuffle` 归约
+- 两条路径都以编译器自己的 `__HAVE_TENSOR__` 宏为前提（Apple GPU family 9 及以上）。更早的机型走上一节的 SIMD 路径
+- 这个宏只回答「GPU 有没有 tensor op」，不回答「这个 metallib 装得上」。半虚拟化 GPU（托管 CI、云 Mac）会定义宏，却以 `unsupported deferred-static-alloca-size function body` 拒绝加载。因此 `compile` 在选路之前会真正加载并求值一个已经生成好的 tensor-core kernel；失败就把整个 graph 重新 lower 一次，改走 SIMD 路径，并把原因写进 `selections` 的 `reason`。代价是每次编译多一次 launch（kernel 已缓存时约 0.25 ms），换来的是首次 matmul 不会抛出一句带 mangled 符号的 `RuntimeError`
+
+
 
 单 token 的 `matmul` 走 warp-per-column 的 GEMV：一个 warp 负责一个输出列，沿 reduction 维读取该列对应的一行权重。gated MLP 的 `gate` 和 `up` 共享同一个 normalized 输入，于是 `fuse_gate_up_projection` 把它们合成一个 `matmul`，并标记 `epilogue="silu_mul_paired"`。
 
@@ -486,7 +495,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
-- matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP 或 split-K
+- matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
 - Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 激活必须是 SiLU（在构造好的 `mlp.act_fn` 上做数值比较，而不是读 `hidden_act`，因为库会把它归一化甚至替换掉），且不能有 sliding-window 层（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）。不满足时抛 `NotImplementedError`。这两种情况此前会静默产出错误数值：融合后的 MLP 硬编码了 `silu(gate) * up`，mask 则由适配层自己构造为普通 causal mask

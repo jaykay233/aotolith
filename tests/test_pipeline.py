@@ -26,44 +26,33 @@ _MLX_DTYPES = {
     torch.int64: mx.int64,
 }
 
-@functools.lru_cache(maxsize=None)
-def _device_loads_tensor_cores() -> bool:
-    """Ask the device by loading a real tensor-core kernel.
 
-    The backend's gate answers "does this GPU have tensor ops", which is what
-    codegen should key on but not the same question as "will these kernels
-    load here": a paravirtualised GPU reports tensor support and then rejects
-    the metallib with "unsupported deferred-static-alloca-size function body".
-    The hosted CI runners are exactly that, so the cheap capability probe says
-    yes and the kernel still dies. Compiling and evaluating the smallest real
-    kernel is the only answer that covers both.
+@functools.lru_cache(maxsize=None)
+def _device_builds_tensor_core_kernels() -> bool:
+    """Ask whether compiling here actually yields a tensor-core plan.
+
+    This is the backend's own verdict, not a second opinion: `compile` tries to
+    load one emitted tensor-core kernel and re-lowers without them if the
+    device refuses, so the kernel name already reflects what runs here. A
+    paravirtualised GPU (the hosted CI runners) reports `__HAVE_TENSOR__` and
+    rejects the metallib, and its plans come back as simdgroup kernels.
     """
 
-    patch = pytest.MonkeyPatch()
-    patch.setattr(metal_backend, "_mpp_supported", lambda: True)
-    try:
-        torch.manual_seed(1)
-        inputs = (
-            torch.randn(64, 64, dtype=torch.float16),
-            torch.randn(64, 64, dtype=torch.float16),
-        )
-        compiled = compile_callable(
-            lambda x, weight: x @ weight, inputs, codegen_matmul=True
-        )
-        # MLX evaluates lazily, so `plan(...)` alone never loads the kernel and
-        # would report success for a kernel the device rejects.
-        mx.eval(compiled.plan(*(_torch_to_mlx(value) for value in inputs))[0])
-    except RuntimeError:
-        return False
-    finally:
-        patch.undo()
-    return True
+    torch.manual_seed(1)
+    inputs = (
+        torch.randn(64, 64, dtype=torch.float16),
+        torch.randn(64, 64, dtype=torch.float16),
+    )
+    compiled = compile_callable(
+        lambda x, weight: x @ weight, inputs, codegen_matmul=True
+    )
+    return "tensorcore" in compiled.plan.kernels[0].name
 
 
 def _require_tensor_cores() -> None:
     """Skip tests that assert tensor-core source where the device has none."""
 
-    if not _device_loads_tensor_cores():
+    if not _device_builds_tensor_core_kernels():
         pytest.skip("this GPU cannot load MetalPerformancePrimitives kernels")
 
 
@@ -4782,6 +4771,107 @@ def test_backend_falls_back_when_the_gpu_cannot_load_tensor_ops(
     expected = _torch_to_mlx(attention(*attention_inputs))
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_a_device_that_rejects_tensor_core_kernels_still_compiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gap `__HAVE_TENSOR__` cannot see: tensor ops exist and do not load.
+
+    A paravirtualised GPU — hosted CI, cloud Macs — defines the macro and then
+    refuses the metallib with "unsupported deferred-static-alloca-size function
+    body". `compile` has to notice that, rebuild without tensor cores, and say
+    why in the selection, because the alternative is an opaque `RuntimeError`
+    on a user's first matmul.
+    """
+
+    monkeypatch.setattr(metal_backend, "_TENSOR_CORES_BLOCKED", False)
+    monkeypatch.setattr(metal_backend, "_TENSOR_CORE_BLOCK_ERROR", None)
+    assert metal_backend._mpp_supported(), "this test needs the hardware gate on"
+
+    create_kernel = metal_backend._metal_kernel
+
+    def refuse_tensor_core_kernels(name, input_names, output_names, source, header):
+        kernel = create_kernel(name, input_names, output_names, source, header)
+        if "matmul2d" not in source:
+            return kernel
+
+        def reject(*args, **kwargs):
+            raise RuntimeError(
+                f"[metal::Device] Unable to load kernel {name}\n"
+                " error: unsupported deferred-static-alloca-size function body"
+            )
+
+        return reject
+
+    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_tensor_core_kernels)
+
+    torch.manual_seed(38)
+    inputs = (
+        torch.randn(64, 64, dtype=torch.float16),
+        torch.randn(64, 64, dtype=torch.float16),
+    )
+    plan = compile_callable(
+        lambda x, weight: x @ weight, inputs, codegen_matmul=True
+    ).plan
+
+    assert "tensorcore" not in plan.kernels[0].name
+    assert metal_backend.tensor_core_fallback_reason() is not None
+    assert "tensor cores rejected" in plan.selections[0].reason
+
+    actual = plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(inputs[0] @ inputs[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def test_tensor_core_support_is_checked_per_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device can load FP16 tensor ops and reject FP32 ones.
+
+    Probing a single kernel would then keep the FP32 kernel that cannot load.
+    The FP32 tile here is `64x64x64` and the FP16 one `64x64x32`, so refusing by
+    kernel name simulates exactly that asymmetry.
+    """
+
+    monkeypatch.setattr(metal_backend, "_TENSOR_CORES_BLOCKED", False)
+    monkeypatch.setattr(metal_backend, "_TENSOR_CORE_BLOCK_ERROR", None)
+
+    create_kernel = metal_backend._metal_kernel
+
+    def refuse_float32_tiles(name, input_names, output_names, source, header):
+        kernel = create_kernel(name, input_names, output_names, source, header)
+        if "tensorcore" not in name or "64x64x64" not in name:
+            return kernel
+
+        def reject(*args, **kwargs):
+            raise RuntimeError(f"[metal::Device] Unable to load kernel {name}")
+
+        return reject
+
+    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_float32_tiles)
+
+    torch.manual_seed(39)
+    half = (torch.randn(64, 64, dtype=torch.float16),) * 2
+    half_plan = compile_callable(
+        lambda x, weight: x @ weight, half, codegen_matmul=True
+    ).plan
+    assert "tensorcore" in half_plan.kernels[0].name
+
+    # The blocked flag is process-wide, so this is the last compile that can
+    # still see tensor cores.
+    torch.manual_seed(40)
+    single = (torch.randn(64, 64, dtype=torch.float32),) * 2
+    float_plan = compile_callable(
+        lambda x, weight: x @ weight, single, codegen_matmul=True
+    ).plan
+    assert "tensorcore" not in float_plan.kernels[0].name
+
+    actual = float_plan(*(_torch_to_mlx(value) for value in single))[0]
+    expected = _torch_to_mlx(single[0] @ single[1])
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize(

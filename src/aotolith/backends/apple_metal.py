@@ -4,7 +4,7 @@ import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import ceil, isfinite, isinf, isnan, prod
 from statistics import median
@@ -284,9 +284,10 @@ _MPP_HEADER = (
 # parsing `device_info()["architecture"]`, which would mean encoding a table of
 # marketing names that Apple can extend or retire.
 #
-# Note this is a hardware-capability answer, not "these kernels will load":
-# a paravirtualised GPU (hosted CI, cloud Macs) reports `__HAVE_TENSOR__` and
-# still rejects them, so the tests probe by loading a real kernel instead.
+# This is a hardware-capability answer, not "these kernels will load": a
+# paravirtualised GPU (hosted CI, cloud Macs) reports `__HAVE_TENSOR__` and
+# still rejects them. That case is caught by loading a real kernel at compile
+# time, which then sets `_TENSOR_CORES_BLOCKED` for the rest of the process.
 _MPP_PROBE_SOURCE = """
         out[0] = 0;
 #if __HAVE_TENSOR__
@@ -294,9 +295,26 @@ _MPP_PROBE_SOURCE = """
 #endif
 """
 
+_TENSOR_CORES_BLOCKED = False
+_TENSOR_CORE_BLOCK_ERROR: str | None = None
+
+
+def _block_tensor_cores(error: str) -> None:
+    """Stop emitting tensor-core kernels after this device rejected one."""
+
+    global _TENSOR_CORES_BLOCKED, _TENSOR_CORE_BLOCK_ERROR
+    _TENSOR_CORES_BLOCKED = True
+    _TENSOR_CORE_BLOCK_ERROR = error
+
+
+def tensor_core_fallback_reason() -> str | None:
+    """Return why tensor cores were abandoned, or None if they still apply."""
+
+    return _TENSOR_CORE_BLOCK_ERROR
+
 
 @lru_cache(maxsize=None)
-def _mpp_supported() -> bool:
+def _compiler_reports_tensor_ops() -> bool:
     """Return whether this GPU has tensor ops the codegen may target."""
 
     try:
@@ -320,6 +338,14 @@ def _mpp_supported() -> bool:
         return bool(result.item())
     except Exception:  # noqa: BLE001 - any failure means "do not use MPP".
         return False
+
+
+def _mpp_supported() -> bool:
+    """Return whether codegen may emit tensor-core kernels."""
+
+    if _TENSOR_CORES_BLOCKED:
+        return False
+    return _compiler_reports_tensor_ops()
 
 
 # Tensor-core (NAX / MXU) GEMM tiles, each
@@ -998,6 +1024,82 @@ class _NativeCandidate:
     runtime: Any
 
 
+def _tensor_core_candidates_load(
+    graph: Graph, candidates: Mapping[str, _NativeCandidate]
+) -> bool:
+    """Try to load the emitted tensor-core kernels and evaluate them.
+
+    `__HAVE_TENSOR__` answers whether the GPU has tensor ops; it does not answer
+    whether the metallib will load. A paravirtualised GPU reports the macro and
+    then rejects the kernel with "unsupported deferred-static-alloca-size
+    function body", so this asks the driver by running the smallest thing that
+    goes through the real kernels. Doing it here costs a launch per compile
+    instead of an opaque `RuntimeError` on a user's first matmul.
+
+    One probe per kernel kind and input dtype set: support is not guaranteed to
+    be uniform, so a device that loads FP16 tensor ops and rejects FP32 ones is
+    caught too. Within a group the smallest shapes are probed, because the
+    dummy inputs are allocated at full size. Nothing is checked for
+    correctness, only that the kernel loads and dispatches; if this wrongly
+    fails, the plan still computes the right answer through the simdgroup path,
+    and the tests that assert tensor-core source catch the throughput loss.
+    """
+
+    probes: dict[tuple[Any, ...], tuple[int, _NativeCandidate]] = {}
+    for candidate in candidates.values():
+        artifact = candidate.artifact
+        if "tensorcore" not in artifact.name:
+            continue
+        types = [graph.value(value_id).type for value_id in artifact.input_ids]
+        key = (artifact.kind, tuple(item.dtype for item in types))
+        elements = sum(prod(item.shape) for item in types)
+        smallest = probes.get(key)
+        if smallest is None or elements < smallest[0]:
+            probes[key] = (elements, candidate)
+
+    for _, candidate in probes.values():
+        try:
+            inputs = [
+                mx.zeros(
+                    graph.value(value_id).type.shape,
+                    dtype=_MLX_DTYPES[graph.value(value_id).type.dtype],
+                )
+                for value_id in candidate.artifact.input_ids
+            ]
+            # MLX is lazy, so `runtime(...)` alone never loads the kernel and
+            # would report success for one the device rejects.
+            mx.eval(*_as_arrays(candidate.runtime(*inputs)))
+        except Exception as error:  # noqa: BLE001 - any failure means "no MPP".
+            _block_tensor_cores(str(error))
+            return False
+    return True
+
+
+
+
+_TENSOR_CORE_NOTE = "tensor cores rejected by this device"
+
+
+def _annotate_tensor_core_fallback(
+    selections: tuple[KernelSelection, ...],
+) -> tuple[KernelSelection, ...]:
+    """Say so when the plan is native but is not using tensor cores."""
+
+    if _TENSOR_CORE_BLOCK_ERROR is None:
+        return selections
+    return tuple(
+        replace(selection, reason=f"{selection.reason} ({_TENSOR_CORE_NOTE})")
+        if selection.is_native
+        else selection
+        for selection in selections
+    )
+
+def _as_arrays(outputs: Any) -> tuple[Any, ...]:
+    if isinstance(outputs, (list, tuple)):
+        return tuple(outputs)
+    return (outputs,)
+
+
 class AppleMetalBackend:
     """Lower supported IR regions to Metal kernels with an MLX runtime."""
 
@@ -1022,14 +1124,8 @@ class AppleMetalBackend:
         self.autotune_iterations = autotune_iterations
         self.selection_overrides = dict(selection_overrides or {})
 
-    def compile(
-        self,
-        graph: Graph,
-        *,
-        tune_inputs: Sequence[Any] | None = None,
-    ) -> CompiledPlan:
-        if not mx.metal.is_available():
-            raise RuntimeError("Apple Metal is unavailable in this process")
+    def _lower_candidates(self, graph: Graph) -> dict[str, _NativeCandidate]:
+        """Emit one native candidate per operation this backend can lower."""
 
         candidates: dict[str, _NativeCandidate] = {}
         for index, op in enumerate(graph.ops):
@@ -1123,6 +1219,25 @@ class AppleMetalBackend:
                 candidates[artifact.output_id] = _NativeCandidate(
                     artifact, runtime
                 )
+        return candidates
+
+    def compile(
+        self,
+        graph: Graph,
+        *,
+        tune_inputs: Sequence[Any] | None = None,
+    ) -> CompiledPlan:
+        if not mx.metal.is_available():
+            raise RuntimeError("Apple Metal is unavailable in this process")
+
+        candidates = self._lower_candidates(graph)
+        if _mpp_supported() and not _tensor_core_candidates_load(
+            graph, candidates
+        ):
+            # This device compiled the tensor-core kernels and refused to
+            # load them, so re-lower once without them rather than leaving
+            # a plan that raises on its first matmul.
+            candidates = self._lower_candidates(graph)
 
         if self.autotune and not self.selection_overrides:
             kernels, selections, callables = self._autotune(
@@ -1136,7 +1251,7 @@ class AppleMetalBackend:
         return CompiledPlan(
             graph,
             kernels,
-            selections,
+            _annotate_tensor_core_fallback(selections),
             callables,
             plan_storage(graph),
         )
