@@ -33,11 +33,16 @@ jobs:
     # why `-rs` matters — a green run on this runner does not cover the
     # tensor-core paths, only the ones every GPU takes.
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `requires-python` claims 3.11, so test it rather than assume it.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install the package the way a user would
         # An editable install of the dev extra, rather than a bare `pip install
         # pytest`, so the wheel metadata and package layout are exercised too.
