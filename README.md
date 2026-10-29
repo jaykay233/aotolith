@@ -338,6 +338,9 @@ The matmul kernel drives MPP tensor-core `matmul2d` over tiled operands. Tiles a
 
 The attention kernel is a register-resident FlashAttention pass: one simdgroup owns a 16-row query fragment and the full value width, so the online-softmax accumulators never leave registers, `Q` is staged once in threadgroup memory, and `K`/`V` stream straight from device memory. It reaches 16.8 TFLOPS on long sequences, but MLX's SDPA stays about 20% ahead on prefill shapes. Decode is a different problem: a one-row query has no use for tiled online softmax, so the backend emits a separate single-query kernel that keeps a whole head's scores in threadgroup memory, reduces `max` and `sum(exp)` in two levels, and accumulates values without rescaling. That kernel is why `--codegen-attention` no longer costs decode throughput: it is one launch per layer over a 192-slot cache and lands within noise of MLX's SDPA instead of 20% behind it. Staging `K`/`V` in threadgroup memory was measured 3x slower for the tiled prefill kernel: the tile is shared by only two simdgroups, and the per-tile barriers cost more than the duplicated device loads they replace. `CompiledPlan.selections` records which path each operation used and why a fallback occurred. Both kernels only cover FP16/BF16; anything else selects MLX.
 
+Tensor cores need Apple GPU family 9 or later, so both tensor-core paths are gated on the compiler's own `__HAVE_TENSOR__` macro. Everything before that — M1, M2, and anything virtualised — takes the simdgroup path instead, which is the same code the fallback tests check against PyTorch, rather than a kernel that fails to load. A paravirtualised GPU is a real gap here: it reports `__HAVE_TENSOR__` and still rejects the metallib with `unsupported deferred-static-alloca-size function body`. That is why CI skips the tensor-core assertions and prints the reason: a green run on a hosted runner covers the simdgroup paths only.
+
+
 ## Supported Surface
 
 | Area | Coverage |
@@ -368,8 +371,12 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 
 ```bash
 python -m pytest -q
+ruff check src tests examples
 python examples/tiny_llama_compile.py
 ```
+
+CI runs exactly that on every push and pull request: `ruff` on Linux, and on an Apple Silicon macOS runner an editable install of the `dev` extra, the suite, and `python -m build`. The hosted runners have a paravirtual GPU that cannot load the tensor-core kernels, so those tests skip there after trying to load one — `pytest -rs` prints why, and a green run covers the simdgroup paths only.
+
 
 Additional examples cover embeddings, MLP and matmul kernels, softmax, reductions, normalization, attention, and static KV-cache generation:
 
