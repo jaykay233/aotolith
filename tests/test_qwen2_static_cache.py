@@ -293,3 +293,82 @@ def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() ->
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 6)
+
+def test_adapter_refuses_a_mlp_activation_it_does_not_implement() -> None:
+    """A GELU model has the same layout, so nothing downstream would notice.
+
+    The fused MLP hardcodes ``silu(gate) * up``. Without this check a model with
+    ``hidden_act="gelu"`` compiles, runs, and returns numbers that are wrong by
+    far more than the test tolerance.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        hidden_act="gelu",
+    )
+    model = transformers.Qwen2ForCausalLM(config).eval()
+
+    with pytest.raises(NotImplementedError, match="silu MLP activation"):
+        compile_qwen2_static_cache(model, prompt_length=4, max_new_tokens=4)
+
+
+def test_adapter_refuses_sliding_window_attention() -> None:
+    """The adapter builds a plain causal mask, so a sliding window is a mismatch."""
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        layer_types=["sliding_attention", "sliding_attention"],
+    )
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    assert model.model.has_sliding_layers
+
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        compile_qwen2_static_cache(model, prompt_length=4, max_new_tokens=4)
+
+
+def test_adapter_accepts_the_configurations_it_does_support() -> None:
+    """Silu, tied or untied embeddings, and plain MHA all stay compilable."""
+
+    transformers = pytest.importorskip("transformers")
+    for overrides in (
+        {"hidden_act": "silu"},
+        {"tie_word_embeddings": False},
+        {"num_key_value_heads": 4},
+        {"hidden_act": "silu", "tie_word_embeddings": False},
+    ):
+        config = transformers.Qwen2Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=32,
+            **{"num_key_value_heads": 2, **overrides},
+        )
+        model = transformers.Qwen2ForCausalLM(config).eval()
+        runtime = compile_qwen2_static_cache(
+            model,
+            prompt_length=4,
+            max_new_tokens=4,
+            codegen_matmul=True,
+            codegen_attention=True,
+        )
+        tokens = runtime.greedy_generate(
+            [[1, 2, 3, 4]], max_new_tokens=3, sync_each_step=False
+        )
+        mx.eval(tokens)
+        assert tokens.shape == (1, 3), overrides

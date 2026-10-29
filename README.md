@@ -360,6 +360,7 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
 - Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured matmul shapes. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
+- The Qwen2 static-cache adapter implements SiLU MLP activation and a plain causal mask only. A config that selects another activation or sliding-window layers is rejected at compile time rather than compiled against the wrong semantics; the check reads the constructed layers rather than the config string, because the library normalises some of those fields away. The adapter verifies the activation numerically, which also catches a custom `act_fn` that the config does not describe.
 - The repository does not implement scheduler, continuous batching, preemption, paged KV cache, prefix cache, sampling policies, PD disaggregation, EP/MoE dispatch, EPLB, or serving APIs.
 - Training and autograd are out of scope.
 

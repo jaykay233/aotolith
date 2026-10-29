@@ -489,6 +489,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径，且还没有 Metal 4 MPP 或 split-K
 - 没有反向传播和训练支持
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
+- Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 激活必须是 SiLU（在构造好的 `mlp.act_fn` 上做数值比较，而不是读 `hidden_act`，因为库会把它归一化甚至替换掉），且不能有 sliding-window 层（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）。不满足时抛 `NotImplementedError`。这两种情况此前会静默产出错误数值：融合后的 MLP 硬编码了 `silu(gate) * up`，mask 则由适配层自己构造为普通 causal mask
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA

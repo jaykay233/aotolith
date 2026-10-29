@@ -358,6 +358,7 @@ attention kernel 是寄存器驻留的 FlashAttention：一个 simdgroup 负责 
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
 - 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 matmul shape 上都快于 MLX；`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢约 20%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。
+- Qwen2 静态 cache 适配层只实现 SiLU MLP 激活和普通 causal mask。如果 config 选了别的激活或 sliding-window 层，会在编译期直接拒绝，而不是按错误的语义编译出结果。这些检查读的是构造好的层，而不是 config 字符串——库会把其中一部分字段归一化掉。激活用数值方式校验，因此连 config 描述不到的自定义 `act_fn` 也能抓到。
 - 仓库不实现 scheduler、continuous batching、抢占、paged KV cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch、EPLB 或 serving API。
 - 不支持训练和 autograd。
 

@@ -25,6 +25,70 @@ import torch.nn.functional as F
 
 from ..compiler import CompiledModulePlan, compile_module
 
+# Probe points for the activation check below. They span the range where SiLU
+# and the other activations a Qwen2 config can select disagree, including a
+# negative input, where SiLU is not monotonic.
+_ACTIVATION_PROBES = (0.25, -0.75, 1.5, -2.5, 3.0, -6.0)
+_ACTIVATION_TOLERANCE = 1e-5
+
+
+def _validate_activation(model: torch.nn.Module) -> None:
+    """Reject a model whose MLP activation is not the one the adapter hardcodes.
+
+    ``_finish_layer`` computes ``silu(gate) * up``, but ``Qwen2Config`` accepts
+    any ``hidden_act``, and the resulting model still has the same layer layout.
+    Nothing downstream would notice a GELU model: it would compile, run, and
+    return numbers that are quietly wrong. Comparing the module's own activation
+    against SiLU catches that, and it reads the constructed layer rather than the
+    config string, which the library may have normalised or replaced.
+    """
+
+    probe = torch.tensor(_ACTIVATION_PROBES, dtype=torch.float32)
+    expected = probe * torch.sigmoid(probe)
+    for index, layer in enumerate(model.model.layers):
+        activation = getattr(layer.mlp, "act_fn", None)
+        if activation is None:
+            raise NotImplementedError(
+                f"layer {index} has no mlp.act_fn; the static-cache adapter "
+                "requires a gated MLP"
+            )
+        with torch.no_grad():
+            actual = activation(probe)
+        if not torch.allclose(
+            actual, expected, atol=_ACTIVATION_TOLERANCE, rtol=0.0
+        ):
+            name = getattr(model.config, "hidden_act", "<unknown>")
+            raise NotImplementedError(
+                "the static-cache adapter only implements silu MLP activation, "
+                f"but this model uses {name!r}: its layers are fused around "
+                "silu(gate) * up, so compiling it would return wrong numbers"
+            )
+
+
+def _validate_no_sliding_attention(model: torch.nn.Module) -> None:
+    """Reject a model that masks attention with anything other than causality.
+
+    The adapter builds its own causal mask, so a config that makes layers use a
+    sliding window would compile against the wrong mask instead of failing.
+    Transformers exposes this on the decoder for current versions, and on the
+    per-layer type list for the older ones.
+    """
+
+    if getattr(model.model, "has_sliding_layers", False):
+        raise NotImplementedError(
+            "sliding-window attention is not supported: the static-cache "
+            "adapter builds a plain causal mask for every layer"
+        )
+    layer_types = getattr(model.config, "layer_types", None)
+    if isinstance(layer_types, (list, tuple)) and any(
+        kind == "sliding_attention" for kind in layer_types
+    ):
+        raise NotImplementedError(
+            "sliding-window attention is not supported: the static-cache "
+            "adapter builds a plain causal mask for every layer"
+        )
+
+
 
 def _rms_norm(
     value: torch.Tensor,
@@ -63,6 +127,8 @@ class _Qwen2StaticBase(torch.nn.Module):
             )
         if getattr(config, "rope_scaling", None) is not None:
             raise NotImplementedError("Qwen2 RoPE scaling is not supported yet")
+        _validate_activation(model)
+        _validate_no_sliding_attention(model)
 
         self.model = model
         self.cache_capacity = cache_capacity
