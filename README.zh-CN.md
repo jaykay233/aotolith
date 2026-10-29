@@ -5,6 +5,7 @@
 一个原生支持 Apple Silicon 和 Metal 的实验性 Transformer 模型编译器。
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml/badge.svg)](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-000000?logo=apple&logoColor=white)](#环境要求)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#当前状态)
