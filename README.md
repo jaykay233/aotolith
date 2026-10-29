@@ -54,11 +54,14 @@ Kernel selection / fallback planning
         ▼
 CompiledPlan
         │
+        ├── first call unrolls the graph into straight-line Python
         ├── save: manifest + graphs + kernels + selections + state
         │
         ▼
 Versioned artifact → reload and rebuild kernels → Apple GPU
 ```
+
+A step that runs thousands of times per generation should not re-resolve its operands every time. The first call therefore compiles the plan into a Python function whose body is one assignment per operation, with kernel call sites bound as constants; later calls validate their inputs and run that function. Nothing about the kernels changes, only the bookkeeping around them.
 
 ## Requirements
 
@@ -150,6 +153,84 @@ logits = compiled(input_ids)[0]
 mx.eval(logits)
 ```
 
+### Compile a Qwen2.5 Static KV Cache
+
+`aotolith.models.qwen2` provides a single-request static-graph adapter for Qwen2/Qwen2.5. It separates prefill and one-token decode into two graphs connected by a fixed-capacity KV cache, and implements Qwen2 RMSNorm, RoPE, GQA, SwiGLU, and the LM head.
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from aotolith.models.qwen2 import compile_qwen2_static_cache
+
+
+model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    dtype=torch.bfloat16,
+).eval()
+prompt_ids = tokenizer.encode("Explain KV cache in one sentence", add_special_tokens=False)[:128]
+
+runtime = compile_qwen2_static_cache(
+    model,
+    prompt_length=len(prompt_ids),
+    max_new_tokens=64,
+)
+tokens = runtime.greedy_generate(prompt_ids, max_new_tokens=64)
+print(tokens.tolist())
+```
+
+The adapter fixes batch size, prompt length, and maximum generation length and implements greedy single-request generation only. The host owns the token loop; scheduling, batching, paged KV allocation, and sampling remain outside the compiler. `runtime.save("qwen")` writes separate prefill and decode `.aoto` files, each currently containing its own copy of the model state.
+
+Query, key, and value share one normalized input, so the adapter stores them as a single packed projection per layer and multiplies once. Splitting the result costs two view operations and removes two kernel launches: the 128-row key and value projections were far too small to fill the GPU, and each ran at under a fifth of the bandwidth the fused projection reaches.
+
+The repository benchmark uses the same prompt, precision, and `128 + 64` token settings for PyTorch MPS, MLX, and Aotolith:
+
+```bash
+python examples/qwen_static_cache_benchmark.py --output /tmp/qwen-aotolith.json
+python examples/qwen_static_cache_benchmark.py \
+  --codegen-matmul \
+  --mlx-baseline \
+  --output /tmp/qwen-aotolith-codegen.json
+```
+
+`--mlx-baseline` times `mlx_lm`'s own greedy decode on the same prompt in the same process, so the native number is measured on the machine running the benchmark instead of quoted from elsewhere. On this machine (M5 Pro, MLX 0.32) it reads **195.5-197.2 tokens/s** across runs.
+
+| configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` |
+| --- | --- | --- | --- | --- |
+| MLX fallback only | 10 146 tok/s | 103.3 tok/s | 116.2 tok/s | 0.59x |
+| `--codegen-matmul` | 13 274 tok/s | 178.6 tok/s | **232.5 tok/s** | **1.18x** |
+| `--codegen-matmul --codegen-attention` | 12 746 tok/s | 176.8 tok/s | 231.8 tok/s | 1.18x |
+
+(Qwen2.5-0.5B-Instruct, 128 prompt tokens, greedy, batch 1, median of 11 repeats, BF16; the same 64 generated tokens as the PyTorch reference in every row. Across eleven runs of this build, decode lands in 231.4-232.9 tokens/s, prefill in 13.0k-13.5k tokens/s, and the `mlx_lm` baseline in 195.3-197.2 tokens/s; prefill falling to 12.7k with `--codegen-attention` is the attention kernel's slower long-sequence tile, not a decode cost.)
+
+`decode_async` is the figure to compare against `mlx_lm`, because both amortize the host loop across tokens; `decode_sync_each_step` pays a device sync every token, which no serving loop needs. The async path used to trail the synchronous one and now leads it, because the plan only forces a single device sync per step.
+
+All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer.
+
+Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs 4.0 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, and three MLP matrices of 8.72 MB each, plus the 272 MB LM head), which at 4.0 ms is 248 GB/s. Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 414 GB/s, while the 8.7 MB MLP launches sustain 265-281 GB/s. A launch whose output is only 4864 columns wide cannot fill the device the way one with 151936 can, which is the concrete reason the small buckets trail. Going meaningfully faster than this needs fewer bytes read, not fewer kernels.
+
+Per-bucket GPU cost for one decode step, measured by replaying each bucket enough times to keep the device queue full, so the wall clock is device time and host submission is hidden:
+
+| bucket | launches | traffic per launch | GPU time per launch | bandwidth |
+| --- | --- | --- | --- | --- |
+| LM head GEMV | 1 | 272.3 MB | 658 us | 414 GB/s |
+| MLP up GEMV + `silu_mul` | 24 | 8.73 MB | 33.0 us | 265 GB/s |
+| MLP down GEMV + residual | 24 | 8.73 MB | 32.7 us | 267 GB/s |
+| MLP gate GEMV + RMSNorm | 24 | 8.72 MB | 31.0 us | 281 GB/s |
+| fused QKV GEMV + RMSNorm | 24 | 2.07 MB | 10.9 us | 190 GB/s |
+| attention, single query | 24 | 0.10 MB | 7.7 us | 13 GB/s |
+| o_proj GEMV + residual | 24 | 1.61 MB | 7.7 us | 210 GB/s |
+| RoPE q / k | 48 | 1 KB | 7.5 us | - |
+| additive attention mask | 1 | 0.2 KB | 23.6 us | - |
+
+That sums to 4.0 ms of device time and 991 MB, which is the whole step. The LM head plus the three MLP matrices are 75% of it, and they are moving bytes rather than waiting on dispatches; the other quarter is spread over 121 launches that each move 2 MB or less. A step still carries 194 dependent launches, but the ones with almost no traffic (RoPE, the mask) are cheap enough in the real chain that removing them does not move the total. Folding the query and key rotary calls into one 16-head rotation is exactly that experiment: it removed 24 launches and 24 graph ops, and decode stayed at 232.9 tokens/s against 232.5 before, inside the run-to-run band, so it was not kept.
+
+Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel.
+
+Two experiments in this area were measured and dropped. Writing the new key/value straight into slot `positions` and selecting the live slots with the mask reads better than rolling the window, but MLX lowers a scatter to an index-compare pass over the whole window where the concatenate is a straight copy of the same bytes: 0.18 ms slower per step, so the roll stays. And the rotary position for a decode token is `valid_length - 1`, not `valid_length`; `Qwen2StaticCacheRuntime.decode_token` documented the second and briefly used it, which cost 0.7 in max logit deviation against the reference and broke the exact-token match. It now matches all 64 tokens.
+
 ### Command Line And Artifacts
 
 The installed `aoto` command compiles a callable, module, or HuggingFace model. It can also inspect or execute the result without importing the original model.
@@ -203,13 +284,28 @@ compiled = aoto.compile_callable(
 )
 ```
 
-Native code generation is not automatically faster. On the shapes benchmarked so far, the custom matmul and attention kernels are slower than MLX's tuned implementations, which is why both options remain opt-in. `CompiledPlan.selections` records which path each operation used and why a fallback occurred.
+The generated tensor-core kernels beat MLX on matmul but still trail MLX's SDPA on attention, so the two options are opt-in for different reasons:
+
+| Benchmark | Aotolith | MLX | Ratio |
+|---|---|---|---|
+| matmul 512x2048x512 f32 | 89.4 us | 114.2 us | 1.28x |
+| matmul 512x2048x512 f16 | 64.8 us | 85.4 us | 1.32x |
+| matmul 512x2048x512 bf16 | 64.5 us | 76.6 us | 1.19x |
+| matmul 1024x4864x896 f16 | 372.9 us | 531.2 us | 1.42x |
+| matmul 4096x4096x4096 f16 | 5.51 ms | 5.45 ms | 0.99x |
+| attention 1x8x512x64 f16 causal | 35.2 us | 28.5 us | 0.81x |
+| attention 1x8x2048x128 f16 causal | 585.6 us | 461.6 us | 0.79x |
+| attention 1x64x4096x128 f16 causal | 16.3 ms | 13.2 ms | 0.81x |
+
+The matmul kernel drives MPP tensor-core `matmul2d` over tiled operands. Tiles are chosen from the output shape and the right operand layout: a transposed right operand is K-contiguous and rewards wide column blocks, while a row-major right operand strides through K and instead rewards a taller reduction step. Across 43 measured shape and layout combinations the selector stays within 5% of the fastest tile measured for that shape, and against MLX it averages 1.16x (transposed right operand) and 1.10x (row-major) with no shape below 1.01x. The largest shapes converge on parity because both implementations approach the same tensor-core throughput.
+
+The attention kernel is a register-resident FlashAttention pass: one simdgroup owns a 16-row query fragment and the full value width, so the online-softmax accumulators never leave registers, `Q` is staged once in threadgroup memory, and `K`/`V` stream straight from device memory. It reaches 16.8 TFLOPS on long sequences, but MLX's SDPA stays about 20% ahead on prefill shapes. Decode is a different problem: a one-row query has no use for tiled online softmax, so the backend emits a separate single-query kernel that keeps a whole head's scores in threadgroup memory, reduces `max` and `sum(exp)` in two levels, and accumulates values without rescaling. That kernel is why `--codegen-attention` no longer costs decode throughput: it is one launch per layer over a 192-slot cache and lands within noise of MLX's SDPA instead of 20% behind it. Staging `K`/`V` in threadgroup memory was measured 3x slower for the tiled prefill kernel: the tile is shared by only two simdgroups, and the per-tile barriers cost more than the duplicated device loads they replace. `CompiledPlan.selections` records which path each operation used and why a fallback occurred. Both kernels only cover FP16/BF16; anything else selects MLX.
 
 ## Supported Surface
 
 | Area | Coverage |
 |---|---|
-| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; fixed-capacity static KV cache prefill/decode |
+| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode; Qwen2.5-0.5B-Instruct validated |
 | Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, including supported batch broadcasting |
 | Indexing | Embedding, `index_select`, advanced indexing, `gather`, and `scatter` |
 | Transformer operations | Scaled dot-product attention, decomposed causal attention, softmax, sum/mean, cumsum, LayerNorm, RMSNorm, SiLU, GELU, SwiGLU, and other common pointwise operations |
@@ -225,7 +321,7 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 - Tensor-valued keyword arguments are not graph inputs yet.
 - Shared parameter storage aliases are currently serialized as separate state entries. Correctness is preserved, but the artifact does not yet deduplicate aliased storage.
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
-- Native kernel coverage and performance remain narrower than MLX. `codegen_matmul` and `codegen_attention` are opt-in because the current custom kernels are not consistently faster.
+- Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured matmul shapes. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
 - The repository does not implement scheduler, continuous batching, preemption, paged KV cache, prefix cache, sampling policies, PD disaggregation, EP/MoE dispatch, EPLB, or serving APIs.
 - Training and autograd are out of scope.
@@ -247,6 +343,8 @@ python examples/metal_attention_benchmark.py
 ```
 
 First execution includes MLX kernel JIT compilation and GPU dispatch. Timing from a first run is not a steady-state benchmark.
+
+PyTorch raises `IndexError` for out-of-range embedding and gather indices, while MLX silently wraps or fills them, so the backend reproduces that check. The values live on the device, so validating them costs a sync: checking every operation up front cost six device synchronizations per decode step, and queuing the checks and collapsing them into one reduction brought that to one. A caller that already knows the indices are in range can drop the last one — `plan(..., verify_index_bounds=False)`, or `runtime.decode_token(..., verify_token=False)` — which is what the greedy loop does, because every token it feeds back came from an `argmax` over the vocabulary. The strict default is unchanged and still raises `IndexError`.
 
 ## Roadmap
 
