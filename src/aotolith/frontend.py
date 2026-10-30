@@ -347,6 +347,10 @@ _SCATTER_REDUCE_NAMES = {
     "mean": "mean",
 }
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
+# ``nansum`` is a composite in ATen too: NaNs are replaced by zero, then the
+# regular ``sum`` runs, so ``nanmean`` (which PyTorch decomposes into
+# ``nansum`` divided by a clamped non-NaN count) lowers through the same path.
+_NANSUM_TARGET = "aten.nansum.default"
 # `sort` and `topk` return (values, indices); the IR has single-output
 # operations, so each selection becomes its own operation and only the ones the
 # graph actually reads are emitted.
@@ -742,6 +746,15 @@ def capture_fx(
                     values[value.id] = value
                 node_ids[node] = output_id
                 continue
+            if target == _NANSUM_TARGET:
+                nansum_ops, output_id = _nansum_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in nansum_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
             if target == _CONSTANT_PAD_TARGET and _constant_pad_crops(node):
                 crop_ops, output_id = _constant_pad_crop_operations(
                     node, node_ids, len(ops)
@@ -982,9 +995,14 @@ def _sequence_view_operations(
             raise ValueError(f"{target} expects three arguments, got {len(args)}")
         input_node, _, dim = args
     else:
-        if len(args) != 2:
+        if target == "aten.unbind.int" and len(args) == 1:
+            # ``torch.unbind(x)`` traces with the default ``dim=0`` elided.
+            input_node = args[0]
+            dim = 0
+        elif len(args) == 2:
+            input_node, dim = args
+        else:
             raise ValueError(f"{target} expects two arguments, got {len(args)}")
-        input_node, dim = args
     if not isinstance(dim, int) or isinstance(dim, bool):
         raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
 
@@ -2340,6 +2358,132 @@ def _logsumexp_arguments(
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"logsumexp.dim repeats an axis: {dims!r}")
     return input_node, normalized, keepdim
+
+
+def _nansum_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.nansum`` as ``masked_fill(isnan(x), 0) -> sum``.
+
+    That is ATen's own definition, so an all-NaN slice sums to zero and an
+    integer input skips the mask entirely. A requested ``dtype`` casts the
+    operand first, which also matches ATen's accumulation width.
+    """
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError("nansum expects an input tensor")
+
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError("nansum requires a ranked tensor")
+
+    dims = args[1] if len(args) > 1 else kwargs.get("dim")
+    keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+    dtype = args[3] if len(args) > 3 else kwargs.get("dtype")
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"nansum.keepdim must be a boolean, got {keepdim!r}")
+
+    if dims is None:
+        normalized_dims = tuple(range(rank))
+    elif isinstance(dims, int) and not isinstance(dims, bool):
+        normalized_dims = (dims % rank,)
+    elif isinstance(dims, (tuple, list)) and dims and all(
+        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    ):
+        normalized_dims = tuple(dim % rank for dim in dims)
+    else:
+        raise ValueError(f"nansum.dim must contain integers, got {dims!r}")
+    if len(set(normalized_dims)) != len(normalized_dims):
+        raise ValueError(f"nansum.dim repeats an axis: {dims!r}")
+
+    output_type = _node_type(node)
+    reduced_shape = tuple(
+        1 if axis in normalized_dims else size
+        for axis, size in enumerate(input_type.shape)
+    )
+    expected_shape = (
+        reduced_shape
+        if keepdim
+        else tuple(
+            size
+            for axis, size in enumerate(input_type.shape)
+            if axis not in normalized_dims
+        )
+    )
+    if output_type.shape != expected_shape:
+        raise ValueError(
+            f"nansum output shape {output_type.shape} does not match the "
+            f"reduced {expected_shape}"
+        )
+
+    target_dtype = input_type.dtype
+    if dtype is not None:
+        mapped = _TORCH_DTYPES.get(str(dtype))
+        if mapped is None:
+            raise ValueError(f"unsupported nansum dtype: {dtype}")
+        target_dtype = mapped
+    if output_type.dtype != target_dtype:
+        raise ValueError(
+            f"nansum output dtype {output_type.dtype} does not match the "
+            f"requested {target_dtype}"
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+        value_dtype: DType,
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, value_dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    if target_dtype != input_type.dtype:
+        current = emit(
+            "cast",
+            (current,),
+            {"dtype": target_dtype},
+            input_type.shape,
+            target_dtype,
+        )
+    if target_dtype in {DType.F16, DType.BF16, DType.F32}:
+        nan_mask = emit(
+            "isnan",
+            (current,),
+            {},
+            input_type.shape,
+            DType.BOOL,
+        )
+        current = emit(
+            "masked_fill",
+            (current, nan_mask),
+            {"value": 0.0},
+            input_type.shape,
+            target_dtype,
+        )
+    total_id = emit(
+        "sum",
+        (current,),
+        {"dims": normalized_dims, "keepdim": keepdim},
+        expected_shape,
+        target_dtype,
+    )
+    return tuple(operations), total_id
 
 
 def _constant_pad_crops(node: object) -> bool:
@@ -3949,7 +4093,11 @@ def _operation_inputs(
         input_id = args[0]
         dims = args[1]
         keepdim = args[2] if len(args) == 3 else False
-        if isinstance(dims, int) and not isinstance(dims, bool):
+        if dims is None:
+            # ATen's decompositions spell a full reduction as ``dim=None``
+            # rather than the one-argument ``sum.default``.
+            normalized_dims = tuple(range(len(_node_type(input_id).shape)))
+        elif isinstance(dims, int) and not isinstance(dims, bool):
             normalized_dims = (dims,)
         elif isinstance(dims, (tuple, list)) and all(
             isinstance(dim, int) and not isinstance(dim, bool) for dim in dims

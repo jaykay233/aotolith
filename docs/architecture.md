@@ -79,7 +79,8 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten._softmax.default`、`aten._safe_softmax.default` | `softmax`、`safe_softmax` |
 | `aten._log_softmax.default` | `log_softmax`，走 MLX 的 log-sum-exp |
 | `aten.scaled_dot_product_attention.default` 及 CPU/CUDA flash、efficient attention target | `attention` |
-| `aten.sum.default`、`aten.sum.dim_IntList` | `sum` |
+| `aten.sum.default`、`aten.sum.dim_IntList` | `sum`；`dim_IntList` 的 `dim=None` 视为全轴归约 |
+| `aten.nansum.default` | 组合 lowering：`isnan` + `masked_fill(0)` + `sum`，`nanmean` 由此展开 |
 | `aten.mean.default`、`aten.mean.dim` | `mean` |
 | `aten.prod.default`、`aten.prod.dim_int` | `prod`，走 MLX reduction，支持多轴与 `keepdim` |
 | `aten.amax.default`、`aten.amin.default` | `amax`、`amin`，走 MLX reduction，支持多轴与 `keepdim` |
@@ -199,7 +200,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 `aten.index.Tensor` 规范化成一个 `index` op，inputs 是 `source` 加每个非 `None` 的索引 tensor，被索引的轴写进 `axes` attribute。索引轴相邻时（如 `x[i, j]`、`x[:, i, j]`），PyTorch 把 broadcast 后的索引维度插在原来那段轴的位置，`axes` 直接取这些原始轴即可。索引轴被 `None`/静态轴隔开时（如 `x[i, :, j]`），PyTorch 把 broadcast 维度放到最前面，此时前端先发一个 `permute`，把所有被索引的轴按原顺序移到最前、其余轴保持原相对顺序，再以 `axes = (0, ..., k-1)` 调用同一个 `index`：gather 结果的 layout 就是 broadcast 维加剩余轴，和 PyTorch 的结果一致，不需要尾部再转置。Runtime 用 `source[(slice(None),) * axes[0] + indices]` 执行，逐索引检查 `[0, source.shape[axis])` 范围。
 
-`split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
+`split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。`torch.unbind(x)` 省略 `dim` 时按 ATen 的默认值 0 处理，`make_fx` 会把该参数从节点里省掉。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、pad 的 (before, after) 对与静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、常量 `mx.pad`、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
@@ -208,6 +209,8 @@ reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因�
 `diagonal` 也走视图链而不是新 op：前端把 `dim1`/`dim2` permute 到末尾、把这一对合成一条平轴，然后以 `step = columns + 1` 切片。`A[i, i + offset]` 在展平后的位置正好是 `i * (columns + 1) + start`，其中 `start` 由 offset 的正负决定偏移行列，因此 `torch.diagonal` 与矩阵上的 `torch.diag` 都只是一次 strided slice。输出 shape 按 PyTorch 的规则把两维删掉、把对角线长度追加到最后，前端会拿它和节点 metadata 对照校验。
 
 `logsumexp` 是组合 lowering，没有对应 IR op：`amax`（keepdim）求出平移量，`isinf` + `masked_fill` 把无穷大的最大值换成 0，再走 `sub -> exp -> sum -> log -> add`，最后按 `keepdim` 决定是否需要 `reshape`。把无穷最大值换成 0 是 ATen 自己的做法，所以 `+inf` 行保持 `+inf`、全 `-inf` 行保持 `-inf`，不会因为 `inf - inf` 变成 `nan`；只有 `amax`/`masked_fill` 是额外的 op，`sub`/`exp` 会融合进相邻的 pointwise 区域。空 `dim` 序列在捕获期报错，因为 ATen 对它没有定义。
+
+`nansum` 同样没有新 op，它按 ATen 的定义展开成 `isnan -> masked_fill(0) -> sum`，因此全 NaN 的切片求和为 0，整数输入直接跳过掩码（`isnan` 恒为假），`dtype` 参数先把操作数 `cast` 到目标 dtype 再归约，与 ATen 的累加宽度一致。`nanmean` 由 PyTorch 自己展开成 `nansum(x) / max(count, 1)`，其中 count 是对 `x != x` 取反后的 `sum`，所以整条链落在两个归约加一次 pointwise 除法上，全 NaN 的切片是 NaN（`0 / 1`），与 PyTorch 相同。这也暴露了 `aten.sum.dim_IntList` 的 `dim=None` 拼法：ATen 的分解用 `None` 表示全轴归约而不是省略参数，前端把两者归一化到同一组 `dims`。
 
 `cumprod` 与 `cumsum` 共用同一套参数规范化与校验，Runtime 分别映射到 `mx.cumsum` 和 `mx.cumprod`。`masked_fill.Tensor` 的填充值在 PyTorch 里必须是 0 维 tensor（更高维会被 ATen 直接拒绝），因此它等价于把 `where` 的操作数换个顺序，前端直接发 `where(mask, value, input)`，复用同一套广播与 dtype 提升规则。
 

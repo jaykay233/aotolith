@@ -4589,6 +4589,143 @@ def test_unbind_lowering_returns_each_squeezed_tensor() -> None:
     assert all(mx.allclose(a, e) for a, e in zip(actual, expected, strict=True))
 
 
+def test_unbind_defaults_to_the_leading_axis() -> None:
+    def unbind_leading(x):
+        return torch.unbind(x)
+
+    torch.manual_seed(83)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(unbind_leading, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "slice",
+        "squeeze",
+        "slice",
+        "squeeze",
+        "slice",
+        "squeeze",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in unbind_leading(x))
+    mx.eval(*actual, *expected)
+    assert len(actual) == len(expected) == 3
+    assert all(mx.allclose(a, e) for a, e in zip(actual, expected, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("dim", "keepdim"),
+    [
+        (-1, False),
+        (1, False),
+        (0, True),
+        ((0, 2), False),
+        (None, False),
+        (None, True),
+    ],
+)
+def test_nansum_ignores_nan_like_pytorch(dim, keepdim) -> None:
+    torch.manual_seed(84)
+    x = torch.randn(2, 3, 4)
+    x[0, 0, 0] = float("nan")
+    x[1, 2, :] = float("nan")
+
+    def fn(value):
+        return torch.nansum(value, dim=dim, keepdim=keepdim)
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "fused_elementwise",
+        "sum",
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.allclose(actual, expected)
+
+
+def test_nansum_of_an_all_nan_slice_is_zero() -> None:
+    x = torch.tensor([[1.0, float("nan")], [float("nan"), float("nan")]])
+    result = compile_callable(lambda value: torch.nansum(value, dim=-1), (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert [float(value) for value in actual] == [1.0, 0.0]
+
+
+def test_nansum_on_integers_skips_the_mask() -> None:
+    x = torch.tensor([[3, 1], [2, 5]])
+    result = compile_callable(lambda value: torch.nansum(value), (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["sum"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert int(actual) == int(torch.nansum(x))
+
+
+def test_nansum_honours_the_requested_dtype() -> None:
+    x = torch.randn(2, 4)
+    x[0, 0] = float("nan")
+    result = compile_callable(
+        lambda value: torch.nansum(value, dim=-1, dtype=torch.float32), (x,)
+    )
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "fused_elementwise",
+        "sum",
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(torch.nansum(x, dim=-1, dtype=torch.float32).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float32
+    assert mx.allclose(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("dim", "keepdim"),
+    [(-1, False), (1, True), (0, False), (None, False), (None, True)],
+)
+def test_nanmean_matches_pytorch(dim, keepdim) -> None:
+    torch.manual_seed(85)
+    x = torch.randn(3, 4, 2)
+    x[0, 1, 1] = float("nan")
+    x[2, :, 0] = float("nan")
+
+    def fn(value):
+        return torch.nanmean(value, dim=dim, keepdim=keepdim)
+
+    actual = compile_callable(fn, (x,)).plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    one_nan = mx.isnan(actual) ^ mx.isnan(expected)
+    filled_actual = mx.where(mx.isnan(actual), 0.0, actual)
+    filled_expected = mx.where(mx.isnan(expected), 0.0, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert not bool(mx.any(one_nan))
+    assert bool(mx.allclose(filled_actual, filled_expected, atol=1e-6, rtol=1e-6))
+
+
+def test_nanmean_of_an_all_nan_slice_stays_nan() -> None:
+    x = torch.tensor([[float("nan"), float("nan")], [1.0, 3.0]])
+    result = compile_callable(lambda value: torch.nanmean(value, dim=-1), (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert bool(mx.isnan(actual[0]))
+    assert float(actual[1]) == 2.0
+
+
+def test_sum_accepts_a_none_dim_like_the_decompositions() -> None:
+    torch.manual_seed(86)
+    x = torch.randn(2, 3, 4)
+    for keepdim in (False, True):
+        result = compile_callable(
+            lambda value: torch.sum(value, None, keepdim), (x,)
+        )
+        actual = result.plan(mx.array(x.numpy()))[0]
+        expected = mx.array(torch.sum(x, None, keepdim).numpy())
+        mx.eval(actual, expected)
+        assert actual.shape == tuple(expected.shape)
+        assert mx.allclose(actual, expected)
+
+
 def test_transformer_decoder_block_compiles_and_runs() -> None:
     def decoder_block(
         x,
