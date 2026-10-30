@@ -1566,6 +1566,106 @@ def test_constant_pad_rejects_negative_pads() -> None:
         compile_callable(fn, (torch.randn(2, 3),))
 
 
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda a, b: a / b,
+        lambda a, b: a / 4,
+        lambda a, b: b / a,
+    ],
+)
+def test_integer_true_division_promotes_to_float(fn) -> None:
+    a = torch.tensor([4, 6, 9])
+    b = torch.tensor([2, 4, 3])
+    result = compile_callable(fn, (a, b))
+    assert "cast" in [op.op for op in result.lowered_graph.ops]
+    actual = result.plan(_torch_to_mlx(a), _torch_to_mlx(b))[0]
+    expected_value = fn(a, b)
+    expected = mx.array(expected_value.numpy()).astype(actual.dtype)
+    mx.eval(actual, expected)
+    assert expected_value.dtype == torch.float32
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda a, b: a + b,
+        lambda a, b: a - b,
+        lambda a, b: a * b,
+        lambda a, b: a // b,
+        lambda a, b: a % b,
+        lambda a, b: torch.maximum(a, b),
+        lambda a, b: a < b,
+        lambda a, b: a == b,
+    ],
+)
+def test_mixed_integer_pointwise_promotes_to_int64(fn) -> None:
+    a = torch.tensor([7, 5, 9], dtype=torch.int32)
+    b = torch.tensor([2, 4, 9], dtype=torch.int64)
+    result = compile_callable(fn, (a, b))
+    ops = [op.op for op in result.lowered_graph.ops]
+    assert ops[0] == "cast"
+    actual = result.plan(_torch_to_mlx(a), _torch_to_mlx(b))[0]
+    expected = mx.array(fn(a, b).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda a, b: a + b,
+        lambda a, b: a * b,
+        lambda a, b: a < b,
+    ],
+)
+def test_integer_operand_with_float_promotes_to_the_float_dtype(fn) -> None:
+    a = torch.tensor([1, 5, 9])
+    b = torch.tensor([1.5, 4.25, 9.0])
+    result = compile_callable(fn, (a, b))
+    actual = result.plan(_torch_to_mlx(a), _torch_to_mlx(b))[0]
+    expected_value = fn(a, b)
+    expected = mx.array(expected_value.numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_where_promotes_mixed_branch_dtypes() -> None:
+    def fn(condition, left, right):
+        return torch.where(condition, left, right)
+
+    condition = torch.tensor([True, False, True])
+    left = torch.tensor([1, 2, 3], dtype=torch.int32)
+    right = torch.tensor([4, 5, 6], dtype=torch.int64)
+    result = compile_callable(fn, (condition, left, right))
+    ops = [op.op for op in result.lowered_graph.ops]
+    assert ops == ["cast", "where"]
+    actual = result.plan(
+        _torch_to_mlx(condition), _torch_to_mlx(left), _torch_to_mlx(right)
+    )[0]
+    expected = mx.array(fn(condition, left, right).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_matching_dtypes_are_not_cast() -> None:
+    def fn(a, b):
+        return (a + b) * b
+
+    a = torch.tensor([1, 2], dtype=torch.int64)
+    b = torch.tensor([3, 4], dtype=torch.int64)
+    result = compile_callable(fn, (a, b))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    actual = result.plan(_torch_to_mlx(a), _torch_to_mlx(b))[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(fn(a, b).numpy()))
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)

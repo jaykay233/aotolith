@@ -501,7 +501,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - 不支持动态 shape、控制流和 list/dict 输出；常量生成支持 `scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 的 float/bool/I32/I64 输出
 - `arange` 的 I32/I64 输出要求整数 start/end/step，并在 kernel 内用 int64 计算，超过 2^53 的值不会经过浮点。FP16/BF16/F32 输出接受任意有限边界：kernel 在编译期把 double 常量拆成 float 头尾，再用 fma 残差和 two-sum 重建 `start + index * step`，所以整数步长以及 0.1、0.25 这类步长与 PyTorch 逐位一致，其余步长在实测中不超过序列量级的 1 ulp（PyTorch 自己的 CPU 实现用的也是有限精度中间量，同样会偏离精确实数）。整型输出配小数边界会明确报错
 - bool tensor 支持比较、logical、bitwise、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；I32/I64 tensor 除作为 embedding/index_select/gather/scatter indices 外，也支持上述整数 pointwise 集合
-- 整数 pointwise 当前要求输入、tensor 边界和输出同宽；I32 与 I64 混合、除 `torch.square` 特殊形式外的整数 `pow`、true division 和不在支持集合内的算子会明确报错。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
+- 整数 pointwise 不要求输入、tensor 边界和输出同宽：在 PyTorch 自己会做类型提升的组合上，前端插入 `cast` 节点而不是拒绝整张图——I32 与 I64 混合提升到 I64，`div` 的整数操作数提升到输出的 float dtype，整数与浮点混合提升到那个 float dtype，`where` 的两个分支按同样规则提升。bool 与数值 dtype 混合仍会被拒绝，整数 `pow` 除 `torch.square` 这种特殊形式外仍不支持。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
 - scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`/`mean`，含 `include_self=False`）都支持；`mean` 需要浮点输入，因为它要同时累计写入次数并做除法。`index_add` 只接受 1-D index。`scatter_`/`scatter_add_`/`scatter_reduce_`/`index_add_` 与 `add_` 一样做 SSA legalization：只允许被改写的原值在图内只有一个消费者，编译后的调用返回更新后的值，不会回写调用方仍然持有的那块 tensor，因此调用方必须使用返回值。重复索引的累加顺序不做确定性保证
 - softmax 支持任意单轴。PyTorch 的 `softmax` 本身只接受单个 `dim`，多轴形式总是展开成 reshape + 单轴 softmax + reshape，这条链路可以正常编译
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖

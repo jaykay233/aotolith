@@ -204,6 +204,26 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "bitwise_xor",
 }
 _REDUCTION_OPS = {"sum", "mean"}
+_INTEGRAL_DTYPES = {DType.I32, DType.I64}
+_FLOATING_DTYPES = {DType.F16, DType.BF16, DType.F32}
+# Binary pointwise ops whose operands PyTorch would promote before applying
+# the operator. `pow` stays out because integer exponentiation has no exact
+# float equivalent.
+_PROMOTABLE_POINTWISE_OPS = {
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "floor_divide",
+    "remainder",
+    "maximum",
+    "minimum",
+    "logaddexp",
+    "atan2",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+} | _COMPARISON_OPS
 _DIRECT_ATTENTION_TARGETS = {
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._scaled_dot_product_flash_attention.default",
@@ -470,9 +490,17 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 inputs, scalar_attrs = _operation_inputs(
                     op_name, call_args, node_ids, node.kwargs
                 )
-            output_id = f"v{len(ops)}"
             attrs = _operation_attrs(op_name, node.kwargs)
             attrs.update(scalar_attrs)
+            if op_name == "where" and len(inputs) == 3:
+                inputs = (inputs[0],) + _promote_pointwise_operands(
+                    "where", inputs[1:], values, ops, _node_type(node).dtype
+                )
+            elif op_name in _PROMOTABLE_POINTWISE_OPS:
+                inputs = _promote_pointwise_operands(
+                    op_name, inputs, values, ops, _node_type(node).dtype
+                )
+            output_id = f"v{len(ops)}"
             if op_name in _REDUCTION_OPS and "dims" not in attrs:
                 input_type = values[inputs[0]].type
                 attrs["dims"] = tuple(range(len(input_type.shape)))
@@ -1798,6 +1826,57 @@ def _argument_ids(argument: object, node_ids: dict[object, str]) -> str:
         return node_ids[argument]
     except (KeyError, TypeError) as exc:
         raise ValueError(f"unsupported FX argument: {argument!r}") from exc
+
+
+def _promoted_pointwise_dtype(
+    op_name: str,
+    dtypes: set[DType],
+    output_dtype: DType,
+) -> DType | None:
+    """Return the dtype PyTorch would apply operands of ``dtypes`` in."""
+
+    if not dtypes <= _INTEGRAL_DTYPES | _FLOATING_DTYPES:
+        # Boolean operands keep their own rules; nothing to promote here.
+        return None
+    if op_name == "div" and dtypes <= _INTEGRAL_DTYPES:
+        # True division always produces a float, even for integer operands.
+        return output_dtype if output_dtype in _FLOATING_DTYPES else None
+    if len(dtypes) == 1:
+        return None
+    if dtypes <= _INTEGRAL_DTYPES:
+        return DType.I64 if DType.I64 in dtypes else DType.I32
+    if dtypes & _INTEGRAL_DTYPES:
+        floats = dtypes - _INTEGRAL_DTYPES
+        return DType.F32 if len(floats) > 1 else next(iter(floats))
+    # Two different float widths promote to float32, the width PyTorch uses
+    # for the mixed pair, before the operator sees them.
+    return DType.F32
+
+
+def _promote_pointwise_operands(
+    op_name: str,
+    inputs: tuple[str, ...],
+    values: dict[str, Value],
+    ops: list[Operation],
+    output_dtype: DType,
+) -> tuple[str, ...]:
+    """Insert casts so a pointwise op sees the operands PyTorch would."""
+
+    dtypes = {values[input_id].type.dtype for input_id in inputs}
+    target = _promoted_pointwise_dtype(op_name, dtypes, output_dtype)
+    if target is None:
+        return inputs
+    promoted: list[str] = []
+    for input_id in inputs:
+        value = values[input_id]
+        if value.type.dtype == target:
+            promoted.append(input_id)
+            continue
+        cast_id = f"v{len(ops)}"
+        values[cast_id] = Value(cast_id, TensorType(value.type.shape, target))
+        ops.append(Operation("cast", (input_id,), (cast_id,), {}))
+        promoted.append(cast_id)
+    return tuple(promoted)
 
 
 def _operation_inputs(
