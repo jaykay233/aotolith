@@ -140,6 +140,8 @@ _SUPPORTED_OPS = {
     "aten.gather.default": "gather",
     "aten.scatter.src": "scatter",
     "aten.scatter.value": "scatter",
+    "aten.scatter_add.default": "scatter",
+    "aten.index_add.default": "index_add",
 }
 
 # Copies that carry no arithmetic. When one of these produces an empty tensor it
@@ -225,6 +227,17 @@ _INDEX_TARGET = "aten.index.Tensor"
 _MATRIX_TRANSPOSE_TARGET = "aten.t.default"
 _STACK_TARGET = "aten.stack.default"
 _SCATTER_TARGETS = {"aten.scatter.src", "aten.scatter.value"}
+_SCATTER_ADD_TARGET = "aten.scatter_add.default"
+_SCATTER_REDUCE_TARGET = "aten.scatter_reduce.two"
+_INDEX_ADD_TARGET = "aten.index_add.default"
+# `scatter_reduce` renames the two reductions whose accumulation is not an
+# addition; `mean` needs a per-output count that no single MLX scatter does.
+_SCATTER_REDUCE_NAMES = {
+    "sum": "add",
+    "prod": "prod",
+    "amax": "amax",
+    "amin": "amin",
+}
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
 
@@ -352,10 +365,22 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
-            if target in _SCATTER_TARGETS:
+            if target in _SCATTER_TARGETS or target in {
+                _SCATTER_ADD_TARGET,
+                _SCATTER_REDUCE_TARGET,
+            }:
                 inputs, attrs, output_type = _scatter_operation(node, node_ids)
                 output_id = f"v{len(ops)}"
                 ops.append(Operation("scatter", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
+                continue
+            if target == _INDEX_ADD_TARGET:
+                inputs, attrs, output_type = _index_add_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("index_add", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
@@ -1133,15 +1158,25 @@ def _scatter_operation(
 ) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
     args = getattr(node, "args", ())
     kwargs = dict(getattr(node, "kwargs", {}))
-    if kwargs:
+    target = str(getattr(node, "target", ""))
+    reduce_name: object = None
+    if target == _SCATTER_REDUCE_TARGET:
+        # `scatter_reduce` carries its reduction as a positional argument.
+        if len(args) != 5:
+            raise ValueError(
+                f"scatter_reduce expects five arguments, got {len(args)}"
+            )
+        source, dim, indices, update, reduce_name = args
+    else:
+        if len(args) != 4:
+            raise ValueError(f"scatter expects four arguments, got {len(args)}")
+        source, dim, indices, update = args
+    reduce, include_self = _scatter_reduce_attrs(target, reduce_name, kwargs)
+    if reduce is None and kwargs:
         raise ValueError(
             f"scatter received unsupported keyword arguments: {sorted(kwargs)}"
         )
-    if len(args) != 4:
-        raise ValueError(f"scatter expects four arguments, got {len(args)}")
 
-    source, dim, indices, update = args
-    target = str(getattr(node, "target", ""))
     if not isinstance(dim, int) or isinstance(dim, bool):
         raise ValueError(f"scatter.dim must be an integer, got {dim!r}")
     source_type = _node_type(source)
@@ -1202,6 +1237,9 @@ def _scatter_operation(
             _argument_ids(indices, node_ids),
             _argument_ids(update, node_ids),
         )
+        if reduce is not None:
+            attrs["reduce"] = reduce
+            attrs["include_self"] = include_self
 
     output_type = _node_type(node)
     if output_type != source_type:
@@ -1210,6 +1248,123 @@ def _scatter_operation(
             f"does not match input {(source_type.shape, source_type.dtype)}"
         )
     return inputs, attrs, output_type
+
+
+def _scatter_reduce_attrs(
+    target: str, reduce_name: object, kwargs: dict[str, object]
+) -> tuple[str | None, bool]:
+    """Read the reduction of ``scatter_reduce``/``scatter_add``.
+
+    Returns ``(reduce, include_self)``, with ``reduce`` ``None`` for the plain
+    overwrite forms.
+    """
+
+    if target == "aten.scatter_add.default":
+        if kwargs:
+            raise ValueError(
+                "scatter_add received unsupported keyword arguments: "
+                f"{sorted(kwargs)}"
+            )
+        return "add", True
+    if target != _SCATTER_REDUCE_TARGET:
+        return None, True
+    unknown = sorted(set(kwargs) - {"reduce", "include_self"})
+    if unknown:
+        raise ValueError(
+            "scatter_reduce received unsupported keyword arguments: "
+            f"{unknown}"
+        )
+    if reduce_name is None:
+        reduce_name = kwargs.get("reduce", "sum")
+    if reduce_name == "mean":
+        raise NotImplementedError(
+            "scatter_reduce reduce='mean' is not supported: it needs a "
+            "per-output element count that a scatter cannot accumulate"
+        )
+    if reduce_name not in _SCATTER_REDUCE_NAMES:
+        raise ValueError(
+            f"scatter_reduce.reduce {reduce_name!r} is not supported; expected "
+            f"one of {sorted([*_SCATTER_REDUCE_NAMES, 'mean'])}"
+        )
+    include_self = kwargs.get("include_self", True)
+    if not isinstance(include_self, bool):
+        raise ValueError(
+            f"scatter_reduce.include_self must be a boolean, got {include_self!r}"
+        )
+    return _SCATTER_REDUCE_NAMES[str(reduce_name)], include_self
+
+
+def _index_add_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    unknown = sorted(set(kwargs) - {"alpha"})
+    if unknown:
+        raise ValueError(
+            f"index_add received unsupported keyword arguments: {unknown}"
+        )
+    if len(args) != 4:
+        raise ValueError(f"index_add expects four arguments, got {len(args)}")
+
+    source, dim, indices, update = args
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"index_add.dim must be an integer, got {dim!r}")
+    source_type = _node_type(source)
+    indices_type = _node_type(indices)
+    update_type = _node_type(update)
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("index_add requires a tensor with rank >= 1")
+    if dim < -rank or dim >= rank:
+        raise ValueError(f"index_add.dim {dim} is outside rank {rank}")
+    axis = dim + rank if dim < 0 else dim
+    if len(indices_type.shape) != 1:
+        raise NotImplementedError(
+            "index_add requires a 1-D index tensor, got "
+            f"{indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "index_add indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    if update_type.dtype != source_type.dtype:
+        raise ValueError(
+            "index_add source dtype must match the input dtype, got "
+            f"{update_type.dtype.value} and {source_type.dtype.value}"
+        )
+    expected_update = (
+        source_type.shape[:axis]
+        + (indices_type.shape[0],)
+        + source_type.shape[axis + 1 :]
+    )
+    if update_type.shape != expected_update:
+        raise ValueError(
+            f"index_add source shape {update_type.shape} does not match "
+            f"{expected_update}"
+        )
+    alpha = kwargs.get("alpha", 1)
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+        raise ValueError(f"index_add.alpha must be a scalar number, got {alpha!r}")
+    if not isfinite(float(alpha)):
+        raise ValueError(f"index_add.alpha must be finite, got {alpha!r}")
+
+    output_type = _node_type(node)
+    if output_type != source_type:
+        raise ValueError(
+            f"index_add output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match input {(source_type.shape, source_type.dtype)}"
+        )
+    return (
+        (
+            _argument_ids(source, node_ids),
+            _argument_ids(indices, node_ids),
+            _argument_ids(update, node_ids),
+        ),
+        {"dim": axis, "alpha": float(alpha)},
+        output_type,
+    )
 
 
 def _attention_operation(

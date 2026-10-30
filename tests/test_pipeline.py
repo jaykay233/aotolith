@@ -903,6 +903,45 @@ def test_deferred_bounds_checks_cover_every_lookup() -> None:
         result.plan(*(_torch_to_mlx(value) for value in overflowing))
 
 
+def test_deferred_bounds_checks_reduce_before_combining() -> None:
+    """Queued lookups can have different index shapes; their masks cannot mix.
+
+    Combining the raw masks makes the flush itself raise a broadcast error, so
+    the plan fails on valid indices instead of returning the answer.
+    """
+
+    def fn(left, left_indices, right, right_indices):
+        return (
+            torch.nn.functional.embedding(left_indices, left),
+            torch.nn.functional.embedding(right_indices, right),
+        )
+
+    left = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    right = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    left_indices = torch.tensor([0, 2, 1], dtype=torch.int64)
+    right_indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    result = compile_callable(
+        fn, (left, left_indices, right, right_indices)
+    )
+
+    valid = (left, left_indices, right, right_indices)
+    outputs = result.plan(*(_torch_to_mlx(value) for value in valid))
+    expected = tuple(_torch_to_mlx(value) for value in fn(*valid))
+    mx.eval(*outputs, *expected)
+    assert len(outputs) == len(expected) == 2
+    for actual, want in zip(outputs, expected, strict=True):
+        assert mx.array_equal(actual, want)
+
+    overflowing = (
+        left,
+        torch.tensor([0, 3, 1]),
+        right,
+        torch.tensor([[0, 1], [2, 3]]),
+    )
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(*(_torch_to_mlx(value) for value in overflowing))
+
+
 @pytest.mark.parametrize(
     ("dim", "index_dtype", "values"),
     [
@@ -1080,6 +1119,261 @@ def test_scatter_rejects_source_smaller_than_indices() -> None:
 
     with pytest.raises(ValueError, match="source shape .* smaller than indices shape"):
         compile_graph(graph)
+
+
+def test_scatter_add_accumulates_duplicate_indices_instead_of_overwriting() -> None:
+    """`scatter_add` is the reduction form: two writes to one slot both count.
+
+    A duplicated index is exactly where an implementation that quietly reuses
+    the overwrite path still returns a plausible-looking tensor.
+    """
+
+    def fn(source, indices, update):
+        return source.scatter_add(0, indices, update)
+
+    source = torch.arange(12, dtype=torch.float16).reshape(4, 3)
+    # Row 1 is targeted twice, row 3 not at all.
+    indices = torch.tensor([[1, 1, 1], [1, 1, 1], [0, 2, 1]], dtype=torch.int64)
+    update = torch.arange(9, dtype=torch.float16).reshape(3, 3)
+    result = compile_callable(fn, (source, indices, update))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["scatter"]
+    assert result.lowered_graph.ops[0].attrs == {
+        "dim": 0,
+        "reduce": "add",
+        "include_self": True,
+    }
+    assert result.plan.kernels == ()
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert actual.shape == source.shape
+    assert actual.dtype == _MLX_DTYPES[source.dtype]
+    # fp16 accumulation order is the device's, so compare with a tolerance.
+    assert mx.allclose(actual, expected, atol=1e-2, rtol=1e-2)
+    # The untouched row keeps its original value.
+    assert mx.array_equal(actual[3], _torch_to_mlx(source)[3])
+
+
+def test_moe_combine_routes_tokens_with_index_add() -> None:
+    """The MoE combine path: weighted tokens accumulated per expert slot.
+
+    Two tokens route to the same expert, which is the case a per-expert
+    overwrite would get wrong.
+    """
+
+    def fn(tokens, expert_ids, weights):
+        contributions = tokens * weights[:, None]
+        combined = torch.zeros(4, tokens.shape[-1], dtype=tokens.dtype)
+        return combined.index_add(0, expert_ids, contributions)
+
+    torch.manual_seed(50)
+    tokens = torch.randn(5, 3)
+    expert_ids = torch.tensor([0, 1, 0, 3, 0], dtype=torch.int64)
+    weights = torch.tensor([0.5, 1.5, -0.25, 2.0, 0.75])
+    result = compile_callable(fn, (tokens, expert_ids, weights))
+
+    assert "index_add" in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(
+        _torch_to_mlx(tokens),
+        _torch_to_mlx(expert_ids),
+        _torch_to_mlx(weights),
+    )[0]
+    expected = _torch_to_mlx(fn(tokens, expert_ids, weights))
+    mx.eval(actual, expected)
+    assert actual.shape == (4, 3)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    # Expert 2 receives no token and stays exactly zero.
+    assert mx.array_equal(actual[2], mx.zeros((3,), dtype=mx.float32))
+
+
+@pytest.mark.parametrize(
+    ("reduce", "expected_reduce"),
+    [("sum", "add"), ("prod", "prod"), ("amax", "amax"), ("amin", "amin")],
+)
+def test_scatter_reduce_covers_every_supported_reduction(
+    reduce: str, expected_reduce: str
+) -> None:
+    def fn(source, indices, update):
+        return source.scatter_reduce(1, indices, update, reduce=reduce)
+
+    torch.manual_seed(48)
+    source = torch.randn(2, 4)
+    indices = torch.tensor([[0, 2, 2, 3], [1, 1, 0, 3]], dtype=torch.int64)
+    update = torch.randn(2, 4)
+    result = compile_callable(fn, (source, indices, update))
+
+    assert result.lowered_graph.ops[0].attrs["reduce"] == expected_reduce
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_scatter_reduce_without_self_ignores_the_base_tensor() -> None:
+    def fn(source, indices, update):
+        return source.scatter_reduce(
+            0, indices, update, reduce="amax", include_self=False
+        )
+
+    indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    update = torch.tensor([[5.0, -2.0], [3.0, 7.0]])
+    base = torch.full((3, 2), 100.0)
+    other_base = torch.full((3, 2), -100.0)
+    result = compile_callable(fn, (base, indices, update))
+    assert result.lowered_graph.ops[0].attrs["include_self"] is False
+
+    first = result.plan(
+        _torch_to_mlx(base),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    second = result.plan(
+        _torch_to_mlx(other_base),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(base, indices, update))
+    mx.eval(first, second, expected)
+    assert mx.array_equal(first, expected)
+    # Every indexed row is the reduction of the updates alone, so the base only
+    # survives outside the scattered region.
+    assert mx.array_equal(first[:2], second[:2])
+    assert not mx.array_equal(first[2], second[2])
+    assert mx.array_equal(first[2], _torch_to_mlx(base)[2])
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_index_add_accumulates_the_update_along_one_axis(dim: int) -> None:
+    def fn(source, indices, update):
+        return torch.index_add(source, dim, indices, update)
+
+    torch.manual_seed(49)
+    source = torch.randn(4, 5)
+    axis = dim % source.ndim
+    indices = torch.tensor([0, 3, 0], dtype=torch.int64)
+    update_shape = list(source.shape)
+    update_shape[axis] = 3
+    update = torch.randn(update_shape)
+    result = compile_callable(fn, (source, indices, update))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["index_add"]
+    assert result.lowered_graph.ops[0].attrs == {"dim": axis, "alpha": 1.0}
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_index_add_alpha_scales_each_update() -> None:
+    def fn(source, indices, update):
+        return torch.index_add(source, 0, indices, update, alpha=2.5)
+
+    source = torch.zeros(4, 3)
+    indices = torch.tensor([1, 1, 3], dtype=torch.int32)
+    update = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    result = compile_callable(fn, (source, indices, update))
+    assert result.lowered_graph.ops[0].attrs["alpha"] == 2.5
+
+    actual = result.plan(
+        _torch_to_mlx(source),
+        _torch_to_mlx(indices),
+        _torch_to_mlx(update),
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_index_add_does_not_mutate_the_base_tensor() -> None:
+    def fn(source, indices, update):
+        return torch.index_add(source, 0, indices, update)
+
+    source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    indices = torch.tensor([0, 1], dtype=torch.int64)
+    update = torch.ones(2, 3)
+    result = compile_callable(fn, (source, indices, update))
+    source_mlx = _torch_to_mlx(source)
+    original = _torch_to_mlx(source)
+
+    actual = result.plan(source_mlx, _torch_to_mlx(indices), _torch_to_mlx(update))[0]
+    mx.eval(actual, source_mlx, original)
+    assert mx.array_equal(source_mlx, original)
+    assert mx.array_equal(actual, _torch_to_mlx(fn(source, indices, update)))
+
+
+@pytest.mark.parametrize("invalid", [[-1, 0], [4, 0]])
+def test_index_add_rejects_out_of_range_indices(invalid) -> None:
+    def fn(source, indices, update):
+        return torch.index_add(source, 0, indices, update)
+
+    source = torch.zeros(3, 2)
+    indices = torch.tensor([0, 2], dtype=torch.int64)
+    update = torch.ones(2, 2)
+    result = compile_callable(fn, (source, indices, update))
+
+    with pytest.raises(IndexError, match="index out of range"):
+        result.plan(
+            _torch_to_mlx(source),
+            _torch_to_mlx(torch.tensor(invalid, dtype=torch.int64)),
+            _torch_to_mlx(update),
+        )
+
+
+def test_index_add_rejects_a_multi_dimensional_index() -> None:
+    source_type = TensorType((4, 3), DType.F32)
+    index_type = TensorType((2, 2), DType.I64)
+    value_type = TensorType((2, 2, 3), DType.F32)
+    values = {
+        "source": Value("source", source_type),
+        "indices": Value("indices", index_type),
+        "update": Value("update", value_type),
+        "out": Value("out", source_type),
+    }
+    graph = Graph(
+        ("source", "indices", "update"),
+        values,
+        (
+            Operation(
+                "index_add",
+                ("source", "indices", "update"),
+                ("out",),
+                {"dim": 0, "alpha": 1.0},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(NotImplementedError, match="1-D index tensor"):
+        compile_graph(graph)
+
+
+def test_scatter_reduce_mean_is_rejected_rather_than_approximated() -> None:
+    def fn(source, indices, update):
+        return source.scatter_reduce(0, indices, update, reduce="mean")
+
+    source = torch.zeros(4, 2)
+    indices = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64)
+    update = torch.ones(2, 2)
+
+    with pytest.raises(NotImplementedError, match="reduce='mean'"):
+        compile_callable(fn, (source, indices, update))
 
 
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:

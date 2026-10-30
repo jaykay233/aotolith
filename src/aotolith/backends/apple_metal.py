@@ -467,10 +467,15 @@ def _flush_index_checks(
         if indices.size == 0:
             continue
         bad = mx.logical_or(indices < low, indices >= upper_bound)
-        violation = bad if violation is None else mx.logical_or(violation, bad)
+        # One plan can queue index tensors of different shapes, so reduce each
+        # one before combining: the masks themselves do not broadcast.
+        found = mx.any(bad)
+        violation = (
+            found if violation is None else mx.logical_or(violation, found)
+        )
     if violation is None:
         return
-    if bool(mx.any(violation).item()):
+    if bool(violation.item()):
         raise IndexError("index out of range in self")
 
 
@@ -562,6 +567,16 @@ def _evaluate_mlx_op(
         )
         if len(op.inputs) == 3:
             values = values[tuple(slice(0, size) for size in indices.shape)]
+        reduce = op.attrs.get("reduce")
+        if reduce is not None:
+            return _mlx_scatter_reduce(
+                source,
+                indices,
+                values,
+                axis,
+                str(reduce),
+                bool(op.attrs.get("include_self", True)),
+            )
         source_slices = [
             slice(0, indices.shape[dim]) if dim != axis else slice(None)
             for dim in range(len(source.shape))
@@ -573,6 +588,14 @@ def _evaluate_mlx_op(
         output = mx.array(source)
         output[slices] = updated
         return output
+    if op.op == "index_add":
+        source, indices, values = (env[value_id] for value_id in op.inputs)
+        axis = int(op.attrs["dim"])
+        alpha = float(op.attrs.get("alpha", 1.0))
+        _check_take_indices(indices, source.shape[axis])
+        selection: tuple[Any, ...] = (slice(None),) * axis + (indices,)
+        contribution = values if alpha == 1.0 else values * alpha
+        return source.at[selection].add(contribution)
     if op.op == "cumsum":
         axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
         value = mx.cumsum(env[op.inputs[0]], axis=axis)
@@ -626,6 +649,86 @@ def _evaluate_mlx_op(
     return _evaluate_pointwise_mlx(
         op, env, graph.value(op.outputs[0]).type
     )
+
+
+# MLX accumulates a scatter through ``array.at[...]``; the method name and the
+# value a fresh accumulator starts from are the whole difference between the
+# reductions. ``mean`` has no entry because it needs a per-output count.
+_SCATTER_REDUCE_METHODS = {
+    "add": "add",
+    "prod": "multiply",
+    "amax": "maximum",
+    "amin": "minimum",
+}
+_SCATTER_REDUCE_IDENTITIES = {
+    "add": 0.0,
+    "prod": 1.0,
+    "amax": float("-inf"),
+    "amin": float("inf"),
+}
+_SCATTER_REDUCES = frozenset(_SCATTER_REDUCE_METHODS)
+
+
+def _mlx_scatter_reduce(
+    source: mx.array,
+    indices: mx.array,
+    values: Any,
+    axis: int,
+    reduce: str,
+    include_self: bool,
+) -> mx.array:
+    """Accumulate ``values`` into ``source`` at ``indices`` along ``axis``.
+
+    MLX has no reducing ``put_along_axis``, but advanced indexing reaches every
+    coordinate the scatter form can: the non-scatter axes are coordinate grids
+    broadcast to the index shape, so each source element is addressed exactly
+    once per update. Duplicate indices accumulate in whatever order the device
+    schedules them, which is also what CUDA ``scatter_add`` does.
+
+    ``include_self=False`` means an updated element is the reduction of just
+    the scattered values, so those positions start from the reduction's
+    identity and are then spliced over the untouched source region.
+    """
+
+    method = _SCATTER_REDUCE_METHODS[reduce]
+    rank = len(source.shape)
+    region = tuple(
+        slice(0, indices.shape[dim]) if dim != axis else slice(None)
+        for dim in range(rank)
+    )
+    region_shape = tuple(
+        source.shape[dim] if dim == axis else indices.shape[dim]
+        for dim in range(rank)
+    )
+    grid: list[Any] = []
+    for dim in range(rank):
+        if dim == axis:
+            grid.append(indices)
+            continue
+        view = [1] * rank
+        view[dim] = indices.shape[dim]
+        grid.append(mx.arange(indices.shape[dim]).reshape(view))
+    if include_self:
+        accumulator = source[region]
+        updated = getattr(accumulator.at[tuple(grid)], method)(values)
+        output = mx.array(source)
+        output[region] = updated
+        return output
+    accumulator = mx.full(
+        region_shape,
+        _SCATTER_REDUCE_IDENTITIES[reduce],
+        dtype=source.dtype,
+    )
+    updated = getattr(accumulator.at[tuple(grid)], method)(values)
+    written = mx.put_along_axis(
+        mx.zeros(region_shape, dtype=mx.bool_),
+        indices,
+        mx.ones(indices.shape, dtype=mx.bool_),
+        axis=axis,
+    )
+    output = mx.array(source)
+    output[region] = mx.where(written, updated, source[region])
+    return output
 
 
 def _apply_mlx_matmul_norm(
@@ -1188,6 +1291,8 @@ class AppleMetalBackend:
                 _validate_gather_op(graph, op)
             elif op.op == "scatter":
                 _validate_scatter_op(graph, op)
+            elif op.op == "index_add":
+                _validate_index_add_op(graph, op)
             elif op.op == "cumsum":
                 _validate_cumsum_op(graph, op)
             elif op.op in {"triu", "tril"}:
@@ -1547,6 +1652,10 @@ class AppleMetalBackend:
             return "dtype conversion uses MLX astype"
         if op.op in LAYOUT_OPS:
             return "layout operation uses an MLX view or materialization"
+        if op.op == "scatter":
+            return "scatter and its reductions use the MLX runtime atomic path"
+        if op.op == "index_add":
+            return "index_add uses the MLX runtime scatter-add"
         return "operation uses the MLX runtime implementation"
 
     def _compile_elementwise(
@@ -7121,29 +7230,105 @@ def _validate_scatter_op(graph: Graph, op: Operation) -> None:
         value = op.attrs["value"]
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"scatter.value must be a scalar number, got {value!r}")
-    else:
-        if set(op.attrs) != {"dim"}:
+        return
+
+    reduce = op.attrs.get("reduce")
+    allowed = {"dim"} if reduce is None else {"dim", "reduce", "include_self"}
+    if set(op.attrs) - allowed:
+        raise ValueError(
+            f"scatter has unsupported attributes: {sorted(set(op.attrs) - allowed)}"
+        )
+    if reduce is not None:
+        if reduce not in _SCATTER_REDUCES:
             raise ValueError(
-                f"scatter has unsupported attributes: {sorted(set(op.attrs) - {'dim'})}"
+                f"scatter.reduce {reduce!r} is not supported; expected one of "
+                f"{sorted(_SCATTER_REDUCES)}"
             )
-        update_type = graph.value(op.inputs[2]).type
-        if update_type.dtype != source_type.dtype:
+        include_self = op.attrs.get("include_self", True)
+        if not isinstance(include_self, bool):
             raise ValueError(
-                "scatter source dtype must match the input dtype, "
-                f"got {update_type.dtype.value} and {source_type.dtype.value}"
+                f"scatter.include_self must be a boolean, got {include_self!r}"
             )
-        if len(update_type.shape) != rank:
-            raise ValueError(
-                f"scatter source must have rank {rank}, got {update_type.shape}"
-            )
-        for update_axis, (update_dim, index_dim) in enumerate(
-            zip(update_type.shape, indices_type.shape, strict=True)
-        ):
-            if update_dim < index_dim:
-                raise ValueError(
-                    f"scatter source shape {update_type.shape} is smaller than "
-                    f"indices shape {indices_type.shape} on axis {update_axis}"
+        if not include_self and reduce in {"amax", "amin"}:
+            if source_type.dtype not in {DType.F16, DType.BF16, DType.F32}:
+                raise NotImplementedError(
+                    f"scatter.reduce={reduce} with include_self=False needs a "
+                    "floating-point input for its identity value, got "
+                    f"{source_type.dtype.value}"
                 )
+    update_type = graph.value(op.inputs[2]).type
+    if update_type.dtype != source_type.dtype:
+        raise ValueError(
+            "scatter source dtype must match the input dtype, "
+            f"got {update_type.dtype.value} and {source_type.dtype.value}"
+        )
+    if len(update_type.shape) != rank:
+        raise ValueError(
+            f"scatter source must have rank {rank}, got {update_type.shape}"
+        )
+    for update_axis, (update_dim, index_dim) in enumerate(
+        zip(update_type.shape, indices_type.shape, strict=True)
+    ):
+        if update_dim < index_dim:
+            raise ValueError(
+                f"scatter source shape {update_type.shape} is smaller than "
+                f"indices shape {indices_type.shape} on axis {update_axis}"
+            )
+
+
+def _validate_index_add_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 3:
+        raise ValueError(f"index_add expects three inputs, got {len(op.inputs)}")
+    source_type = graph.value(op.inputs[0]).type
+    indices_type = graph.value(op.inputs[1]).type
+    update_type = graph.value(op.inputs[2]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError("index_add requires a tensor with rank >= 1")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"index_add.dim must be an integer, got {dim!r}")
+    if dim < 0 or dim >= rank:
+        raise ValueError(f"index_add.dim {dim} is outside rank {rank}")
+    unknown = set(op.attrs) - {"dim", "alpha"}
+    if unknown:
+        raise ValueError(
+            f"index_add has unsupported attributes: {sorted(unknown)}"
+        )
+    alpha = op.attrs.get("alpha", 1.0)
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+        raise ValueError(f"index_add.alpha must be a scalar number, got {alpha!r}")
+    if len(indices_type.shape) != 1:
+        raise NotImplementedError(
+            "index_add requires a 1-D index tensor, got "
+            f"{indices_type.shape}"
+        )
+    if indices_type.dtype not in {DType.I32, DType.I64}:
+        raise ValueError(
+            "index_add indices must be int32 or int64, "
+            f"got {indices_type.dtype.value}"
+        )
+    if update_type.dtype != source_type.dtype:
+        raise ValueError(
+            "index_add source dtype must match the input dtype, got "
+            f"{update_type.dtype.value} and {source_type.dtype.value}"
+        )
+    expected_update = (
+        source_type.shape[:dim]
+        + (indices_type.shape[0],)
+        + source_type.shape[dim + 1 :]
+    )
+    if update_type.shape != expected_update:
+        raise ValueError(
+            f"index_add source shape {update_type.shape} does not match "
+            f"{expected_update}"
+        )
+    if output_type != source_type:
+        raise ValueError(
+            f"index_add output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match input {(source_type.shape, source_type.dtype)}"
+        )
 
 
 def _validate_cumsum_op(graph: Graph, op: Operation) -> None:
