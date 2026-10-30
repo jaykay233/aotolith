@@ -434,7 +434,6 @@ _INPLACE_TARGETS = {
 _CONSTANT_PAD_TARGET = "aten.constant_pad_nd.default"
 # `logsumexp` is a composite in ATen: a stable max shift plus a log-sum, with
 # infinite maxima replaced by zero so a saturated row keeps its limit.
-_DOT_TARGET = "aten.dot.default"
 _MV_TARGET = "aten.mv.default"
 _TRACE_TARGET = "aten.trace.default"
 _LOGSUMEXP_TARGET = "aten.logsumexp.default"
@@ -506,7 +505,6 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _DIAGONAL_COPY_TARGET,
         _VECTOR_NORM_TARGET,
         _CONSTANT_PAD_TARGET,
-        _DOT_TARGET,
         _MV_TARGET,
         _TRACE_TARGET,
         _LOGSUMEXP_TARGET,
@@ -838,9 +836,8 @@ def capture_fx(
                     else:
                         dead_nodes.add(user)
                 continue
-            if target in (_DOT_TARGET, _MV_TARGET, _TRACE_TARGET):
+            if target in (_MV_TARGET, _TRACE_TARGET):
                 builder = {
-                    _DOT_TARGET: _dot_operations,
                     _MV_TARGET: _mv_operations,
                     _TRACE_TARGET: _trace_operations,
                 }[target]
@@ -2167,42 +2164,6 @@ def _layer_norm_operation(
         stat_type,
         frozenset(wanted),
     )
-
-
-def _dot_operations(
-    node: object,
-    node_ids: dict[object, str],
-    first_op_index: int,
-) -> tuple[tuple[tuple[Operation, Value], ...], str]:
-    """Lower ``aten.dot`` into a fused multiply plus a full reduction."""
-
-    args = getattr(node, "args", ())
-    if len(args) != 2:
-        raise ValueError(f"dot expects two arguments, got {len(args)}")
-    output_type = _node_type(node)
-    left_type = _node_type(args[0])
-    inputs = tuple(_argument_ids(argument, node_ids) for argument in args)
-
-    product_id = f"v{first_op_index}"
-    operations: list[tuple[Operation, Value]] = [
-        (
-            Operation("mul", inputs, (product_id,), {}),
-            Value(product_id, TensorType(left_type.shape, output_type.dtype)),
-        )
-    ]
-    output_id = f"v{first_op_index + 1}"
-    operations.append(
-        (
-            Operation(
-                "sum",
-                (product_id,),
-                (output_id,),
-                {"dims": (0,), "keepdim": False},
-            ),
-            Value(output_id, output_type),
-        )
-    )
-    return tuple(operations), output_id
 
 
 def _mv_operations(
