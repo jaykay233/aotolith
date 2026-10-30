@@ -649,6 +649,33 @@ def _evaluate_mlx_op(
         axis = int(op.attrs["dim"]) % value.ndim
         shifted = value - mx.logsumexp(value, axis=axis, keepdims=True)
         return shifted.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op == "vector_norm":
+        value = env[op.inputs[0]]
+        rank = value.ndim
+        dims = tuple(int(dim) % rank for dim in op.attrs["dims"])
+        keepdim = bool(op.attrs.get("keepdim", False))
+        ord_value = float(op.attrs["ord"])
+        output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        compute = (
+            value
+            if value.dtype in (mx.float32, mx.float64)
+            else value.astype(mx.float32)
+        )
+        # MLX only takes a single norm axis, so the reduced axes move to the
+        # back and collapse into one before the call.
+        remaining = [axis for axis in range(rank) if axis not in dims]
+        permuted = mx.transpose(compute, remaining + list(dims))
+        prefix = tuple(compute.shape[axis] for axis in remaining)
+        flattened = permuted.reshape(prefix + (-1,))
+        reduced = mx.linalg.norm(flattened, ord=ord_value, axis=-1)
+        if keepdim:
+            reduced = reduced.reshape(
+                tuple(
+                    1 if axis in dims else size
+                    for axis, size in enumerate(compute.shape)
+                )
+            )
+        return reduced.astype(output_dtype)
     if op.op in {"var", "std"}:
         value = env[op.inputs[0]]
         dims = tuple(int(dim) % value.ndim for dim in op.attrs["dims"])
@@ -1469,6 +1496,8 @@ class AppleMetalBackend:
                 _validate_mlx_reduction_op(graph, op)
             elif op.op == "log_softmax":
                 _validate_log_softmax_op(graph, op)
+            elif op.op == "vector_norm":
+                _validate_vector_norm_op(graph, op)
             elif op.op in {"var", "std"}:
                 _validate_variance_op(graph, op)
             elif op.op in {"argmax", "argmin"}:
@@ -7728,6 +7757,51 @@ def _validate_log_softmax_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             "log_softmax must preserve the input tensor type, got "
             f"{(output_type.shape, output_type.dtype.value)}"
+        )
+
+
+def _validate_vector_norm_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"vector_norm expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise ValueError("vector_norm does not support rank-0 tensors")
+    if input_type.dtype not in _FLOATING_DTYPES:
+        raise NotImplementedError(
+            f"vector_norm needs a floating-point input, got {input_type.dtype.value}"
+        )
+    ord_value = op.attrs.get("ord")
+    if isinstance(ord_value, bool) or not isinstance(ord_value, (int, float)):
+        raise ValueError(f"vector_norm.ord must be a real number, got {ord_value!r}")
+    dims = op.attrs.get("dims")
+    if not isinstance(dims, tuple) or not dims:
+        raise ValueError(f"vector_norm.dims must be a non-empty tuple, got {dims!r}")
+    if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims):
+        raise ValueError(f"vector_norm.dims must contain integers, got {dims!r}")
+    axes = tuple(int(dim) % rank for dim in dims)
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"vector_norm.dims repeats an axis: {dims!r}")
+    keepdim = op.attrs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"vector_norm.keepdim must be a boolean, got {keepdim!r}")
+    expected = (
+        tuple(1 if axis in axes else size for axis, size in enumerate(input_type.shape))
+        if keepdim
+        else tuple(
+            size for axis, size in enumerate(input_type.shape) if axis not in axes
+        )
+    )
+    if output_type.shape != expected:
+        raise ValueError(
+            f"vector_norm output shape {output_type.shape} does not match the "
+            f"reduced input {expected}"
+        )
+    if output_type.dtype != input_type.dtype:
+        raise ValueError(
+            "vector_norm must preserve the input dtype, got "
+            f"{output_type.dtype.value} for a {input_type.dtype.value} input"
         )
 
 

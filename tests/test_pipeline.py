@@ -88,6 +88,9 @@ def test_pointwise_fusion_emits_one_metal_region() -> None:
 
 
 def test_repeated_compilation_reuses_identical_metal_kernel() -> None:
+    # The first compilation probes for tensor cores, and that probe is itself a
+    # cached metal kernel, so memoize it before counting misses.
+    metal_backend._compiler_reports_tensor_ops()
     metal_backend._metal_kernel.cache_clear()
     x = torch.randn(2, 8)
     first = compile_callable(lambda value: torch.relu(value), (x,))
@@ -2034,6 +2037,112 @@ def test_variance_rejects_non_integer_correction() -> None:
         compile_callable(
             lambda value: torch.var(value, -1, correction=0.5), (x,)
         )
+
+
+@pytest.mark.parametrize(
+    ("shape", "repeats"),
+    [
+        ((3,), (4,)),
+        ((3, 4), (2, 3)),
+        ((3, 4), (2, 1, 3)),
+        ((2, 3, 4), (2, 1, 2)),
+        ((2, 3, 4), (1, 1, 1)),
+        ((1, 5), (3, 2)),
+    ],
+)
+def test_repeat_and_tile_lower_to_layout_operations(shape, repeats) -> None:
+    torch.manual_seed(65)
+    x = torch.randn(shape)
+    for fn in (lambda value: value.repeat(*repeats), lambda value: value.tile(*repeats)):
+        result = compile_callable(fn, (x,))
+        assert all(
+            op.op in {"reshape", "expand"} for op in result.lowered_graph.ops
+        )
+        actual = result.plan(mx.array(x.numpy()))[0]
+        expected = mx.array(fn(x).numpy())
+        mx.eval(actual, expected)
+        assert actual.shape == tuple(expected.shape)
+        assert mx.array_equal(actual, expected)
+
+
+def test_repeat_with_only_ones_disappears() -> None:
+    x = torch.randn(3, 4)
+    result = compile_callable(lambda value: value.repeat(1, 1), (x,))
+    assert result.lowered_graph.ops == ()
+
+
+def test_repeat_rejects_empty_dimensions() -> None:
+    x = torch.randn(3, 4)
+    with pytest.raises(NotImplementedError, match="empty dimension"):
+        compile_callable(lambda value: value.repeat(0, 2), (x,))
+
+
+@pytest.mark.parametrize(
+    ("ord_value", "dims", "keepdim"),
+    [
+        (2.0, (-1,), True),
+        (2.0, None, False),
+        (1.0, (0,), False),
+        (float("inf"), None, False),
+        (float("-inf"), (-1,), False),
+        (3.0, (1, 2), True),
+        (0.0, (-1,), False),
+    ],
+)
+def test_vector_norm_matches_pytorch(ord_value, dims, keepdim) -> None:
+    torch.manual_seed(66)
+    x = torch.randn(2, 3, 4)
+
+    def fn(value):
+        return torch.linalg.vector_norm(value, ord_value, dims, keepdim)
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["vector_norm"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_vector_norm_folds_into_functional_normalize() -> None:
+    torch.manual_seed(67)
+    x = torch.randn(4, 5)
+    result = compile_callable(
+        lambda value: torch.nn.functional.normalize(value, dim=-1, eps=1e-9),
+        (x,),
+    )
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "vector_norm",
+        "clamp_min",
+        "expand",
+        "div",
+    ]
+    assert result.lowered_graph.ops[0].attrs["ord"] == 2.0
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(
+        torch.nn.functional.normalize(x, dim=-1, eps=1e-9).numpy()
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_vector_norm_supports_low_precision_artifact_round_trip(tmp_path) -> None:
+    torch.manual_seed(68)
+    x = torch.randn(2, 6, dtype=torch.float16)
+
+    def fn(value):
+        return torch.linalg.vector_norm(value, 2, (-1,), True) * value
+
+    result = compile_callable(fn, (x,))
+    path = tmp_path / "vector_norm.aoto"
+    save_compiled(result, path)
+    loaded = load_compiled_module(path)
+    actual = loaded(mx.array(x.float().numpy(), dtype=mx.float16))[0]
+    expected = mx.array(fn(x.float()).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float16
+    assert mx.allclose(actual.astype(mx.float32), expected, atol=2e-3, rtol=2e-3)
 
 
 def test_log_softmax_supports_low_precision() -> None:

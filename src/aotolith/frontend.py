@@ -282,6 +282,9 @@ _VARIANCE_TARGETS = {
     "aten.std.dim": "std",
     "aten.std.default": "std",
 }
+# ``repeat`` and ``tile`` share this ATen target; it lowers to layout ops.
+_REPEAT_TARGET = "aten.repeat.default"
+_VECTOR_NORM_TARGET = "aten.linalg_vector_norm.default"
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
@@ -512,6 +515,24 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = produced[index]
                     else:
                         dead_nodes.add(user)
+                continue
+            if target == _REPEAT_TARGET:
+                repeat_ops, output_id = _repeat_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in repeat_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
+            if target == _VECTOR_NORM_TARGET:
+                inputs, attrs, output_type = _vector_norm_operation(
+                    node, node_ids
+                )
+                output_id = f"v{len(ops)}"
+                ops.append(Operation("vector_norm", inputs, (output_id,), attrs))
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
                 continue
             if target in _VARIANCE_TARGETS:
                 inputs, attrs, output_type = _variance_operation(node, node_ids)
@@ -1682,6 +1703,138 @@ def _layer_norm_operation(
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
     return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _repeat_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.repeat`` into reshape/expand/reshape.
+
+    PyTorch aligns repeats with the trailing axes and left-pads both the shape
+    and the repeat list with ones, then reads ``out[i, j] = in[i % si, j % sj]``.
+    Splitting every axis into ``(repeat, size)`` and broadcasting turns exactly
+    that into a view chain.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"repeat expects two arguments, got {len(args)}")
+    input_node, repeats = args
+    if not isinstance(repeats, (tuple, list)) or not repeats:
+        raise ValueError(f"repeat.repeats must be a non-empty sequence, got {repeats!r}")
+    if not all(
+        isinstance(repeat, int) and not isinstance(repeat, bool) for repeat in repeats
+    ):
+        raise ValueError(f"repeat.repeats must contain integers, got {repeats!r}")
+    if any(repeat < 0 for repeat in repeats):
+        raise ValueError(f"repeat.repeats must not be negative, got {repeats!r}")
+    if any(repeat == 0 for repeat in repeats):
+        raise NotImplementedError(
+            "repeat with a zero repeat produces an empty dimension, which the "
+            "static IR does not model"
+        )
+
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    new_rank = max(rank, len(repeats))
+    padded_shape = (1,) * (new_rank - rank) + input_type.shape
+    padded_repeats = (1,) * (new_rank - len(repeats)) + tuple(repeats)
+    output_shape = tuple(
+        size * repeat for size, repeat in zip(padded_shape, padded_repeats)
+    )
+    if output_shape != _node_type(node).shape:
+        raise ValueError(
+            f"repeat output shape {_node_type(node).shape} does not match the "
+            f"computed {output_shape}"
+        )
+    if padded_shape == output_shape:
+        return (), _argument_ids(input_node, node_ids)
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str, inputs: tuple[str, ...], attrs: dict[str, object], shape: tuple[int, ...]
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(shape, input_type.dtype)),
+            )
+        )
+        return value_id
+
+    interleaved = tuple(
+        item for size in padded_shape for item in (1, size)
+    )
+    expanded = tuple(
+        item
+        for size, repeat in zip(padded_shape, padded_repeats)
+        for item in (repeat, size)
+    )
+    current = emit(
+        "reshape",
+        (_argument_ids(input_node, node_ids),),
+        {"shape": interleaved},
+        interleaved,
+    )
+    current = emit("expand", (current,), {"shape": expanded}, expanded)
+    current = emit("reshape", (current,), {"shape": output_shape}, output_shape)
+    return tuple(operations), current
+
+
+def _vector_norm_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError("linalg_vector_norm expects an input tensor")
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError("linalg_vector_norm requires a ranked tensor")
+
+    ord_value = args[1] if len(args) > 1 else kwargs.get("ord", 2)
+    if isinstance(ord_value, bool) or not isinstance(ord_value, (int, float)):
+        raise NotImplementedError(
+            f"linalg_vector_norm.ord must be a real number, got {ord_value!r}"
+        )
+    dims = args[2] if len(args) > 2 else kwargs.get("dim")
+    keepdim = args[3] if len(args) > 3 else kwargs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(
+            f"linalg_vector_norm.keepdim must be a boolean, got {keepdim!r}"
+        )
+
+    if dims is None:
+        normalized_dims = tuple(range(rank))
+    elif isinstance(dims, int) and not isinstance(dims, bool):
+        normalized_dims = (dims % rank,)
+    elif isinstance(dims, (tuple, list)) and dims and all(
+        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    ):
+        normalized_dims = tuple(dim % rank for dim in dims)
+    else:
+        raise ValueError(
+            f"linalg_vector_norm.dim must contain integers, got {dims!r}"
+        )
+    if len(set(normalized_dims)) != len(normalized_dims):
+        raise ValueError(f"linalg_vector_norm.dim repeats an axis: {dims!r}")
+
+    return (
+        (_argument_ids(input_node, node_ids),),
+        {
+            "ord": float(ord_value),
+            "dims": tuple(sorted(normalized_dims)),
+            "keepdim": keepdim,
+        },
+        _node_type(node),
+    )
 
 
 def _variance_operation(
