@@ -72,6 +72,158 @@ def test_compile_module_binds_registered_buffer_and_does_not_retain_module() -> 
     assert mx.allclose(actual, mx.array(expected.numpy()))
 
 
+def test_compile_module_binds_a_tensor_literal_built_in_forward() -> None:
+    """A ``torch.tensor(...)`` inside ``forward`` is a constant of the model.
+
+    make_fx lifts such a literal into a graph attribute, which a bare
+    ``capture_fx`` call rejects because a constant cannot be a plan input.
+    ``compile_module`` binds it as private state instead, in the order the graph
+    reaches it, so the compiled numbers match the eager module.
+    """
+
+    class LiteralModule(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            scale = torch.tensor([0.5, 0.25, 0.125])
+            bias = torch.tensor([1.0, 2.0, 3.0])
+            return (value * scale + bias) * 2.0
+
+    torch.manual_seed(41)
+    module = LiteralModule().eval()
+    value = torch.randn(2, 3)
+    expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    assert compiled.state_names == ("<constant 0>", "<constant 1>")
+    # Each literal arrives as a constant plus a fresh copy, which the frontend
+    # keeps as an ``alias`` in the input graph and simplification erases.
+    assert [op.op for op in compiled.input_graph.ops] == [
+        "alias",
+        "alias",
+        "mul",
+        "add",
+        "mul",
+    ]
+    # The three pointwise steps fuse into one kernel over the bound constants.
+    assert [op.op for op in compiled.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = compiled(value)[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-6, rtol=1e-6)
+
+
+def test_compile_module_binds_a_plain_tensor_attribute_as_state() -> None:
+    """A tensor kept on the module without ``register_buffer`` still compiles.
+
+    Tracing runs the forward pass under fake tensors, which reject a real
+    tensor, so ``self.scale = torch.tensor(...)`` used to fail before any graph
+    existed. Binding it like a buffer makes it state under its own name, and the
+    module is left exactly as the caller handed it over.
+    """
+
+    class AttributeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = torch.nn.Linear(2, 2, bias=False)
+            self.block.mask = torch.tensor([1.0, 0.5])
+            self.scale = torch.tensor([2.0, 3.0])
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return (self.block(value) * self.block.mask) * self.scale
+
+    torch.manual_seed(42)
+    module = AttributeModule().eval()
+    value = torch.randn(3, 2)
+    expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    # Parameters first, then buffers in module order: the root's own tensor
+    # precedes the one living on the child module.
+    assert compiled.state_names == ("block.weight", "scale", "block.mask")
+    # The attributes are restored: still plain tensors, still in ``__dict__``.
+    assert list(module._buffers) == []
+    assert list(module.block._buffers) == []
+    assert "scale" in module.__dict__
+    assert "mask" in module.block.__dict__
+
+    actual = compiled(value)[0]
+    mx.eval(actual)
+    # MLX's f32 GPU matmul rounds its inputs more coarsely than PyTorch's CPU
+    # kernel, so the comparison stays at the tolerance the other matmul tests
+    # use. A swapped binding would move a value by more than that.
+    assert mx.allclose(
+        actual, mx.array(expected.detach().numpy()), atol=2e-3, rtol=1e-3
+    )
+
+
+def test_compile_module_restores_tensor_attributes_after_a_failed_capture() -> None:
+    class FailingModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scale = torch.tensor([2.0, 3.0])
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            offset = self.scale.sum()
+            raise RuntimeError(f"forward refused to trace {offset.shape}")
+
+    module = FailingModule().eval()
+    with pytest.raises(RuntimeError, match="forward refused to trace"):
+        compile_module(module, (torch.randn(2, 2),))
+
+    assert list(module._buffers) == []
+    assert "scale" in module.__dict__
+    assert torch.equal(module.scale, torch.tensor([2.0, 3.0]))
+
+
+def test_a_tensor_in_a_container_attribute_is_reported_actionably() -> None:
+    """A tensor held inside a list attribute cannot be bound, and says so."""
+
+    class ListModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scales = [torch.tensor([1.0, 2.0])]
+            self.bias = torch.tensor([0.5, 0.5])
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value * self.scales[0] + self.bias
+
+    module = ListModule().eval()
+    with pytest.raises(NotImplementedError) as excinfo:
+        compile_module(module, (torch.randn(2, 2),))
+
+    message = str(excinfo.value)
+    assert "example_inputs" in message
+    assert "register_buffer" in message
+    # The plain attribute that *can* be bound is restored on the way out.
+    assert list(module._buffers) == []
+    assert "bias" in module.__dict__
+
+
+def test_bound_constant_survives_an_artifact_round_trip(tmp_path: Path) -> None:
+    class LiteralModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(3, 3, dtype=torch.bfloat16))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return (value @ self.weight) * torch.tensor([1.0, 2.0, 1.0])
+
+    from aotolith import load_compiled_module
+
+    torch.manual_seed(43)
+    module = LiteralModule().eval()
+    value = torch.randn(2, 3, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    loaded = load_compiled_module(compiled.save(tmp_path / "literal.aoto"))
+    assert loaded.state_names == ("weight", "<constant 0>")
+
+    actual = loaded(_to_mlx(value))[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+
 def test_compile_module_supports_cumsum_and_multi_axis_indexing() -> None:
     class IndexingModule(torch.nn.Module):
         def forward(

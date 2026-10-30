@@ -841,6 +841,7 @@ def test_non_empty_constant_tensor_names_the_use_cache_hint() -> None:
     assert "_tensor_constant0" in message
     assert "(3,)" in message
     assert "use_cache" in message
+    assert "compile_module" in message
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])

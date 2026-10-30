@@ -28,6 +28,12 @@ _SUPPORTED_OPS = {
     "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
     "aten.alias.default": "alias",
+    # A tensor literal built inside ``forward`` reaches the graph as a constant
+    # plus this fresh-copy marker. The copy carries no arithmetic, and every
+    # in-place op is legalized before it reaches the IR, so rebinding the value
+    # is enough and avoids materializing a second buffer.
+    "aten.lift_fresh_copy.default": "alias",
+    "aten.lift_fresh.default": "alias",
     "aten._to_copy.default": "cast",
     "aten._softmax.default": "softmax",
     "aten._safe_softmax.default": "safe_softmax",
@@ -362,8 +368,21 @@ _INPLACE_SCATTER_TARGETS = {
 }
 
 
-def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
-    """Capture a supported callable with make_fx and build the compiler IR."""
+def capture_fx(
+    fn: Callable[..., Any],
+    example_inputs: Sequence[Any],
+    *,
+    promoted_constants: list[Any] | None = None,
+) -> Graph:
+    """Capture a supported callable with make_fx and build the compiler IR.
+
+    ``promoted_constants`` opts into binding a tensor that tracing captured as
+    an FX ``get_attr`` node instead of rejecting it. Each such tensor becomes
+    one extra graph input, appended after the traced placeholders in the order
+    the graph reaches them, and its value is collected in the list the caller
+    passed. ``compile_module`` uses this to fold module attributes and tensors
+    built inside ``forward`` into the plan's private inputs.
+    """
 
     try:
         from torch.fx.experimental.proxy_tensor import make_fx
@@ -373,7 +392,19 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     # Fake tracing keeps capture shape-only: the default "real" mode executes
     # every operator on the example inputs, so tracing a large matmul costs a
     # full CPU matmul and compile time scales with the problem size.
-    traced = make_fx(fn, tracing_mode="fake")(*example_inputs)
+    try:
+        traced = make_fx(fn, tracing_mode="fake")(*example_inputs)
+    except AssertionError as exc:
+        if "Please convert all Tensors to FakeTensors" not in str(exc):
+            raise
+        raise NotImplementedError(
+            "a tensor reached an operator without being a graph input. Fake "
+            "tracing only accepts the traced inputs and registered parameters "
+            "and buffers, so a constant held on the module inside a container "
+            "(a list, tuple or mapping attribute) or captured in a closure is "
+            "invisible to it. Pass it through example_inputs or example_kwargs, "
+            "or register it with register_buffer"
+        ) from exc
     _reject_unsupported_attention_dropout(traced.graph)
     # ``use_cache=True`` models start their KV cache from zero-length tensors,
     # which make_fx bakes into the graph as constants plus identity copies of
@@ -401,9 +432,18 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 # Folding happens at the concatenation that consumes it; any
                 # other use reaches ``_argument_ids`` and fails by name.
                 continue
-            raise NotImplementedError(
-                _constant_tensor_message(traced, node)
+            if promoted_constants is None:
+                raise NotImplementedError(
+                    _constant_tensor_message(traced, node)
+                )
+            constant = _constant_value(traced, node)
+            value_id = f"arg{len(input_ids)}"
+            node_ids[node] = value_id
+            input_ids.append(value_id)
+            values[value_id] = Value(
+                value_id, _tensor_type(constant, f"constant {node.target!r}")
             )
+            promoted_constants.append(constant)
         elif node.op == "call_function":
             if node in node_ids:
                 continue
@@ -825,7 +865,10 @@ def _constant_tensor_message(traced: object, node: object) -> str:
         f"captured graph embeds constant tensor {target!r} of shape {rendered}; "
         "constant tensors are not plan inputs. A HuggingFace model traced with "
         "use_cache=True is the usual source: pass "
-        "example_kwargs={'use_cache': False} to keep the cache out of the graph"
+        "example_kwargs={'use_cache': False} to keep the cache out of the graph. "
+        "compile_module binds these constants as private plan inputs on its own, "
+        "so this only affects a bare capture_fx call; pass the tensor through "
+        "example_inputs instead to make it an explicit graph input"
     )
 
 

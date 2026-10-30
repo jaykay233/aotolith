@@ -174,7 +174,11 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 `stack` 没有独立的 IR op。前端先检查所有输入的 shape 和 dtype 一致，再把 `dim` 归一化到输出 rank 范围，生成每个输入一个 `unsqueeze`，最后用一个 `cat` 合并。这样 `stack` 直接复用已有的 layout 校验、CSE 和 MLX runtime，不需要额外的 tuple 或 sequence 输入语义。
 
-`get_attr` 常量和零长度 `cat` 操作数。`use_cache=True` 是 HuggingFace 模型的默认设置，它的 KV cache 从 `torch.tensor([])` 起步，`make_fx` 会把它提升为图里的 `get_attr` 常量，并插入一个 `lift_fresh_copy` 恒等拷贝。IR 的 `TensorType` 要求每一维为正，因此空 tensor 无法成为 plan 输入；但零长度的 `cat` 操作数对结果没有任何贡献，所以前端在拼接处把它折掉：只剩一个操作数时整条 `cat` 直接退化成该操作数，剩两个及以上时按剩余操作数生成 `cat`。`lift_fresh_copy`、`clone`、`detach`、`alias`、`_to_copy`、`contiguous` 这类不携带算术的拷贝，如果输出为空 tensor 也一并跳过。非空的常量 tensor 仍然被拒绝，报错会带上常量名和 shape，并提示 `use_cache=True` 是最常见的来源——这才是真正需要用户改写模型调用的情况。
+`get_attr` 常量和零长度 `cat` 操作数。`use_cache=True` 是 HuggingFace 模型的默认设置，它的 KV cache 从 `torch.tensor([])` 起步，`make_fx` 会把它提升为图里的 `get_attr` 常量，并插入一个 `lift_fresh_copy` 恒等拷贝。IR 的 `TensorType` 要求每一维为正，因此空 tensor 无法成为 plan 输入；但零长度的 `cat` 操作数对结果没有任何贡献，所以前端在拼接处把它折掉：只剩一个操作数时整条 `cat` 直接退化成该操作数，剩两个及以上时按剩余操作数生成 `cat`。`lift_fresh_copy`、`clone`、`detach`、`alias`、`_to_copy`、`contiguous` 这类不携带算术的拷贝，如果输出为空 tensor 也一并跳过。非空时 `lift_fresh_copy` 直接 lowering 成 `alias`：它不携带算术，且 in-place 操作在进入 IR 之前已被函数化。
+
+非空的常量 tensor 分两条路处理。`compile_module` 把它们按图里出现的顺序提升成 plan 的私有输入（`capture_fx(..., promoted_constants=...)`），和参数、buffer 一样绑定进 plan，因此 `forward` 里手写的 `torch.tensor([...])`、`torch.zeros(...)`、`zeros_like` 之类都不再需要用户改写；常量在 `state_names` 里以 `<constant N>` 编号出现，artifact 往返也不丢。裸调 `capture_fx` 时没有状态绑定可挂，仍然拒绝，报错带上常量名和 shape，并提示 `use_cache=True` 是最常见的来源、以及 `compile_module` 会自行处理。
+
+模块上未注册成 buffer 的普通 tensor 属性（`self.scale = torch.tensor([...])`）在捕获期间临时注册为 buffer：fake tracing 无法接受真实 tensor，而 `functional_call` 只会替换参数和 buffer，所以属性先进入 `_buffers`、从 `__dict__` 里让出（否则普通属性会遮蔽 buffer 查找），捕获结束后再原样还原。这些 tensor 因此以属性自身的名字成为 plan 状态，例如 `("block.weight", "scale", "block.mask")`：参数在前，buffer 按模块遍历顺序在后。
 
 `embedding` 保留为一个 IR op，输入顺序与 ATen 一致，为 `weight, indices`。前端要求 weight 是 rank-2 的 FP16/BF16/FP32 tensor，indices 是 `int32/int64`，输出 shape 为 `indices.shape + (embedding_dim,)`。`padding_idx` 只影响反向梯度，推理时允许并校验范围；`scale_grad_by_freq` 和 `sparse` 同样只影响反向传播。`max_norm` 会生成 `embedding_renorm_` 节点，当前不进入这个 lowering。Runtime 用 `mx.take(weight, indices, axis=0)` 执行 gather，不生成 Metal kernel。
 

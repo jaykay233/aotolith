@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -92,6 +93,8 @@ class CompiledModulePlan:
 
     compilation: CompilationResult
     input_count: int
+    # Parameter and buffer names, then one ``<constant N>`` entry per tensor that
+    # tracing captured as a graph constant, in the order the graph reaches them.
     state_names: tuple[str, ...]
     _state_values: tuple[mx.array, ...]
     # Tensor-valued ``example_kwargs``, promoted to graph inputs so callers can
@@ -298,13 +301,98 @@ def compile_module(
             "the compiled plan uses that name for its own argument"
         )
 
+    with _tensor_attributes_as_buffers(module):
+        return _compile_module_graph(
+            module,
+            example_inputs=example_inputs,
+            static_kwargs=static_kwargs,
+            tensor_kwarg_names=tensor_kwarg_names,
+            tensor_kwarg_templates=tensor_kwarg_templates,
+            tensor_kwarg_values=tensor_kwarg_values,
+            output_key=output_key,
+            target=target,
+            codegen_matmul=codegen_matmul,
+            codegen_attention=codegen_attention,
+            autotune=autotune,
+            autotune_warmup=autotune_warmup,
+            autotune_iterations=autotune_iterations,
+        )
+
+
+@contextmanager
+def _tensor_attributes_as_buffers(module: Any) -> Iterator[None]:
+    """Temporarily register plain tensor attributes so tracing can bind them.
+
+    A module sometimes keeps a constant tensor as a plain attribute
+    (``self.scale = torch.tensor([...])``) instead of registering it. Tracing
+    runs the forward pass under ``FakeTensorMode``, and a real tensor reaching an
+    operator there is an error, so the module would fail before any graph
+    exists. Registering the attribute as a buffer puts it in the state that
+    ``functional_call`` binds, which keeps capture shape-only and turns the
+    tensor into a bound plan input under the attribute's own name.
+
+    The registration adds the name to ``_buffers`` and takes the same name out
+    of the instance ``__dict__``: a plain attribute shadows the buffer, so
+    ``functional_call``'s substitution would otherwise never reach ``forward``.
+    The attribute holds the same tensor throughout, so the module behaves
+    identically while this is in effect, and both changes are undone on the way
+    out, including when capture raises.
+    """
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - compile_module imports it first
+        raise RuntimeError("PyTorch is required for compile_module") from exc
+
+    registered: list[tuple[Any, str, Any]] = []
+    try:
+        for holder in module.modules():
+            parameters = holder._parameters
+            buffers = holder._buffers
+            for name, value in list(vars(holder).items()):
+                if name in parameters or name in buffers:
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    continue
+                buffers[name] = value
+                # A buffer is reached through ``__getattr__``; the plain
+                # attribute lives in ``__dict__`` and would shadow it, keeping
+                # ``functional_call``'s substitution invisible to ``forward``.
+                del holder.__dict__[name]
+                registered.append((holder, name, value))
+        yield
+    finally:
+        for holder, name, value in reversed(registered):
+            holder._buffers.pop(name, None)
+            holder.__dict__[name] = value
+
+
+def _compile_module_graph(
+    module: Any,
+    *,
+    example_inputs: Sequence[Any],
+    static_kwargs: Mapping[str, Any],
+    tensor_kwarg_names: Sequence[str],
+    tensor_kwarg_templates: Sequence[Any],
+    tensor_kwarg_values: Sequence[Any],
+    output_key: str | None,
+    target: str,
+    codegen_matmul: bool,
+    codegen_attention: bool,
+    autotune: bool,
+    autotune_warmup: int,
+    autotune_iterations: int,
+) -> CompiledModulePlan:
+    """Trace and lower the module once its tensor attributes are bound state."""
+
+    import torch
+
     state = dict(module.named_parameters(remove_duplicate=False))
     state.update(module.named_buffers(remove_duplicate=False))
     state_names = tuple(state)
     state_values = tuple(state.values())
     input_count = len(example_inputs)
     forward_input_count = input_count + len(tensor_kwarg_values)
-    bound_values = _unique_mlx_state(state_values)
 
     def functional_forward(*args: Any) -> Any:
         inputs = tuple(args[:input_count])
@@ -328,11 +416,16 @@ def compile_module(
         return _select_module_output(output, output_key)
 
     traced_inputs = tuple(example_inputs) + tuple(tensor_kwarg_values)
-
+    # Tensors that tracing captured as constants (a module attribute that is
+    # not a parameter or buffer, or a tensor built inside ``forward``) become
+    # private plan inputs in the order the graph reaches them, so the plan's
+    # bound state is the module state followed by those constants.
+    constants: list[Any] = []
     result = compile_graph(
         capture_fx(
             functional_forward,
             traced_inputs + state_values,
+            promoted_constants=constants,
         ),
         target=target,
         codegen_matmul=codegen_matmul,
@@ -344,10 +437,12 @@ def compile_module(
             traced_inputs + state_values if autotune else None
         ),
     )
+    bound_values = _unique_mlx_state((*state_values, *constants))
     return CompiledModulePlan(
         compilation=result,
         input_count=input_count,
-        state_names=state_names,
+        state_names=tuple(state_names)
+        + tuple(f"<constant {index}>" for index in range(len(constants))),
         _state_values=bound_values,
         tensor_kwarg_names=tuple(tensor_kwarg_names),
         tensor_kwarg_templates=tuple(tensor_kwarg_templates),
