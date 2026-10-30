@@ -180,7 +180,7 @@ _NUMERIC_ATTRS = {
     "sub": {"alpha": 1.0},
     "rsub": {"alpha": 1.0},
     "leaky_relu": {"negative_slope": 0.01},
-    "elu": {"alpha": 1.0},
+    "elu": {"alpha": 1.0, "scale": 1.0, "input_scale": 1.0},
     "softplus": {"beta": 1.0, "threshold": 20.0},
     "threshold": {"threshold": 0.0, "value": 0.0},
 }
@@ -301,8 +301,12 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
     node_ids: dict[object, str] = {}
     ops: list[Operation] = []
     output_ids: tuple[str, ...] = ()
+    # Multi-output nodes whose unused selections never need a value.
+    dead_nodes: set[object] = set()
 
     for node in traced.graph.nodes:
+        if node in dead_nodes:
+            continue
         if node.op == "placeholder":
             value_id = f"arg{len(input_ids)}"
             node_ids[node] = value_id
@@ -446,15 +450,29 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = output_id
                 continue
             if target == "aten.native_layer_norm.default":
-                output_id = f"v{len(ops)}"
-                inputs, attrs, output_type = _layer_norm_operation(
+                inputs, attrs, output_type, wanted = _layer_norm_operation(
                     node, node_ids
                 )
-                ops.append(Operation("layer_norm", inputs, (output_id,), attrs))
-                node_ids[node] = output_id
-                values[output_id] = Value(output_id, output_type)
+                produced: dict[int, str] = {}
+                if 0 in wanted:
+                    output_id = f"v{len(ops)}"
+                    ops.append(
+                        Operation("layer_norm", inputs, (output_id,), attrs)
+                    )
+                    values[output_id] = Value(output_id, output_type)
+                    produced[0] = output_id
+                if 1 in wanted or 2 in wanted:
+                    produced.update(
+                        _layer_norm_statistics(
+                            ops, values, inputs[0], attrs, wanted
+                        )
+                    )
                 for user in node.users:
-                    node_ids[user] = output_id
+                    index = user.args[1]
+                    if index in produced:
+                        node_ids[user] = produced[index]
+                    else:
+                        dead_nodes.add(user)
                 continue
             if target == _LOGSIGMOID_TARGET:
                 output_id = f"v{len(ops)}"
@@ -1586,6 +1604,7 @@ def _layer_norm_operation(
         raise ValueError(f"layer_norm.eps must be a scalar number, got {eps!r}")
 
     output_node = None
+    wanted: set[int] = set()
     for user in getattr(node, "users", {}):
         if user.target is not operator.getitem:
             raise NotImplementedError(
@@ -1594,16 +1613,15 @@ def _layer_norm_operation(
         if len(user.args) != 2 or not isinstance(user.args[1], int):
             raise ValueError(f"malformed layer_norm getitem: {user!r}")
         index = user.args[1]
-        if index == 0 and user.users:
-            output_node = user
-        elif index in {1, 2} and user.users:
-            raise NotImplementedError(
-                "layer_norm mean/rstd outputs are not supported yet"
-            )
-        elif index not in {0, 1, 2}:
+        if index not in {0, 1, 2}:
             raise ValueError(f"native_layer_norm output index must be 0, 1, or 2, got {index}")
+        if not user.users:
+            continue
+        wanted.add(index)
+        if index == 0:
+            output_node = user
 
-    if output_node is None:
+    if output_node is None and not wanted:
         raise ValueError("native_layer_norm result is not used")
 
     inputs = [_argument_ids(input_value, node_ids)]
@@ -1620,7 +1638,69 @@ def _layer_norm_operation(
         "has_weight": has_weight,
         "has_bias": has_bias,
     }
-    return tuple(inputs), attrs, _node_type(output_node)
+    input_type = _node_type(node.args[0])
+    output_type = TensorType(input_type.shape, input_type.dtype)
+    return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _layer_norm_statistics(
+    ops: list[Operation],
+    values: dict[str, Value],
+    input_id: str,
+    attrs: dict[str, object],
+    wanted: frozenset[int],
+) -> dict[int, str]:
+    """Materialize the mean/rstd outputs PyTorch returns beside layer_norm.
+
+    The native kernel computes both internally but only writes the normalized
+    value, and the IR has single-output operations, so the statistics are
+    rebuilt from a two-pass variance over the normalized axes. They only exist
+    when the graph actually reads them.
+    """
+
+    input_type = values[input_id].type
+    shape = input_type.shape
+    normalized_shape = attrs["normalized_shape"]
+    assert isinstance(normalized_shape, tuple)
+    rank = len(shape)
+    norm_rank = len(normalized_shape)
+    if norm_rank > rank or shape[rank - norm_rank :] != normalized_shape:
+        raise ValueError(
+            f"layer_norm normalized_shape {normalized_shape} does not match "
+            f"the trailing axes of {shape}"
+        )
+    dims = tuple(range(rank - norm_rank, rank))
+    stats_shape = shape[: rank - norm_rank] + (1,) * norm_rank
+    dtype = input_type.dtype
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        op_attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+    ) -> str:
+        value_id = f"v{len(ops)}"
+        ops.append(Operation(op, inputs, (value_id,), op_attrs))
+        values[value_id] = Value(value_id, TensorType(output_shape, dtype))
+        return value_id
+
+    produced = {
+        1: emit("mean", (input_id,), {"dims": dims, "keepdim": True}, stats_shape)
+    }
+    if 2 in wanted:
+        centered = emit("sub", (input_id, produced[1]), {}, shape)
+        squared = emit("mul", (centered, centered), {}, shape)
+        variance = emit(
+            "mean", (squared,), {"dims": dims, "keepdim": True}, stats_shape
+        )
+        shifted = emit(
+            "add",
+            (variance,),
+            {"scalar": float(attrs["eps"]), "scalar_position": "rhs"},
+            stats_shape,
+        )
+        produced[2] = emit("rsqrt", (shifted,), {}, stats_shape)
+    return produced
 
 
 def _logsigmoid_operation(
@@ -2322,13 +2402,20 @@ def _operation_inputs(
         return tuple(inputs), attrs
 
     if op in {"leaky_relu", "elu"}:
-        if len(args) != 2:
-            raise ValueError(f"{op} expects two arguments, got {len(args)}")
-        argument = args[1]
-        if not isinstance(argument, (int, float)) or isinstance(argument, bool):
-            raise ValueError(f"{op} scalar must be a number, got {argument!r}")
-        name = "negative_slope" if op == "leaky_relu" else "alpha"
-        return ((_argument_ids(args[0], node_ids),), {name: float(argument)})
+        allowed = {2} if op == "leaky_relu" else {2, 3, 4}
+        if len(args) not in allowed:
+            raise ValueError(f"{op} expects {allowed} arguments, got {len(args)}")
+        attrs: dict[str, object] = {}
+        names = ["negative_slope"] if op == "leaky_relu" else [
+            "alpha",
+            "scale",
+            "input_scale",
+        ]
+        for name, argument in zip(names, args[1:]):
+            if not isinstance(argument, (int, float)) or isinstance(argument, bool):
+                raise ValueError(f"{op}.{name} must be a number, got {argument!r}")
+            attrs[name] = float(argument)
+        return ((_argument_ids(args[0], node_ids),), attrs)
 
     if op in _REDUCTION_OPS:
         if len(args) == 1:

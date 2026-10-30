@@ -4531,10 +4531,26 @@ def _emit_pointwise_expression(
     if op.op == "elu":
         value = arguments[0]
         alpha = _msl_float_literal(float(op.attrs.get("alpha", 1.0)))
-        return (
-            f"(({value}) >= 0.0f ? ({value}) : "
-            f"{alpha} * (metal::exp({value}) - 1.0f))"
+        scale = float(op.attrs.get("scale", 1.0))
+        input_scale = float(op.attrs.get("input_scale", 1.0))
+        if scale == 1.0 and input_scale == 1.0:
+            return (
+                f"(({value}) >= 0.0f ? ({value}) : "
+                f"{alpha} * (metal::exp({value}) - 1.0f))"
+            )
+        # ATen's signature is elu(x, alpha, scale, input_scale) and it scales
+        # the negative branch by input_scale only, so the positive branch keeps
+        # the raw value. selu is the scale=1.0507 spelling of this.
+        scaled = (
+            value
+            if input_scale == 1.0
+            else f"(({value}) * {_msl_float_literal(input_scale)})"
         )
+        body = (
+            f"metal::max(0.0f, {value}) + metal::min(0.0f, "
+            f"{alpha} * (metal::exp({scaled}) - 1.0f))"
+        )
+        return f"(({body}) * {_msl_float_literal(scale)})" if scale != 1.0 else body
     if op.op == "hardswish":
         value = arguments[0]
         body = (

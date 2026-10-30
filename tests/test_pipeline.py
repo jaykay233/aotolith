@@ -12,6 +12,8 @@ from aotolith import (
     compile_graph,
     eliminate_common_subexpressions,
     fuse_pointwise,
+    load_compiled_module,
+    save_compiled,
 )
 from aotolith.backends import apple_metal as metal_backend
 from aotolith.ir import DType, Graph, Operation, TensorType, Value
@@ -3898,6 +3900,65 @@ def test_broadcast_pointwise_inputs_are_fused() -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("name", "fn", "expected_literals"),
+    [
+        ("elu", lambda x: torch.nn.functional.elu(x), ()),
+        ("elu alpha", lambda x: torch.nn.functional.elu(x, 1.5), ()),
+        (
+            "elu scale",
+            lambda x: torch.ops.aten.elu.default(x, 1.5, 0.75, 1.0),
+            ("0.75",),
+        ),
+        (
+            "elu input_scale",
+            lambda x: torch.ops.aten.elu.default(x, 1.2, 0.9, 2.0),
+            ("0.9", "2.0"),
+        ),
+        (
+            "selu",
+            lambda x: torch.nn.functional.selu(x),
+            ("1.0507009873554805", "1.6732632423543772"),
+        ),
+    ],
+)
+def test_elu_honours_the_aten_scale_arguments(name, fn, expected_literals) -> None:
+    torch.manual_seed(4)
+    x = torch.randn(3, 5)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["elu"]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["elu"]
+    source = result.plan.kernels[0].source
+    for literal in expected_literals:
+        assert literal in source
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_selu_keeps_the_positive_branch_unscaled_by_input_scale() -> None:
+    """ATen scales only the negative branch by ``input_scale``."""
+
+    positive = torch.tensor([0.5, 2.0])
+    negative = torch.tensor([-0.5, -2.0])
+
+    def fn(value):
+        return torch.ops.aten.elu.default(value, 1.2, 0.9, 2.0)
+
+    result = compile_callable(fn, (positive,))
+    actual = result.plan(mx.array(positive.numpy()))[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array([0.45, 1.8]))
+
+    negative_result = compile_callable(fn, (negative,))
+    actual_negative = negative_result.plan(mx.array(negative.numpy()))[0]
+    mx.eval(actual_negative)
+    expected_negative = mx.array(fn(negative).numpy())
+    assert mx.allclose(actual_negative, expected_negative, atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize("approximate", [None, "tanh"])
 def test_gelu_is_generated_as_a_metal_kernel(approximate) -> None:
     def fn(x):
@@ -6419,15 +6480,81 @@ def test_layer_norm_supports_low_precision(dtype) -> None:
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_layer_norm_rejects_auxiliary_outputs() -> None:
+def test_layer_norm_exposes_the_mean_and_rstd_statistics() -> None:
+    torch.manual_seed(60)
     x = torch.randn(2, 3, 7)
 
     def fn(value):
-        _, mean, _ = torch.native_layer_norm(value, (7,), None, None, 1e-5)
-        return mean
+        _, mean, rstd = torch.native_layer_norm(value, (7,), None, None, 1e-5)
+        return mean * rstd
 
-    with pytest.raises(NotImplementedError, match="mean/rstd"):
-        compile_callable(fn, (x,))
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "mean",
+        "fused_elementwise",
+        "mean",
+        "fused_elementwise",
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (2, 3, 1)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("index", [1, 2])
+def test_layer_norm_statistics_work_without_the_normalized_output(index) -> None:
+    torch.manual_seed(62)
+    x = torch.randn(4, 9)
+
+    def fn(value):
+        return torch.native_layer_norm(value, (9,), None, None, 1e-3)[index]
+
+    result = compile_callable(fn, (x,))
+    assert "layer_norm" not in [op.op for op in result.lowered_graph.ops]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_layer_norm_statistics_compose_with_the_normalized_output() -> None:
+    torch.manual_seed(63)
+    x = torch.randn(2, 5, 6)
+    weight = torch.randn(6)
+    bias = torch.randn(6)
+
+    def fn(value, scale, shift):
+        out, mean, rstd = torch.native_layer_norm(value, (6,), scale, shift, 1e-5)
+        return out + rstd * mean
+
+    result = compile_callable(fn, (x, weight, bias))
+    ops = [op.op for op in result.lowered_graph.ops]
+    assert ops[0] == "layer_norm"
+    actual = result.plan(
+        mx.array(x.numpy()), mx.array(weight.numpy()), mx.array(bias.numpy())
+    )[0]
+    expected = mx.array(fn(x, weight, bias).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_layer_norm_statistics_survive_an_artifact_round_trip(tmp_path) -> None:
+    torch.manual_seed(64)
+    x = torch.randn(2, 3, 5)
+
+    def fn(value):
+        out, _, rstd = torch.native_layer_norm(value, (5,), None, None, 1e-5)
+        return out * rstd
+
+    result = compile_callable(fn, (x,))
+    path = tmp_path / "layer_norm_stats.aoto"
+    save_compiled(result, path)
+    loaded = load_compiled_module(path)
+    actual = loaded(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
