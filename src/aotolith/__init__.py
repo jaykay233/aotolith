@@ -3,6 +3,7 @@
 from ._version import __version__
 from .artifact import (
     ABI_VERSION,
+    FORMAT_VERSION,
     ArtifactCompatibilityError,
     ArtifactError,
     load_compiled_module,
@@ -37,6 +38,7 @@ from .passes import (
 
 __all__ = [
     "ABI_VERSION",
+    "FORMAT_VERSION",
     "ArtifactCompatibilityError",
     "ArtifactError",
     "ArenaAssignment",

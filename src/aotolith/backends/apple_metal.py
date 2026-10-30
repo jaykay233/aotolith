@@ -514,13 +514,50 @@ def _metal_kernel(
 
 @dataclass(frozen=True, slots=True)
 class KernelArtifact:
+    """One generated kernel and the IR values it writes.
+
+    Most kernels write a single tensor. A kernel that already computes several
+    results writes them together and lists every output here, which is what
+    lets a multi-output IR operation stay one kernel instead of being split
+    into a producer plus a re-derivation of its siblings.
+    """
+
     name: str
     source: str
     header: str
     input_ids: tuple[str, ...]
-    output_id: str
-    tensor_type: TensorType
+    output_ids: tuple[str, ...]
+    tensor_types: tuple[TensorType, ...]
     kind: str
+
+    def __post_init__(self) -> None:
+        if not self.output_ids:
+            raise ValueError(f"kernel {self.name} must write at least one value")
+        if len(self.output_ids) != len(self.tensor_types):
+            raise ValueError(
+                f"kernel {self.name} lists {len(self.output_ids)} outputs but "
+                f"{len(self.tensor_types)} types"
+            )
+
+    @property
+    def output_id(self) -> str:
+        """The only output of a single-output kernel."""
+
+        if len(self.output_ids) != 1:
+            raise ValueError(
+                f"kernel {self.name} writes {len(self.output_ids)} values"
+            )
+        return self.output_ids[0]
+
+    @property
+    def tensor_type(self) -> TensorType:
+        """The type of a single-output kernel's only output."""
+
+        if len(self.tensor_types) != 1:
+            raise ValueError(
+                f"kernel {self.name} writes {len(self.tensor_types)} values"
+            )
+        return self.tensor_types[0]
 
 
 _PENDING_INDEX_CHECKS: ContextVar[list[tuple[mx.array, int, bool]] | None] = (
@@ -606,8 +643,12 @@ def _tensor_nbytes(tensor_type: TensorType) -> int:
 
 def _evaluate_mlx_op(
     graph: Graph, op: Operation, env: dict[str, mx.array]
-) -> mx.array:
-    """Evaluate one IR operation with MLX fallback semantics."""
+) -> mx.array | tuple[mx.array, ...]:
+    """Evaluate one IR operation with MLX fallback semantics.
+
+    A single-output operation returns its array. A multi-output operation
+    returns one array per declared output, in declaration order.
+    """
 
     if op.op == "fused_elementwise":
         body = op.attrs.get("body")
@@ -1337,13 +1378,24 @@ class CompiledPlan:
                 runtime = self._callables.get(op.outputs[0])
                 if runtime is not None:
                     result = runtime(*(env[value_id] for value_id in op.inputs))
+                else:
+                    result = _evaluate_mlx_op(self.graph, op, env)
+                if len(op.outputs) == 1:
                     store_result(op.outputs[0], result)
-                    for value_id in self.storage_plan.release_after_op[op_index]:
-                        env.pop(value_id, None)
-                    continue
-
-                result = _evaluate_mlx_op(self.graph, op, env)
-                store_result(op.outputs[0], result)
+                else:
+                    if not isinstance(result, tuple):
+                        raise RuntimeError(
+                            f"{op.op} produces {len(op.outputs)} values but its "
+                            f"runtime returned "
+                            f"{type(result).__name__}"
+                        )
+                    if len(result) != len(op.outputs):
+                        raise RuntimeError(
+                            f"{op.op} produces {len(op.outputs)} values but its "
+                            f"runtime returned {len(result)}"
+                        )
+                    for value_id, array in zip(op.outputs, result, strict=True):
+                        store_result(value_id, array)
                 for value_id in self.storage_plan.release_after_op[op_index]:
                     env.pop(value_id, None)
         finally:
@@ -1591,7 +1643,10 @@ class AppleMetalBackend:
 
             if compiled is not None:
                 artifact, runtime = compiled
-                candidates[artifact.output_id] = _NativeCandidate(
+                # Candidates are keyed by the operation's first output, which
+                # is also what a selection records; a multi-output kernel still
+                # fills every output of that operation.
+                candidates[artifact.output_ids[0]] = _NativeCandidate(
                     artifact, runtime
                 )
         return candidates
@@ -1985,8 +2040,8 @@ class AppleMetalBackend:
             source=source,
             header=_MSL_HEADER,
             input_ids=input_ids,
-            output_id=output_id,
-            tensor_type=output_type,
+            output_ids=(output_id,),
+            tensor_types=(output_type,),
             kind=kind,
         )
         return artifact, runtime
@@ -2038,8 +2093,8 @@ class AppleMetalBackend:
             source=source,
             header=_MSL_HEADER,
             input_ids=(),
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind=op.op,
         )
         return artifact, runtime
@@ -2130,8 +2185,8 @@ class AppleMetalBackend:
             source=source,
             header=_MPP_HEADER,
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind="attention",
         )
         return artifact, runtime
@@ -2188,8 +2243,8 @@ class AppleMetalBackend:
             source=source,
             header=_MSL_HEADER,
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind="attention",
         )
         return artifact, runtime
@@ -2780,8 +2835,8 @@ class AppleMetalBackend:
             source=source,
             header="",
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind="attention",
         )
         return artifact, runtime
@@ -2907,8 +2962,8 @@ class AppleMetalBackend:
             source=source,
             header="",
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind=op.op,
         )
         return artifact, runtime
@@ -3056,8 +3111,8 @@ class AppleMetalBackend:
             source=source,
             header="",
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind=op.op,
         )
         return artifact, runtime
@@ -3118,8 +3173,8 @@ class AppleMetalBackend:
             source=source,
             header=_MSL_HEADER,
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind="rope",
         )
         return artifact, runtime
@@ -3159,10 +3214,39 @@ class AppleMetalBackend:
 
         input_type = graph.value(op.inputs[0]).type
         output_type = graph.value(op.outputs[0]).type
+        # ``layer_norm`` may also write the per-row statistics it already
+        # reduces, which is what makes the tuple-returning ATen signature one
+        # kernel instead of a main output plus a re-derived pair.
+        stat_types = tuple(
+            graph.value(value_id).type for value_id in op.outputs[1:]
+        )
+        if stat_types and kind != "layer_norm":
+            raise ValueError(
+                f"{kind} only writes one output, got {len(op.outputs)}"
+            )
+        if len(op.outputs) not in {1, 3}:
+            raise ValueError(
+                f"{kind} writes one or three values, got {len(op.outputs)}"
+            )
         if input_type.dtype != output_type.dtype:
             raise NotImplementedError(
                 f"Metal {kind} requires identical input/output dtypes"
             )
+        for position, stat_type in enumerate(stat_types):
+            # ATen reports the statistics with the normalized axes collapsed to
+            # one, so the expected shape keeps them as singleton dimensions.
+            expected_stat = input_type.shape[:-len(normalized_shape)] + (
+                1,
+            ) * len(normalized_shape)
+            if stat_type.shape != expected_stat:
+                raise ValueError(
+                    f"{kind} statistic {position + 1} shape {stat_type.shape} "
+                    f"does not match the reduced {expected_stat}"
+                )
+            if stat_type.dtype != input_type.dtype:
+                raise NotImplementedError(
+                    f"Metal {kind} requires identical statistic dtypes"
+                )
         if input_type.shape != output_type.shape:
             raise ValueError(
                 f"{kind} output shape {output_type.shape} != {input_type.shape}"
@@ -3270,6 +3354,18 @@ class AppleMetalBackend:
         if bias_position is not None:
             normalized_expression += f" + float(in_{bias_position}[col])"
 
+        # One thread per row writes the statistics the reduction already
+        # computed, so the tuple ATen returns costs two stores, not a second
+        # pass over the input.
+        stat_write_source = (
+            "        if (tid == 0) {\n"
+            "            mean_out[row] = (T)mean_value;\n"
+            "            rstd_out[row] = (T)inv_std;\n"
+            "        }\n"
+            if stat_types
+            else ""
+        )
+
         source = f"""
         uint tid = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
@@ -3279,17 +3375,25 @@ class AppleMetalBackend:
 {textwrap.indent(reduction_source, '        ')}
         float inv_std = metal::rsqrt({reduction_result} + {eps!r}f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
+{stat_write_source}
         for (uint col = tid; col < {columns}u; col += {threads}u) {{
             float current = float(in_0[offset + col]);
             out[offset + col] = (T)({normalized_expression});
         }}
         """
         name = f"metal_{kind}_{threads}_{index}"
+        write_stats = bool(stat_types)
+        output_names = ("out",)
+        output_shapes = [output_type.shape]
+        if write_stats:
+            output_names = ("out", "mean_out", "rstd_out")
+            output_shapes = [output_type.shape] + [
+                stat_type.shape for stat_type in stat_types
+            ]
         kernel = _metal_kernel(
             name,
             tuple(f"in_{position}" for position in range(len(op.inputs))),
-            ("out",),
+            output_names,
             source,
             "",
         )
@@ -3297,24 +3401,26 @@ class AppleMetalBackend:
         threadgroup = (threads, 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
-        def runtime(*inputs: mx.array) -> mx.array:
+        def runtime(*inputs: mx.array) -> mx.array | tuple[mx.array, ...]:
             outputs = kernel(
                 inputs=list(inputs),
                 template=[("T", dtype)],
                 grid=grid,
                 threadgroup=threadgroup,
-                output_shapes=[output_type.shape],
-                output_dtypes=[dtype],
+                output_shapes=output_shapes,
+                output_dtypes=[dtype] * len(output_shapes),
             )
-            return outputs[0]
+            if not write_stats:
+                return outputs[0]
+            return tuple(outputs)
 
         artifact = KernelArtifact(
             name=name,
             source=source,
             header="",
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,) + stat_types,
             kind=kind,
         )
         return artifact, runtime
@@ -3576,8 +3682,8 @@ class AppleMetalBackend:
             source=source,
             header=header,
             input_ids=op.inputs,
-            output_id=op.outputs[0],
-            tensor_type=output_type,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
             kind=op.op,
         )
         return artifact, runtime

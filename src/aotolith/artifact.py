@@ -23,7 +23,11 @@ if TYPE_CHECKING:
     from .compiler import CompilationResult, CompiledModulePlan
 
 ARTIFACT_FORMAT = "aotolith"
-FORMAT_VERSION = 4
+# Format 5 serializes a kernel's outputs as parallel `output_ids` and
+# `tensor_types` lists so a kernel may write several values; a multi-output IR
+# operation is one kernel rather than a producer plus re-derivations of its
+# siblings. Readers still accept format 4's singular `output_id`/`tensor_type`.
+FORMAT_VERSION = 5
 ABI_VERSION = "1.3"
 # 1.3 added `entrypoint.kwargs`, the tensor-valued keyword inputs promoted to
 # graph inputs. Artifacts without that field are the 1.2 layout, where every
@@ -796,27 +800,46 @@ def _encode_kernel(kernel: KernelArtifact) -> dict[str, object]:
         "source": kernel.source,
         "header": kernel.header,
         "input_ids": list(kernel.input_ids),
-        "output_id": kernel.output_id,
-        "tensor_type": {
-            "shape": list(kernel.tensor_type.shape),
-            "dtype": kernel.tensor_type.dtype.value,
-        },
+        "output_ids": list(kernel.output_ids),
+        "tensor_types": [
+            {
+                "shape": list(tensor_type.shape),
+                "dtype": tensor_type.dtype.value,
+            }
+            for tensor_type in kernel.tensor_types
+        ],
         "kind": kernel.kind,
     }
 
 
 def _decode_kernel(payload: Mapping[str, Any]) -> KernelArtifact:
     try:
+        # Format 4 kernels wrote one output under singular keys; the reader
+        # still accepts them so an older archive loads instead of failing.
+        if "output_ids" in payload:
+            output_ids = tuple(str(value) for value in payload["output_ids"])
+            tensor_types = tuple(
+                TensorType(
+                    tuple(int(dim) for dim in item["shape"]),
+                    DType(item["dtype"]),
+                )
+                for item in payload["tensor_types"]
+            )
+        else:
+            output_ids = (str(payload["output_id"]),)
+            tensor_types = (
+                TensorType(
+                    tuple(int(dim) for dim in payload["tensor_type"]["shape"]),
+                    DType(payload["tensor_type"]["dtype"]),
+                ),
+            )
         return KernelArtifact(
             name=str(payload["name"]),
             source=str(payload["source"]),
             header=str(payload["header"]),
             input_ids=tuple(str(value) for value in payload["input_ids"]),
-            output_id=str(payload["output_id"]),
-            tensor_type=TensorType(
-                tuple(int(dim) for dim in payload["tensor_type"]["shape"]),
-                DType(payload["tensor_type"]["dtype"]),
-            ),
+            output_ids=output_ids,
+            tensor_types=tensor_types,
             kind=str(payload["kind"]),
         )
     except (KeyError, TypeError, ValueError) as exc:

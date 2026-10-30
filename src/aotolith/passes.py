@@ -1247,7 +1247,7 @@ def eliminate_common_subexpressions(graph: Graph) -> Graph:
             value_id = aliases[value_id]
         return value_id
 
-    common: dict[tuple[object, ...], str] = {}
+    common: dict[tuple[object, ...], tuple[str, ...]] = {}
     rewritten: list[Operation] = []
     for op in graph.ops:
         inputs = tuple(resolve(value_id) for value_id in op.inputs)
@@ -1259,18 +1259,26 @@ def eliminate_common_subexpressions(graph: Graph) -> Graph:
             if inputs == op.inputs and attrs is op.attrs
             else Operation(op.op, inputs, op.outputs, attrs)
         )
-        output_type = graph.value(op.outputs[0]).type
+        output_types = tuple(
+            graph.value(value_id).type for value_id in op.outputs
+        )
         key = (
             current.op,
             current.inputs,
-            (output_type.shape, output_type.dtype.value),
+            tuple(
+                (output_type.shape, output_type.dtype.value)
+                for output_type in output_types
+            ),
             _operation_attribute_key(graph, current, resolve),
         )
         existing = common.get(key)
         if existing is not None:
-            aliases[current.outputs[0]] = existing
+            for value_id, replacement in zip(
+                current.outputs, existing, strict=True
+            ):
+                aliases[value_id] = replacement
             continue
-        common[key] = current.outputs[0]
+        common[key] = current.outputs
         rewritten.append(current)
 
     outputs = tuple(resolve(value_id) for value_id in graph.outputs)

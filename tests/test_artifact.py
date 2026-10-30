@@ -12,6 +12,7 @@ import torch
 
 from aotolith import (
     ABI_VERSION,
+    FORMAT_VERSION,
     ArtifactCompatibilityError,
     compile_module,
 )
@@ -56,7 +57,7 @@ def test_module_artifact_round_trip_and_manifest(tmp_path: Path) -> None:
         "state/00001.bin",
     } <= names
     assert manifest["format"] == "aotolith"
-    assert manifest["format_version"] == 4
+    assert manifest["format_version"] == FORMAT_VERSION
     assert manifest["abi_version"] == ABI_VERSION
     assert manifest["entrypoint"]["kind"] == "module"
     assert [item["name"] for item in manifest["entrypoint"]["state"]] == [

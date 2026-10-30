@@ -203,7 +203,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 `aten.index.Tensor` 规范化成一个 `index` op，inputs 是 `source` 加每个非 `None` 的索引 tensor，被索引的轴写进 `axes` attribute。索引轴相邻时（如 `x[i, j]`、`x[:, i, j]`），PyTorch 把 broadcast 后的索引维度插在原来那段轴的位置，`axes` 直接取这些原始轴即可。索引轴被 `None`/静态轴隔开时（如 `x[i, :, j]`），PyTorch 把 broadcast 维度放到最前面，此时前端先发一个 `permute`，把所有被索引的轴按原顺序移到最前、其余轴保持原相对顺序，再以 `axes = (0, ..., k-1)` 调用同一个 `index`：gather 结果的 layout 就是 broadcast 维加剩余轴，和 PyTorch 的结果一致，不需要尾部再转置。Runtime 用 `source[(slice(None),) * axes[0] + indices]` 执行，逐索引检查 `[0, source.shape[axis])` 范围。
 
-`split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。`torch.unbind(x)` 省略 `dim` 时按 ATen 的默认值 0 处理，`make_fx` 会把该参数从节点里省掉。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
+`split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。`torch.unbind(x)` 省略 `dim` 时按 ATen 的默认值 0 处理，`make_fx` 会把该参数从节点里省掉。因此这些 tuple 在上游就展开成各自的单输出 op，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。多输出的 IR 形式留给“一个 kernel 本来就写出多个结果”的情形（见 `layer_norm`），而不是让下游去拆 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、pad 的 (before, after) 对与静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、常量 `mx.pad`、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
@@ -221,9 +221,9 @@ reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因�
 
 `addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`/`scale`/`input_scale`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute。`scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 都是无 tensor 输入的常量节点：值和输出 dtype 分别来自 IR attribute 与节点 metadata。`new_*` 和 `*_like` 的模板 tensor 只参与 FX 捕获，不进入 op 的运行时输入。浮点/bool 常量可以单独生成 Metal kernel，也可以与相邻 pointwise op 融合；I32/I64 常量走独立的整数 kernel。CSE 的 key 包含输出 shape/dtype，因此同一模板上的不同 dtype 覆盖或不同整数宽度不会被错误合并。`arange` 的三个 ATen target 统一规范化为 `(start, end, step)` attributes；I32/I64 输出要求整数参数，FP16/BF16/F32 输出接受任意有限参数。
 
-`F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。第 1/2 个输出（mean、rstd）在被图读取时会展开成 `mean` 加一段两次遍历的方差链，因为 IR 的 op 都是单输出；只读 mean/rstd、不读归一化输出的图同样可以编译。
+`F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把它折叠成一个 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。第 1/2 个输出（mean、rstd）是同一个 kernel 的另外两个输出：kernel 本来就要两遍归约出均值和方差，`tid == 0` 的线程把它们直接写出去，所以读统计量不需要再做一次 reduction。只读 mean/rstd、不读归一化输出的图同样可以编译，此时归一化结果照样写出、只是没人读。
 
-`sort` 和 `topk` 返回 `(values, indices)`，但 IR 的 op 只能有一个输出，前端按 `getitem` 实际读取的下标分别生成 `sort`/`argsort` 或 `topk`/`topk_indices`。只读 values 时不生成 indices，反之亦然。`max`/`min` 带 `dim` 时是同一模式的第三个例子：values 选择生成 `amax`/`amin`（与不带 `dim` 的全局形式共用），indices 选择生成 `argmax`/`argmin`，因此 `values, indices = x.max(dim=-1)` 展开成两次归约，而只读 `.values` 的图不会算索引；ATen 的 tie 规则（取第一个最大值）正是 MLX `argmax` 的行为，NaN 行也一样（values 为 NaN，索引指向第一个 NaN）。三者都由 MLX 执行：`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。
+`sort` 和 `topk` 返回 `(values, indices)`，前端按 `getitem` 实际读取的下标分别生成 `sort`/`argsort` 或 `topk`/`topk_indices`：这两个算子由 MLX 执行，取 values 和取 indices 是两次不同的调用，所以按需生成才省得掉一次。只读 values 时不生成 indices，反之亦然。`max`/`min` 带 `dim` 时是同一模式的第三个例子：values 选择生成 `amax`/`amin`（与不带 `dim` 的全局形式共用），indices 选择生成 `argmax`/`argmin`，因此 `values, indices = x.max(dim=-1)` 展开成两次归约，而只读 `.values` 的图不会算索引；ATen 的 tie 规则（取第一个最大值）正是 MLX `argmax` 的行为，NaN 行也一样（values 为 NaN，索引指向第一个 NaN）。三者都由 MLX 执行：`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。
 
 `F.rms_norm` 没有单独的 ATen target，在当前 PyTorch 中会展开成 `pow -> mean -> add_ -> rsqrt -> mul -> optional weight mul`。前端只在中间节点单消费者、reduction 覆盖连续尾维且 shape 吻合时折叠成 `rms_norm`，避免把任意的平方、均值、rsqrt 组合误认为归一化。折叠同时接受手写形态：平方可以是 `pow(x, 2)` 或 `x * x`，eps 可以是 `add_` 或非原地 `add`，缩放可以是 `rsqrt` 或 `sqrt` 加 `div`，weight 可以在任意一侧；不匹配时退回普通 elementwise 图。FP16/BF16 下 `make_fx` 还会插入 float32 `_to_copy`，折叠范围包含这组 cast。
 
@@ -238,7 +238,7 @@ FP16/BF16 的 CPU SDPA 分解图常把 Q/K/V 转成 FP32 计算，再把结果�
 IR 定义在 `ir.py`：
 
 - `Value` 有唯一 ID 和静态 `TensorType`
-- `Operation` 只产生一个输出，输入是已定义的 value ID
+- `Operation` 产生一个或多个输出，输入是已定义的 value ID。绝大多数算子只写一个值；`native_layer_norm` 这类在 ATen 里返回 tuple 的算子把同一个 kernel 已经算出的多个结果一次写成多个 SSA value，因此 tuple 语义不需要靠“再推导一遍兄弟输出”来表达
 - `Graph.validate()` 检查输入唯一性、use-before-def、重复定义、输出类型是否存在
 
 这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
@@ -538,7 +538,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ## 14. 编译产物、校验与加载
 
-`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 4、ABI version 1.3，包含：
+`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 5、ABI version 1.3，包含：
 
 | 文件 | 内容 |
 |---|---|
@@ -572,7 +572,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - `prod`/`amax`/`amin` 走 MLX reduction 而不是生成 kernel，支持任意非空轴集合与 `keepdim`；`amax`/`amin` 与 PyTorch 逐位一致，`prod` 因为乘法顺序不同可能在 float 上相差几个 ulp，整数乘法按位宽回绕。`log_softmax` 走 MLX 的 log-sum-exp，只接受浮点输入；重复轴会在 lowering 期报错
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
-- LayerNorm 的 mean/rstd 辅助输出会在被图读取时展开成 `mean` 加一段两次遍历的方差链（`sub`/`mul`/`mean`/`add eps`/`rsqrt`），因为 IR 的 op 都是单输出，naked kernel 只写归一化结果。它们只在真的被读取时才生成，不需要时不会多算；数值上与原 kernel 内部的 Welford 统计相差几个 ulp（实测 `1e-5` 以内）。只读 rstd/mean、不读主输出也是合法的
+- LayerNorm 的 mean/rstd 是 `layer_norm` op 的第 2、3 个输出，由同一个 kernel 在完成两遍归约后直接写出，读它们不额外做 reduction。数值上与原 kernel 内部的 Welford 统计相差几个 ulp（实测 `1e-5` 以内）。只读 rstd/mean、不读主输出也是合法的；此时归一化结果仍会被写出，只是图里没有消费者
 - RMSNorm 的 pattern 覆盖 `F.rms_norm` 以及手写的常见写法：`pow(x, 2)` 或 `x * x` 求平方、`add_`/`add` 加 eps、`rsqrt` 或 `sqrt`+`div` 归一化、weight 在乘法任一侧，都折叠成同一个 `rms_norm`。未知的写法会退回普通 elementwise 图而不是报错，因此上游分解链变化只影响是否融合，不影响是否可编译
 - `sort`/`topk`/`argmax`/`argmin` 走 MLX 而不是生成 kernel。索引输出固定 I64；`sort` 的 `stable` 只做布尔校验，ties 的索引顺序沿用 MLX 的排序实现，PyTorch 的 `stable=True` 不保证一致（values 总是一致）。`topk` 的 `sorted=False` 仍然返回排序结果，PyTorch 对此只承诺相同的元素集合。NaN 排序位置与 PyTorch 相同（升序在末尾、降序在最前）。全 rank-0 的 `argmax` 返回 rank-0 索引；IR 不支持零长度维度，所以 `topk(k=0)` 在建立输出类型时就报错
 - `var`/`std` 走 MLX 的 `mx.var`，`dims`/`keepdim`/`correction` 保存在 attribute 中。三条 ATen 拼法（`var.correction`、`var.dim`、`var.default`，`std` 同理）在前端统一归一化，`unbiased` 会折算成 `correction`。整数 `correction` 直接作为 `ddof` 传给 `mx.var`；小数 `correction` 因为 MLX 的 `ddof` 只接受整数，改算有偏方差再乘 `n / (n - correction)`（`n` 是实际被归约的元素数），这正是 ATen 的定义。`correction >= 归约元素数` 时与 PyTorch 一样得到 inf，非有限的 `correction` 在捕获期报错。FP16/BF16 输入先提升到 FP32 再归约，最后 cast 回输入 dtype，与 PyTorch 的累加精度一致

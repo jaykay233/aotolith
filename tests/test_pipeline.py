@@ -535,6 +535,47 @@ def test_common_subexpression_elimination_reuses_matmul() -> None:
     assert mx.allclose(actual, expected)
 
 
+def test_common_subexpression_elimination_folds_a_multi_output_operation() -> None:
+    source = TensorType((2, 6), DType.F32)
+    normalized = TensorType((2, 6), DType.F32)
+    statistic = TensorType((2, 1), DType.F32)
+    values = {
+        "x": Value("x", source),
+        "first_out": Value("first_out", normalized),
+        "first_mean": Value("first_mean", statistic),
+        "second_out": Value("second_out", normalized),
+        "second_mean": Value("second_mean", statistic),
+        "summed": Value("summed", normalized),
+        "out": Value("out", normalized),
+    }
+    attrs = {
+        "normalized_shape": (6,),
+        "eps": 1e-5,
+        "has_weight": False,
+        "has_bias": False,
+    }
+    graph = Graph(
+        ("x",),
+        values,
+        (
+            Operation("layer_norm", ("x",), ("first_out", "first_mean"), attrs),
+            Operation("layer_norm", ("x",), ("second_out", "second_mean"), attrs),
+            Operation("add", ("first_out", "second_out"), ("summed",)),
+            Operation("mul", ("summed", "second_mean"), ("out",)),
+        ),
+        ("out",),
+    )
+
+    optimized = eliminate_common_subexpressions(graph)
+    # Both calls reduce the same input the same way, so the second one is
+    # dropped and *every* output of it is aliased onto the first one's - folding
+    # only the first output would leave the statistics computed twice.
+    assert [op.op for op in optimized.ops] == ["layer_norm", "add", "mul"]
+    assert optimized.ops[0].outputs == ("first_out", "first_mean")
+    assert optimized.ops[1].inputs == ("first_out", "first_out")
+    assert optimized.ops[2].inputs == ("summed", "first_mean")
+
+
 def test_common_subexpression_key_preserves_cast_dtype() -> None:
     source = TensorType((2, 3), DType.F16)
     first_type = TensorType((2, 3), DType.F32)
@@ -8231,17 +8272,20 @@ def test_layer_norm_exposes_the_mean_and_rstd_statistics() -> None:
         return mean * rstd
 
     result = compile_callable(fn, (x,))
-    assert [op.op for op in result.lowered_graph.ops] == [
-        "mean",
-        "fused_elementwise",
-        "mean",
-        "fused_elementwise",
+    op = result.lowered_graph.ops[0]
+    assert op.op == "layer_norm"
+    # The statistics are outputs of the normalization kernel, not a second pass
+    # over the input, so the whole graph is one kernel and one pointwise region.
+    assert len(op.outputs) == 3
+    assert [kernel.name for kernel in result.plan.kernels] == [
+        "metal_layer_norm_8_0",
+        "mul_1",
     ]
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert actual.shape == (2, 3, 1)
-    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize("index", [1, 2])
@@ -8253,10 +8297,16 @@ def test_layer_norm_statistics_work_without_the_normalized_output(index) -> None
         return torch.native_layer_norm(value, (9,), None, None, 1e-3)[index]
 
     result = compile_callable(fn, (x,))
-    assert "layer_norm" not in [op.op for op in result.lowered_graph.ops]
+    ops = result.lowered_graph.ops
+    assert [op.op for op in ops] == ["layer_norm"]
+    # Reading only a statistic still needs the normalization kernel, because
+    # that kernel is what reduces the moments; it writes the normalized value
+    # anyway and the graph leaves it unused.
+    assert len(ops[0].outputs) == 3
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
+    assert actual.shape == expected.shape
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 

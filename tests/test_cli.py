@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 
+from aotolith import FORMAT_VERSION
 from cli_fixture import TinyCliModule
 
 
@@ -64,7 +65,7 @@ def test_cli_compiles_inspects_verifies_and_runs_module(tmp_path: Path) -> None:
 
     inspect_result = _run_cli("inspect", str(artifact))
     manifest = json.loads(inspect_result.stdout)
-    assert manifest["format_version"] == 4
+    assert manifest["format_version"] == FORMAT_VERSION
     assert manifest["entrypoint"]["input_count"] == 1
     assert [item["name"] for item in manifest["entrypoint"]["state"]] == [
         "weight",

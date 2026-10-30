@@ -495,6 +495,18 @@ def capture_fx(
     # Multi-output nodes whose unused selections never need a value.
     dead_nodes: set[object] = set()
 
+    def next_index() -> int:
+        """Index of the next value id to hand out.
+
+        Ids count allocated values rather than operations, because one
+        operation may produce several; excluding the inputs keeps a
+        single-output graph numbered from ``v0``. Every lowering helper takes
+        this same index as its first free slot, so a composite can emit as
+        many values as it needs without colliding with the enclosing loop.
+        """
+
+        return len(values) - len(input_ids)
+
     for node in traced.graph.nodes:
         if node in dead_nodes:
             continue
@@ -536,7 +548,7 @@ def capture_fx(
                         "aten.t is only supported for rank-2 tensors, got "
                         f"shape {input_type.shape}"
                     )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(
                     Operation(
                         "transpose",
@@ -552,7 +564,7 @@ def capture_fx(
                 # ``torch.squeeze(x)`` drops every singleton axis, which is a
                 # pure reshape and needs no per-axis sweep.
                 output_type = _node_type(node)
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(
                     Operation(
                         "reshape",
@@ -565,7 +577,7 @@ def capture_fx(
                 node_ids[node] = output_id
                 continue
             if target == _SELECT_TARGET:
-                select_ops = _select_operations(node, node_ids, len(ops))
+                select_ops = _select_operations(node, node_ids, next_index())
                 for operation, value in select_ops:
                     ops.append(operation)
                     values[value.id] = value
@@ -580,7 +592,7 @@ def capture_fx(
                     permuted_shape = tuple(
                         source_type.shape[axis] for axis in permute_dims
                     )
-                    permuted_id = f"v{len(ops)}"
+                    permuted_id = f"v{next_index()}"
                     ops.append(
                         Operation(
                             "permute",
@@ -594,20 +606,20 @@ def capture_fx(
                         TensorType(permuted_shape, source_type.dtype),
                     )
                     inputs = (permuted_id,) + inputs[1:]
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("index", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target in _SEQUENCE_VIEW_TARGETS:
-                sequence_ops = _sequence_view_operations(node, node_ids, len(ops))
+                sequence_ops = _sequence_view_operations(node, node_ids, next_index())
                 for operation, value in sequence_ops:
                     ops.append(operation)
                     values[value.id] = value
                 continue
             if target == _STACK_TARGET:
                 stack_ops, output_id, output_type = _stack_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in stack_ops:
                     ops.append(operation)
@@ -619,7 +631,7 @@ def capture_fx(
                 inputs, attrs, output_type = _embedding_operation(
                     node, node_ids
                 )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("embedding", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
@@ -628,14 +640,14 @@ def capture_fx(
                 inputs, attrs, output_type = _index_select_operation(
                     node, node_ids
                 )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("index_select", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target == "aten.gather.default":
                 inputs, attrs, output_type = _gather_operation(node, node_ids)
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("gather", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
@@ -649,7 +661,7 @@ def capture_fx(
                 _SCATTER_REDUCE_TARGET,
             }:
                 inputs, attrs, output_type = _scatter_operation(node, node_ids)
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("scatter", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
@@ -658,7 +670,7 @@ def capture_fx(
                 inputs, attrs, output_type = _index_add_operation(
                     node, node_ids
                 )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("index_add", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
@@ -666,7 +678,7 @@ def capture_fx(
             rms_norm = _rms_norm_operation(node, node_ids)
             if rms_norm is not None:
                 inputs, attrs, output_type, folded_nodes = rms_norm
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("rms_norm", inputs, (output_id,), attrs))
                 values[output_id] = Value(output_id, output_type)
                 for folded_node in folded_nodes:
@@ -676,7 +688,7 @@ def capture_fx(
                 inputs, attrs, output_node = _attention_operation(
                     node, node_ids
                 )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("attention", inputs, (output_id,), attrs))
                 values[output_id] = Value(output_id, _node_type(output_node))
                 node_ids[node] = output_id
@@ -685,23 +697,26 @@ def capture_fx(
                         node_ids[user] = output_id
                 continue
             if target == "aten.native_layer_norm.default":
-                inputs, attrs, output_type, wanted = _layer_norm_operation(
-                    node, node_ids
+                inputs, attrs, output_type, stat_type, wanted = (
+                    _layer_norm_operation(node, node_ids)
                 )
+                # One kernel writes the normalized value and, when the graph
+                # reads them, the two statistics it already reduced. Reading
+                # only a statistic still needs the op, so the normalized value
+                # is written and simply left unused.
+                # A graph that reads only the normalized value keeps the
+                # single-output form; any other selection needs the full tuple.
+                writes_statistics = wanted - {0}
+                output_count = 3 if writes_statistics else 1
+                output_ids = tuple(
+                    f"v{next_index() + position}" for position in range(output_count)
+                )
+                ops.append(Operation("layer_norm", inputs, output_ids, attrs))
                 produced: dict[int, str] = {}
-                if 0 in wanted:
-                    output_id = f"v{len(ops)}"
-                    ops.append(
-                        Operation("layer_norm", inputs, (output_id,), attrs)
-                    )
-                    values[output_id] = Value(output_id, output_type)
-                    produced[0] = output_id
-                if 1 in wanted or 2 in wanted:
-                    produced.update(
-                        _layer_norm_statistics(
-                            ops, values, inputs[0], attrs, wanted
-                        )
-                    )
+                types = (output_type, stat_type, stat_type)
+                for index, output_id in enumerate(output_ids):
+                    values[output_id] = Value(output_id, types[index])
+                    produced[index] = output_id
                 for user in node.users:
                     index = user.args[1]
                     if index in produced:
@@ -710,7 +725,7 @@ def capture_fx(
                         dead_nodes.add(user)
                 continue
             if target == _LOGSIGMOID_TARGET:
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 inputs, attrs, output_node = _logsigmoid_operation(node, node_ids)
                 ops.append(Operation("logsigmoid", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
@@ -720,7 +735,7 @@ def capture_fx(
                 continue
             if target in _EXTREMUM_DIM_TARGETS:
                 extremum_ops, produced = _extremum_dim_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in extremum_ops:
                     ops.append(operation)
@@ -734,7 +749,7 @@ def capture_fx(
                 continue
             if target in _SORT_TARGETS:
                 sort_ops, produced = _sort_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in sort_ops:
                     ops.append(operation)
@@ -752,7 +767,7 @@ def capture_fx(
                     _MV_TARGET: _mv_operations,
                     _TRACE_TARGET: _trace_operations,
                 }[target]
-                lowered_ops, output_id = builder(node, node_ids, len(ops))
+                lowered_ops, output_id = builder(node, node_ids, next_index())
                 for operation, value in lowered_ops:
                     ops.append(operation)
                     values[value.id] = value
@@ -760,7 +775,7 @@ def capture_fx(
                 continue
             if target in {_DIAGONAL_TARGET, _DIAGONAL_COPY_TARGET}:
                 diagonal_ops, output_id = _diagonal_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in diagonal_ops:
                     ops.append(operation)
@@ -769,7 +784,7 @@ def capture_fx(
                 continue
             if target == _LOGSUMEXP_TARGET:
                 logsumexp_ops, output_id = _logsumexp_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in logsumexp_ops:
                     ops.append(operation)
@@ -778,7 +793,7 @@ def capture_fx(
                 continue
             if target == _NANSUM_TARGET:
                 nansum_ops, output_id = _nansum_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in nansum_ops:
                     ops.append(operation)
@@ -787,7 +802,7 @@ def capture_fx(
                 continue
             if target in {"aten.count_nonzero.default", "aten.count_nonzero.dim_IntList"}:
                 count_ops, output_id = _count_nonzero_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in count_ops:
                     ops.append(operation)
@@ -804,7 +819,7 @@ def capture_fx(
             }:
                 conjunction = target.startswith("aten.all.")
                 boolean_ops, output_id = _all_any_operations(
-                    node, node_ids, len(ops), conjunction=conjunction
+                    node, node_ids, next_index(), conjunction=conjunction
                 )
                 for operation, value in boolean_ops:
                     ops.append(operation)
@@ -813,7 +828,7 @@ def capture_fx(
                 continue
             if target == _CONSTANT_PAD_TARGET and _constant_pad_crops(node):
                 crop_ops, output_id = _constant_pad_crop_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in crop_ops:
                     ops.append(operation)
@@ -822,7 +837,7 @@ def capture_fx(
                 continue
             if target in _PAD_MODE_TARGETS:
                 padding_ops, output_id = _padding_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in padding_ops:
                     ops.append(operation)
@@ -831,7 +846,7 @@ def capture_fx(
                 continue
             if target == _REPEAT_TARGET:
                 repeat_ops, output_id = _repeat_operations(
-                    node, node_ids, len(ops)
+                    node, node_ids, next_index()
                 )
                 for operation, value in repeat_ops:
                     ops.append(operation)
@@ -842,14 +857,14 @@ def capture_fx(
                 inputs, attrs, output_type = _vector_norm_operation(
                     node, node_ids
                 )
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(Operation("vector_norm", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target in _VARIANCE_TARGETS:
                 inputs, attrs, output_type = _variance_operation(node, node_ids)
-                output_id = f"v{len(ops)}"
+                output_id = f"v{next_index()}"
                 ops.append(
                     Operation(
                         _VARIANCE_TARGETS[target], inputs, (output_id,), attrs
@@ -898,15 +913,25 @@ def capture_fx(
             attrs.update(scalar_attrs)
             if op_name == "where" and len(inputs) == 3:
                 inputs = (inputs[0],) + _promote_pointwise_operands(
-                    "where", inputs[1:], values, ops, _node_type(node).dtype
+                    "where",
+                    inputs[1:],
+                    values,
+                    ops,
+                    _node_type(node).dtype,
+                    len(input_ids),
                 )
             elif op_name in _PROMOTABLE_POINTWISE_OPS or (
                 op_name in _FLOAT_ONLY_POINTWISE_OPS
             ):
                 inputs = _promote_pointwise_operands(
-                    op_name, inputs, values, ops, _node_type(node).dtype
+                    op_name,
+                    inputs,
+                    values,
+                    ops,
+                    _node_type(node).dtype,
+                    len(input_ids),
                 )
-            output_id = f"v{len(ops)}"
+            output_id = f"v{next_index()}"
             if op_name in _REDUCTION_OPS and "dims" not in attrs:
                 input_type = values[inputs[0]].type
                 attrs["dims"] = tuple(range(len(input_type.shape)))
@@ -1986,7 +2011,15 @@ def _attention_output_node(node: object, target: str) -> object:
 def _layer_norm_operation(
     node: object,
     node_ids: dict[object, str],
-) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+) -> tuple[
+    tuple[str, ...], dict[str, object], TensorType, TensorType, frozenset[int]
+]:
+    """Read one ``native_layer_norm`` call and the selections the graph reads.
+
+    The op writes the normalized value, and - because the kernel reduces the
+    moments anyway - the per-row mean and reciprocal standard deviation as two
+    more outputs, so a graph that reads them pays no second reduction.
+    """
     args = getattr(node, "args", ())
     if len(args) != 5:
         raise ValueError(f"native_layer_norm expects five arguments, got {len(args)}")
@@ -2044,7 +2077,19 @@ def _layer_norm_operation(
     }
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
-    return tuple(inputs), attrs, output_type, frozenset(wanted)
+    # ATen reports the statistics with the normalized axes collapsed to one, so
+    # they broadcast against the normalized value.
+    stat_shape = input_type.shape[: len(input_type.shape) - len(shape)] + (
+        1,
+    ) * len(shape)
+    stat_type = TensorType(stat_shape, input_type.dtype)
+    return (
+        tuple(inputs),
+        attrs,
+        output_type,
+        stat_type,
+        frozenset(wanted),
+    )
 
 
 def _dot_operations(
@@ -3429,66 +3474,6 @@ def _sort_operations(
     return tuple(operations), produced
 
 
-def _layer_norm_statistics(
-    ops: list[Operation],
-    values: dict[str, Value],
-    input_id: str,
-    attrs: dict[str, object],
-    wanted: frozenset[int],
-) -> dict[int, str]:
-    """Materialize the mean/rstd outputs PyTorch returns beside layer_norm.
-
-    The native kernel computes both internally but only writes the normalized
-    value, and the IR has single-output operations, so the statistics are
-    rebuilt from a two-pass variance over the normalized axes. They only exist
-    when the graph actually reads them.
-    """
-
-    input_type = values[input_id].type
-    shape = input_type.shape
-    normalized_shape = attrs["normalized_shape"]
-    assert isinstance(normalized_shape, tuple)
-    rank = len(shape)
-    norm_rank = len(normalized_shape)
-    if norm_rank > rank or shape[rank - norm_rank :] != normalized_shape:
-        raise ValueError(
-            f"layer_norm normalized_shape {normalized_shape} does not match "
-            f"the trailing axes of {shape}"
-        )
-    dims = tuple(range(rank - norm_rank, rank))
-    stats_shape = shape[: rank - norm_rank] + (1,) * norm_rank
-    dtype = input_type.dtype
-
-    def emit(
-        op: str,
-        inputs: tuple[str, ...],
-        op_attrs: dict[str, object],
-        output_shape: tuple[int, ...],
-    ) -> str:
-        value_id = f"v{len(ops)}"
-        ops.append(Operation(op, inputs, (value_id,), op_attrs))
-        values[value_id] = Value(value_id, TensorType(output_shape, dtype))
-        return value_id
-
-    produced = {
-        1: emit("mean", (input_id,), {"dims": dims, "keepdim": True}, stats_shape)
-    }
-    if 2 in wanted:
-        centered = emit("sub", (input_id, produced[1]), {}, shape)
-        squared = emit("mul", (centered, centered), {}, shape)
-        variance = emit(
-            "mean", (squared,), {"dims": dims, "keepdim": True}, stats_shape
-        )
-        shifted = emit(
-            "add",
-            (variance,),
-            {"scalar": float(attrs["eps"]), "scalar_position": "rhs"},
-            stats_shape,
-        )
-        produced[2] = emit("rsqrt", (shifted,), {}, stats_shape)
-    return produced
-
-
 def _logsigmoid_operation(
     node: object,
     node_ids: dict[object, str],
@@ -3778,6 +3763,7 @@ def _promote_pointwise_operands(
     values: dict[str, Value],
     ops: list[Operation],
     output_dtype: DType,
+    input_count: int,
 ) -> tuple[str, ...]:
     """Insert casts so a pointwise op sees the operands PyTorch would."""
 
@@ -3791,7 +3777,7 @@ def _promote_pointwise_operands(
         if value.type.dtype == target:
             promoted.append(input_id)
             continue
-        cast_id = f"v{len(ops)}"
+        cast_id = f"v{len(values) - input_count}"
         values[cast_id] = Value(cast_id, TensorType(value.type.shape, target))
         ops.append(Operation("cast", (input_id,), (cast_id,), {}))
         promoted.append(cast_id)
