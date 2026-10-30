@@ -31,8 +31,13 @@ _SUPPORTED_OPS = {
     "aten._to_copy.default": "cast",
     "aten._softmax.default": "softmax",
     "aten._safe_softmax.default": "safe_softmax",
+    "aten._log_softmax.default": "log_softmax",
     "aten.sum.default": "sum",
     "aten.sum.dim_IntList": "sum",
+    "aten.prod.dim_int": "prod",
+    "aten.prod.default": "prod",
+    "aten.amax.default": "amax",
+    "aten.amin.default": "amin",
     "aten.cumsum.default": "cumsum",
     "aten.mean.default": "mean",
     "aten.mean.dim": "mean",
@@ -203,7 +208,7 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "bitwise_or",
     "bitwise_xor",
 }
-_REDUCTION_OPS = {"sum", "mean"}
+_REDUCTION_OPS = {"sum", "mean", "prod", "amax", "amin"}
 _INTEGRAL_DTYPES = {DType.I32, DType.I64}
 _FLOATING_DTYPES = {DType.F16, DType.BF16, DType.F32}
 # Binary pointwise ops whose operands PyTorch would promote before applying
@@ -2033,7 +2038,7 @@ def _operation_inputs(
             raise ValueError(f"cast expects one argument, got {len(args)}")
         return ((_argument_ids(args[0], node_ids),), {})
 
-    if op in {"softmax", "safe_softmax"}:
+    if op in {"softmax", "safe_softmax", "log_softmax"}:
         if len(args) not in ({2, 3} if op == "safe_softmax" else {3}):
             raise ValueError(f"{op} received unexpected arguments: {len(args)}")
         input_id, dim = args[:2]

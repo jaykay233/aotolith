@@ -636,6 +636,19 @@ def _evaluate_mlx_op(
         selection: tuple[Any, ...] = (slice(None),) * axis + (indices,)
         contribution = values if alpha == 1.0 else values * alpha
         return source.at[selection].add(contribution)
+    if op.op in {"prod", "amax", "amin"}:
+        value = env[op.inputs[0]]
+        dims = tuple(int(dim) % value.ndim for dim in op.attrs["dims"])
+        keepdim = bool(op.attrs.get("keepdim", False))
+        operation = {"prod": mx.prod, "amax": mx.max, "amin": mx.min}[op.op]
+        reduced = operation(value, axis=dims, keepdims=keepdim)
+        output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        return reduced.astype(output_dtype)
+    if op.op == "log_softmax":
+        value = env[op.inputs[0]]
+        axis = int(op.attrs["dim"]) % value.ndim
+        shifted = value - mx.logsumexp(value, axis=axis, keepdims=True)
+        return shifted.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
     if op.op == "cumsum":
         axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
         value = mx.cumsum(env[op.inputs[0]], axis=axis)
@@ -1384,6 +1397,10 @@ class AppleMetalBackend:
                 _validate_index_add_op(graph, op)
             elif op.op == "cumsum":
                 _validate_cumsum_op(graph, op)
+            elif op.op in {"prod", "amax", "amin"}:
+                _validate_mlx_reduction_op(graph, op)
+            elif op.op == "log_softmax":
+                _validate_log_softmax_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -1745,6 +1762,10 @@ class AppleMetalBackend:
             return "scatter and its reductions use the MLX runtime atomic path"
         if op.op == "index_add":
             return "index_add uses the MLX runtime scatter-add"
+        if op.op in {"prod", "amax", "amin"}:
+            return "reduction uses the MLX runtime reduction"
+        if op.op == "log_softmax":
+            return "log_softmax uses the MLX runtime log-sum-exp"
         return "operation uses the MLX runtime implementation"
 
     def _compile_elementwise(
@@ -7551,6 +7572,72 @@ def _validate_cumsum_op(graph: Graph, op: Operation) -> None:
     if output_type.shape != input_type.shape:
         raise ValueError(
             f"cumsum output shape {output_type.shape} != {input_type.shape}"
+        )
+
+
+def _validate_mlx_reduction_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise ValueError(f"{op.op} does not support rank-0 tensors")
+    dims = op.attrs.get("dims")
+    if not isinstance(dims, tuple) or not dims:
+        raise ValueError(f"{op.op}.dims must be a non-empty tuple, got {dims!r}")
+    if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims):
+        raise ValueError(f"{op.op}.dims must contain integers, got {dims!r}")
+    axes = tuple(int(dim) % rank for dim in dims)
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"{op.op}.dims repeats an axis: {dims!r}")
+    keepdim = op.attrs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{op.op}.keepdim must be a boolean, got {keepdim!r}")
+    expected = (
+        tuple(1 if axis in axes else size for axis, size in enumerate(input_type.shape))
+        if keepdim
+        else tuple(
+            size for axis, size in enumerate(input_type.shape) if axis not in axes
+        )
+    )
+    if output_type.shape != expected:
+        raise ValueError(
+            f"{op.op} output shape {output_type.shape} does not match the "
+            f"reduced input {expected}"
+        )
+    if output_type.dtype != input_type.dtype:
+        raise ValueError(
+            f"{op.op} must preserve the input dtype, got "
+            f"{output_type.dtype.value} for a {input_type.dtype.value} input"
+        )
+    if op.op == "prod" and input_type.dtype == DType.BOOL:
+        raise ValueError("prod does not accept boolean tensor inputs")
+
+
+def _validate_log_softmax_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"log_softmax expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    if len(input_type.shape) == 0:
+        raise ValueError("log_softmax does not support rank-0 tensors")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"log_softmax.dim must be an integer, got {dim!r}")
+    if not -len(input_type.shape) <= dim < len(input_type.shape):
+        raise ValueError(
+            f"log_softmax.dim {dim} exceeds rank {len(input_type.shape)}"
+        )
+    if input_type.dtype not in _FLOATING_DTYPES:
+        raise NotImplementedError(
+            "log_softmax needs a floating-point input, got "
+            f"{input_type.dtype.value}"
+        )
+    if output_type != input_type:
+        raise ValueError(
+            "log_softmax must preserve the input tensor type, got "
+            f"{(output_type.shape, output_type.dtype.value)}"
         )
 
 

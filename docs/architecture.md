@@ -71,9 +71,12 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.clone.default`、`aten.alias.default` | `contiguous`、`alias` |
 | `aten._to_copy.default` | `cast` |
 | `aten._softmax.default`、`aten._safe_softmax.default` | `softmax`、`safe_softmax` |
+| `aten._log_softmax.default` | `log_softmax`，走 MLX 的 log-sum-exp |
 | `aten.scaled_dot_product_attention.default` 及 CPU/CUDA flash、efficient attention target | `attention` |
 | `aten.sum.default`、`aten.sum.dim_IntList` | `sum` |
 | `aten.mean.default`、`aten.mean.dim` | `mean` |
+| `aten.prod.default`、`aten.prod.dim_int` | `prod`，走 MLX reduction，支持多轴与 `keepdim` |
+| `aten.amax.default`、`aten.amin.default` | `amax`、`amin`，走 MLX reduction，支持多轴与 `keepdim` |
 | `aten.native_layer_norm.default` | `layer_norm`，仅第 0 个输出 |
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
@@ -505,6 +508,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`/`mean`，含 `include_self=False`）都支持；`mean` 需要浮点输入，因为它要同时累计写入次数并做除法。`index_add` 只接受 1-D index。`scatter_`/`scatter_add_`/`scatter_reduce_`/`index_add_` 与 `add_` 一样做 SSA legalization：只允许被改写的原值在图内只有一个消费者，编译后的调用返回更新后的值，不会回写调用方仍然持有的那块 tensor，因此调用方必须使用返回值。重复索引的累加顺序不做确定性保证
 - softmax 支持任意单轴。PyTorch 的 `softmax` 本身只接受单个 `dim`，多轴形式总是展开成 reshape + 单轴 softmax + reshape，这条链路可以正常编译
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
+- `prod`/`amax`/`amin` 走 MLX reduction 而不是生成 kernel，支持任意非空轴集合与 `keepdim`；`amax`/`amin` 与 PyTorch 逐位一致，`prod` 因为乘法顺序不同可能在 float 上相差几个 ulp，整数乘法按位宽回绕。`log_softmax` 走 MLX 的 log-sum-exp，只接受浮点输入；重复轴会在 lowering 期报错
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd
 - RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern

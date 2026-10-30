@@ -1721,6 +1721,130 @@ def test_integer_pow_rejects_a_negative_scalar_exponent() -> None:
         compile_callable(fn, (torch.tensor([2], dtype=torch.int64),))
 
 
+@pytest.mark.parametrize(
+    ("fn", "shape", "op_name"),
+    [
+        (lambda x: torch.prod(x, dim=-1), (2, 3, 4), "prod"),
+        (lambda x: torch.prod(x, dim=1, keepdim=True), (2, 3, 4), "prod"),
+        (lambda x: torch.prod(x), (2, 3), "prod"),
+        (lambda x: torch.amax(x, dim=1), (2, 3, 4), "amax"),
+        (lambda x: torch.amax(x, dim=(0, 2), keepdim=True), (2, 3, 4), "amax"),
+        (lambda x: torch.amin(x, dim=-2), (2, 3, 4), "amin"),
+        (lambda x: torch.amin(x, dim=(1, 2)), (2, 3, 4), "amin"),
+    ],
+)
+def test_reduction_family_matches_pytorch(fn, shape, op_name) -> None:
+    torch.manual_seed(53)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    assert result.plan.kernels == ()
+    assert [selection.implementation for selection in result.plan.selections] == [
+        "mlx"
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    if op_name == "prod":
+        # Multiplying in a different order rounds a different intermediate,
+        # so a product only matches PyTorch within a few ulps.
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    else:
+        assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("fn", "values"),
+    [
+        (lambda x: torch.prod(x, dim=1), [[2, 3], [4, 5]]),
+        (lambda x: torch.amax(x, dim=0), [[3, 1], [4, 2]]),
+        (lambda x: torch.amin(x, dim=1), [[3, -1], [-4, 2]]),
+    ],
+)
+def test_integer_reductions_match_pytorch(fn, values) -> None:
+    x = torch.tensor(values, dtype=torch.int64)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(_torch_to_mlx(x))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_prod_wraps_integer_overflow_like_pytorch() -> None:
+    x = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.int64)
+
+    def fn(value):
+        return torch.prod(value, dim=1)
+
+    result = compile_callable(fn, (x,))
+    actual = result.plan(_torch_to_mlx(x))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("dim", "shape"),
+    [(1, (2, 3, 4)), (-1, (2, 3, 4)), (0, (3, 5))],
+)
+def test_log_softmax_matches_pytorch(dim, shape) -> None:
+    torch.manual_seed(54)
+    x = torch.randn(shape)
+    result = compile_callable(lambda value: torch.log_softmax(value, dim), (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["log_softmax"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(torch.log_softmax(x, dim).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_log_softmax_supports_low_precision() -> None:
+    torch.manual_seed(55)
+    x = torch.randn(2, 6, dtype=torch.float16)
+    result = compile_callable(lambda value: torch.log_softmax(value, -1), (x,))
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mx.float16))[0]
+    expected = mx.array(torch.log_softmax(x.float(), -1).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float16
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_log_softmax_rejects_integer_inputs() -> None:
+    with pytest.raises(NotImplementedError, match="needs a floating-point input"):
+        compile_callable(
+            lambda value: torch.log_softmax(value, -1),
+            (torch.tensor([[1, 2]]),),
+        )
+
+
+def test_reduction_rejects_repeated_axes() -> None:
+    values = {
+        "x": Value("x", TensorType((2, 3), DType.F32)),
+        "out": Value("out", TensorType((3,), DType.F32)),
+    }
+    graph = Graph(
+        ("x",),
+        values,
+        (
+            Operation(
+                "amax",
+                ("x",),
+                ("out",),
+                {"dims": (1, -1), "keepdim": False},
+            ),
+        ),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="repeats an axis"):
+        compile_graph(graph)
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)
