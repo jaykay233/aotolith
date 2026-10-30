@@ -60,6 +60,12 @@ _SUPPORTED_OPS = {
     "aten.floor_divide.Scalar": "floor_divide",
     "aten.remainder.Tensor": "remainder",
     "aten.remainder.Scalar": "remainder",
+    "aten.fmod.Tensor": "fmod",
+    "aten.fmod.Scalar": "fmod",
+    "aten.lerp.Tensor": "lerp",
+    "aten.lerp.Scalar": "lerp",
+    "aten.addcmul.default": "addcmul",
+    "aten.addcdiv.default": "addcdiv",
     "aten.pow.Tensor_Tensor": "pow",
     "aten.pow.Tensor_Scalar": "pow",
     "aten.pow.Scalar": "pow",
@@ -187,6 +193,8 @@ _NUMERIC_ATTRS = {
     "elu": {"alpha": 1.0, "scale": 1.0, "input_scale": 1.0},
     "softplus": {"beta": 1.0, "threshold": 20.0},
     "threshold": {"threshold": 0.0, "value": 0.0},
+    "addcmul": {"value": 1.0},
+    "addcdiv": {"value": 1.0},
 }
 
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
@@ -200,6 +208,7 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "div",
     "floor_divide",
     "remainder",
+    "fmod",
     "pow",
     "maximum",
     "minimum",
@@ -225,6 +234,7 @@ _PROMOTABLE_POINTWISE_OPS = {
     "div",
     "floor_divide",
     "remainder",
+    "fmod",
     "maximum",
     "minimum",
     "logaddexp",
@@ -3391,6 +3401,44 @@ def _operation_inputs(
             (_argument_ids(input_id, node_ids), _argument_ids(mask_id, node_ids)),
             {"value": value},
         )
+
+    if op == "lerp":
+        if len(args) != 3:
+            raise ValueError(f"lerp expects three arguments, got {len(args)}")
+        start_id, end_id, weight = args
+        inputs = (
+            _argument_ids(start_id, node_ids),
+            _argument_ids(end_id, node_ids),
+        )
+        try:
+            weight_id = _argument_ids(weight, node_ids)
+        except ValueError:
+            if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                raise ValueError(
+                    f"unsupported lerp weight: {weight!r}"
+                ) from None
+            return inputs, {"weight": float(weight)}
+        return (*inputs, weight_id), {}
+
+    if op in {"addcmul", "addcdiv"}:
+        # ATen's signature is (self, tensor1, tensor2, *, value=1).
+        if len(args) not in {3, 4}:
+            raise ValueError(
+                f"{op} expects three or four positional arguments, "
+                f"got {len(args)}"
+            )
+        inputs = tuple(
+            _argument_ids(argument, node_ids) for argument in args[:3]
+        )
+        attrs: dict[str, object] = {}
+        if len(args) == 4:
+            if "value" in kwargs:
+                raise ValueError(f"{op} received duplicate value arguments")
+            value = args[3]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{op}.value must be a scalar, got {value!r}")
+            attrs["value"] = float(value)
+        return inputs, attrs
 
     if op == "clamp":
         if len(args) not in {1, 2, 3}:

@@ -6054,6 +6054,164 @@ def test_integer_minimum_floor_division_by_negative_one_wraps(dtype) -> None:
     assert mx.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("divisor", [3.0, -3.0, 2.5])
+def test_float_floor_divide_and_remainder_match_pytorch(dtype, divisor) -> None:
+    value = torch.tensor(
+        [-7.5, -6.0, -1.0, 0.0, 1.0, 6.0, 7.5, 9.0], dtype=dtype
+    )
+
+    def fn(tensor):
+        quotient = torch.floor_divide(tensor, divisor)
+        remainder = torch.remainder(tensor, divisor)
+        return quotient * 100 + remainder
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    source = result.plan.kernels[0].source
+    assert "tsc_floor_div_f32(" in source
+    assert "tsc_remainder_f32(" in source
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_float_remainder_keeps_the_divisor_sign() -> None:
+    # ATen adjusts the truncated remainder towards the divisor, so the result
+    # of a mixed-sign pair is non-negative for a positive divisor and vice
+    # versa; fmod deliberately does neither.
+    dividend = torch.tensor([-7.0, -7.0, 7.0, 7.0, 0.0])
+    divisor = torch.tensor([3.0, -3.0, 3.0, -3.0, -3.0])
+
+    result = compile_callable(torch.remainder, (dividend, divisor))
+    assert [op.op for op in result.lowered_graph.ops] == ["remainder"]
+    assert "tsc_remainder_f32(" in result.plan.kernels[0].source
+
+    actual = result.plan(_torch_to_mlx(dividend), _torch_to_mlx(divisor))[0]
+    expected = _torch_to_mlx(torch.remainder(dividend, divisor))
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist()
+    assert actual.tolist() == [2.0, -1.0, 1.0, -2.0, 0.0]
+
+
+def test_fmod_follows_the_dividend_sign() -> None:
+    dividend = torch.tensor([-7.5, -1.0, 0.0, 1.0, 7.5])
+    divisor = torch.tensor([3.0, 3.0, 3.0, -3.0, 3.0])
+
+    result = compile_callable(torch.fmod, (dividend, divisor))
+    assert [op.op for op in result.lowered_graph.ops] == ["fmod"]
+    assert "metal::fmod(" in result.plan.kernels[0].source
+
+    actual = result.plan(_torch_to_mlx(dividend), _torch_to_mlx(divisor))[0]
+    expected = _torch_to_mlx(torch.fmod(dividend, divisor))
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist()
+    assert actual.tolist() == [-1.5, -1.0, 0.0, 1.0, 1.5]
+
+
+@pytest.mark.parametrize("weight", [0.25, 0.75])
+def test_lerp_matches_pytorch_for_tensor_and_scalar_weights(weight) -> None:
+    torch.manual_seed(23)
+    start = torch.randn(16)
+    end = torch.randn(16)
+    weight_tensor = torch.full((16,), weight)
+
+    cases = (
+        (
+            compile_callable(
+                lambda self_, other: torch.lerp(self_, other, weight),
+                (start, end),
+            ),
+            (start, end),
+            torch.lerp(start, end, weight),
+        ),
+        (
+            compile_callable(torch.lerp, (start, end, weight_tensor)),
+            (start, end, weight_tensor),
+            torch.lerp(start, end, weight_tensor),
+        ),
+    )
+
+    for result, inputs, expected in cases:
+        assert "tsc_lerp_f32(" in result.plan.kernels[0].source
+        actual = result.plan(*(_torch_to_mlx(item) for item in inputs))[0]
+        mx.eval(actual)
+        assert mx.allclose(actual, _torch_to_mlx(expected), atol=1e-6, rtol=1e-6)
+
+
+def test_lerp_switches_branch_near_one_half() -> None:
+    # Both ATen branches agree to within rounding, but the branch that avoids
+    # cancellation is the one that keeps the result near `end` exact.
+    start = torch.tensor([1000.0, -1000.0])
+    end = torch.tensor([1.0, -1.0])
+
+    result = compile_callable(
+        lambda self_, other, weight: torch.lerp(self_, other, weight),
+        (start, end, torch.tensor([0.6, 0.6])),
+    )
+    actual = result.plan(
+        _torch_to_mlx(start), _torch_to_mlx(end), _torch_to_mlx(torch.tensor([0.6, 0.6]))
+    )[0]
+    expected = torch.lerp(start, end, torch.tensor([0.6, 0.6]))
+    mx.eval(actual)
+    assert actual.tolist() == pytest.approx(expected.tolist(), rel=1e-6)
+
+
+@pytest.mark.parametrize("value", [None, 0.5])
+@pytest.mark.parametrize(
+    ("operation", "operator"),
+    [(torch.addcmul, "*"), (torch.addcdiv, "/")],
+)
+def test_addcmul_and_addcdiv_match_pytorch(operation, operator, value) -> None:
+    torch.manual_seed(29)
+    accumulator = torch.randn(3, 4)
+    left = torch.randn(3, 4)
+    right = torch.randn(3, 1).abs() + 0.5
+    expression = "1.0" if value is None else repr(float(value))
+
+    if value is None:
+
+        def fn(acc, first, second):
+            # Adding the accumulator keeps the op inside a fused region, which
+            # is the path a real graph takes for a non-terminal operation.
+            return operation(acc, first, second) + acc
+
+    else:
+
+        def fn(acc, first, second):
+            return operation(acc, first, second, value=value) + acc
+
+    result = compile_callable(fn, (accumulator, left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+    source = result.plan.kernels[0].source
+    # ATen scales the numerator before dividing, so addcdiv emits
+    # `self + value * t1 / t2` rather than `self + value * (t1 / t2)`.
+    assert f"{expression} * (" in source
+    if operator == "/":
+        assert ") / (" in source
+
+    actual = result.plan(
+        _torch_to_mlx(accumulator), _torch_to_mlx(left), _torch_to_mlx(right)
+    )[0]
+    expected = _torch_to_mlx(fn(accumulator, left, right))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_addcmul_rejects_integer_operands() -> None:
+    value = torch.arange(4, dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="floating-point"):
+        compile_callable(
+            lambda acc, left, right: torch.addcmul(acc, left, right),
+            (value, value, value),
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_integer_bitwise_ops_fuse_with_tensor_and_scalar_operands(dtype) -> None:
     left = torch.tensor([-9, -4, -1, 0, 1, 4, 9], dtype=dtype)

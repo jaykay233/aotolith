@@ -202,6 +202,25 @@ inline float tsc_mish(float value) {
         : value * metal::tanh(tsc_softplus(value, 1.0f, 20.0f));
 }
 
+inline float tsc_floor_div_f32(float dividend, float divisor) {
+    return metal::floor(dividend / divisor);
+}
+
+inline float tsc_remainder_f32(float dividend, float divisor) {
+    float mod = metal::fmod(dividend, divisor);
+    if (mod != 0.0f && ((divisor < 0.0f) != (mod < 0.0f))) {
+        mod += divisor;
+    }
+    return mod;
+}
+
+inline float tsc_lerp_f32(float start, float end, float weight) {
+    // ATen's lerp picks the branch with the smaller cancellation error.
+    return metal::abs(weight) < 0.5f
+        ? start + weight * (end - start)
+        : end - (end - start) * (1.0f - weight);
+}
+
 inline int tsc_neg_i32(int value) {
     return (int)(0u - (uint)value);
 }
@@ -4100,6 +4119,36 @@ def _validate_pointwise_region(
                 raise ValueError("numeric masked_fill requires a numeric value")
             continue
 
+        if op.op == "lerp":
+            floating_inputs = len(input_types) == 3 or (
+                len(input_types) == 2 and "weight" in op.attrs
+            )
+            if not floating_inputs:
+                raise ValueError("lerp requires one weight tensor or scalar")
+            if any(
+                input_type.dtype not in _FLOATING_DTYPES
+                for input_type in input_types
+            ):
+                raise ValueError("lerp requires floating-point tensor operands")
+            continue
+
+        if op.op in {"addcmul", "addcdiv"}:
+            if len(input_types) != 3:
+                raise ValueError(
+                    f"{op.op} requires self, tensor1 and tensor2 tensors"
+                )
+            if any(
+                input_type.dtype not in _FLOATING_DTYPES
+                for input_type in input_types
+            ):
+                raise ValueError(
+                    f"{op.op} requires floating-point tensor operands"
+                )
+            value = op.attrs.get("value", 1.0)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{op.op}.value must be a scalar, got {value!r}")
+            continue
+
         if output_type.dtype == DType.BOOL or any(
             input_type.dtype == DType.BOOL for input_type in input_types
         ):
@@ -4613,6 +4662,31 @@ def _emit_pointwise_expression(
     if op.op == "atan2":
         left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_atan2({left}, {right})"
+    if op.op == "floor_divide":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"tsc_floor_div_f32({left}, {right})"
+    if op.op == "remainder":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"tsc_remainder_f32({left}, {right})"
+    if op.op == "fmod":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"metal::fmod({left}, {right})"
+    if op.op == "lerp":
+        if len(arguments) == 3:
+            return f"tsc_lerp_f32({arguments[0]}, {arguments[1]}, {arguments[2]})"
+        if len(arguments) != 2 or "weight" not in op.attrs:
+            raise ValueError("malformed lerp op")
+        weight = _msl_float_literal(float(op.attrs["weight"]))
+        return f"tsc_lerp_f32({arguments[0]}, {arguments[1]}, {weight})"
+    if op.op in {"addcmul", "addcdiv"}:
+        if len(arguments) != 3:
+            raise ValueError(f"{op.op} requires three tensor operands")
+        value = _msl_float_literal(float(op.attrs.get("value", 1.0)))
+        operator = "*" if op.op == "addcmul" else "/"
+        return (
+            f"{arguments[0]} + {value} * ({arguments[1]}) "
+            f"{operator} ({arguments[2]})"
+        )
     if op.op in {"add", "sub", "rsub"}:
         left, right = _binary_operands(op, arguments, input_types)
         operator = "+" if op.op == "add" else "-"

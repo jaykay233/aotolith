@@ -102,6 +102,10 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.div.Tensor` | `div` |
 | `aten.floor_divide.default`、`aten.floor_divide.Tensor`、`aten.floor_divide.Scalar` | `floor_divide` |
 | `aten.remainder.Tensor`、`aten.remainder.Scalar` | `remainder` |
+| `aten.fmod.Tensor`、`aten.fmod.Scalar` | `fmod` |
+| `aten.lerp.Tensor`、`aten.lerp.Scalar` | `lerp`，保留 tensor 或标量 weight |
+| `aten.addcmul.default` | `addcmul`，保留 `value`（默认 1） |
+| `aten.addcdiv.default` | `addcdiv`，保留 `value`（默认 1） |
 | `aten.pow.Tensor_Tensor`、`aten.pow.Tensor_Scalar`、`aten.pow.Scalar` | `pow` |
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
 | `aten.logaddexp.default` | `logaddexp` |
@@ -309,6 +313,8 @@ input_offset = (elem % 3) * 1
 `maximum`/`minimum` 在比较相等时选择左操作数，以匹配 PyTorch 对 signed zero 的行为，并显式传播任一操作数的 NaN。`logaddexp` 使用 `max(a, b) + log1p(exp(-abs(a - b)))`，避免两个同号大数直接相加后溢出；任一输入为 NaN 时返回 NaN，最大值为正无穷时返回正无穷，两个 `-inf` 返回 `-inf`。`exp2` 直接生成 `metal::exp2`。
 
 Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异，因此 `tsc_atan2` 显式处理 NaN、`x == ±0`、`y == ±0`、`x`/`y` 为无穷以及 `(-inf, -inf)` 等象限边界，其余有限值回退到系统 `atan2`。这些规则与 `torch.atan2` 的参数顺序一致。
+
+浮点 `floor_divide` 生成 `tsc_floor_div_f32`，就是 `floor(a / b)`，`inf`/`NaN` 按 IEEE 传播；浮点 `remainder` 生成 `tsc_remainder_f32`，先取 `metal::fmod` 再在余数非零且与除数异号时加一次除数，与 ATen 的浮点 kernel 同构，因此结果始终与除数同号。`fmod` 直接生成 `metal::fmod`，符号跟随被除数。`lerp` 生成 `tsc_lerp_f32`，照搬 ATen 的两个分支——`|weight| < 0.5` 时用 `start + weight * (end - start)`，否则用 `end - (end - start) * (1 - weight)`——两个分支的取舍是为了减少抵消误差，`lerp.Scalar` 的标量 weight 在编译期就成为字面量。`addcmul`/`addcdiv` 生成 `self + value * t1 * t2` 与 `self + value * t1 / t2`；`addcdiv` 保持 ATen 的求值顺序（先乘后除），因为 `value * t1 / t2` 与 `value * (t1 / t2)` 在浮点下并不相等。这三种算子只接受浮点 tensor，整数输入在 lowering 阶段报错，而 `floor_divide`/`remainder`/`fmod` 对整数与浮点都支持。
 
 整数常量和 `arange` 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。整数 `arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。浮点 `arange` 不能直接用 double 走 GPU：Metal 没有 double，所以编译期把 `start`、`step` 这两个 Python double 各拆成 float 头尾（`hi` 是平台 float32 舍入值，`lo` 是剩下那部分），kernel 内先算 `factor * step_hi`，用 `fma` 拿到乘积的精确残差，再用 two-sum 求出 `product + start_hi` 的舍入误差，最后把两个误差和常量尾部一起加回去。这样每个元素等价于一次双精度求和后舍入，`arange(0, 1, 0.1)` 给出 0.9 而不是 float32 乘积的 0.90000004。
 
