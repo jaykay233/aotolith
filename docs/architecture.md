@@ -32,7 +32,7 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 
 模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；它们在运行期和 artifact 里共享同一份 buffer 和 payload，见第 15 节。
 
-HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。其余关键字参数仍是 tracing 期常量；值里嵌套 tensor（list/dict 等）目前明确报错而不是静默当成常量。
+HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。提升是递归的：list、tuple、mapping 里嵌套的 tensor 也会逐个成为图输入（`position_embeddings=(cos, sin)` 对应一个关键字、两个图输入，`past_key_values=[(k, v), ...]` 同理），调用方按 tracing 时的嵌套结构传回同一个值。同一个值里非 tensor 的叶子仍是 tracing 期常量，调用时传入不同的值会报错，而不是被静默忽略。其余关键字参数整体仍是 tracing 期常量。
 
 两层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 
@@ -51,6 +51,9 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.t.default` | `transpose`，rank-2 矩阵转置 |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
+| `aten.scatter_add.default` | `scatter`，`reduce=add` |
+| `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin` |
+| `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
 | `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
@@ -148,6 +151,10 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 `gather` 的输入同样为 `source, indices`，但 indices 必须与 source 同 rank，输出 shape 和 dtype 分别等于 indices shape 和 source dtype。非 gather 轴上，indices 对应维度不能大于 source；gather 轴长度不受此限制，索引值仍须落在 source 该轴范围内。Runtime 先按 indices shape 截取 source 的非 gather 轴，再调用 `mx.take_along_axis`。这样既满足 MLX 对非 gather 轴的严格形状要求，也保留 PyTorch 允许索引子区域的行为。`sparse_grad` 只影响反向传播，推理 lowering 会忽略。
 
 `scatter` 输入为 `source, indices`，`aten.scatter.src` 额外接收 update tensor，`aten.scatter.value` 把 scalar 写入 `value` attribute。source、indices 和 update 必须同 rank；indices 的每个非 scatter 轴不能大于 source；update 的每一维不能小于 indices，与 PyTorch 的 `index.size(d) <= src.size(d)` 约束一致。输出始终保持 source 的 shape 和 dtype。Runtime 检查索引范围，把 update 截到 indices shape，调用 `mx.put_along_axis`，再复制 source 并写回更新区域，因此不会修改输入。重复索引的胜者与 PyTorch 一样不做确定性保证。
+
+`aten.scatter_add.default` 和 `aten.scatter_reduce.two` 复用同一个 `scatter` op，只是多带 `reduce` attribute（`add`、`prod`、`amax`、`amin`）和 `include_self` bool。MLX 没有会归约的 `put_along_axis`，所以 Runtime 换成 advanced indexing：非 scatter 轴各取一段 `arange` 网格并广播到 indices shape，得到和 scatter 形式一一对应的坐标，再用 `array.at[...]` 的 `add`/`multiply`/`maximum`/`minimum` 完成累加。`include_self=False` 表示被写到的位置只由 update 归约，不能被 source 参与，因此先以该归约的单位元（0、1、∓inf）建累加器，再用 `put_along_axis` 写出的 mask 把未写到的位置拼回 source。`amax`/`amin` 的单位元是 ±inf，整数输入会因此显式报错。`reduce='mean'` 需要每个输出位置的计数，单次 scatter 无法累计，前端直接报错而不是近似。重复索引的累加顺序不做确定性保证，与 CUDA 的 `scatter_add` 一致。
+
+`aten.index_add.default` 单独 lowering 成 `index_add` op：index 必须是 1-D，update 形状是 source 在 `dim` 轴替换成 index 长度后的形状，`alpha` 作为 attribute 保留。Runtime 检查范围后用 `source.at[..., indices].add(update * alpha)` 一次完成，输出仍是新的 tensor，不修改输入。
 
 `aten.select.int` 没有独立 IR op。前端把负轴和负索引归一化，校验索引范围，再生成只包含目标元素的 `slice` 和删除该轴的 `squeeze`。输入 rank 为 1 时输出 rank-0 scalar；其他情况下输出 shape 等于输入删除目标轴后的 shape。
 
@@ -436,7 +443,8 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 - attention：优先调用生成的 MSL kernel；未生成或发生 fallback 时调用 `mx.fast.scaled_dot_product_attention`，并对安全 softmax 的整行 mask 补零
 - embedding/index_select：调用带范围检查的 MLX `mx.take`，输出保持 source dtype
 - gather：检查索引范围，截取非 gather 轴后调用 MLX `mx.take_along_axis`
-- scatter：检查索引范围，把 update 截到 indices shape，复制 source 后用 `mx.put_along_axis` 更新
+- scatter：检查索引范围，把 update 截到 indices shape，复制 source 后用 `mx.put_along_axis` 更新；带 `reduce` 时改用广播坐标网格加 `array.at[...]` 的归约方法
+- index_add：检查索引范围后用 `source.at[..., indices].add(update * alpha)` 累加
 - `cat`：校验后的 tensor 输入交给 `mx.concatenate`
 - layout op：调用 MLX 的 view、broadcast 和 slicing 语义
 - cast：调用 MLX `astype`，保留源和目标 dtype、shape
@@ -475,7 +483,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 | `storage_plan.json` | live interval、slot、release point、峰值活跃字节和 arena 大小 |
 | `state/*.bin` | module 参数和 buffer 的 MLX 原始字节，每个 state entry 记录名称、shape、dtype、nbytes 和 digest |
 
-ABI 1.3 增加了 `entrypoint.kwargs`，记录被提升为图输入的 tensor 关键字参数。图输入顺序是 public inputs、这些关键字输入、state；`entrypoint.input_count` 仍然只数 public inputs，因此读取 1.2 产物（没有该字段）时布局与旧版一致。
+ABI 1.3 增加了 `entrypoint.kwargs`，记录被提升为图输入的 tensor 关键字参数。图输入顺序是 public inputs、这些关键字输入、state；`entrypoint.input_count` 仍然只数 public inputs，因此读取 1.2 产物（没有该字段）时布局与旧版一致。每条 `kwargs` 记录对应一个 tensor 叶子，`name` 是关键字名，`path` 记录它在值里的位置（`["tuple", 0]`、`["dict", "mask"]` 这样的容器链）。`path` 是后加的可选字段：没有它时该关键字的名字就是一个叶子，旧产物因此照旧加载；只有嵌套提升才会写出非空 `path`。
 
 两张图、kernel table、selection table、storage plan 和每个 state tensor 都使用 SHA-256 digest。`read_artifact_manifest()` 只校验 manifest 中的格式、ABI、target 和可选 device profile；`load_compiled_module()` 还会读取并校验全部 payload，反序列化 IR，检查入口的 public input、关键字输入和 state 布局，再根据 lowered graph 和已保存的 selection 重建 kernel。
 
@@ -492,7 +500,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `arange` 目前只支持整数 start/end/step 和 I32/I64 输出；浮点 `arange` 尚未实现
 - bool tensor 支持比较、logical、bitwise、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；I32/I64 tensor 除作为 embedding/index_select/gather/scatter indices 外，也支持上述整数 pointwise 集合
 - 整数 pointwise 当前要求输入、tensor 边界和输出同宽；I32 与 I64 混合、除 `torch.square` 特殊形式外的整数 `pow`、true division 和不在支持集合内的算子会明确报错。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
-- scatter 只支持默认写入语义，不支持 `reduce`、`scatter_add` 或 `scatter_reduce`
+- scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`，含 `include_self=False`）都支持；`reduce='mean'` 需要逐输出计数，尚未实现。`index_add` 只接受 1-D index，`index_add_` 这类原地形式不做 SSA legalization。重复索引的累加顺序不做确定性保证
 - softmax 支持任意单轴，但不支持一次对多个轴做 softmax
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - LayerNorm/RMSNorm 只支持连续尾维 reduction

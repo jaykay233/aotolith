@@ -166,7 +166,19 @@ compiled = aoto.compile_module(
 logits = compiled(input_ids, position_ids=position_ids)[0]
 ```
 
-非 tensor 的关键字参数在 tracing 期固定；值里只是**包含** tensor 的关键字参数会明确报错，不会被静默当成常量捕获。
+非 tensor 的关键字参数在 tracing 期固定。提升是递归的：值里嵌在 list、tuple、mapping 中的 tensor 各自成为一个图输入，调用方按同样的嵌套结构传回：
+
+```python
+cos, sin = position_embeddings  # 新版 HF 层就是这样传的一对 tensor
+compiled = aoto.compile_module(
+    model,
+    (input_ids,),
+    example_kwargs={"position_embeddings": (cos, sin)},
+)
+logits = compiled(input_ids, position_embeddings=(cos, sin))[0]
+```
+
+不是 tensor 的叶子——比如 `use_cache=False`，或者同一个 mapping 里的一个 float——仍然是 tracing 期常量；调用时给它传不同的值会报错，而不是被静默忽略。
 
 ### 编译 Qwen2.5 静态 KV Cache
 
@@ -369,7 +381,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 |---|---|
 | 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting |
-| 索引 | embedding、`index_select`、advanced indexing、`gather` 和 `scatter` |
+| 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin` |
 | Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、sum/mean、cumsum、LayerNorm、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
 | 布局与数据移动 | view/reshape、transpose/permute、slice、expand、cat/stack、clone、cast 和静态常量 |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32 和 I64 |
@@ -380,9 +392,10 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 ## 已知限制
 
 - shape 和 dtype 在编译期固定，不支持动态 shape、符号维度和控制流。
-- tensor-valued `example_kwargs` 会被提升为图输入、按名字传入；值里只是**包含** tensor（list/dict 等）的关键字参数会明确报错，而不是被当作常量捕获。
+- tensor-valued `example_kwargs` 会被提升为图输入、按名字传入，而且是递归提升的：list、tuple、mapping 里嵌套的 tensor 各自成为一个图输入，所以 `position_embeddings=(cos, sin)` 是一个关键字对应两个输入，`past_key_values=[(k, v), ...]` 同理；调用方按 tracing 时的嵌套结构传回。同一个值里非 tensor 的叶子仍是 tracing 期常量，传入不同的值会报错而不是被静默替换。
 - 共享参数只绑定一次：同一个 tensor 在两个名字下共享同一个 MLX buffer 和同一份 artifact payload。图里仍然每个名字一个输入，因为 tracing 就是这么产生的。只共享 storage 但内容不同的视图（如 tensor 和它的 `.t()`）不会被合并。
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
+- `scatter`、`scatter_add`、`scatter_reduce` 和 `index_add` 走 MLX 而不是生成 kernel。归约覆盖 `sum`/`prod`/`amax`/`amin`，都支持 `include_self=False`；`scatter_reduce(reduce="mean")` 需要逐输出计数，直接报错；`amax`/`amin` 在 `include_self=False` 时需要浮点输入，因为它们的单位元是 ±inf。重复索引按设备调度顺序累加，这正是 CUDA `scatter_add` 给出的保证，而 PyTorch 的 CPU 路径给不了。
 - 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 FP16/BF16 matmul shape 上都快于 MLX；f32 则是刻意比 MLX 慢——tensor core 没有 f32 模式，所以它留在与 PyTorch 逐位一致的标量 kernel 上。`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢 10%–17%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。
 - Qwen2 静态 cache 适配层只实现 SiLU MLP 激活和普通 causal mask。如果 config 选了别的激活或 sliding-window 层，会在编译期直接拒绝，而不是按错误的语义编译出结果。这些检查读的是构造好的层，而不是 config 字符串——库会把其中一部分字段归一化掉。激活用数值方式校验，因此连 config 描述不到的自定义 `act_fn` 也能抓到。

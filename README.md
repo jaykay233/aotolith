@@ -166,7 +166,19 @@ compiled = aoto.compile_module(
 logits = compiled(input_ids, position_ids=position_ids)[0]
 ```
 
-Non-tensor keyword arguments stay fixed at trace time, and a keyword whose value only *contains* tensors is rejected rather than silently captured as a constant.
+Non-tensor keyword arguments stay fixed at trace time. Promotion is recursive, so a keyword that holds tensors inside a list, tuple or mapping produces one graph input per tensor and the caller passes the same nesting back:
+
+```python
+cos, sin = position_embeddings  # a pair of tensors, as newer HF layers take them
+compiled = aoto.compile_module(
+    model,
+    (input_ids,),
+    example_kwargs={"position_embeddings": (cos, sin)},
+)
+logits = compiled(input_ids, position_embeddings=(cos, sin))[0]
+```
+
+Leaves that are not tensors — `use_cache=False`, or a float inside the same mapping — remain tracing-time constants. Passing a different value for one raises instead of being silently ignored.
 
 ### Compile a Qwen2.5 Static KV Cache
 
@@ -369,7 +381,7 @@ Tensor cores need Apple GPU family 9 or later, so both tensor-core paths are gat
 |---|---|
 | Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode; Qwen2.5-0.5B-Instruct validated |
 | Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, including supported batch broadcasting |
-| Indexing | Embedding, `index_select`, advanced indexing, `gather`, and `scatter` |
+| Indexing | Embedding, `index_select`, advanced indexing, `gather`, `scatter`, `scatter_add`, `index_add`, and the `scatter_reduce` reductions `sum`/`prod`/`amax`/`amin` |
 | Transformer operations | Scaled dot-product attention, decomposed causal attention, softmax, sum/mean, cumsum, LayerNorm, RMSNorm, SiLU, GELU, SwiGLU, and other common pointwise operations |
 | Layout and data movement | View/reshape, transpose/permute, slice, expand, cat/stack, clone, casts, and static constants |
 | Dtypes | FP16, BF16, FP32, bool, I32, and I64 where supported by the operation |
@@ -380,9 +392,10 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 ## Known Limitations
 
 - Shapes and dtypes are fixed at compile time. Dynamic shapes, symbolic dimensions, and control flow are not supported.
-- Tensor-valued `example_kwargs` are promoted to graph inputs and passed by name. Keyword values that merely *contain* tensors (a list or dict of them) are rejected rather than captured as constants.
+- Tensor-valued `example_kwargs` are promoted to graph inputs and passed by name. Promotion is recursive: tensors nested inside lists, tuples and mappings each become a graph input, so `position_embeddings=(cos, sin)` is one keyword over two inputs and `past_key_values=[(k, v), ...]` works the same way; callers pass the traced nesting back. Non-tensor leaves inside such a value stay tracing-time constants, and passing a different value for one is an error rather than a silent substitution.
 - Tied parameters are bound once: a tensor reachable under two names shares one MLX buffer and one artifact payload. The graph still has an input per name, because that is what tracing produced. Views that share storage without sharing contents (a tensor and its `.t()`) are kept separate.
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
+- `scatter`, `scatter_add`, `scatter_reduce` and `index_add` execute on MLX rather than in a generated kernel. The reductions cover `sum`/`prod`/`amax`/`amin`, each with `include_self=False`; `scatter_reduce(reduce="mean")` is rejected because it needs a per-output count, and `amax`/`amin` without `include_self` need a floating-point input since their identity is ±inf. Duplicate indices accumulate in the device's order, which is the guarantee CUDA `scatter_add` gives and PyTorch's CPU path does not.
 - Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured FP16/BF16 matmul shapes. f32 is slower than MLX on purpose: it stays on the exact scalar kernel because the tensor cores have no f32 mode. `codegen_attention` trails MLX's SDPA by 10-17% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
 - The Qwen2 static-cache adapter implements SiLU MLP activation and a plain causal mask only. A config that selects another activation or sliding-window layers is rejected at compile time rather than compiled against the wrong semantics; the check reads the constructed layers rather than the config string, because the library normalises some of those fields away. The adapter verifies the activation numerically, which also catches a custom `act_fn` that the config does not describe.
