@@ -649,6 +649,58 @@ def _evaluate_mlx_op(
         axis = int(op.attrs["dim"]) % value.ndim
         shifted = value - mx.logsumexp(value, axis=axis, keepdims=True)
         return shifted.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op in {"argmax", "argmin"}:
+        value = env[op.inputs[0]]
+        operation = mx.argmax if op.op == "argmax" else mx.argmin
+        dim = op.attrs.get("dim")
+        if dim is None:
+            reduced = operation(value.reshape(-1))
+        else:
+            reduced = operation(
+                value,
+                axis=int(dim) % value.ndim,
+                keepdims=bool(op.attrs.get("keepdim", False)),
+            )
+        return reduced.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op in {"sort", "argsort"}:
+        value = env[op.inputs[0]]
+        axis = int(op.attrs["dim"]) % value.ndim
+        operation = mx.sort if op.op == "sort" else mx.argsort
+        ordered = operation(value, axis=axis)
+        if bool(op.attrs.get("descending", False)):
+            ordered = mx.flip(ordered, axis=axis)
+        return ordered.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op in {"topk", "topk_indices"}:
+        value = env[op.inputs[0]]
+        axis = int(op.attrs["dim"]) % value.ndim
+        k = int(op.attrs["k"])
+        largest = bool(op.attrs.get("largest", True))
+        if op.op == "topk":
+            if k == value.shape[axis]:
+                # MLX's select-based topk does not order a full-length window,
+                # so a full selection falls back to a sort.
+                ordered = mx.argsort(value, axis=axis)
+                if largest:
+                    ordered = mx.flip(ordered, axis=axis)
+                selected = mx.take_along_axis(value, ordered, axis=axis)
+            else:
+                # MLX returns the selected window in ascending order, so both
+                # directions reverse it to match torch.topk's sorted output.
+                raw = mx.topk(value if largest else -value, k, axis=axis)
+                selected = mx.flip(raw, axis=axis)
+                if not largest:
+                    selected = -selected
+        else:
+            indices = mx.argsort(value, axis=axis)
+            selection: list[slice] = [slice(None)] * value.ndim
+            if largest:
+                selection[axis] = slice(value.shape[axis] - k, value.shape[axis])
+                indices = mx.flip(indices[tuple(selection)], axis=axis)
+            else:
+                selection[axis] = slice(0, k)
+                indices = indices[tuple(selection)]
+            selected = indices
+        return selected.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
     if op.op == "cumsum":
         axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
         value = mx.cumsum(env[op.inputs[0]], axis=axis)
@@ -1401,6 +1453,10 @@ class AppleMetalBackend:
                 _validate_mlx_reduction_op(graph, op)
             elif op.op == "log_softmax":
                 _validate_log_softmax_op(graph, op)
+            elif op.op in {"argmax", "argmin"}:
+                _validate_arg_reduction_op(graph, op)
+            elif op.op in {"sort", "argsort", "topk", "topk_indices"}:
+                _validate_ordering_op(graph, op)
             elif op.op in {"triu", "tril"}:
                 _validate_triangular_op(graph, op)
             elif op.op == "cast":
@@ -7654,6 +7710,105 @@ def _validate_log_softmax_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             "log_softmax must preserve the input tensor type, got "
             f"{(output_type.shape, output_type.dtype.value)}"
+        )
+
+
+def _validate_arg_reduction_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    keepdim = op.attrs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{op.op}.keepdim must be a boolean, got {keepdim!r}")
+    dim = op.attrs.get("dim")
+    if dim is None:
+        if keepdim:
+            raise ValueError(f"{op.op} cannot keep a dimension without a dim")
+        expected = () if rank else ()
+    else:
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"{op.op}.dim must be an integer or None, got {dim!r}")
+        if not -rank <= dim < rank:
+            raise ValueError(f"{op.op}.dim {dim} exceeds rank {rank}")
+        axis = dim % rank
+        expected = (
+            tuple(
+                1 if position == axis else size
+                for position, size in enumerate(input_type.shape)
+            )
+            if keepdim
+            else tuple(
+                size
+                for position, size in enumerate(input_type.shape)
+                if position != axis
+            )
+        )
+    if output_type.shape != expected:
+        raise ValueError(
+            f"{op.op} output shape {output_type.shape} does not match {expected}"
+        )
+    if output_type.dtype != DType.I64:
+        raise ValueError(
+            f"{op.op} must return I64 indices, got {output_type.dtype.value}"
+        )
+    if input_type.dtype == DType.BOOL:
+        raise ValueError(f"{op.op} does not accept boolean tensor inputs")
+
+
+def _validate_ordering_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise ValueError(f"{op.op} does not support rank-0 tensors")
+    dim = op.attrs.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{op.op}.dim must be an integer, got {dim!r}")
+    if not -rank <= dim < rank:
+        raise ValueError(f"{op.op}.dim {dim} exceeds rank {rank}")
+    axis = dim % rank
+
+    if op.op in {"sort", "argsort"}:
+        descending = op.attrs.get("descending", False)
+        if not isinstance(descending, bool):
+            raise ValueError(
+                f"{op.op}.descending must be a boolean, got {descending!r}"
+            )
+        expected = input_type.shape
+        expected_dtype = input_type.dtype if op.op == "sort" else DType.I64
+    else:
+        largest = op.attrs.get("largest", True)
+        if not isinstance(largest, bool):
+            raise ValueError(
+                f"{op.op}.largest must be a boolean, got {largest!r}"
+            )
+        k = op.attrs.get("k")
+        if not isinstance(k, int) or isinstance(k, bool) or k < 0:
+            raise ValueError(f"{op.op}.k must be a non-negative integer, got {k!r}")
+        if k > input_type.shape[axis]:
+            raise ValueError(
+                f"{op.op}.k {k} exceeds dimension {axis} of size "
+                f"{input_type.shape[axis]}"
+            )
+        expected = input_type.shape[:axis] + (k,) + input_type.shape[axis + 1 :]
+        expected_dtype = input_type.dtype if op.op == "topk" else DType.I64
+
+    if output_type.shape != expected:
+        raise ValueError(
+            f"{op.op} output shape {output_type.shape} does not match {expected}"
+        )
+    if output_type.dtype != expected_dtype:
+        raise ValueError(
+            f"{op.op} must return {expected_dtype.value}, got "
+            f"{output_type.dtype.value}"
+        )
+    if input_type.dtype == DType.BOOL:
+        raise NotImplementedError(
+            f"{op.op} does not accept boolean tensor inputs"
         )
 
 

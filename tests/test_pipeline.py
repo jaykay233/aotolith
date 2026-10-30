@@ -1806,6 +1806,175 @@ def test_log_softmax_matches_pytorch(dim, shape) -> None:
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("name", "fn"),
+    [
+        ("dim", lambda value: value.argmax(-1)),
+        ("keepdim", lambda value: value.argmax(1, keepdim=True)),
+        ("whole tensor", lambda value: value.argmax()),
+        ("argmin", lambda value: value.argmin(0)),
+        ("argmin keepdim", lambda value: value.argmin(-2, keepdim=True)),
+    ],
+)
+def test_arg_reductions_match_pytorch(name, fn) -> None:
+    torch.manual_seed(56)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "argmin" if "argmin" in name else "argmax"
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.int64
+    assert actual.shape == tuple(expected.shape)
+    assert mx.array_equal(actual, expected)
+
+
+def test_argmax_on_integers_and_rank_zero_output() -> None:
+    x = torch.tensor([[3, 9, 1], [7, 2, 5]])
+    result = compile_callable(lambda value: value.argmax(), (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert actual.shape == ()
+    assert int(actual) == int(x.argmax())
+
+
+@pytest.mark.parametrize(
+    ("dim", "descending"),
+    [(1, False), (-1, False), (0, True), (1, True)],
+)
+def test_sort_values_and_indices_match_pytorch(dim, descending) -> None:
+    torch.manual_seed(57)
+    x = torch.randn(4, 6)
+
+    def fn(value):
+        sorted_result = torch.sort(value, dim=dim, descending=descending)
+        return sorted_result.values, sorted_result.indices
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["sort", "argsort"]
+    values, indices = result.plan(mx.array(x.numpy()))
+    expected_values, expected_indices = fn(x)
+    mx.eval(values, indices)
+    assert values.dtype == mx.float32
+    assert indices.dtype == mx.int64
+    assert mx.array_equal(values, mx.array(expected_values.numpy()))
+    assert mx.array_equal(indices, mx.array(expected_indices.numpy()))
+
+
+def test_sort_emits_only_the_selection_the_graph_reads() -> None:
+    torch.manual_seed(58)
+    x = torch.randn(3, 5)
+
+    values_only = compile_callable(
+        lambda value: torch.sort(value, dim=-1).values, (x,)
+    )
+    assert [op.op for op in values_only.lowered_graph.ops] == ["sort"]
+
+    indices_only = compile_callable(
+        lambda value: torch.sort(value, dim=-1).indices, (x,)
+    )
+    assert [op.op for op in indices_only.lowered_graph.ops] == ["argsort"]
+    actual = indices_only.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(torch.sort(x, dim=-1).indices.numpy()))
+
+
+def test_sort_orders_nan_like_pytorch() -> None:
+    x = torch.tensor([[1.0, float("nan"), 3.0, 2.0]])
+    for descending in (False, True):
+        result = compile_callable(
+            lambda value: torch.sort(value, dim=-1, descending=descending).values,
+            (x,),
+        )
+        actual = result.plan(mx.array(x.numpy()))[0]
+        expected = mx.array(
+            torch.sort(x, dim=-1, descending=descending).values.numpy()
+        )
+        mx.eval(actual, expected)
+        same = mx.equal(actual, expected) | (mx.isnan(actual) & mx.isnan(expected))
+        assert bool(mx.all(same))
+
+
+@pytest.mark.parametrize(
+    ("k", "dim", "largest"),
+    [(2, -1, True), (3, 0, False), (5, 1, True), (1, 1, True), (6, 1, False)],
+)
+def test_topk_values_and_indices_match_pytorch(k, dim, largest) -> None:
+    torch.manual_seed(59)
+    x = torch.randn(4, 6) if dim in {-1, 1} else torch.randn(5, 4)
+
+    def fn(value):
+        selected = torch.topk(value, k, dim=dim, largest=largest)
+        return selected.values, selected.indices
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "topk",
+        "topk_indices",
+    ]
+    values, indices = result.plan(mx.array(x.numpy()))
+    expected_values, expected_indices = fn(x)
+    mx.eval(values, indices)
+    assert values.shape == tuple(expected_values.shape)
+    assert indices.dtype == mx.int64
+    assert mx.array_equal(values, mx.array(expected_values.numpy()))
+    assert mx.array_equal(indices, mx.array(expected_indices.numpy()))
+
+
+def test_topk_emits_each_selection_independently() -> None:
+    torch.manual_seed(60)
+    x = torch.randn(2, 7)
+
+    indices_only = compile_callable(
+        lambda value: torch.topk(value, 3, dim=-1).indices, (x,)
+    )
+    assert [op.op for op in indices_only.lowered_graph.ops] == ["topk_indices"]
+    actual = indices_only.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(torch.topk(x, 3, dim=-1).indices.numpy()))
+
+
+def test_topk_rejects_k_beyond_the_dimension() -> None:
+    input_type = TensorType((2, 3), DType.F32)
+    output_type = TensorType((2, 4), DType.F32)
+    graph = Graph(
+        ("x",),
+        {"x": Value("x", input_type), "out": Value("out", output_type)},
+        (
+            Operation(
+                "topk",
+                ("x",),
+                ("out",),
+                {"dim": 1, "k": 4, "largest": True},
+            ),
+        ),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="exceeds dimension"):
+        compile_graph(graph)
+
+
+def test_sorting_survives_an_artifact_round_trip(tmp_path) -> None:
+    torch.manual_seed(61)
+    x = torch.randn(3, 6)
+
+    def fn(value):
+        values, _ = torch.sort(value, dim=-1, descending=True)
+        return values.argmax(-1), torch.topk(value, 2, dim=-1).values
+
+    result = compile_callable(fn, (x,))
+    path = tmp_path / "sorting.aoto"
+    save_compiled(result, path)
+    loaded = load_compiled_module(path)
+    actual = loaded(mx.array(x.numpy()))
+    expected = fn(x)
+    mx.eval(*actual)
+    for produced, reference in zip(actual, expected, strict=True):
+        assert mx.array_equal(produced, mx.array(reference.numpy()))
+
+
 def test_log_softmax_supports_low_precision() -> None:
     torch.manual_seed(55)
     x = torch.randn(2, 6, dtype=torch.float16)

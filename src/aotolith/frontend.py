@@ -39,6 +39,8 @@ _SUPPORTED_OPS = {
     "aten.amax.default": "amax",
     "aten.amin.default": "amin",
     "aten.cumsum.default": "cumsum",
+    "aten.argmax.default": "argmax",
+    "aten.argmin.default": "argmin",
     "aten.mean.default": "mean",
     "aten.mean.dim": "mean",
     "aten.silu.default": "silu",
@@ -266,6 +268,10 @@ _SCATTER_REDUCE_NAMES = {
     "mean": "mean",
 }
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
+# `sort` and `topk` return (values, indices); the IR has single-output
+# operations, so each selection becomes its own operation and only the ones the
+# graph actually reads are emitted.
+_SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
@@ -482,6 +488,20 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 for user in node.users:
                     node_ids[user] = output_id
                 values[output_id] = Value(output_id, _node_type(output_node))
+                continue
+            if target in _SORT_TARGETS:
+                sort_ops, produced = _sort_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in sort_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                for user in node.users:
+                    index = user.args[1]
+                    if index in produced:
+                        node_ids[user] = produced[index]
+                    else:
+                        dead_nodes.add(user)
                 continue
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
@@ -1643,6 +1663,116 @@ def _layer_norm_operation(
     return tuple(inputs), attrs, output_type, frozenset(wanted)
 
 
+def _sort_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], dict[int, str]]:
+    """Lower ``sort``/``topk`` selections into single-output IR operations."""
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{target} expects a tensor input")
+
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+
+    if target == "aten.sort.default":
+        dim = args[1] if len(args) > 1 else kwargs.get("dim", -1)
+        descending = args[2] if len(args) > 2 else kwargs.get("descending", False)
+        stable = args[3] if len(args) > 3 else kwargs.get("stable", False)
+        if not isinstance(descending, bool):
+            raise ValueError(
+                f"{target}.descending must be a boolean, got {descending!r}"
+            )
+        if not isinstance(stable, bool):
+            raise ValueError(f"{target}.stable must be a boolean, got {stable!r}")
+    else:
+        if len(args) < 2:
+            raise ValueError(f"{target} expects an input and k")
+        dim = args[2] if len(args) > 2 else kwargs.get("dim", -1)
+        largest = args[3] if len(args) > 3 else kwargs.get("largest", True)
+        ordered = args[4] if len(args) > 4 else kwargs.get("sorted", True)
+        if not isinstance(largest, bool):
+            raise ValueError(f"{target}.largest must be a boolean, got {largest!r}")
+        if not isinstance(ordered, bool):
+            raise ValueError(f"{target}.sorted must be a boolean, got {ordered!r}")
+        k = args[1]
+        if not isinstance(k, int) or isinstance(k, bool) or k < 0:
+            raise ValueError(f"{target}.k must be a non-negative integer, got {k!r}")
+
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+    if not -rank <= dim < rank:
+        raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+    axis = dim % rank
+    if target == "aten.topk.default" and k > input_type.shape[axis]:
+        raise ValueError(
+            f"{target}.k {k} exceeds the size {input_type.shape[axis]} of "
+            f"dimension {axis}"
+        )
+
+    wanted: dict[int, object] = {}
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{target} outputs must be selected with getitem")
+        user_args = getattr(user, "args", ())
+        if len(user_args) != 2 or not isinstance(user_args[1], int):
+            raise ValueError(f"malformed {target} getitem: {user!r}")
+        index = user_args[1]
+        if index not in {0, 1}:
+            raise ValueError(f"{target} output index must be 0 or 1, got {index}")
+        if user.users:
+            wanted[index] = user
+
+    operations: list[tuple[Operation, Value]] = []
+    produced: dict[int, str] = {}
+
+    def emit(
+        name: str,
+        attrs: dict[str, object],
+        index: int,
+        output_type: TensorType,
+    ) -> None:
+        output_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (Operation(name, (_argument_ids(input_node, node_ids),), (output_id,), attrs), Value(output_id, output_type))
+        )
+        produced[index] = output_id
+
+    if target == "aten.sort.default":
+        attrs: dict[str, object] = {"dim": axis, "descending": descending}
+        if 0 in wanted:
+            emit("sort", dict(attrs), 0, input_type)
+        if 1 in wanted:
+            emit(
+                "argsort",
+                dict(attrs),
+                1,
+                TensorType(input_type.shape, DType.I64),
+            )
+        return tuple(operations), produced
+
+    k = int(args[1])
+    output_shape = input_type.shape[:axis] + (k,) + input_type.shape[axis + 1 :]
+    attrs = {"dim": axis, "k": k, "largest": largest}
+    if 0 in wanted:
+        emit("topk", dict(attrs), 0, TensorType(output_shape, input_type.dtype))
+    if 1 in wanted:
+        emit(
+            "topk_indices",
+            dict(attrs),
+            1,
+            TensorType(output_shape, DType.I64),
+        )
+    return tuple(operations), produced
+
+
 def _layer_norm_statistics(
     ops: list[Operation],
     values: dict[str, Value],
@@ -2015,6 +2145,27 @@ def _operation_inputs(
     kwargs: dict[str, object] | None = None,
 ) -> tuple[tuple[str, ...], dict[str, object]]:
     kwargs = {} if kwargs is None else kwargs
+    if op in {"argmax", "argmin"}:
+        if not args:
+            raise ValueError(f"{op} expects an input tensor")
+        if len(args) > 3:
+            raise ValueError(
+                f"{op} expects one to three positional arguments, got {len(args)}"
+            )
+        dim = args[1] if len(args) > 1 else kwargs.get("dim")
+        keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+        if dim is not None and (
+            not isinstance(dim, int) or isinstance(dim, bool)
+        ):
+            raise ValueError(f"{op}.dim must be an integer or None, got {dim!r}")
+        if not isinstance(keepdim, bool):
+            raise ValueError(f"{op}.keepdim must be a boolean, got {keepdim!r}")
+        if dim is None and keepdim:
+            raise ValueError(f"{op} cannot keep a dimension without a dim")
+        return (
+            (_argument_ids(args[0], node_ids),),
+            {"dim": dim, "keepdim": keepdim},
+        )
     if op == "cat":
         if len(args) not in {1, 2}:
             raise ValueError(f"cat expects one or two arguments, got {len(args)}")
@@ -2570,6 +2721,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         )
     if op == "cat":
         allowed.add("dim")
+    if op in {"argmax", "argmin"}:
+        allowed.update({"dim", "keepdim"})
     if op == "cumsum":
         allowed.update({"dim", "dtype"})
     if op == "flip":
@@ -2601,6 +2754,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         "roll",
         "triu",
         "tril",
+        "argmax",
+        "argmin",
     }:
         return {}
 
