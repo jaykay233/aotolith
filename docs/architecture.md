@@ -46,7 +46,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.baddbmm.default` | `addmm`，batch 维按 broadcasting 语义执行 |
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
-| `aten.index.Tensor` | `index`，支持连续多轴 advanced indexing 和 index broadcasting |
+| `aten.index.Tensor` | `index`，支持多轴 advanced indexing（含被静态/index 轴隔开的非相邻索引）和 index broadcasting |
 | `aten.cumsum.default` | `cumsum`，沿单个静态轴执行前缀和 |
 | `aten.t.default` | `transpose`，rank-2 矩阵转置 |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
@@ -170,6 +170,8 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 `aten.index_add.default` 单独 lowering 成 `index_add` op：index 必须是 1-D，update 形状是 source 在 `dim` 轴替换成 index 长度后的形状，`alpha` 作为 attribute 保留。Runtime 检查范围后用 `source.at[..., indices].add(update * alpha)` 一次完成，输出仍是新的 tensor，不修改输入。
 
 `aten.select.int` 没有独立 IR op。前端把负轴和负索引归一化，校验索引范围，再生成只包含目标元素的 `slice` 和删除该轴的 `squeeze`。输入 rank 为 1 时输出 rank-0 scalar；其他情况下输出 shape 等于输入删除目标轴后的 shape。
+
+`aten.index.Tensor` 规范化成一个 `index` op，inputs 是 `source` 加每个非 `None` 的索引 tensor，被索引的轴写进 `axes` attribute。索引轴相邻时（如 `x[i, j]`、`x[:, i, j]`），PyTorch 把 broadcast 后的索引维度插在原来那段轴的位置，`axes` 直接取这些原始轴即可。索引轴被 `None`/静态轴隔开时（如 `x[i, :, j]`），PyTorch 把 broadcast 维度放到最前面，此时前端先发一个 `permute`，把所有被索引的轴按原顺序移到最前、其余轴保持原相对顺序，再以 `axes = (0, ..., k-1)` 调用同一个 `index`：gather 结果的 layout 就是 broadcast 维加剩余轴，和 PyTorch 的结果一致，不需要尾部再转置。Runtime 用 `source[(slice(None),) * axes[0] + indices]` 执行，逐索引检查 `[0, source.shape[axis])` 范围。
 
 `split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 

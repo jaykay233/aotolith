@@ -386,9 +386,28 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 node_ids[node] = select_ops[-1][0].outputs[0]
                 continue
             if target == _INDEX_TARGET:
-                inputs, attrs, output_type = _advanced_index_operation(
-                    node, node_ids
+                inputs, attrs, output_type, permute_dims = (
+                    _advanced_index_operation(node, node_ids)
                 )
+                if permute_dims is not None:
+                    source_type = values[inputs[0]].type
+                    permuted_shape = tuple(
+                        source_type.shape[axis] for axis in permute_dims
+                    )
+                    permuted_id = f"v{len(ops)}"
+                    ops.append(
+                        Operation(
+                            "permute",
+                            (inputs[0],),
+                            (permuted_id,),
+                            {"dims": permute_dims},
+                        )
+                    )
+                    values[permuted_id] = Value(
+                        permuted_id,
+                        TensorType(permuted_shape, source_type.dtype),
+                    )
+                    inputs = (permuted_id,) + inputs[1:]
                 output_id = f"v{len(ops)}"
                 ops.append(Operation("index", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
@@ -1155,7 +1174,7 @@ def _index_select_operation(
 
 def _advanced_index_operation(
     node: object, node_ids: dict[object, str]
-) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+) -> tuple[tuple[str, ...], dict[str, object], TensorType, tuple[int, ...] | None]:
     args = getattr(node, "args", ())
     kwargs = dict(getattr(node, "kwargs", {}))
     if kwargs:
@@ -1194,21 +1213,34 @@ def _advanced_index_operation(
     )
     first_axis = indexed_axes[0]
     last_axis = indexed_axes[-1]
+    # PyTorch inserts the broadcast index dimensions where the indexed axes
+    # were when they are adjacent, and at the front when they are separated by
+    # a fixed axis. Moving the separated axes to the front turns the second
+    # rule into the first, so the gather itself stays the same op.
+    permute_dims: tuple[int, ...] | None = None
     if indexed_axes != tuple(range(first_axis, last_axis + 1)):
-        raise NotImplementedError(
-            "non-contiguous advanced indexing is not supported: "
-            f"indexed axes {indexed_axes}"
+        permute_dims = indexed_axes + tuple(
+            axis for axis in range(len(source_type.shape)) if axis not in indexed_axes
         )
 
     broadcast_shape = _broadcast_shapes(
         tuple(index_type.shape for index_type in index_types),
         "advanced index",
     )
-    expected_shape = (
-        source_type.shape[:first_axis]
-        + broadcast_shape
-        + source_type.shape[last_axis + 1 :]
-    )
+    if permute_dims is None:
+        expected_shape = (
+            source_type.shape[:first_axis]
+            + broadcast_shape
+            + source_type.shape[last_axis + 1 :]
+        )
+        op_axes = indexed_axes
+    else:
+        remaining = tuple(
+            source_type.shape[axis]
+            for axis in permute_dims[len(indexed_axes) :]
+        )
+        expected_shape = broadcast_shape + remaining
+        op_axes = tuple(range(len(indexed_axes)))
     expected_type = TensorType(expected_shape, source_type.dtype)
     output_type = _node_type(node)
     if output_type != expected_type:
@@ -1220,7 +1252,7 @@ def _advanced_index_operation(
     inputs = (_argument_ids(source, node_ids),) + tuple(
         _argument_ids(index, node_ids) for index in index_nodes
     )
-    return inputs, {"axes": indexed_axes}, output_type
+    return inputs, {"axes": op_axes}, output_type, permute_dims
 
 
 def _broadcast_shapes(

@@ -4097,6 +4097,70 @@ def test_select_lowers_to_slice_and_squeeze(dim, index) -> None:
     assert mx.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x, a, b: x[a, :, b, :],
+        lambda x, a, b: x[:, a, :, b],
+        lambda x, a, b: x[a, :, b, a],
+        lambda x, a, b: x[a, :, 0, b],
+        lambda x, a, b: x[a, 0, :, b],
+    ],
+)
+def test_non_adjacent_advanced_indexing_matches_pytorch(fn) -> None:
+    # PyTorch moves the broadcast index dimensions to the front when index
+    # tensors are separated by a fixed axis, so the frontend permutes the
+    # indexed axes first instead of rejecting the spelling.
+    torch.manual_seed(58)
+    sample = torch.randn(3, 4, 5, 6)
+    a = torch.randint(0, 3, (3,))
+    b = torch.randint(0, 5, (3,))
+    expected = fn(sample, a, b)
+    result = compile_callable(fn, (sample, a, b))
+    assert "index" in [op.op for op in result.lowered_graph.ops]
+    actual = result.plan(_torch_to_mlx(sample), _torch_to_mlx(a), _torch_to_mlx(b))[
+        0
+    ]
+    mx.eval(actual)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.array_equal(actual, _torch_to_mlx(expected))
+
+
+def test_non_adjacent_advanced_indexing_permutes_before_the_gather() -> None:
+    def fn(x, a, b):
+        return x[a, :, b, :]
+
+    sample = torch.randn(3, 4, 5, 6)
+    a = torch.zeros(2, dtype=torch.int64)
+    b = torch.zeros(2, dtype=torch.int64)
+    result = compile_callable(fn, (sample, a, b))
+    ops = result.lowered_graph.ops
+    assert [op.op for op in ops] == ["permute", "index"]
+    assert ops[0].attrs == {"dims": (0, 2, 1, 3)}
+    assert ops[1].attrs == {"axes": (0, 1)}
+
+
+def test_non_adjacent_advanced_indexing_rejects_out_of_range() -> None:
+    def fn(x, i):
+        return x[i, :, 0]
+
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(fn, (x, torch.zeros(2, dtype=torch.int64)))
+    with pytest.raises(IndexError):
+        result.plan(mx.zeros((3, 4, 5)), mx.array([0, 5], dtype=mx.int64))
+
+
+def test_adjacent_advanced_indexing_stays_one_op() -> None:
+    def fn(x, i, j):
+        return x[:, i, j]
+
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(
+        fn, (x, torch.zeros(2, dtype=torch.int64), torch.zeros(2, dtype=torch.int64))
+    )
+    assert [op.op for op in result.lowered_graph.ops] == ["index"]
+
+
 def test_select_can_produce_a_scalar() -> None:
     def fn(x):
         return x.select(0, -2)
