@@ -44,6 +44,10 @@ _SUPPORTED_OPS = {
     "aten.prod.default": "prod",
     "aten.amax.default": "amax",
     "aten.amin.default": "amin",
+    # The full-reduction spellings: ``max(x)``/``min(x)`` reduce every axis,
+    # which is what an ``amax``/``amin`` with no dims means.
+    "aten.max.default": "amax",
+    "aten.min.default": "amin",
     "aten.cumsum.default": "cumsum",
     "aten.cumprod.default": "cumprod",
     "aten.argmax.default": "argmax",
@@ -347,6 +351,13 @@ _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 # operations, so each selection becomes its own operation and only the ones the
 # graph actually reads are emitted.
 _SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
+# ``max(dim)``/``min(dim)`` also return (values, indices): the values are the
+# same reduction as ``amax``/``amin`` and the indices are ``argmax``/``argmin``,
+# so each selection is lowered on its own and unused ones never materialize.
+_EXTREMUM_DIM_TARGETS = {
+    "aten.max.dim": ("amax", "argmax"),
+    "aten.min.dim": ("amin", "argmin"),
+}
 # PyTorch spells variance two ways depending on version and call style; both
 # normalize to one IR shape (dims, keepdim, correction).
 _VARIANCE_TARGETS = {
@@ -672,6 +683,20 @@ def capture_fx(
                 for user in node.users:
                     node_ids[user] = output_id
                 values[output_id] = Value(output_id, _node_type(output_node))
+                continue
+            if target in _EXTREMUM_DIM_TARGETS:
+                extremum_ops, produced = _extremum_dim_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in extremum_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                for user in node.users:
+                    index = user.args[1]
+                    if index in produced:
+                        node_ids[user] = produced[index]
+                    else:
+                        dead_nodes.add(user)
                 continue
             if target in _SORT_TARGETS:
                 sort_ops, produced = _sort_operations(
@@ -2824,6 +2849,86 @@ def _variance_operation(
         },
         _node_type(node),
     )
+
+
+def _extremum_dim_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], dict[int, str]]:
+    """Lower ``max(dim)``/``min(dim)`` selections into single-output operations.
+
+    The values are the same reduction ``amax``/``amin`` performs, and the
+    indices are the matching ``argmax``/``argmin``; ATen's tie rule (the first
+    maximal element) is the one the selection path already follows.
+    """
+
+    target = str(getattr(node, "target", ""))
+    value_op, index_op = _EXTREMUM_DIM_TARGETS[target]
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{target} expects a tensor input")
+
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+
+    dim = args[1] if len(args) > 1 else kwargs.get("dim")
+    keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+    if not -rank <= dim < rank:
+        raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{target}.keepdim must be a boolean, got {keepdim!r}")
+    axis = dim % rank
+
+    wanted: dict[int, object] = {}
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{target} outputs must be selected with getitem")
+        user_args = getattr(user, "args", ())
+        if len(user_args) != 2 or not isinstance(user_args[1], int):
+            raise ValueError(f"malformed {target} getitem: {user!r}")
+        index = user_args[1]
+        if index not in {0, 1}:
+            raise ValueError(f"{target} output index must be 0 or 1, got {index}")
+        if user.users:
+            wanted[index] = user
+
+    output_shape = (
+        input_type.shape[:axis]
+        + (1,)
+        + input_type.shape[axis + 1 :]
+        if keepdim
+        else input_type.shape[:axis] + input_type.shape[axis + 1 :]
+    )
+    operations: list[tuple[Operation, Value]] = []
+    produced: dict[int, str] = {}
+
+    def emit(name: str, attrs: dict[str, object], index: int, dtype: DType) -> None:
+        output_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(
+                    name,
+                    (_argument_ids(input_node, node_ids),),
+                    (output_id,),
+                    attrs,
+                ),
+                Value(output_id, TensorType(output_shape, dtype)),
+            )
+        )
+        produced[index] = output_id
+
+    if 0 in wanted:
+        emit(value_op, {"dims": (axis,), "keepdim": keepdim}, 0, input_type.dtype)
+    if 1 in wanted:
+        emit(index_op, {"dim": axis, "keepdim": keepdim}, 1, DType.I64)
+    return tuple(operations), produced
 
 
 def _sort_operations(

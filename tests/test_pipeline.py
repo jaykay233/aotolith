@@ -2143,6 +2143,133 @@ def test_topk_rejects_k_beyond_the_dimension() -> None:
         compile_graph(graph)
 
 
+@pytest.mark.parametrize(
+    ("reduction", "dim", "keepdim"),
+    [
+        ("max", 1, False),
+        ("max", -1, False),
+        ("max", 0, True),
+        ("max", 2, True),
+        ("min", 1, False),
+        ("min", -2, False),
+        ("min", 0, True),
+        ("min", 2, True),
+    ],
+)
+def test_extremum_with_dim_matches_pytorch(reduction, dim, keepdim) -> None:
+    torch.manual_seed(62)
+    x = torch.randn(2, 3, 4)
+    reference = getattr(torch, reduction)(x, dim=dim, keepdim=keepdim)
+
+    values = compile_callable(
+        lambda value: getattr(torch, reduction)(
+            value, dim=dim, keepdim=keepdim
+        ).values,
+        (x,),
+    )
+    indices = compile_callable(
+        lambda value: getattr(torch, reduction)(
+            value, dim=dim, keepdim=keepdim
+        ).indices,
+        (x,),
+    )
+    assert [op.op for op in values.lowered_graph.ops] == [f"a{reduction}"]
+    assert [op.op for op in indices.lowered_graph.ops] == [f"arg{reduction}"]
+
+    actual_values = values.plan(mx.array(x.numpy()))[0]
+    actual_indices = indices.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual_values, actual_indices)
+    assert actual_values.shape == tuple(reference.values.shape)
+    assert actual_indices.dtype == mx.int64
+    assert mx.array_equal(actual_values, mx.array(reference.values.numpy()))
+    assert mx.array_equal(actual_indices, mx.array(reference.indices.numpy()))
+
+
+def test_extremum_with_dim_returns_both_selections() -> None:
+    torch.manual_seed(63)
+    x = torch.randn(4, 5)
+
+    def fn(value):
+        top = torch.max(value, dim=-1)
+        bottom = torch.min(value, dim=-1)
+        return top.values, top.indices, bottom.values, bottom.indices
+
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "amax",
+        "argmax",
+        "amin",
+        "argmin",
+    ]
+    actual = result.plan(mx.array(x.numpy()))
+    expected = fn(x)
+    mx.eval(*actual)
+    for produced, reference in zip(actual, expected, strict=True):
+        assert mx.array_equal(produced, mx.array(reference.numpy()))
+
+
+def test_extremum_with_dim_breaks_ties_and_nan_like_pytorch() -> None:
+    x = torch.tensor(
+        [
+            [1.0, float("nan"), 5.0, 5.0],
+            [3.0, 3.0, 3.0, 3.0],
+            [float("-inf"), 0.0, -0.0, 0.0],
+        ]
+    )
+
+    def fn(value):
+        top = torch.max(value, dim=1)
+        bottom = torch.min(value, dim=1)
+        return top.values, top.indices, bottom.values, bottom.indices
+
+    actual = compile_callable(fn, (x,)).plan(mx.array(x.numpy()))
+    expected = fn(x)
+    mx.eval(*actual)
+    for produced, reference in zip(actual, expected, strict=True):
+        reference = mx.array(reference.numpy())
+        assert produced.shape == reference.shape
+        if reference.dtype == mx.int64:
+            assert produced.dtype == mx.int64
+            assert mx.array_equal(produced, reference)
+        else:
+            same = mx.equal(produced, reference) | (
+                mx.isnan(produced) & mx.isnan(reference)
+            )
+            assert bool(mx.all(same))
+
+
+def test_extremum_without_dim_reduces_every_axis() -> None:
+    torch.manual_seed(64)
+    x = torch.randn(3, 4, 2)
+    for reduction in ("max", "min"):
+        result = compile_callable(
+            lambda value: getattr(torch, reduction)(value), (x,)
+        )
+        assert [op.op for op in result.lowered_graph.ops] == [f"a{reduction}"]
+        actual = result.plan(mx.array(x.numpy()))[0]
+        mx.eval(actual)
+        assert actual.shape == ()
+        assert float(actual) == float(getattr(torch, reduction)(x))
+
+
+def test_extremum_with_dim_survives_an_artifact_round_trip(tmp_path) -> None:
+    torch.manual_seed(65)
+    x = torch.randn(4, 6)
+
+    def fn(value):
+        top = torch.max(value, dim=-1)
+        return top.indices.to(value.dtype) + torch.min(value, dim=1).values
+
+    result = compile_callable(fn, (x,))
+    path = tmp_path / "extremum.aoto"
+    save_compiled(result, path)
+    loaded = load_compiled_module(path)
+    actual = loaded(mx.array(x.numpy()))[0]
+    expected = fn(x)
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(expected.numpy()))
+
+
 def test_sorting_survives_an_artifact_round_trip(tmp_path) -> None:
     torch.manual_seed(61)
     x = torch.randn(3, 6)

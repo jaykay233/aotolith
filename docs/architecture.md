@@ -88,6 +88,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.repeat.default`（`Tensor.repeat`/`Tensor.tile`） | 展开成 `reshape -> expand -> reshape`，不生成 kernel |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
 | `aten.argmax.default`、`aten.argmin.default` | `argmax`、`argmin`，输出固定 I64 |
+| `aten.max.dim`、`aten.min.dim` | `amax`/`amin` 加 `argmax`/`argmin`，按被读取的输出选择 |
 | `aten.sort.default` | `sort` / `argsort`（按被读取的输出选择） |
 | `aten.topk.default` | `topk` / `topk_indices`（按被读取的输出选择） |
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
@@ -214,7 +215,7 @@ reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因�
 
 `F.layer_norm` 会被 `make_fx` 展开成 `native_layer_norm` 和三个 `getitem`。当前编译器把第 0 个输出折叠成单输出 `layer_norm` IR op，normalized shape、eps 以及是否带 weight/bias 保存在 attribute 中。第 1/2 个输出（mean、rstd）在被图读取时会展开成 `mean` 加一段两次遍历的方差链，因为 IR 的 op 都是单输出；只读 mean/rstd、不读归一化输出的图同样可以编译。
 
-`sort` 和 `topk` 返回 `(values, indices)`，但 IR 的 op 只能有一个输出，前端按 `getitem` 实际读取的下标分别生成 `sort`/`argsort` 或 `topk`/`topk_indices`。只读 values 时不生成 indices，反之亦然。二者都由 MLX 执行：`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。
+`sort` 和 `topk` 返回 `(values, indices)`，但 IR 的 op 只能有一个输出，前端按 `getitem` 实际读取的下标分别生成 `sort`/`argsort` 或 `topk`/`topk_indices`。只读 values 时不生成 indices，反之亦然。`max`/`min` 带 `dim` 时是同一模式的第三个例子：values 选择生成 `amax`/`amin`（与不带 `dim` 的全局形式共用），indices 选择生成 `argmax`/`argmin`，因此 `values, indices = x.max(dim=-1)` 展开成两次归约，而只读 `.values` 的图不会算索引；ATen 的 tie 规则（取第一个最大值）正是 MLX `argmax` 的行为，NaN 行也一样（values 为 NaN，索引指向第一个 NaN）。三者都由 MLX 执行：`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。`sort` 映射到 `mx.sort`/`mx.argsort` 再按需要在目标轴翻转，`topk` 在 `k` 小于该轴长度时用 `mx.topk`（MLX 返回升序窗口，所以两个方向都翻转一次），`k` 等于轴长时退回 `argsort` + `take_along_axis`，因为 MLX 的 select 路径不保证全量窗口的顺序。`argmax`/`argmin` 不带 dim 时先展平成 rank-0 索引，带 dim 时保留 `keepdim`；三者的索引输出固定是 I64。
 
 `F.rms_norm` 没有单独的 ATen target，在当前 PyTorch 中会展开成 `pow -> mean -> add_ -> rsqrt -> mul -> optional weight mul`。前端只在中间节点单消费者、reduction 覆盖连续尾维且 shape 吻合时折叠成 `rms_norm`，避免把任意的平方、均值、rsqrt 组合误认为归一化。折叠同时接受手写形态：平方可以是 `pow(x, 2)` 或 `x * x`，eps 可以是 `add_` 或非原地 `add`，缩放可以是 `rsqrt` 或 `sqrt` 加 `div`，weight 可以在任意一侧；不匹配时退回普通 elementwise 图。FP16/BF16 下 `make_fx` 还会插入 float32 `_to_copy`，折叠范围包含这组 cast。
 
