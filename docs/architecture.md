@@ -64,7 +64,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.select.int` | 在前端展开为单元素 `slice + squeeze` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
-| `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等 |
+| `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等；负数条目按 ATen 语义裁剪展开后的 extent，前端先发 `slice` 再把负宽度钳成 0 的 `pad` |
 | `aten.reflection_pad1d.default`、`aten.reflection_pad2d.default` | 展开成 `slice`/`flip`/`cat` 视图链；负数条目按 ATen 语义先展开再裁剪，不生成 kernel |
 | `aten.replication_pad1d.default`、`aten.replication_pad2d.default` | 展开成 `slice`/`expand`/`cat` 视图链；负数条目同样先展开再裁剪 |
 | `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |

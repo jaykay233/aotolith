@@ -1563,12 +1563,68 @@ def test_constant_pad_validates_pairs_against_the_rank_at_runtime() -> None:
         plan(mx.zeros((2, 3)))
 
 
-def test_constant_pad_rejects_negative_pads() -> None:
+@pytest.mark.parametrize(
+    ("shape", "pads", "value"),
+    [
+        ((2, 6), (-1, -2), 0.5),
+        ((2, 6), (-2, 0), -1.0),
+        ((2, 6), (-1, 2), 3.0),
+        ((2, 6), (2, -1), 3.0),
+        ((2, 3, 4), (-1, 1, 0, -1), 2.0),
+        ((2, 3, 4), (1, -1, -2, 2), 0.0),
+    ],
+)
+def test_constant_pad_crops_negative_entries(shape, pads, value) -> None:
+    # ATen derives the fill region from the distance past the source, so a
+    # negative entry crops the padded extent instead of failing.
     def fn(x):
-        return torch.nn.functional.pad(x, (-1, 1))
+        return torch.nn.functional.pad(x, pads, value=value)
 
-    with pytest.raises(NotImplementedError, match="crop the input"):
-        compile_callable(fn, (torch.randn(2, 3),))
+    torch.manual_seed(56)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    assert {op.op for op in result.lowered_graph.ops} <= {"slice", "pad"}
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected)
+
+
+def test_constant_pad_crop_and_pad_share_one_axis() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (-1, 2), value=-7.0)
+
+    source = mx.array([[1.0, 2.0, 3.0, 4.0]])
+    result = compile_callable(fn, (torch.zeros(1, 4),))
+    actual = result.plan(source)[0]
+    mx.eval(actual)
+    # One element is cropped from the front, then two fills are appended, which
+    # is what `F.pad(x, (-1, 2))` produces.
+    assert actual.tolist() == [[2.0, 3.0, 4.0, -7.0, -7.0]]
+    assert [op.op for op in result.lowered_graph.ops] == ["slice", "pad"]
+
+
+def test_constant_pad_with_only_crops_is_a_slice() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (-1, -1))
+
+    torch.manual_seed(57)
+    x = torch.randn(3, 6)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["slice"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_constant_pad_rejects_a_crop_that_empties_the_axis() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (-2, -1))
+
+    with pytest.raises(NotImplementedError, match="cannot represent"):
+        compile_callable(fn, (torch.randn(1, 3),))
 
 
 @pytest.mark.parametrize(

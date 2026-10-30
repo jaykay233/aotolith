@@ -294,6 +294,9 @@ _PAD_MODE_TARGETS = {
     "aten.replication_pad2d.default": ("replicate", 2),
 }
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
+# Constant padding accepts negative entries the same way the mirror modes do:
+# they crop the padded extent, so the frontend slices before it pads.
+_CONSTANT_PAD_TARGET = "aten.constant_pad_nd.default"
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
 _INPLACE_SCATTER_TARGETS = {
@@ -523,6 +526,15 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = produced[index]
                     else:
                         dead_nodes.add(user)
+                continue
+            if target == _CONSTANT_PAD_TARGET and _constant_pad_crops(node):
+                crop_ops, output_id = _constant_pad_crop_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in crop_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
                 continue
             if target in _PAD_MODE_TARGETS:
                 padding_ops, output_id = _padding_operations(
@@ -1722,6 +1734,142 @@ def _layer_norm_operation(
     return tuple(inputs), attrs, output_type, frozenset(wanted)
 
 
+def _constant_pad_crops(node: object) -> bool:
+    """Report whether a constant pad carries negative (cropping) entries."""
+
+    args = getattr(node, "args", ())
+    if len(args) < 2:
+        return False
+    pads = args[1]
+    if not isinstance(pads, (tuple, list)):
+        return False
+    return any(
+        isinstance(item, int) and not isinstance(item, bool) and item < 0
+        for item in pads
+    )
+
+
+def _constant_pad_crop_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower a constant pad with negative entries as slice-then-pad.
+
+    ATen derives the fill region from the distance past the source, so cropping
+    the *padded* extent is the same as cropping the source first and padding
+    what survives. The pad op only ever sees non-negative widths.
+    """
+
+    input_node, pads, value = _constant_pad_arguments(
+        getattr(node, "args", ()), getattr(node, "kwargs", {})
+    )
+    input_type = _node_type(input_node)
+    shape = input_type.shape
+    rank = len(shape)
+    padded_dims = len(pads) // 2
+    if padded_dims > rank:
+        raise ValueError(
+            f"constant_pad_nd holds {padded_dims} padding pairs for a rank-"
+            f"{rank} input"
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, input_type.dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    current_shape = shape
+    clamped: list[int] = []
+    for position in range(padded_dims):
+        axis = rank - 1 - position
+        before, after = pads[2 * position], pads[2 * position + 1]
+        clamped.extend((max(before, 0), max(after, 0)))
+        if before >= 0 and after >= 0:
+            continue
+        start, end = max(-before, 0), shape[axis] - max(-after, 0)
+        if start >= end:
+            raise NotImplementedError(
+                f"constant_pad_nd crop ({before}, {after}) empties axis {axis} "
+                f"of size {shape[axis]}, which the static IR cannot represent"
+            )
+        current_shape = (
+            current_shape[:axis] + (end - start,) + current_shape[axis + 1 :]
+        )
+        current = emit(
+            "slice",
+            (current,),
+            {"dim": axis, "start": start, "end": end, "step": 1},
+            current_shape,
+        )
+
+    expected = _node_type(node).shape
+    if any(clamped):
+        padded = list(current_shape)
+        for position in range(padded_dims):
+            axis = rank - 1 - position
+            padded[axis] += clamped[2 * position] + clamped[2 * position + 1]
+        current_shape = tuple(padded)
+        current = emit(
+            "pad",
+            (current,),
+            {"pads": tuple(clamped), "value": value},
+            current_shape,
+        )
+    if current_shape != expected:
+        raise ValueError(
+            f"constant_pad_nd output shape {expected} does not match the "
+            f"cropped and padded {current_shape}"
+        )
+    return tuple(operations), current
+
+
+def _constant_pad_arguments(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[object, tuple[int, ...], float]:
+    """Validate the constant pad arguments shared by both lowerings."""
+
+    if len(args) not in {2, 3}:
+        raise ValueError(
+            f"constant_pad_nd expects two or three arguments, got {len(args)}"
+        )
+    input_node, pads = args[:2]
+    value = args[2] if len(args) == 3 else kwargs.get("value", 0.0)
+    mode = kwargs.get("mode")
+    if mode is not None and mode != "constant":
+        raise NotImplementedError(
+            f"constant_pad_nd mode {mode!r} is not supported; only "
+            "constant padding is lowered"
+        )
+    if not isinstance(pads, (tuple, list)) or not pads:
+        raise ValueError(f"pad.pads must be a non-empty sequence, got {pads!r}")
+    if len(pads) % 2 != 0:
+        raise ValueError(
+            "pad.pads must hold one (before, after) pair per padded "
+            f"dimension, got {len(pads)} values"
+        )
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in pads):
+        raise ValueError(f"pad.pads must contain integers, got {pads!r}")
+    if not isinstance(value, (bool, int, float)):
+        raise ValueError(f"pad.value must be a scalar number, got {value!r}")
+    if not isfinite(float(value)):
+        raise ValueError(f"pad.value must be finite, got {value!r}")
+    return input_node, tuple(int(item) for item in pads), float(value)
+
+
 def _padding_operations(
     node: object,
     node_ids: dict[object, str],
@@ -2844,41 +2992,15 @@ def _operation_inputs(
         )
 
     if op == "pad":
-        if len(args) not in {2, 3}:
-            raise ValueError(
-                f"constant_pad_nd expects two or three arguments, got {len(args)}"
-            )
-        input_id, pads = args[:2]
-        value = args[2] if len(args) == 3 else kwargs.get("value", 0.0)
-        mode = kwargs.get("mode")
-        if mode is not None and mode != "constant":
-            raise NotImplementedError(
-                f"constant_pad_nd mode {mode!r} is not supported; only "
-                "constant padding is lowered"
-            )
-        if not isinstance(pads, (tuple, list)) or not pads:
-            raise ValueError(f"pad.pads must be a non-empty sequence, got {pads!r}")
-        if len(pads) % 2 != 0:
-            raise ValueError(
-                "pad.pads must hold one (before, after) pair per padded "
-                f"dimension, got {len(pads)} values"
-            )
-        if not all(
-            isinstance(item, int) and not isinstance(item, bool) for item in pads
-        ):
-            raise ValueError(f"pad.pads must contain integers, got {pads!r}")
-        if not isinstance(value, (bool, int, float)):
-            raise ValueError(f"pad.value must be a scalar number, got {value!r}")
-        if not isfinite(float(value)):
-            raise ValueError(f"pad.value must be finite, got {value!r}")
+        input_id, pads, value = _constant_pad_arguments(args, kwargs)
         if any(item < 0 for item in pads):
             raise NotImplementedError(
-                "negative constant_pad_nd entries crop the input; use "
-                f"slice/narrow for that instead, got {tuple(pads)}"
+                "negative constant_pad_nd entries crop the padded extent and "
+                f"must be lowered as a slice first, got {pads}"
             )
         return (_argument_ids(input_id, node_ids),), {
-            "pads": tuple(int(item) for item in pads),
-            "value": float(value),
+            "pads": pads,
+            "value": value,
         }
 
     if op == "flip":
