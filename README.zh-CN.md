@@ -382,9 +382,9 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 | 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
-| Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、sum/mean/prod/amax/amin/var/std 归约、`vector_norm` 与 `F.normalize`、cumsum、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
+| Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、logsumexp、sum/mean/prod/amax/amin/var/std 归约、`vector_norm` 与 `F.normalize`、cumsum/cumprod、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
 | 排序与选择 | `argmax`、`argmin`、`sort`（values/indices）、`topk`（values/indices，最大或最小），按被读取的输出分别 lowering |
-| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、`repeat`/`tile`、cat/stack、constant/reflect/replicate padding、flip/roll、clone、cast 和静态常量 |
+| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、`repeat`/`tile`、作为 strided view 的 `diagonal`、cat/stack、constant/reflect/replicate padding、flip/roll、clone、cast 和静态常量 |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32 和 I64 |
 | KV Cache | 静态 shape 的 prefill/decode 图契约和布局；分配与分页仍由外部运行时负责 |
 
@@ -403,6 +403,8 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - 整数 pointwise 不再要求操作数 dtype 相同：PyTorch 自己会提升的组合，前端插入 `cast` 节点而不是让整张图失败——I32 与 I64 混合提升到 I64，`div` 的整数操作数提升到输出的 float dtype，整数与浮点混合提升到那个 float dtype。`where` 的两个分支按同样规则提升，所以 `where(mask, int32, int64)` 会以 I64 select 执行。bool 与数值 dtype 混合仍会被拒绝。整数 `pow` 是精确的：kernel 用 square-and-multiply 循环，乘法按位宽回绕，所以 `2**70` 和 PyTorch 一样回绕成 `0`，`0**0` 是 `1`。负的标量指数在编译期直接拒绝；只出现在 tensor 里的负指数不做逐元素检查（PyTorch 会在运行时报错），kernel 对它返回 `0`。
 - `prod`、`amax`、`amin` 和 `log_softmax` 走 MLX 而不是生成 kernel。三个归约支持任意非空轴集合和 `keepdim`；`amax`/`amin` 与 PyTorch 逐位一致，`prod` 因为乘法顺序不同在浮点上可能相差几个 ulp，整数乘积按位宽回绕。`log_softmax` 是输入减去自身的 log-sum-exp，只接受浮点输入，重复轴在 lowering 期报错。
 - `native_layer_norm` 的三个输出都能用。归一化结果仍走专用 kernel；mean 和 rstd 只在图真的读取时才展开成一个 `mean` 加一段两次遍历的方差链（`sub`/`mul`/`mean`/`add eps`/`rsqrt`），因为 IR 的每个 op 只写一个值。它们与 PyTorch 内部的 Welford 统计相差几个 ulp（f32 测试实测在 `1e-5` 以内），只读 `rstd`、不读归一化输出的图也能编译。
+- `logsumexp` 是组合 lowering 而不是新 op：`amax`（keepdim）先做稳定化平移，`masked_fill` 在相减前把无穷大的最大值换成 0，再由 `sum`/`log`/`add` 完成归约。这与 ATen 的实现一致，所以 `+inf` 行保持 `+inf`、全 `-inf` 行保持 `-inf`，不会变成 `nan`；这些算子会和相邻 pointwise 区域一起融合。
+- `cumprod` 和 `cumsum` 一样走 MLX，同样只带一个 `dim` attribute 并保持 dtype。`diagonal` 降级成 strided view：把两根轴 permute 到末尾、合并成一条，对角线就是这条平轴上的每 `columns + 1` 个元素，因此 `torch.diagonal` 和矩阵上的 `torch.diag` 不复制、不生成 kernel。若 offset 使结果为空，因为静态 IR 不建模零长度维度而报错。`masked_fill` 的 tensor 值（0 维）降级成 `where(mask, value, input)`，就是把 select 的两个操作数换位。
 - `elu` 保留 ATen 的 `alpha`/`scale`/`input_scale`，所以 `selu`（scale 1.0507、alpha 1.6733）和手写的 `elu(x, alpha, scale, input_scale)` 都能编译。只有负半支会被 `input_scale` 缩放，与 ATen 一致，测试里直接断言了这一点。
 - `repeat`/`tile` 展开成 `reshape -> expand -> reshape`，不生成 kernel、不复制：每根轴拆成 `(repeat, size)` 后广播，所以 repeats 比 rank 短或长都按 PyTorch 规则左补 1，全 1 的 repeat 整条消失，`repeat=0` 因为 IR 不建模空维度而在捕获期被拒绝。`vector_norm` 走 MLX：`mx.linalg.norm` 只接受单个轴，所以先把被归约的轴 permute 到末尾合并、调用后再按 `keepdim` reshape 回去，一份实现覆盖任意轴集合。`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`，半精度输入先提升到 float32 做归约。
 - `var` 和 `std` 走 MLX。三条 ATen 拼法（`correction`、`dim`、`default`）统一归一化成 `dims`/`keepdim`/`correction`，`unbiased` 折算进 `correction`。`correction` 可以是小数：MLX 的 `ddof` 只接受整数，所以 backend 先算有偏方差，再按 ATen 的定义乘上 `n / (n - correction)`（`n` 是实际被归约的元素数）；`correction` 大于等于归约元素数时与 PyTorch 一样得到 `inf`，非有限的 `correction` 在捕获期被拒绝。半精度输入会先提升到 float32 做归约再 cast 回输入 dtype，与 PyTorch 的累加宽度一致。

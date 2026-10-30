@@ -39,6 +39,7 @@ _SUPPORTED_OPS = {
     "aten.amax.default": "amax",
     "aten.amin.default": "amin",
     "aten.cumsum.default": "cumsum",
+    "aten.cumprod.default": "cumprod",
     "aten.argmax.default": "argmax",
     "aten.argmin.default": "argmin",
     "aten.mean.default": "mean",
@@ -125,6 +126,7 @@ _SUPPORTED_OPS = {
     "aten.isnan.default": "isnan",
     "aten.isinf.default": "isinf",
     "aten.masked_fill.Scalar": "masked_fill",
+    "aten.masked_fill.Tensor": "where",
     "aten.maximum.default": "maximum",
     "aten.minimum.default": "minimum",
     "aten.logaddexp.default": "logaddexp",
@@ -284,6 +286,10 @@ _VARIANCE_TARGETS = {
 }
 # ``repeat`` and ``tile`` share this ATen target; it lowers to layout ops.
 _REPEAT_TARGET = "aten.repeat.default"
+# ``diagonal`` is a strided view: once the two axes are trailing and flat, the
+# diagonal is every ``m + 1``-th element.
+_DIAGONAL_TARGET = "aten.diagonal.default"
+_DIAGONAL_COPY_TARGET = "aten.diagonal_copy.default"
 _VECTOR_NORM_TARGET = "aten.linalg_vector_norm.default"
 # Reflect and replicate padding have no IR op: they are separable, so each axis
 # becomes a slice/flip (reflect) or slice/expand (replicate) plus a concat.
@@ -297,6 +303,9 @@ _INPLACE_TARGETS = {"aten.add_.Tensor"}
 # Constant padding accepts negative entries the same way the mirror modes do:
 # they crop the padded extent, so the frontend slices before it pads.
 _CONSTANT_PAD_TARGET = "aten.constant_pad_nd.default"
+# `logsumexp` is a composite in ATen: a stable max shift plus a log-sum, with
+# infinite maxima replaced by zero so a saturated row keeps its limit.
+_LOGSUMEXP_TARGET = "aten.logsumexp.default"
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
 _INPLACE_SCATTER_TARGETS = {
@@ -546,6 +555,24 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                     else:
                         dead_nodes.add(user)
                 continue
+            if target in {_DIAGONAL_TARGET, _DIAGONAL_COPY_TARGET}:
+                diagonal_ops, output_id = _diagonal_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in diagonal_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
+            if target == _LOGSUMEXP_TARGET:
+                logsumexp_ops, output_id = _logsumexp_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in logsumexp_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
             if target == _CONSTANT_PAD_TARGET and _constant_pad_crops(node):
                 crop_ops, output_id = _constant_pad_crop_operations(
                     node, node_ids, len(ops)
@@ -599,6 +626,12 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 _validate_inplace_legalization(node)
             op_name = _SUPPORTED_OPS[target]
             call_args = node.args
+            if target == "aten.masked_fill.Tensor":
+                # ATen masks the first argument in place, which is exactly
+                # where(mask, value, input) for a tensor fill value.
+                masked, mask, fill = call_args
+                op_name = "where"
+                call_args = (mask, fill, masked)
             if target == "aten.cat.default" and empty_nodes:
                 call_args = _fold_empty_cat_operands(
                     node, empty_nodes, node_ids
@@ -1764,6 +1797,227 @@ def _layer_norm_operation(
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
     return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _diagonal_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.diagonal`` into permute/reshape/slice.
+
+    ``A[i, i + offset]`` sits at flat index ``i * (m + 1) + offset`` once the
+    two axes are trailing and flattened, so the diagonal is a strided slice
+    with no copy.
+    """
+
+    input_node, offset, dim1, dim2 = _diagonal_arguments(node)
+    input_type = _node_type(input_node)
+    shape = input_type.shape
+    rank = len(shape)
+    rows, columns = shape[dim1], shape[dim2]
+    start_row = max(0, -offset)
+    start_column = max(0, offset)
+    length = min(rows - start_row, columns - start_column)
+    if length <= 0:
+        raise NotImplementedError(
+            f"diagonal offset {offset} leaves no elements on a {rows}x{columns} "
+            "matrix, and the static IR has no zero-sized dimensions"
+        )
+    remaining = tuple(
+        size
+        for axis, size in enumerate(shape)
+        if axis not in {dim1, dim2}
+    )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, input_type.dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    order = tuple(
+        axis for axis in range(rank) if axis not in {dim1, dim2}
+    ) + (dim1, dim2)
+    if order != tuple(range(rank)):
+        current = emit("permute", (current,), {"dims": order}, tuple(shape[axis] for axis in order))
+    flattened_shape = remaining + (rows * columns,)
+    current = emit("reshape", (current,), {"shape": flattened_shape}, flattened_shape)
+    step = columns + 1
+    start = start_row * columns + start_column
+    sliced_shape = remaining + (length,)
+    current = emit(
+        "slice",
+        (current,),
+        {
+            "dim": len(remaining),
+            "start": start,
+            "end": start + length * step,
+            "step": step,
+        },
+        sliced_shape,
+    )
+    expected = _node_type(node).shape
+    if sliced_shape != expected:
+        raise ValueError(
+            f"diagonal output shape {expected} does not match the strided "
+            f"view {sliced_shape}"
+        )
+    return tuple(operations), current
+
+
+def _diagonal_arguments(
+    node: object,
+) -> tuple[object, int, int, int]:
+    """Normalize the ``diagonal`` offset and axis arguments."""
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError("diagonal expects an input tensor")
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank < 2:
+        raise NotImplementedError(
+            f"diagonal requires rank 2 or more, got shape {input_type.shape}"
+        )
+
+    offset = args[1] if len(args) > 1 else kwargs.get("offset", 0)
+    dim1 = args[2] if len(args) > 2 else kwargs.get("dim1", 0)
+    dim2 = args[3] if len(args) > 3 else kwargs.get("dim2", 1)
+    for name, value in (("offset", offset), ("dim1", dim1), ("dim2", dim2)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"diagonal.{name} must be an integer, got {value!r}")
+    axis1, axis2 = dim1 % rank, dim2 % rank
+    if axis1 == axis2:
+        raise ValueError(
+            f"diagonal.dim1 and dim2 must differ, both are {axis1}"
+        )
+    return input_node, offset, axis1, axis2
+
+
+def _logsumexp_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.logsumexp`` into amax/masked_fill/exp/sum/log/add.
+
+    ATen shifts by the reduced maximum for stability and replaces an infinite
+    maximum with zero before the subtraction, so a +inf row sums to +inf and an
+    all -inf row keeps -inf instead of producing ``inf - inf``.
+    """
+
+    input_node, dims, keepdim = _logsumexp_arguments(node)
+    input_type = _node_type(input_node)
+    shape = input_type.shape
+    reduced_shape = tuple(
+        1 if axis in dims else size for axis, size in enumerate(shape)
+    )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+        dtype: DType | None = None,
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, dtype or input_type.dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    max_id = emit(
+        "amax",
+        (current,),
+        {"dims": dims, "keepdim": True},
+        reduced_shape,
+    )
+    infinite_id = emit(
+        "isinf",
+        (max_id,),
+        {},
+        reduced_shape,
+        DType.BOOL,
+    )
+    shift_id = emit(
+        "masked_fill",
+        (max_id, infinite_id),
+        {"value": 0.0},
+        reduced_shape,
+    )
+    shifted_id = emit("sub", (current, shift_id), {}, shape)
+    exp_id = emit("exp", (shifted_id,), {}, shape)
+    sum_id = emit("sum", (exp_id,), {"dims": dims, "keepdim": True}, reduced_shape)
+    log_id = emit("log", (sum_id,), {}, reduced_shape)
+    total_id = emit("add", (log_id, shift_id), {}, reduced_shape)
+
+    expected = _node_type(node).shape
+    if not keepdim:
+        total_id = emit("reshape", (total_id,), {"shape": expected}, expected)
+    elif expected != reduced_shape:
+        raise ValueError(
+            f"logsumexp output shape {expected} does not match the reduced "
+            f"{reduced_shape}"
+        )
+    return tuple(operations), total_id
+
+
+def _logsumexp_arguments(
+    node: object,
+) -> tuple[object, tuple[int, ...], bool]:
+    """Normalize the ``logsumexp`` dims and keepdim arguments."""
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError("logsumexp expects an input tensor")
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError("logsumexp requires a ranked tensor")
+
+    dims = args[1] if len(args) > 1 else kwargs.get("dim")
+    keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"logsumexp.keepdim must be a boolean, got {keepdim!r}")
+    if isinstance(dims, int) and not isinstance(dims, bool):
+        normalized = (dims % rank,)
+    elif isinstance(dims, (tuple, list)) and dims and all(
+        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    ):
+        normalized = tuple(dim % rank for dim in dims)
+    elif isinstance(dims, (tuple, list)) and not dims:
+        raise ValueError(
+            "logsumexp needs at least one reduction axis; an empty dim tuple "
+            "has no ATen meaning"
+        )
+    else:
+        raise ValueError(f"logsumexp.dim must contain integers, got {dims!r}")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"logsumexp.dim repeats an axis: {dims!r}")
+    return input_node, normalized, keepdim
 
 
 def _constant_pad_crops(node: object) -> bool:
@@ -2937,18 +3191,18 @@ def _operation_inputs(
             )
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
-    if op == "cumsum":
+    if op in {"cumsum", "cumprod"}:
         if len(args) not in {2, 3}:
             raise ValueError(
-                f"cumsum expects two or three arguments, got {len(args)}"
+                f"{op} expects two or three arguments, got {len(args)}"
             )
         input_id, dim = args[:2]
         if not isinstance(dim, int) or isinstance(dim, bool):
-            raise ValueError(f"cumsum.dim must be an integer, got {dim!r}")
+            raise ValueError(f"{op}.dim must be an integer, got {dim!r}")
         if len(args) == 3 and args[2] is not None:
             dtype_name = str(args[2])
             if _TORCH_DTYPES.get(dtype_name) is None:
-                raise ValueError(f"unsupported cumsum dtype: {dtype_name}")
+                raise ValueError(f"unsupported {op} dtype: {dtype_name}")
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
     if op == "reshape":
@@ -3309,7 +3563,7 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("dim")
     if op in {"argmax", "argmin"}:
         allowed.update({"dim", "keepdim"})
-    if op == "cumsum":
+    if op in {"cumsum", "cumprod"}:
         allowed.update({"dim", "dtype"})
     if op == "flip":
         allowed.add("dims")

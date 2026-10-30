@@ -47,7 +47,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
 | `aten.index.Tensor` | `index`，支持多轴 advanced indexing（含被静态/index 轴隔开的非相邻索引）和 index broadcasting |
-| `aten.cumsum.default` | `cumsum`，沿单个静态轴执行前缀和 |
+| `aten.cumsum.default`、`aten.cumprod.default` | `cumsum`、`cumprod`，沿单个静态轴执行前缀 scan，走 MLX |
 | `aten.t.default` | `transpose`，rank-2 矩阵转置 |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
@@ -64,6 +64,9 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.select.int` | 在前端展开为单元素 `slice + squeeze` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
+| `aten.diagonal.default`、`aten.diagonal_copy.default` | 展开成 `permute -> reshape -> slice` 的 strided view，不生成 kernel |
+| `aten.masked_fill.Tensor` | 降级成 `where`，操作数顺序为 `mask, value, input` |
+| `aten.logsumexp.default` | 组合 lowering：`amax` 平移 + `masked_fill` 抹掉无穷最大值 + `exp`/`sum`/`log`/`add` |
 | `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等；负数条目按 ATen 语义裁剪展开后的 extent，前端先发 `slice` 再把负宽度钳成 0 的 `pad` |
 | `aten.reflection_pad1d.default`、`aten.reflection_pad2d.default` | 展开成 `slice`/`flip`/`cat` 视图链；负数条目按 ATen 语义先展开再裁剪，不生成 kernel |
 | `aten.replication_pad1d.default`、`aten.replication_pad2d.default` | 展开成 `slice`/`expand`/`cat` 视图链；负数条目同样先展开再裁剪 |
@@ -178,6 +181,12 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、pad 的 (before, after) 对与静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、常量 `mx.pad`、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
 reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因此 IR 里只有 `slice`、`flip`、`expand` 和 `cat`：每一维先按正数条目生成镜像片（`slice` 取内层窗口再 `flip`）或复制片（`slice` 取边沿再 `expand`），交给 `cat` 拼到主轴前后。负数条目按 ATen 的语义视为裁剪，但它们裁剪的是**展开后的** extent，所以实现先完整展开再 `slice` 出窗口：镜像窗口始终锚定在未裁剪的边界上，这与 PyTorch 一致（例如长度为 6 的轴做 `(-1, 2)` 会得到 `x[1:]` 末尾再镜像两个元素，而不是对 `x[1:]` 做镜像）。同一个轴同时出现正负条目也能这样表达，无需拒绝。reflect 的窗口宽度必须小于该轴长度，否则前端在 lowering 期报错。
+
+`diagonal` 也走视图链而不是新 op：前端把 `dim1`/`dim2` permute 到末尾、把这一对合成一条平轴，然后以 `step = columns + 1` 切片。`A[i, i + offset]` 在展平后的位置正好是 `i * (columns + 1) + start`，其中 `start` 由 offset 的正负决定偏移行列，因此 `torch.diagonal` 与矩阵上的 `torch.diag` 都只是一次 strided slice。输出 shape 按 PyTorch 的规则把两维删掉、把对角线长度追加到最后，前端会拿它和节点 metadata 对照校验。
+
+`logsumexp` 是组合 lowering，没有对应 IR op：`amax`（keepdim）求出平移量，`isinf` + `masked_fill` 把无穷大的最大值换成 0，再走 `sub -> exp -> sum -> log -> add`，最后按 `keepdim` 决定是否需要 `reshape`。把无穷最大值换成 0 是 ATen 自己的做法，所以 `+inf` 行保持 `+inf`、全 `-inf` 行保持 `-inf`，不会因为 `inf - inf` 变成 `nan`；只有 `amax`/`masked_fill` 是额外的 op，`sub`/`exp` 会融合进相邻的 pointwise 区域。空 `dim` 序列在捕获期报错，因为 ATen 对它没有定义。
+
+`cumprod` 与 `cumsum` 共用同一套参数规范化与校验，Runtime 分别映射到 `mx.cumsum` 和 `mx.cumprod`。`masked_fill.Tensor` 的填充值在 PyTorch 里必须是 0 维 tensor（更高维会被 ATen 直接拒绝），因此它等价于把 `where` 的操作数换个顺序，前端直接发 `where(mask, value, input)`，复用同一套广播与 dtype 提升规则。
 
 `addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`/`scale`/`input_scale`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute。`scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 都是无 tensor 输入的常量节点：值和输出 dtype 分别来自 IR attribute 与节点 metadata。`new_*` 和 `*_like` 的模板 tensor 只参与 FX 捕获，不进入 op 的运行时输入。浮点/bool 常量可以单独生成 Metal kernel，也可以与相邻 pointwise op 融合；I32/I64 常量走独立的整数 kernel。CSE 的 key 包含输出 shape/dtype，因此同一模板上的不同 dtype 覆盖或不同整数宽度不会被错误合并。`arange` 的三个 ATen target 统一规范化为 `(start, end, step)` attributes；I32/I64 输出要求整数参数，FP16/BF16/F32 输出接受任意有限参数。
 

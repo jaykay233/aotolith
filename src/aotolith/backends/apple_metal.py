@@ -744,9 +744,10 @@ def _evaluate_mlx_op(
                 indices = indices[tuple(selection)]
             selected = indices
         return selected.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
-    if op.op == "cumsum":
+    if op.op in {"cumsum", "cumprod"}:
         axis = int(op.attrs["dim"]) % len(env[op.inputs[0]].shape)
-        value = mx.cumsum(env[op.inputs[0]], axis=axis)
+        scan = mx.cumsum if op.op == "cumsum" else mx.cumprod
+        value = scan(env[op.inputs[0]], axis=axis)
         output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
         return value.astype(output_dtype)
     if op.op == "cast":
@@ -1490,8 +1491,8 @@ class AppleMetalBackend:
                 _validate_scatter_op(graph, op)
             elif op.op == "index_add":
                 _validate_index_add_op(graph, op)
-            elif op.op == "cumsum":
-                _validate_cumsum_op(graph, op)
+            elif op.op in {"cumsum", "cumprod"}:
+                _validate_scan_op(graph, op)
             elif op.op in {"prod", "amax", "amin"}:
                 _validate_mlx_reduction_op(graph, op)
             elif op.op == "log_softmax":
@@ -7675,22 +7676,22 @@ def _validate_index_add_op(graph: Graph, op: Operation) -> None:
         )
 
 
-def _validate_cumsum_op(graph: Graph, op: Operation) -> None:
+def _validate_scan_op(graph: Graph, op: Operation) -> None:
     if len(op.inputs) != 1:
-        raise ValueError(f"cumsum expects one input, got {len(op.inputs)}")
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
     dim = op.attrs.get("dim")
     if not isinstance(dim, int) or isinstance(dim, bool):
-        raise ValueError(f"cumsum.dim must be an integer, got {dim!r}")
+        raise ValueError(f"{op.op}.dim must be an integer, got {dim!r}")
     input_type = graph.value(op.inputs[0]).type
     if not input_type.shape:
-        raise ValueError("cumsum does not support rank-0 tensors")
+        raise ValueError(f"{op.op} does not support rank-0 tensors")
     axis = dim + len(input_type.shape) if dim < 0 else dim
     if axis < 0 or axis >= len(input_type.shape):
-        raise ValueError(f"cumsum.dim {dim} exceeds rank {len(input_type.shape)}")
+        raise ValueError(f"{op.op}.dim {dim} exceeds rank {len(input_type.shape)}")
     output_type = graph.value(op.outputs[0]).type
     if output_type.shape != input_type.shape:
         raise ValueError(
-            f"cumsum output shape {output_type.shape} != {input_type.shape}"
+            f"{op.op} output shape {output_type.shape} != {input_type.shape}"
         )
 
 

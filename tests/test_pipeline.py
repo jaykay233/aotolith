@@ -2257,6 +2257,149 @@ def test_fractional_correction_equal_to_the_count_yields_inf() -> None:
 
 
 @pytest.mark.parametrize(
+    "fn",
+    [
+        lambda value: torch.logsumexp(value, -1),
+        lambda value: torch.logsumexp(value, 0, keepdim=True),
+        lambda value: torch.logsumexp(value, dim=(1, 2)),
+        lambda value: torch.logsumexp(value, dim=[0, 2], keepdim=True),
+    ],
+)
+def test_logsumexp_matches_pytorch(fn) -> None:
+    torch.manual_seed(67)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(fn, (x,))
+    # The composite is a max shift plus a log-sum, so no MLX logsumexp needed.
+    assert "amax" in [op.op for op in result.lowered_graph.ops]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_logsumexp_keeps_saturated_limits() -> None:
+    # ATen replaces an infinite maximum with zero before subtracting, so a
+    # +inf row stays +inf and an all -inf row stays -inf instead of going nan.
+    x = torch.tensor(
+        [
+            [float("inf"), 0.0],
+            [float("-inf"), float("-inf")],
+            [1000.0, 1001.0],
+        ]
+    )
+    result = compile_callable(lambda value: torch.logsumexp(value, -1), (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = torch.logsumexp(x, -1)
+    mx.eval(actual)
+    assert actual.tolist()[:2] == [math.inf, -math.inf]
+    assert actual.tolist()[2] == pytest.approx(expected[2].item(), rel=1e-6)
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_cumprod_matches_pytorch(dim) -> None:
+    def fn(value):
+        return torch.cumprod(value, dim)
+
+    torch.manual_seed(68)
+    x = torch.randn(3, 4)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["cumprod"]
+    assert result.lowered_graph.ops[0].attrs == {"dim": dim}
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_cumprod_preserves_an_integer_dtype() -> None:
+    def fn(value):
+        return torch.cumprod(value, 1)
+
+    x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(_torch_to_mlx(x))[0]
+    expected = _torch_to_mlx(fn(x))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("shape", "offset", "dim1", "dim2"),
+    [
+        ((4, 4), 0, 0, 1),
+        ((4, 4), 2, 0, 1),
+        ((4, 4), -2, 0, 1),
+        ((3, 4), 1, 0, 1),
+        ((3, 4), -1, 0, 1),
+        ((3, 4, 5), 0, -2, -1),
+        ((3, 4, 5), -2, 1, 2),
+        ((3, 4, 5), 1, 0, 2),
+        ((2, 3, 4, 5), 0, 1, 3),
+    ],
+)
+def test_diagonal_matches_pytorch(shape, offset, dim1, dim2) -> None:
+    def fn(value):
+        return torch.diagonal(value, offset, dim1, dim2)
+
+    torch.manual_seed(69)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    # The diagonal is a strided slice of a flattened trailing pair, so the
+    # plan copies nothing and launches no kernel.
+    assert result.plan.kernels == ()
+    assert {op.op for op in result.lowered_graph.ops} <= {
+        "permute",
+        "reshape",
+        "slice",
+    }
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.array_equal(actual, expected)
+
+
+def test_diagonal_reads_the_expected_elements() -> None:
+    source = mx.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    result = compile_callable(
+        lambda value: torch.diagonal(value), (torch.zeros(2, 3),)
+    )
+    mx.eval(result.plan(source))
+    assert result.plan(source)[0].tolist() == [1.0, 5.0]
+    shifted = compile_callable(
+        lambda value: torch.diagonal(value, 1), (torch.zeros(2, 3),)
+    )
+    assert shifted.plan(source)[0].tolist() == [2.0, 6.0]
+
+
+def test_diagonal_rejects_an_offset_with_no_elements() -> None:
+    with pytest.raises(NotImplementedError, match="no elements"):
+        compile_callable(
+            lambda value: torch.diagonal(value, 4), (torch.randn(3, 3),)
+        )
+
+
+def test_masked_fill_with_a_tensor_value_lowers_to_where() -> None:
+    def fn(value, mask, fill):
+        return value.masked_fill(mask, fill)
+
+    torch.manual_seed(70)
+    x = torch.randn(3, 4)
+    mask = torch.rand(3, 4) > 0.5
+    fill = torch.tensor(-2.5)
+    result = compile_callable(fn, (x, mask, fill))
+    assert [op.op for op in result.lowered_graph.ops] == ["where"]
+    actual = result.plan(
+        mx.array(x.numpy()), mx.array(mask.numpy()), mx.array(fill.numpy())
+    )[0]
+    expected = mx.array(fn(x, mask, fill).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
     ("shape", "repeats"),
     [
         ((3,), (4,)),
