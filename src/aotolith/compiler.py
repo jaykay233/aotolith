@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -25,6 +25,11 @@ from .passes import (
     simplify_layouts,
 )
 
+# Container kinds recorded in a keyword template and in an artifact manifest.
+_KWARG_LIST = "list"
+_KWARG_TUPLE = "tuple"
+_KWARG_DICT = "dict"
+
 
 @dataclass(frozen=True, slots=True)
 class CompilationResult:
@@ -44,6 +49,44 @@ class CompilationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _KwargLeaf:
+    """A tensor keyword value that becomes one graph input."""
+
+
+@dataclass(frozen=True, slots=True)
+class _KwargStatic:
+    """A keyword leaf with no tensor in it, kept as a tracing-time constant."""
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _KwargSequence:
+    """A list/tuple keyword value rebuilt around whichever leaves are tensors."""
+
+    kind: str
+    items: tuple[Any, ...]
+    # ``namedtuple`` subclasses are rebuilt through their constructor; a plain
+    # list or tuple needs none. Only used while tracing, never serialized.
+    factory: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class _KwargMapping:
+    """A mapping keyword value rebuilt around whichever leaves are tensors."""
+
+    items: tuple[tuple[Any, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _KwargTensor:
+    """A promoted leaf: where it sits in the value and what it traced as."""
+
+    path: tuple[tuple[str, Any], ...]
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
 class CompiledModulePlan:
     """An executable plan with module parameters captured as bound state."""
 
@@ -53,8 +96,12 @@ class CompiledModulePlan:
     _state_values: tuple[mx.array, ...]
     # Tensor-valued ``example_kwargs``, promoted to graph inputs so callers can
     # pass them by name and change them per call. In ``graph.inputs`` they sit
-    # between the positional inputs and the bound state.
+    # between the positional inputs and the bound state, in the order their
+    # tensors appear inside each value. ``tensor_kwarg_templates`` records how
+    # those leaves were nested, so a value such as ``(cos, sin)`` -- two graph
+    # inputs behind one keyword -- is accepted in its original shape.
     tensor_kwarg_names: tuple[str, ...] = ()
+    tensor_kwarg_templates: tuple[Any, ...] = ()
 
     @property
     def plan(self) -> CompiledPlan:
@@ -107,7 +154,31 @@ class CompiledModulePlan:
             raise ValueError(
                 "unexpected keyword inputs: " + ", ".join(unexpected)
             )
-        return tuple(supplied[name] for name in self.tensor_kwarg_names)
+        values: list[Any] = []
+        for name, template in zip(
+            self.tensor_kwarg_names, self._kwarg_templates(), strict=True
+        ):
+            _collect_kwarg_tensors(
+                template, supplied[name], values, f"keyword {name!r}"
+            )
+        return tuple(values)
+
+    def _kwarg_templates(self) -> tuple[Any, ...]:
+        """Templates for each promoted keyword, oldest artifacts included.
+
+        Plans rebuilt from artifacts written before nested promotion recorded
+        only a keyword name per graph input, which is exactly one tensor leaf
+        at the top level.
+        """
+
+        if len(self.tensor_kwarg_templates) == len(self.tensor_kwarg_names):
+            return self.tensor_kwarg_templates
+        if self.tensor_kwarg_templates:
+            raise ValueError(
+                "tensor keyword templates do not match the tensor keyword "
+                "names"
+            )
+        return tuple(_KwargLeaf() for _ in self.tensor_kwarg_names)
 
 
 def compile_graph(
@@ -210,21 +281,17 @@ def compile_module(
     kwargs = dict(example_kwargs or {})
     static_kwargs: dict[str, Any] = {}
     tensor_kwarg_names: list[str] = []
+    tensor_kwarg_templates: list[Any] = []
     tensor_kwarg_values: list[Any] = []
-    nested: list[str] = []
     for name, value in kwargs.items():
-        if isinstance(value, torch.Tensor):
+        leaves: list[_KwargTensor] = []
+        template = _kwarg_template(value, f"example_kwargs[{name!r}]", (), leaves)
+        if leaves:
             tensor_kwarg_names.append(name)
-            tensor_kwarg_values.append(value)
-        elif _contains_tensor(value):
-            nested.append(name)
+            tensor_kwarg_templates.append(template)
+            tensor_kwarg_values.extend(leaf.value for leaf in leaves)
         else:
             static_kwargs[name] = value
-    if nested:
-        raise NotImplementedError(
-            "example_kwargs values that contain tensors are not graph inputs "
-            f"yet: {nested}"
-        )
     if "verify_index_bounds" in tensor_kwarg_names:
         raise ValueError(
             "a tensor keyword input cannot be named 'verify_index_bounds': "
@@ -236,7 +303,7 @@ def compile_module(
     state_names = tuple(state)
     state_values = tuple(state.values())
     input_count = len(example_inputs)
-    forward_input_count = input_count + len(tensor_kwarg_names)
+    forward_input_count = input_count + len(tensor_kwarg_values)
     bound_values = _unique_mlx_state(state_values)
 
     def functional_forward(*args: Any) -> Any:
@@ -245,9 +312,11 @@ def compile_module(
             zip(state_names, args[forward_input_count:], strict=True)
         )
         call_kwargs = dict(static_kwargs)
-        call_kwargs.update(
-            zip(tensor_kwarg_names, args[input_count:forward_input_count])
-        )
+        promoted = iter(args[input_count:forward_input_count])
+        for name, template in zip(
+            tensor_kwarg_names, tensor_kwarg_templates, strict=True
+        ):
+            call_kwargs[name] = _build_kwarg_value(template, promoted)
         with torch.no_grad():
             output = torch.func.functional_call(
                 module,
@@ -281,7 +350,257 @@ def compile_module(
         state_names=state_names,
         _state_values=bound_values,
         tensor_kwarg_names=tuple(tensor_kwarg_names),
+        tensor_kwarg_templates=tuple(tensor_kwarg_templates),
     )
+
+
+def _kwarg_template(
+    value: Any,
+    where: str,
+    path: tuple[tuple[str, Any], ...],
+    leaves: list[_KwargTensor],
+) -> Any:
+    """Describe one keyword value, promoting every tensor inside it.
+
+    Only tensors are promoted. A subtree with no tensors is kept whole as a
+    tracing-time constant, so ``{"use_cache": False}`` still traces as a Python
+    value and ``{"scale": 2.0, "mask": tensor}`` promotes just the mask.
+    """
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is required for compile_module") from exc
+
+    if isinstance(value, torch.Tensor):
+        leaves.append(_KwargTensor(path, value))
+        return _KwargLeaf()
+
+    if isinstance(value, Mapping):
+        found: list[_KwargTensor] = []
+        items = tuple(
+            (
+                key,
+                _kwarg_template(
+                    child,
+                    f"{where}[{key!r}]",
+                    path + ((_KWARG_DICT, key),),
+                    found,
+                ),
+            )
+            for key, child in value.items()
+        )
+        if not found:
+            return _KwargStatic(value)
+        leaves.extend(found)
+        return _KwargMapping(items)
+
+    if isinstance(value, (list, tuple)):
+        kind = _KWARG_LIST if isinstance(value, list) else _KWARG_TUPLE
+        found = []
+        items = tuple(
+            _kwarg_template(
+                child,
+                f"{where}[{index}]",
+                path + ((kind, index),),
+                found,
+            )
+            for index, child in enumerate(value)
+        )
+        if not found:
+            return _KwargStatic(value)
+        leaves.extend(found)
+        factory = (
+            type(value)
+            if kind == _KWARG_TUPLE
+            and type(value) is not tuple
+            and hasattr(type(value), "_fields")
+            else None
+        )
+        return _KwargSequence(kind, items, factory)
+
+    if _contains_tensor(value):
+        raise NotImplementedError(
+            f"{where} is a {type(value).__name__} that holds tensors; only "
+            "lists, tuples and mappings promote their tensors to graph inputs"
+        )
+    return _KwargStatic(value)
+
+
+def _build_kwarg_value(node: Any, values: Iterator[Any]) -> Any:
+    """Rebuild a keyword value around the tensors bound to its leaves."""
+
+    if isinstance(node, _KwargLeaf):
+        return next(values)
+    if isinstance(node, _KwargSequence):
+        items = [_build_kwarg_value(child, values) for child in node.items]
+        if node.factory is not None:
+            return node.factory(*items)
+        return items if node.kind == _KWARG_LIST else tuple(items)
+    if isinstance(node, _KwargMapping):
+        return {
+            key: _build_kwarg_value(child, values)
+            for key, child in node.items
+        }
+    if isinstance(node, _KwargStatic):
+        return node.value
+    raise TypeError(
+        f"unknown keyword template {type(node).__name__}"
+    )
+
+
+def _collect_kwarg_tensors(
+    node: Any, value: Any, sink: list[Any], where: str
+) -> None:
+    """Append the tensors inside one supplied keyword value, in graph order.
+
+    The supplied value has to mirror the traced nesting exactly: same container
+    shapes, same mapping keys. A caller that passes a different nesting would
+    otherwise bind tensors to the wrong graph inputs.
+    """
+
+    if isinstance(node, _KwargLeaf):
+        sink.append(value)
+        return
+    if isinstance(node, _KwargSequence):
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"{where} expected "
+                f"{'a list' if node.kind == _KWARG_LIST else 'a tuple'} of "
+                f"{len(node.items)} values, got {type(value).__name__}"
+            )
+        if len(value) != len(node.items):
+            raise ValueError(
+                f"{where} expected {len(node.items)} values, got {len(value)}"
+            )
+        for index, (child, item) in enumerate(zip(node.items, value)):
+            _collect_kwarg_tensors(child, item, sink, f"{where}[{index}]")
+        return
+    if isinstance(node, _KwargMapping):
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                f"{where} expected a mapping with keys "
+                f"{[key for key, _ in node.items]}, got "
+                f"{type(value).__name__}"
+            )
+        expected = [key for key, _ in node.items]
+        if list(value) != expected:
+            raise ValueError(
+                f"{where} expected a mapping with keys {expected}, got "
+                f"{list(value)}"
+            )
+        for key, child in node.items:
+            _collect_kwarg_tensors(child, value[key], sink, f"{where}[{key!r}]")
+        return
+    if isinstance(node, _KwargStatic):
+        if type(value) is not type(node.value) or not _values_match(
+            value, node.value
+        ):
+            raise ValueError(
+                f"{where} is not a tensor, so it was captured as a constant "
+                f"while tracing ({node.value!r}); pass the traced value back "
+                "or compile again with the value you need"
+            )
+        return
+    raise TypeError(
+        f"unknown keyword template {type(node).__name__}"
+    )
+
+
+def _values_match(left: Any, right: Any) -> bool:
+    """Compare two non-tensor leaves without letting exotic types raise."""
+
+    try:
+        return bool(left == right)
+    except Exception:  # noqa: BLE001 - an uncomparable leaf is a mismatch
+        return False
+
+
+def _kwarg_leaf_paths(
+    node: Any,
+) -> list[tuple[tuple[str, Any], ...]]:
+    """Return the path of every tensor leaf, in graph-input order."""
+
+    if isinstance(node, _KwargLeaf):
+        return [()]
+    if isinstance(node, _KwargSequence):
+        return [
+            ((node.kind, index),) + rest
+            for index, child in enumerate(node.items)
+            for rest in _kwarg_leaf_paths(child)
+        ]
+    if isinstance(node, _KwargMapping):
+        return [
+            ((_KWARG_DICT, key),) + rest
+            for key, child in node.items
+            for rest in _kwarg_leaf_paths(child)
+        ]
+    return []
+
+
+def _kwarg_template_from_paths(
+    paths: Sequence[Sequence[tuple[str, Any]]], leaf_count: int
+) -> Any:
+    """Rebuild a keyword template from the leaf paths stored in an artifact."""
+
+    if leaf_count == 1 and all(len(path) == 0 for path in paths):
+        return _KwargLeaf()
+
+    def build(depth: int, members: Sequence[Sequence[tuple[str, Any]]]) -> Any:
+        if any(len(path) == depth for path in members):
+            if len(members) != 1:
+                raise ValueError(
+                    "artifact keyword path mixes a tensor leaf with nested "
+                    "tensors"
+                )
+            return _KwargLeaf()
+        kind = members[0][depth][0]
+        if kind == _KWARG_DICT:
+            grouped: dict[Any, list[Sequence[tuple[str, Any]]]] = {}
+            for path in members:
+                step_kind, key = path[depth]
+                if step_kind != _KWARG_DICT:
+                    raise ValueError(
+                        "artifact keyword path changes container kind"
+                    )
+                grouped.setdefault(key, []).append(path)
+            return _KwargMapping(
+                tuple(
+                    (key, build(depth + 1, children))
+                    for key, children in grouped.items()
+                )
+            )
+        if kind not in (_KWARG_LIST, _KWARG_TUPLE):
+            raise ValueError(
+                f"artifact keyword path has unknown container {kind!r}"
+            )
+        indexed: dict[int, list[Sequence[tuple[str, Any]]]] = {}
+        for path in members:
+            step_kind, key = path[depth]
+            if step_kind != kind:
+                raise ValueError(
+                    "artifact keyword path changes container kind"
+                )
+            if not isinstance(key, int) or isinstance(key, bool):
+                raise ValueError(
+                    "artifact keyword path has a non-integer index"
+                )
+            indexed.setdefault(key, []).append(path)
+        if sorted(indexed) != list(range(len(indexed))):
+            raise ValueError(
+                "artifact keyword path skips a container index"
+            )
+        return _KwargSequence(
+            kind,
+            tuple(
+                build(depth + 1, indexed[index])
+                for index in range(len(indexed))
+            ),
+        )
+
+    if not paths:
+        raise ValueError("artifact keyword entry has no tensor leaves")
+    return build(0, paths)
 
 
 def _unique_mlx_state(values: Sequence[Any]) -> tuple[mx.array, ...]:

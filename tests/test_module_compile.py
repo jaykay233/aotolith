@@ -399,6 +399,293 @@ def test_tensor_keyword_arguments_survive_an_artifact_round_trip(
     assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
 
 
+class _PairedKeywordModule(torch.nn.Module):
+    """A module whose keyword argument is a pair of tensors.
+
+    Newer ``transformers`` decoder layers receive ``position_embeddings=(cos,
+    sin)`` exactly like this, and a caller has to be able to vary both halves.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 8).to(torch.bfloat16))
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        cos, sin = position_embeddings
+        rotated = value @ self.weight
+        output = rotated * cos + sin
+        if bias is not None:
+            output = output + bias
+        return output
+
+
+def test_nested_tensor_keywords_promote_every_leaf_in_order() -> None:
+    torch.manual_seed(31)
+    module = _PairedKeywordModule().eval()
+    value = _bf16(2, 8)
+    cos = _bf16(2, 8)
+    sin = _bf16(2, 8)
+    bias = _bf16(2, 8)
+
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={
+            "position_embeddings": (cos, sin),
+            "bias": bias,
+        },
+    )
+
+    # One public name covers both halves; the graph still receives two inputs.
+    assert compiled.tensor_kwarg_names == ("position_embeddings", "bias")
+    assert len(compiled.plan.graph.inputs) == 5  # value, cos, sin, bias, weight
+    shapes = [
+        compiled.plan.graph.value(graph_input).type.shape
+        for graph_input in compiled.plan.graph.inputs
+    ]
+    assert shapes == [(2, 8), (2, 8), (2, 8), (2, 8), (8, 8)]
+
+    other_cos = (_bf16(2, 8) * 2).to(torch.bfloat16)
+    other_bias = _bf16(2, 8) * 0.5
+    with torch.no_grad():
+        expected = module(
+            value,
+            position_embeddings=(other_cos, sin),
+            bias=other_bias,
+        )
+    actual = compiled(
+        _to_mlx(value),
+        position_embeddings=(_to_mlx(other_cos), _to_mlx(sin)),
+        bias=_to_mlx(other_bias),
+    )[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+    # Both halves vary independently: swapping only `sin` changes the result.
+    other_sin = (_bf16(2, 8) * 3).to(torch.bfloat16)
+    with torch.no_grad():
+        swapped = module(
+            value,
+            position_embeddings=(other_cos, other_sin),
+            bias=other_bias,
+        )
+    swapped_actual = compiled(
+        _to_mlx(value),
+        position_embeddings=(_to_mlx(other_cos), _to_mlx(other_sin)),
+        bias=_to_mlx(other_bias),
+    )[0]
+    mx.eval(swapped_actual)
+    assert mx.allclose(swapped_actual, _to_mlx(swapped), atol=1e-2, rtol=1e-2)
+    assert not mx.allclose(swapped_actual, actual, atol=1e-2, rtol=1e-2)
+
+
+class _GatedModule(torch.nn.Module):
+    """A mapping keyword with one tensor leaf and one constant leaf."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 8).to(torch.bfloat16))
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        scaled = value @ self.weight
+        return scaled * gate["mask"] * gate["factor"]
+
+
+def test_mapping_keywords_promote_tensors_and_keep_other_leaves_static() -> None:
+    torch.manual_seed(32)
+    module = _GatedModule().eval()
+    value = _bf16(2, 8)
+    mask = _bf16(2, 8)
+
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={"gate": {"mask": mask, "factor": 2.5}},
+    )
+
+    assert compiled.tensor_kwarg_names == ("gate",)
+    assert len(compiled.plan.graph.inputs) == 3  # value, mask, weight
+
+    other_mask = _bf16(2, 8)
+    with torch.no_grad():
+        expected = module(value, gate={"mask": other_mask, "factor": 2.5})
+    actual = compiled(
+        _to_mlx(value),
+        gate={"mask": _to_mlx(other_mask), "factor": 2.5},
+    )[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+    # A non-tensor leaf is a tracing-time constant: accepting a different one
+    # would silently compute with the traced value instead of the caller's.
+    with pytest.raises(ValueError, match=r"\['factor'\] is not a tensor"):
+        compiled(
+            _to_mlx(value),
+            gate={"mask": _to_mlx(other_mask), "factor": 4.0},
+        )
+    with pytest.raises(ValueError, match=r"expected a mapping with keys"):
+        compiled(_to_mlx(value), gate={"mask": _to_mlx(other_mask)})
+
+
+def test_nested_tensor_keywords_require_the_traced_nesting() -> None:
+    torch.manual_seed(33)
+    module = _PairedKeywordModule().eval()
+    value = _bf16(2, 8)
+    cos = _bf16(2, 8)
+    sin = _bf16(2, 8)
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={"position_embeddings": (cos, sin)},
+    )
+
+    with pytest.raises(ValueError, match="expected a tuple of 2 values"):
+        compiled(_to_mlx(value), position_embeddings=_to_mlx(cos))
+    with pytest.raises(ValueError, match="expected 2 values, got 3"):
+        compiled(
+            _to_mlx(value),
+            position_embeddings=(
+                _to_mlx(cos),
+                _to_mlx(sin),
+                _to_mlx(cos),
+            ),
+        )
+
+
+def test_nested_tensor_keywords_survive_an_artifact_round_trip(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(34)
+    module = _PairedKeywordModule().eval()
+    value = _bf16(2, 8)
+    cos = _bf16(2, 8)
+    sin = _bf16(2, 8)
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={"position_embeddings": (cos, sin)},
+    )
+
+    from aotolith import load_compiled_module, read_artifact_manifest
+
+    artifact = compiled.save(tmp_path / "paired.aoto")
+    manifest = read_artifact_manifest(artifact)
+    assert [
+        (entry["name"], entry["path"])
+        for entry in manifest["entrypoint"]["kwargs"]
+    ] == [
+        ("position_embeddings", [["tuple", 0]]),
+        ("position_embeddings", [["tuple", 1]]),
+    ]
+
+    loaded = load_compiled_module(artifact)
+    assert loaded.tensor_kwarg_names == ("position_embeddings",)
+
+    other_cos = _bf16(2, 8)
+    with torch.no_grad():
+        expected = module(value, position_embeddings=(other_cos, sin))
+    actual = loaded(
+        _to_mlx(value),
+        position_embeddings=(_to_mlx(other_cos), _to_mlx(sin)),
+    )[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+
+class _CachedAttentionModule(torch.nn.Module):
+    """A list of ``(key, value)`` pairs, the usual past-key-value layout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 8).to(torch.bfloat16))
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
+        output = value @ self.weight
+        for key, cached in past_key_values:
+            output = output + cached @ key
+        return output
+
+
+def test_deeply_nested_tensor_keywords_promote_in_traversal_order() -> None:
+    torch.manual_seed(35)
+    module = _CachedAttentionModule().eval()
+    value = _bf16(3, 4)
+    key_one = _bf16(2, 8)
+    cached_one = _bf16(3, 2)
+    key_two = _bf16(5, 8)
+    cached_two = _bf16(1, 5)
+
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={
+            "past_key_values": [
+                (key_one, cached_one),
+                (key_two, cached_two),
+            ]
+        },
+    )
+
+    assert compiled.tensor_kwarg_names == ("past_key_values",)
+    assert [
+        compiled.plan.graph.value(graph_input).type.shape
+        for graph_input in compiled.plan.graph.inputs
+    ] == [
+        (3, 4),
+        (2, 8),
+        (3, 2),
+        (5, 8),
+        (1, 5),
+        (4, 8),
+    ]
+
+    other_key = _bf16(5, 8)
+    with torch.no_grad():
+        expected = module(
+            value,
+            past_key_values=[
+                (key_one, cached_one),
+                (other_key, cached_two),
+            ],
+        )
+    actual = compiled(
+        _to_mlx(value),
+        past_key_values=[
+            (_to_mlx(key_one), _to_mlx(cached_one)),
+            (_to_mlx(other_key), _to_mlx(cached_two)),
+        ],
+    )[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+
+def test_tensor_keywords_in_unsupported_containers_are_reported_by_name() -> None:
+    torch.manual_seed(36)
+    module = _PairedKeywordModule().eval()
+
+    with pytest.raises(
+        NotImplementedError, match=r"example_kwargs\['position_embeddings'\]"
+    ):
+        compile_module(
+            module,
+            (_bf16(2, 8),),
+            example_kwargs={"position_embeddings": {_bf16(2, 8)}},
+        )
+
+
 def test_tied_state_shares_one_buffer() -> None:
     """Tied weights are one tensor under two names and should cost one buffer.
 
@@ -470,14 +757,35 @@ def test_a_transposed_view_is_not_treated_as_aliased_state() -> None:
     assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
 
 
-def test_nested_tensor_keyword_arguments_are_rejected_by_name() -> None:
-    module = _MaskedScaleModule().eval()
-    with pytest.raises(NotImplementedError, match=r"\['mask'\]"):
-        compile_module(
-            module,
-            (_bf16(2, 8),),
-            example_kwargs={"mask": [_bf16(2, 8)]},
-        )
+def test_nested_tensor_keyword_arguments_promote_the_inner_tensor() -> None:
+    """A tensor inside a list is a graph input, not a captured constant.
+
+    The old behaviour rejected any keyword value that merely contained a
+    tensor, which left `past_key_values`, `position_embeddings` and other
+    structured arguments uncompilable.
+    """
+
+    class ListMaskModule(torch.nn.Module):
+        def forward(
+            self, value: torch.Tensor, mask: list[torch.Tensor] | None = None
+        ) -> torch.Tensor:
+            return value + mask[0]
+
+    torch.manual_seed(37)
+    module = ListMaskModule().eval()
+    value = _bf16(2, 8)
+    compiled = compile_module(
+        module,
+        (value,),
+        example_kwargs={"mask": [_bf16(2, 8)]},
+    )
+
+    other = _bf16(2, 8)
+    with torch.no_grad():
+        expected = module(value, mask=[other])
+    actual = compiled(_to_mlx(value), mask=[_to_mlx(other)])[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
 
 
 def test_a_keyword_input_cannot_shadow_the_plan_argument() -> None:

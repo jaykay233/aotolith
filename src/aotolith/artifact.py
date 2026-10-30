@@ -58,19 +58,27 @@ def save_compiled(
     measurements are intentionally data-dependent and can differ between runs.
     """
 
-    from .compiler import CompiledModulePlan
+    from .compiler import CompiledModulePlan, _kwarg_leaf_paths
 
     is_module = isinstance(compiled, CompiledModulePlan)
     if is_module:
         result = compiled.compilation
         input_count = compiled.input_count
-        tensor_kwarg_names = compiled.tensor_kwarg_names
+        kwarg_paths = [
+            (name, path)
+            for name, template in zip(
+                compiled.tensor_kwarg_names,
+                compiled._kwarg_templates(),
+                strict=True,
+            )
+            for path in _kwarg_leaf_paths(template)
+        ]
         state_names = compiled.state_names
         state_values = compiled._state_values
     else:
         result = compiled
         input_count = len(result.plan.graph.inputs)
-        tensor_kwarg_names = ()
+        kwarg_paths = []
         state_names = ()
         state_values = ()
 
@@ -80,7 +88,7 @@ def save_compiled(
             f"{len(state_values)} state arrays"
         )
     if len(result.plan.graph.inputs) != (
-        input_count + len(tensor_kwarg_names) + len(state_values)
+        input_count + len(kwarg_paths) + len(state_values)
     ):
         raise ValueError(
             "graph inputs do not match public inputs, tensor keyword inputs "
@@ -88,13 +96,14 @@ def save_compiled(
         )
 
     kwarg_entries: list[dict[str, object]] = []
-    for index, name in enumerate(tensor_kwarg_names):
+    for index, (name, leaf_path) in enumerate(kwarg_paths):
         value_type = result.plan.graph.value(
             result.plan.graph.inputs[input_count + index]
         ).type
         kwarg_entries.append(
             {
                 "name": name,
+                "path": [[kind, key] for kind, key in leaf_path],
                 "shape": list(value_type.shape),
                 "dtype": value_type.dtype.value,
             }
@@ -354,14 +363,14 @@ def load_compiled_module(
         state_entries=state_entries,
         state_values=state_values,
     )
+    kwarg_names, kwarg_templates = _kwarg_templates_from_entries(kwarg_entries)
     return CompiledModulePlan(
         compilation=compilation,
         input_count=input_count,
         state_names=state_names,
         _state_values=state_values,
-        tensor_kwarg_names=tuple(
-            str(entry["name"]) for entry in kwarg_entries
-        ),
+        tensor_kwarg_names=kwarg_names,
+        tensor_kwarg_templates=kwarg_templates,
     )
 
 
@@ -496,6 +505,7 @@ def _validate_entrypoint_layout(
         _check_input_type(
             graph, graph.inputs[input_count + index], entry, "keyword"
         )
+    _validate_kwarg_paths(kwarg_entries)
     for index, (entry, value) in enumerate(
         zip(state_entries, state_values, strict=True)
     ):
@@ -510,6 +520,103 @@ def _validate_entrypoint_layout(
                 f"{actual_shape}/{actual_dtype.value}, expected "
                 f"{expected.shape}/{expected.dtype.value}"
             )
+
+
+def _validate_kwarg_paths(kwarg_entries: list[Any]) -> None:
+    """Check that keyword paths describe exactly the stored tensor leaves."""
+
+    from .compiler import _kwarg_leaf_paths, _kwarg_template_from_paths
+
+    for name, group in _kwarg_entry_groups(kwarg_entries):
+        try:
+            template = _kwarg_template_from_paths(
+                [_decode_kwarg_path(entry) for entry in group], len(group)
+            )
+        except ValueError as exc:
+            raise ArtifactCompatibilityError(
+                f"artifact keyword {name!r} path is invalid: {exc}"
+            ) from exc
+        if len(_kwarg_leaf_paths(template)) != len(group):
+            raise ArtifactCompatibilityError(
+                f"artifact keyword {name!r} path does not describe "
+                f"{len(group)} tensor leaves"
+            )
+
+
+def _kwarg_templates_from_entries(
+    kwarg_entries: list[Any],
+) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+    """Rebuild one template per promoted keyword from the manifest entries."""
+
+    from .compiler import _kwarg_template_from_paths
+
+    names: list[str] = []
+    templates: list[Any] = []
+    for name, group in _kwarg_entry_groups(kwarg_entries):
+        names.append(name)
+        templates.append(
+            _kwarg_template_from_paths(
+                [_decode_kwarg_path(entry) for entry in group], len(group)
+            )
+        )
+    return tuple(names), tuple(templates)
+
+
+def _kwarg_entry_groups(
+    kwarg_entries: list[Any],
+) -> list[tuple[str, list[Mapping[str, Any]]]]:
+    """Group keyword entries by name, rejecting interleaved duplicates."""
+
+    groups: list[tuple[str, list[Mapping[str, Any]]]] = []
+    seen: set[str] = set()
+    for entry in kwarg_entries:
+        name = str(entry["name"])
+        if groups and groups[-1][0] == name:
+            groups[-1][1].append(entry)
+            continue
+        if name in seen:
+            raise ArtifactCompatibilityError(
+                f"artifact keyword {name!r} entries are not contiguous"
+            )
+        seen.add(name)
+        groups.append((name, [entry]))
+    return groups
+
+
+def _decode_kwarg_path(
+    entry: Mapping[str, Any],
+) -> tuple[tuple[str, Any], ...]:
+    raw = entry.get("path")
+    if raw is None:
+        # Artifacts written before nested keyword promotion name one tensor
+        # per keyword and have no path.
+        return ()
+    if not isinstance(raw, list):
+        raise ArtifactCompatibilityError("artifact keyword path is invalid")
+    from .compiler import _KWARG_DICT, _KWARG_LIST, _KWARG_TUPLE
+
+    path: list[tuple[str, Any]] = []
+    for step in raw:
+        if not isinstance(step, (list, tuple)) or len(step) != 2:
+            raise ArtifactCompatibilityError(
+                "artifact keyword path step is invalid"
+            )
+        kind, key = step
+        if kind not in (_KWARG_LIST, _KWARG_TUPLE, _KWARG_DICT):
+            raise ArtifactCompatibilityError(
+                f"artifact keyword path has unknown container {kind!r}"
+            )
+        if kind == _KWARG_DICT:
+            if isinstance(key, (list, dict)) or key is None:
+                raise ArtifactCompatibilityError(
+                    "artifact keyword path has an invalid mapping key"
+                )
+        elif isinstance(key, bool) or not isinstance(key, int) or key < 0:
+            raise ArtifactCompatibilityError(
+                "artifact keyword path has an invalid sequence index"
+            )
+        path.append((str(kind), key))
+    return tuple(path)
 
 
 def _check_input_type(
