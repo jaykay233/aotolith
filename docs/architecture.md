@@ -386,7 +386,8 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 
 - GEMM 的 block tile 按输出 shape 和右操作数布局从测量得到的 tile 阶梯里选：右操作数转置时 K 连续，偏好宽的 column block；右操作数 row-major 时沿 K 跨步，偏好更高的 reduction step。warp 内用三个 cooperative tensor 分别承接左右操作数和 FP32 累加器，epilogue（bias、alpha/beta、`silu_mul`）在写回时执行
 - 这条路径只服务 FP16/BF16。硬件没有 float32 tensor core，`T = float` 的 `matmul2d` 实际按 bfloat16 精度执行：`512x2048x512` 的 f32 GEMM 因此偏离 PyTorch 1.6e-1，与 MLX 自己 f32 matmul 的偏差相同，而标量 tiled kernel 与 PyTorch 逐位一致（偏差 0）。所以 `_supports_mpp_matmul` 排除 F32，f32 留在标量路径上，代价是该 shape 比 MLX 慢 3.1x
-- attention 用一个 simdgroup 负责 `16` 行 query fragment，`Q` 只暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 读进 cooperative tensor，online softmax 的 `max`/`sum` 仍在寄存器里用 `simd_shuffle` 归约
+- attention 用一个 simdgroup 负责 `16` 行 query fragment，`Q` 只暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 读进 cooperative tensor，online softmax 的 `max`/`sum` 仍在寄存器里用 `simd_shuffle` 归约。`K`/`V` 的行号在逐元素上需要钳到最后一个 key，但当 key 长度和 query tile 都是 32-key tile 的整数倍时这个钳位可证明是恒等运算，只在 tile 真会越过末尾时才生成（`_attention_key_rows_need_clamp`），实测快 1.02–1.13 倍
+- 这条 attention 路径与 MLX SDPA 的剩余差距用 `examples/metal_attention_benchmark.py --ablate` 量化：两个收缩占 88% 的时间（去掉 `QK` 省 42%–45%，去掉 `PV` 省 33%–43%），而把 `K`/`V` 指向同一个常驻 head 只改变不到 3%，说明 device 读取已被掩盖、差距在 MMA 利用率。针对它的三种改法都实测更慢：threadgroup 暂存 `K`/`V` 慢 1.9–2.6 倍且随共享同一 tile 的 warp 数增加而收敛（occupancy 受限），query 片段进寄存器溢出后慢 20%，`matmul2d` 的 reduction 从 16 提到 32 慢 2.7 倍
 - 两条路径都以编译器自己的 `__HAVE_TENSOR__` 宏为前提（Apple GPU family 9 及以上）。更早的机型走上一节的 SIMD 路径
 - 这个宏只回答「GPU 有没有 tensor op」，不回答「这个 metallib 装得上」。半虚拟化 GPU（托管 CI、云 Mac）会定义宏，却以 `unsupported deferred-static-alloca-size function body` 拒绝加载。因此 `compile` 在选路之前会真正加载并求值一个已经生成好的 tensor-core kernel；失败就把整个 graph 重新 lower 一次，改走 SIMD 路径，并把原因写进 `selections` 的 `reason`。代价是每次编译多一次 launch（kernel 已缓存时约 0.25 ms），换来的是首次 matmul 不会抛出一句带 mangled 符号的 `RuntimeError`
 

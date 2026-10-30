@@ -350,15 +350,15 @@ compiled = aoto.compile_callable(
 | matmul 128x896x896 bf16（prefill） | 18.4 us | 16.5 us | 0.89x |
 | matmul 128x896x4864 bf16（prefill） | 53.5 us | 54.3 us | 1.02x |
 | matmul 128x4864x896 bf16（prefill） | 56.9 us | 83.6 us | 1.47x |
-| attention 1x8x512x64 f16 causal | 35.2 us | 28.5 us | 0.81x |
-| attention 1x8x2048x128 f16 causal | 585.6 us | 461.6 us | 0.79x |
-| attention 1x64x4096x128 f16 causal | 16.3 ms | 13.2 ms | 0.81x |
+| attention 1x8x512x64 f16 causal | 34.2 us | 28.5 us | 0.83x |
+| attention 1x8x2048x128 f16 causal | 530.8 us | 466.3 us | 0.88x |
+| attention 1x64x4096x128 f16 causal | 14.8 ms | 13.3 ms | 0.90x |
 
 matmul kernel 用 MPP tensor-core 的 `matmul2d` 跑分块操作数。分块配置由输出 shape 和右操作数的布局共同决定：右操作数转置时 K 方向连续，适合更宽的列分块；右操作数行主序时沿 K 方向跨步，更适合更高的归约步长。在 43 组 shape 与布局组合上，选择器对每个 shape 都保持在实测最优分块的 5% 以内；相对 MLX 平均为 1.16x（右操作数转置）和 1.10x（行主序），没有 shape 低于 1.01x。最大的几个 shape 收敛到持平，因为两边都逼近同一套 tensor core 吞吐。上面三行 128 行的数据是 Qwen2.5-0.5B 尺寸下 128 token prefill 的实测，也是唯一诚实的例外：最窄的那个比 MLX 慢 11%，摊到整个 prefill 上（每层一个 `o_proj`，共 24 个，每个约 3 us）大约是 1%——下面那张 prefill 实测表里看不出开启原生 matmul 有任何差别；而真正主导 prefill 的 `128x4864x896` 则快 1.47x。
 
 f32 那一行是唯一的例外，而且是刻意的：硬件没有 float32 tensor core，`T = float` 的 `matmul2d` 实际按 bfloat16 精度执行，会把这个 shape 的结果偏离 PyTorch 1.6e-1——正好等于 MLX 自己 f32 matmul 的偏差。所以 f32 留在标量 tiled kernel 上，与 PyTorch 逐位一致，代价就是上面那 3.1x。FP16/BF16 不受影响。
 
-attention kernel 是寄存器驻留的 FlashAttention：一个 simdgroup 负责 16 行 query 片段和整个 value 宽度，online-softmax 的累加器始终留在寄存器里，`Q` 只在开头暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 流式读取。长序列上能跑到 16.8 TFLOPS，但在 prefill 形态上仍比 MLX 的 SDPA 慢约 20%。decode 是另一个问题：单行 query 用不上分块 online softmax，所以后端会另外发射一个单 query kernel，把整个 head 的分数留在 threadgroup memory 里，用两级归约求 `max` 和 `sum(exp)`，再做 value 累加而不需要重新缩放。因此 `--codegen-attention` 不再损失 decode 吞吐：它每层只有一次 launch、覆盖 192 个 cache slot，与 MLX 的 SDPA 落在同一噪声范围内，而不是慢 20%。对分块 prefill kernel 而言，把 `K`/`V` 暂存进 threadgroup memory 实测慢 3 倍：这份 tile 只有两个 simdgroup 共享，而每个 tile 的 barrier 代价超过它省下的重复 device 读取。`CompiledPlan.selections` 会记录每个算子实际使用的路径以及 fallback 原因。两个 kernel 都只覆盖 FP16/BF16，其他精度走 MLX。
+attention kernel 是寄存器驻留的 FlashAttention：一个 simdgroup 负责 16 行 query 片段和整个 value 宽度，online-softmax 的累加器始终留在寄存器里，`Q` 只在开头暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 流式读取。长序列上能跑到 18.6 TFLOPS，prefill 形态上比 MLX 的 SDPA 慢 10%–17%。剩下的差距用 `examples/metal_attention_benchmark.py --ablate` 量化：去掉 `QK` matmul 省下 42%–45%，去掉 `PV` 省下 33%–43%，两个收缩就是这个 pass 的 88%，而 device operand 读取已经被它们掩盖——把 `K`/`V` 指向同一个常驻 head 而不是各自的数据，总时间变化不到 3%。所以差距在 MMA 利用率，不在流式读取；针对它试过的写法都实测更慢：把 `K`/`V` 暂存进 threadgroup memory 慢 1.9–2.6 倍（且共享同一份 tile 的 warp 越多损失越小，这正是 occupancy 受限的特征——限制常驻 threadgroup 数量的就是这份 tile），把 query 片段搬进寄存器会溢出、慢 20%，把 `matmul2d` 的 reduction 从 16 加到 32 慢 2.7 倍。真正有效的是 operand 地址运算：`K`/`V` 的行号在逐元素上都被钳到最后一个 key，而当 key 长度和 query tile 都是 32-key tile 的整数倍时这个钳位可证明是恒等运算，因此只在 tile 真的会越过末尾时才生成。在不会触发的情况下省掉它实测快 1.02–1.13 倍，上表的比值是改动之后的。decode 是另一个问题：单行 query 用不上分块 online softmax，所以后端会另外发射一个单 query kernel，把整个 head 的分数留在 threadgroup memory 里，用两级归约求 `max` 和 `sum(exp)`，再做 value 累加而不需要重新缩放。因此 `--codegen-attention` 不再损失 decode 吞吐：它每层只有一次 launch、覆盖 192 个 cache slot，与 MLX 的 SDPA 落在同一噪声范围内。`CompiledPlan.selections` 会记录每个算子实际使用的路径以及 fallback 原因。两个 kernel 都只覆盖 FP16/BF16，其他精度走 MLX。
 
 tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路径都以编译器自己的 `__HAVE_TENSOR__` 宏为准。更早的机型（M1、M2）以及任何虚拟化环境都走 simdgroup 路径——也就是 fallback 测试里会和 PyTorch 对拍的那份代码——而不是发射一个装不上的 kernel。只看这个宏还不够：半虚拟化 GPU（托管 CI、云 Mac）会定义它，却仍然以 `unsupported deferred-static-alloca-size function body` 拒绝该 metallib，最终变成用户第一次 matmul 时一句看不懂的 `RuntimeError`。因此 `compile` 在选路之前会真正加载并求值一个已生成的 tensor-core kernel；设备拒绝时就把整张图重新 lower 一次改走 simdgroup，并把原因记进 `plan.selections`。代价是多一次 launch（kernel 已缓存时约 0.25 ms），且只在确实生成了 tensor-core kernel 时才付。
 
@@ -383,7 +383,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - tensor-valued `example_kwargs` 会被提升为图输入、按名字传入；值里只是**包含** tensor（list/dict 等）的关键字参数会明确报错，而不是被当作常量捕获。
 - 共享参数只绑定一次：同一个 tensor 在两个名字下共享同一个 MLX buffer 和同一份 artifact payload。图里仍然每个名字一个输入，因为 tracing 就是这么产生的。只共享 storage 但内容不同的视图（如 tensor 和它的 `.t()`）不会被合并。
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
-- 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 FP16/BF16 matmul shape 上都快于 MLX；f32 则是刻意比 MLX 慢——tensor core 没有 f32 模式，所以它留在与 PyTorch 逐位一致的标量 kernel 上。`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢约 20%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
+- 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 FP16/BF16 matmul shape 上都快于 MLX；f32 则是刻意比 MLX 慢——tensor core 没有 f32 模式，所以它留在与 PyTorch 逐位一致的标量 kernel 上。`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢 10%–17%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。
 - Qwen2 静态 cache 适配层只实现 SiLU MLP 激活和普通 causal mask。如果 config 选了别的激活或 sliding-window 层，会在编译期直接拒绝，而不是按错误的语义编译出结果。这些检查读的是构造好的层，而不是 config 字符串——库会把其中一部分字段归一化掉。激活用数值方式校验，因此连 config 描述不到的自定义 `act_fn` 也能抓到。
 - 仓库不实现 scheduler、continuous batching、抢占、paged KV cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch、EPLB 或 serving API。

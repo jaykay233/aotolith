@@ -1667,6 +1667,83 @@ def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
     assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
+def test_native_attention_drops_the_key_clamp_on_aligned_tiles() -> None:
+    """An aligned key length makes the per-element clamp provably a no-op."""
+
+    _require_tensor_cores()
+
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=True
+        )
+
+    torch.manual_seed(71)
+    inputs = tuple(torch.randn(1, 2, 256, 64, dtype=torch.float16) for _ in range(3))
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    kernel = result.plan.kernels[0]
+    source = kernel.source
+
+    assert "metal_attention_tensorcore_32x32_64" in kernel.name
+    # The key rows of both operands are addressed directly instead of going
+    # through `metal::min`, which the kernel then never has to evaluate.
+    assert "metal::min(key_base" not in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_native_attention_matches_pytorch_on_an_unaligned_key_length() -> None:
+    """The clamp is kept whenever the tiles can run past the last key."""
+
+    _require_tensor_cores()
+
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=True
+        )
+
+    torch.manual_seed(72)
+    inputs = tuple(torch.randn(1, 2, 1000, 64, dtype=torch.float16) for _ in range(3))
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    source = result.plan.kernels[0].source
+
+    assert "metal::min(key_base" in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_native_attention_drops_the_key_clamp_for_cross_attention() -> None:
+    """A causal query shorter than an aligned key still stops on a tile edge."""
+
+    _require_tensor_cores()
+
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=True
+        )
+
+    torch.manual_seed(73)
+    inputs = (
+        torch.randn(1, 2, 64, 64, dtype=torch.float16),
+        torch.randn(1, 2, 128, 64, dtype=torch.float16),
+        torch.randn(1, 2, 128, 64, dtype=torch.float16),
+    )
+    result = compile_callable(fn, inputs, codegen_attention=True)
+    source = result.plan.kernels[0].source
+
+    assert "metal::min(key_base" not in source
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in inputs))[0]
+    expected = _torch_to_mlx(fn(*inputs))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
 @pytest.mark.parametrize(
     ("dtype", "tolerance"),
     [(torch.float16, 5e-3), (torch.bfloat16, 2e-2)],
