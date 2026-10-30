@@ -347,11 +347,14 @@ The generated tensor-core kernels beat MLX on matmul but still trail MLX's SDPA 
 | matmul 512x2048x512 bf16 | 62.4 us | 82.2 us | 1.32x |
 | matmul 1024x4864x896 f16 | 373.0 us | 519.3 us | 1.39x |
 | matmul 4096x4096x4096 f16 | 5.53 ms | 5.66 ms | 1.02x |
+| matmul 128x896x896 bf16 (prefill) | 18.4 us | 16.5 us | 0.89x |
+| matmul 128x896x4864 bf16 (prefill) | 53.5 us | 54.3 us | 1.02x |
+| matmul 128x4864x896 bf16 (prefill) | 56.9 us | 83.6 us | 1.47x |
 | attention 1x8x512x64 f16 causal | 35.2 us | 28.5 us | 0.81x |
 | attention 1x8x2048x128 f16 causal | 585.6 us | 461.6 us | 0.79x |
 | attention 1x64x4096x128 f16 causal | 16.3 ms | 13.2 ms | 0.81x |
 
-The matmul kernel drives MPP tensor-core `matmul2d` over tiled operands. Tiles are chosen from the output shape and the right operand layout: a transposed right operand is K-contiguous and rewards wide column blocks, while a row-major right operand strides through K and instead rewards a taller reduction step. Across 43 measured shape and layout combinations the selector stays within 5% of the fastest tile measured for that shape, and against MLX it averages 1.16x (transposed right operand) and 1.10x (row-major) with no shape below 1.01x. The largest shapes converge on parity because both implementations approach the same tensor-core throughput.
+The matmul kernel drives MPP tensor-core `matmul2d` over tiled operands. Tiles are chosen from the output shape and the right operand layout: a transposed right operand is K-contiguous and rewards wide column blocks, while a row-major right operand strides through K and instead rewards a taller reduction step. Across 43 measured shape and layout combinations the selector stays within 5% of the fastest tile measured for that shape, and against MLX it averages 1.16x (transposed right operand) and 1.10x (row-major) with no shape below 1.01x. The largest shapes converge on parity because both implementations approach the same tensor-core throughput. The three 128-row rows above are a 128-token prefill at Qwen2.5-0.5B's dimensions, and they are the honest exception: the narrowest one trails MLX by 11%, which over a whole prefill (one `o_proj` per layer, so 24 of them at about 3 us each) costs roughly 1% — the measured prefill table below shows no difference from enabling the native matmul at all — while the projection that dominates prefill, `128x4864x896`, is 1.47x ahead.
 
 The f32 row is the exception, and it is deliberate. The hardware has no float32 tensor cores: a `T = float` `matmul2d` runs at bfloat16 precision, which put that shape 1.6e-1 away from PyTorch — exactly where MLX's own f32 matmul lands. f32 therefore stays on the scalar tiled kernel, which matches PyTorch bit for bit and costs the 3.1x above. Half and bfloat16 are unaffected.
 

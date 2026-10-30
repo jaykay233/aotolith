@@ -345,11 +345,14 @@ compiled = aoto.compile_callable(
 | matmul 512x2048x512 bf16 | 62.4 us | 82.2 us | 1.32x |
 | matmul 1024x4864x896 f16 | 373.0 us | 519.3 us | 1.39x |
 | matmul 4096x4096x4096 f16 | 5.53 ms | 5.66 ms | 1.02x |
+| matmul 128x896x896 bf16（prefill） | 18.4 us | 16.5 us | 0.89x |
+| matmul 128x896x4864 bf16（prefill） | 53.5 us | 54.3 us | 1.02x |
+| matmul 128x4864x896 bf16（prefill） | 56.9 us | 83.6 us | 1.47x |
 | attention 1x8x512x64 f16 causal | 35.2 us | 28.5 us | 0.81x |
 | attention 1x8x2048x128 f16 causal | 585.6 us | 461.6 us | 0.79x |
 | attention 1x64x4096x128 f16 causal | 16.3 ms | 13.2 ms | 0.81x |
 
-matmul kernel 用 MPP tensor-core 的 `matmul2d` 跑分块操作数。分块配置由输出 shape 和右操作数的布局共同决定：右操作数转置时 K 方向连续，适合更宽的列分块；右操作数行主序时沿 K 方向跨步，更适合更高的归约步长。在 43 组 shape 与布局组合上，选择器对每个 shape 都保持在实测最优分块的 5% 以内；相对 MLX 平均为 1.16x（右操作数转置）和 1.10x（行主序），没有 shape 低于 1.01x。最大的几个 shape 收敛到持平，因为两边都逼近同一套 tensor core 吞吐。
+matmul kernel 用 MPP tensor-core 的 `matmul2d` 跑分块操作数。分块配置由输出 shape 和右操作数的布局共同决定：右操作数转置时 K 方向连续，适合更宽的列分块；右操作数行主序时沿 K 方向跨步，更适合更高的归约步长。在 43 组 shape 与布局组合上，选择器对每个 shape 都保持在实测最优分块的 5% 以内；相对 MLX 平均为 1.16x（右操作数转置）和 1.10x（行主序），没有 shape 低于 1.01x。最大的几个 shape 收敛到持平，因为两边都逼近同一套 tensor core 吞吐。上面三行 128 行的数据是 Qwen2.5-0.5B 尺寸下 128 token prefill 的实测，也是唯一诚实的例外：最窄的那个比 MLX 慢 11%，摊到整个 prefill 上（每层一个 `o_proj`，共 24 个，每个约 3 us）大约是 1%——下面那张 prefill 实测表里看不出开启原生 matmul 有任何差别；而真正主导 prefill 的 `128x4864x896` 则快 1.47x。
 
 f32 那一行是唯一的例外，而且是刻意的：硬件没有 float32 tensor core，`T = float` 的 `matmul2d` 实际按 bfloat16 精度执行，会把这个 shape 的结果偏离 PyTorch 1.6e-1——正好等于 MLX 自己 f32 matmul 的偏差。所以 f32 留在标量 tiled kernel 上，与 PyTorch 逐位一致，代价就是上面那 3.1x。FP16/BF16 不受影响。
 
