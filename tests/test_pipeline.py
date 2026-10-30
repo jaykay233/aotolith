@@ -4920,6 +4920,87 @@ def test_arange_large_int64_values_do_not_round_through_float() -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_arange_float_forms_match_pytorch_exactly() -> None:
+    """Integer bounds with a float dtype take the same values as PyTorch."""
+
+    def fn():
+        return (
+            torch.arange(8, dtype=torch.float32),
+            torch.arange(0, 10, 2, dtype=torch.float32),
+            torch.arange(0, 1, 0.1),
+            torch.arange(1, 0, -0.25),
+            torch.arange(0, 1, 0.1, dtype=torch.float16),
+            torch.arange(0, 4, 0.5, dtype=torch.bfloat16),
+        )
+
+    result = compile_callable(fn, ())
+    assert [kernel.kind for kernel in result.plan.kernels] == ["arange"] * 6
+
+    actual = result.plan()
+    expected = tuple(_torch_to_mlx(output) for output in fn())
+    mx.eval(*actual, *expected)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        assert actual_value.dtype == expected_value.dtype
+        assert mx.array_equal(actual_value, expected_value)
+
+
+def _float32_ulp(value: float) -> float:
+    """Spacing of float32 values near ``value``."""
+
+    if value == 0:
+        return 2.0**-149
+    _, exponent = math.frexp(abs(value))
+    return math.ldexp(1.0, exponent - 24)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "step"),
+    [(0.0, 1.0, 0.017), (0.0, 1.0, 0.07), (-1.5, 1.5, 0.3), (0.0, 1.0, 0.001)],
+)
+def test_arange_fractional_steps_stay_within_one_ulp(
+    start: float, end: float, step: float
+) -> None:
+    """Metal has no double, so the fma path is compared in ulps, not exactly.
+
+    PyTorch's own CPU kernel computes these sequences with a different
+    intermediate precision, which is why it does not agree with the exactly
+    rounded value either.
+    """
+
+    result = compile_callable(lambda: torch.arange(start, end, step), ())
+    actual = result.plan()[0]
+    expected = _torch_to_mlx(torch.arange(start, end, step))
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+
+    values = actual.tolist()
+    expected_values = expected.tolist()
+    scale = max((abs(value) for value in expected_values), default=1.0) or 1.0
+    tolerance = _float32_ulp(scale)
+    for got, want in zip(values, expected_values, strict=True):
+        assert abs(got - want) <= tolerance
+
+
+def test_arange_float_output_rejects_fractional_integer_bounds() -> None:
+    output_type = TensorType((3,), DType.I64)
+    graph = Graph(
+        (),
+        {"out": Value("out", output_type)},
+        (
+            Operation(
+                "arange",
+                (),
+                ("out",),
+                {"start": 0.0, "end": 1.5, "step": 0.5},
+            ),
+        ),
+        ("out",),
+    )
+
+    with pytest.raises(NotImplementedError, match="requires integer start"):
+        compile_graph(graph)
+
+
 def test_arange_is_common_subexpression() -> None:
     def fn():
         return torch.arange(8), torch.arange(8)
@@ -5010,9 +5091,10 @@ def test_integer_constant_rejects_i64_overflow() -> None:
         compile_graph(graph)
 
 
-def test_arange_rejects_floating_point_outputs() -> None:
-    with pytest.raises(NotImplementedError, match="int32 and int64"):
-        compile_callable(lambda: torch.arange(8, dtype=torch.float32), ())
+def test_arange_selects_the_float_kernel() -> None:
+    result = compile_callable(lambda: torch.arange(8, dtype=torch.float32), ())
+    assert [kernel.kind for kernel in result.plan.kernels] == ["arange"]
+    assert "fma(factor," in result.plan.kernels[0].source
 
 
 def test_metal_matmul_uses_shared_memory_tiles() -> None:

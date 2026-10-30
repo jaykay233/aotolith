@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -62,6 +63,7 @@ _CONSTANT_POINTWISE_OPS = {
     "full_like",
 }
 _INTEGRAL_DTYPES = {DType.I32, DType.I64}
+_FLOATING_DTYPES = {DType.F16, DType.BF16, DType.F32}
 _INTEGER_POINTWISE_OPS = {
     "add",
     "sub",
@@ -4013,26 +4015,37 @@ def _validate_arange(graph: Graph, op: Operation) -> None:
     if op.inputs:
         raise ValueError("arange must not have tensor inputs")
     output_type = graph.value(op.outputs[0]).type
-    if output_type.dtype not in _INTEGRAL_DTYPES:
+    if output_type.dtype not in _INTEGRAL_DTYPES | _FLOATING_DTYPES:
         raise NotImplementedError(
-            "arange currently supports int32 and int64 outputs only"
+            "arange supports int32, int64, float16, bfloat16 and float32 "
+            f"outputs, got {output_type.dtype.value}"
         )
     if len(output_type.shape) != 1:
         raise ValueError(f"arange must produce a rank-1 tensor, got {output_type.shape}")
 
-    values: list[int] = []
+    values: list[int | float] = []
     for name in ("start", "end", "step"):
         value = op.attrs.get(name)
-        if not isinstance(value, int) or isinstance(value, bool):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise NotImplementedError(
-                "arange currently requires integer start, end and step values"
+                f"arange.{name} must be a scalar number, got {value!r}"
             )
-        if not -(1 << 63) <= value < (1 << 63):
+        if not isfinite(value):
+            raise ValueError(f"arange.{name} must be finite, got {value!r}")
+        if isinstance(value, int) and not -(1 << 63) <= value < (1 << 63):
             raise ValueError(f"arange.{name} {value} exceeds signed int64")
         values.append(value)
     start, end, step = values
     if step == 0:
         raise ValueError("arange.step must be nonzero")
+    integral_bounds = all(isinstance(value, int) for value in values)
+    if output_type.dtype in _INTEGRAL_DTYPES and not integral_bounds:
+        # PyTorch would round every element back to an integer here, which
+        # makes the fractional bounds meaningless.
+        raise NotImplementedError(
+            "arange with integral output dtype requires integer start, end and "
+            f"step values, got {values}"
+        )
 
     expected_length = _arange_length(start, end, step)
     if output_type.shape[0] != expected_length:
@@ -4042,22 +4055,68 @@ def _validate_arange(graph: Graph, op: Operation) -> None:
         )
 
 
-def _arange_length(start: int, end: int, step: int) -> int:
-    if step > 0:
-        if start >= end:
+def _arange_length(start: int | float, end: int | float, step: int | float) -> int:
+    if all(isinstance(value, int) for value in (start, end, step)):
+        start, end, step = int(start), int(end), int(step)
+        if step > 0:
+            if start >= end:
+                return 0
+            return (end - start + step - 1) // step
+        if start <= end:
             return 0
-        return (end - start + step - 1) // step
-    if start <= end:
-        return 0
-    stride = -step
-    return (start - end + stride - 1) // stride
+        stride = -step
+        return (start - end + stride - 1) // stride
+    # PyTorch derives the length from the same double quotient and then clamps
+    # negative results to zero; keeping the exact expression means a fractional
+    # bound either matches or is rejected by the shape check above.
+    length = ceil((float(end) - float(start)) / float(step))
+    return max(length, 0)
 
 
 def _emit_arange_source(op: Operation, output_type: TensorType) -> str:
-    start = _msl_integer_literal(int(op.attrs["start"]), DType.I64)
-    step = _msl_integer_literal(int(op.attrs["step"]), DType.I64)
-    expression = f"(long)({start}) + (long)elem * (long)({step})"
-    return _emit_zero_input_expression(expression, output_type.shape)
+    if output_type.dtype in _INTEGRAL_DTYPES:
+        start = _msl_integer_literal(int(op.attrs["start"]), DType.I64)
+        step = _msl_integer_literal(int(op.attrs["step"]), DType.I64)
+        expression = f"(long)({start}) + (long)elem * (long)({step})"
+        return _emit_zero_input_expression(expression, output_type.shape)
+    # PyTorch forms each element as `start + index * step` and rounds once, so
+    # `arange(0, 1, 0.1)` keeps 0.9 instead of the float32 product 0.90000004.
+    # Metal has no double, so the constants are split at compile time and the
+    # exact sum is rebuilt from the fma product residual and a two-sum, which
+    # rounds like the double expression would.
+    start_hi, start_lo = _split_double_to_floats(float(op.attrs["start"]))
+    step_hi, step_lo = _split_double_to_floats(float(op.attrs["step"]))
+    step_hi_text = _msl_float_literal(step_hi)
+    start_hi_text = _msl_float_literal(start_hi)
+    element_count = prod(output_type.shape)
+    lines = [
+        "uint base = thread_position_in_grid.x * 4u;",
+        "for (uint lane = 0u; lane < 4u; ++lane) {",
+        "    uint elem = base + lane;",
+        f"    if (elem >= {element_count}) {{",
+        "        break;",
+        "    }",
+        "    float factor = (float)elem;",
+        f"    float product = factor * {step_hi_text};",
+        f"    float product_err = fma(factor, {step_hi_text}, -product);",
+        f"    float sum = product + {start_hi_text};",
+        "    float sum_base = sum - product;",
+        f"    float sum_err = (product - (sum - sum_base)) + "
+        f"({start_hi_text} - sum_base);",
+        f"    float tail = sum_err + product_err + "
+        f"factor * {_msl_float_literal(step_lo)} + "
+        f"{_msl_float_literal(start_lo)};",
+        "    out[elem] = (T)(sum + tail);",
+        "}",
+    ]
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _split_double_to_floats(value: float) -> tuple[float, float]:
+    """Split a double into a float head and the float tail of the remainder."""
+
+    head = struct.unpack("<f", struct.pack("<f", value))[0]
+    return head, value - head
 
 
 def _emit_zero_input_expression(
@@ -4087,6 +4146,8 @@ def _msl_integer_literal(value: int, dtype: DType) -> str:
             return "(-2147483647 - 1)"
         return str(value)
     raise ValueError(f"{dtype.value} is not an integer dtype")
+
+
 
 
 def _emit_pointwise_source(
