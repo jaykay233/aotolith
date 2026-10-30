@@ -64,6 +64,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.select.int` | 在前端展开为单元素 `slice + squeeze` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
+| `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等 |
 | `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |
 | `aten.unsqueeze.default` | `unsqueeze` |
 | `aten.squeeze.dim` | `squeeze` |
@@ -161,7 +162,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 `split`、`chunk`、`unbind` 在 FX 中产生 tuple 和 `getitem` 节点。前端根据 `make_fx` 给出的静态输出 metadata，把每个被使用的 tuple 元素直接映射成一个单输出 IR value：`split/chunk` 生成带累计 `start/end` 的 `slice`，`unbind` 生成单元素 `slice` 后接 `squeeze`。因此 IR 仍保持单输出 op 约束，后续 layout 化简、CSE 和 pointwise 融合不需要理解 tuple。这里不能用只有 `squeeze` 的表示，因为多个同形 unbind 输出会被 CSE 误认为相同值。
 
-除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
+除已折叠到矩阵乘的转置和 batch `expand` 外，Layout op 保留为独立 IR 节点。Backend 在下发前检查 reshape 的元素数、transpose/permute 的轴置换、expand 的 broadcast 合法性、slice 的静态输出 shape、flip 的轴集合、roll 的 shift/dim 对齐、pad 的 (before, after) 对与静态输出 shape、unsqueeze 的插入轴，以及 squeeze 删除的 singleton 轴。它们不生成 Metal kernel，而是由 Runtime 映射到 MLX 的 reshape、swapaxes、transpose、broadcast、切片、flip、roll、常量 `mx.pad`、expand-dims 和 squeeze。`clone` 使用 `mx.contiguous` 建立独立布局，`alias` 直接复用输入数组；两者保持 dtype、shape 和值不变。
 
 `addmm` 的 `alpha`/`beta`、`add`/`sub` 的 `alpha`、`leaky_relu` 的 `negative_slope`、`elu` 的 `alpha`、`gelu` 的 `approximate`、`threshold` 的 `threshold`/`value`、softmax 的 `dim`，以及 sum/mean 的 `dims`/`keepdim`/`dtype` 会写入 IR attribute；不指定 dimension 的 sum/mean 会在前端规范化为全部轴，`keepdim=False`。`_to_copy` 的 dtype 直接由 FX 节点的输出 metadata 表示，backend 用 MLX `astype` 执行。二元 pointwise 支持两个 tensor，或一个 tensor 和一个 Python scalar；scalar 以及它位于左侧还是右侧也保存在 attribute 中，比较和 bool `bitwise_*` op 还接受 bool scalar。`pow` 覆盖 tensor exponent、tensor 底数配标量指数，以及标量底数配 tensor 指数。`clamp`/`clamp_min`/`clamp_max` 的标量边界保存在 attribute 中，tensor 边界作为可广播的普通输入，并对 NaN 输入或边界保持与 PyTorch 一致的传播语义。`aten.rsub.Scalar` 单独映射为 `rsub`，因为它的 FX 参数顺序是 `(tensor, scalar)`，语义却是 `scalar - tensor`。`masked_fill.Scalar` 保留原 tensor 和 bool mask 两个输入，填充值进入 attribute。`scalar_tensor`、`zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like` 和 `full_like` 都是无 tensor 输入的常量节点：值和输出 dtype 分别来自 IR attribute 与节点 metadata。`new_*` 和 `*_like` 的模板 tensor 只参与 FX 捕获，不进入 op 的运行时输入。浮点/bool 常量可以单独生成 Metal kernel，也可以与相邻 pointwise op 融合；I32/I64 常量走独立的整数 kernel。CSE 的 key 包含输出 shape/dtype，因此同一模板上的不同 dtype 覆盖或不同整数宽度不会被错误合并。`arange` 的三个 ATen target 统一规范化为 `(start, end, step)` attributes；I32/I64 输出要求整数参数，FP16/BF16/F32 输出接受任意有限参数。
 
@@ -187,7 +188,7 @@ IR 定义在 `ir.py`：
 
 ## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
 
-`simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、只翻转 singleton 轴的 `flip`、所有 shift 对对应维取模后为零的 `roll`、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute`、重复的 `flip` 以及 shift 相消的 `roll` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。
+`simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、只翻转 singleton 轴的 `flip`、所有 shift 对对应维取模后为零的 `roll`、所有 (before, after) 都为零的 `pad`、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute`、重复的 `flip` 以及 shift 相消的 `roll` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。
 
 `canonicalize_batched_matmul` 识别 PyTorch 为 rank-N matmul 生成的折叠模式：输入先 reshape 成二维 batch，执行 `bmm`，输出再 reshape 回原始 batch shape。匹配成功后替换成一个 `matmul`，避免后续 attention pattern 只看到低秩 `bmm`。
 

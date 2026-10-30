@@ -383,7 +383,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
 | Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、sum/mean、cumsum、LayerNorm、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
-| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、cat/stack、clone、cast 和静态常量 |
+| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、cat/stack、constant padding、flip/roll、clone、cast 和静态常量 |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32 和 I64 |
 | KV Cache | 静态 shape 的 prefill/decode 图契约和布局；分配与分页仍由外部运行时负责 |
 
@@ -396,6 +396,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - 共享参数只绑定一次：同一个 tensor 在两个名字下共享同一个 MLX buffer 和同一份 artifact payload。图里仍然每个名字一个输入，因为 tracing 就是这么产生的。只共享 storage 但内容不同的视图（如 tensor 和它的 `.t()`）不会被合并。
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
 - `scatter`、`scatter_add`、`scatter_reduce` 和 `index_add` 走 MLX 而不是生成 kernel。归约覆盖 `sum`/`prod`/`amax`/`amin`/`mean`，都支持 `include_self=False`；`mean` 会在累加数值的同时累加写入次数再相除，因此重复索引取平均而不是求和；`amax`/`amin` 在 `include_self=False` 时需要浮点输入，因为它们的单位元是 ±inf。重复索引按设备调度顺序累加，这正是 CUDA `scatter_add` 给出的保证，而 PyTorch 的 CPU 路径给不了。原地写法（`scatter_`、`scatter_add_`、`scatter_reduce_`、`index_add_`）在被改写的 tensor 于图内没有其他观察者时降级成同一组算子；编译后的调用返回更新后的 tensor，不会回写调用方仍然持有的那块 tensor。
+- `F.pad` 的默认 `constant` 模式降级成 `pad` layout op，由 MLX 执行。padding 对按 PyTorch 的定义从最内层维开始，填充值保持源 dtype。全零的 pad 会被当作恒等操作消除；负数条目（在 PyTorch 里是裁剪）在捕获期直接拒绝并提示改用 `slice`/`narrow`；其他 mode 在捕获期报错。
 - 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 FP16/BF16 matmul shape 上都快于 MLX；f32 则是刻意比 MLX 慢——tensor core 没有 f32 模式，所以它留在与 PyTorch 逐位一致的标量 kernel 上。`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢 10%–17%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
 - `arange` 对 int32/int64 和 float16/bfloat16/float32 都生成 Metal 常量 kernel。整数输出要求整数边界，走 `long` 路径，因此 2**53 以上的值仍然精确。浮点输出接受任意有限边界：Metal 没有 double，所以编译期把 `start` 和 `step` 拆成 float 头和剩余 float 尾，kernel 用 fma 的乘积残差加 two-sum 重建 `start + index * step`，等价于 PyTorch 那条 double 表达式的一次舍入。整数步长以及 0.1、0.25 这类步长与 PyTorch 逐位一致，其余小数步长与序列相差不超过 1 ulp；PyTorch 自己的 CPU kernel 舍入的是另一个中间量，同样会偏离精确实数。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。

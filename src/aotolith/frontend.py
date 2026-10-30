@@ -21,6 +21,7 @@ _SUPPORTED_OPS = {
     "aten.slice.Tensor": "slice",
     "aten.flip.default": "flip",
     "aten.roll.default": "roll",
+    "aten.constant_pad_nd.default": "pad",
     "aten.triu.default": "triu",
     "aten.tril.default": "tril",
     "aten.unsqueeze.default": "unsqueeze",
@@ -2056,6 +2057,44 @@ def _operation_inputs(
             {"dim": dim, "start": start, "end": end, "step": step},
         )
 
+    if op == "pad":
+        if len(args) not in {2, 3}:
+            raise ValueError(
+                f"constant_pad_nd expects two or three arguments, got {len(args)}"
+            )
+        input_id, pads = args[:2]
+        value = args[2] if len(args) == 3 else kwargs.get("value", 0.0)
+        mode = kwargs.get("mode")
+        if mode is not None and mode != "constant":
+            raise NotImplementedError(
+                f"constant_pad_nd mode {mode!r} is not supported; only "
+                "constant padding is lowered"
+            )
+        if not isinstance(pads, (tuple, list)) or not pads:
+            raise ValueError(f"pad.pads must be a non-empty sequence, got {pads!r}")
+        if len(pads) % 2 != 0:
+            raise ValueError(
+                "pad.pads must hold one (before, after) pair per padded "
+                f"dimension, got {len(pads)} values"
+            )
+        if not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in pads
+        ):
+            raise ValueError(f"pad.pads must contain integers, got {pads!r}")
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"pad.value must be a scalar number, got {value!r}")
+        if not isfinite(float(value)):
+            raise ValueError(f"pad.value must be finite, got {value!r}")
+        if any(item < 0 for item in pads):
+            raise NotImplementedError(
+                "negative constant_pad_nd entries crop the input; use "
+                f"slice/narrow for that instead, got {tuple(pads)}"
+            )
+        return (_argument_ids(input_id, node_ids),), {
+            "pads": tuple(int(item) for item in pads),
+            "value": float(value),
+        }
+
     if op == "flip":
         if len(args) != 2:
             raise ValueError(f"flip expects two arguments, got {len(args)}")
@@ -2320,6 +2359,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update({"dim", "dtype"})
     if op == "flip":
         allowed.add("dims")
+    if op == "pad":
+        allowed.update({"value", "mode"})
     if op == "roll":
         allowed.update({"shifts", "dims"})
     if op in {"triu", "tril"}:

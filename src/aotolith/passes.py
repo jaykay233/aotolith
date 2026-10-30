@@ -1280,7 +1280,9 @@ def _remove_identity_layouts(graph: Graph) -> Graph:
             if inputs == op.inputs
             else Operation(op.op, inputs, op.outputs, op.attrs)
         )
-        if current.op in LAYOUT_OPS and _is_identity_layout(graph, current):
+        if (current.op in LAYOUT_OPS or current.op == "pad") and (
+            _is_identity_layout(graph, current)
+        ):
             aliases[current.outputs[0]] = current.inputs[0]
             continue
         rewritten.append(current)
@@ -1451,6 +1453,15 @@ def _is_identity_layout(graph: Graph, op: Operation) -> bool:
         shifts = _roll_shifts_by_axis(op, input_type.shape)
         return shifts is not None and _roll_shift_is_identity(
             shifts, input_type.shape
+        )
+    if op.op == "pad":
+        if input_type.shape != output_type.shape:
+            return False
+        pads = op.attrs.get("pads")
+        return (
+            isinstance(pads, (tuple, list))
+            and len(pads) % 2 == 0
+            and all(_valid_int(item) and int(item) == 0 for item in pads)
         )
     if op.op == "slice":
         dim = op.attrs.get("dim")

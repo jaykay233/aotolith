@@ -64,6 +64,9 @@ _CONSTANT_POINTWISE_OPS = {
 }
 _INTEGRAL_DTYPES = {DType.I32, DType.I64}
 _FLOATING_DTYPES = {DType.F16, DType.BF16, DType.F32}
+# Views lower to MLX indexing; `pad` allocates, but it belongs to the same
+# runtime path because MLX already has a constant-pad kernel for it.
+_MLX_LAYOUT_OPS = LAYOUT_OPS | {"pad"}
 _INTEGER_POINTWISE_OPS = {
     "add",
     "sub",
@@ -616,7 +619,7 @@ def _evaluate_mlx_op(
         return mx.concatenate(
             [env[value_id] for value_id in op.inputs], axis=axis
         )
-    if op.op in LAYOUT_OPS:
+    if op.op in _MLX_LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
     if op.op == "matmul":
         left, right = (env[value_id] for value_id in op.inputs[:2])
@@ -925,7 +928,7 @@ def _bind_plan_op(
     if runtime is not None:
         return runtime
     kind = op.op
-    if kind in LAYOUT_OPS:
+    if kind in _MLX_LAYOUT_OPS:
         return lambda value, _op=op, _graph=graph: _evaluate_layout_mlx(
             _graph, _op, value
         )
@@ -6388,6 +6391,45 @@ def _evaluate_layout_mlx(
         return mx.reshape(value, graph.value(op.outputs[0]).type.shape)
 
     rank = len(value.shape)
+    if op.op == "pad":
+        pads = op.attrs.get("pads")
+        if (
+            not isinstance(pads, tuple)
+            or len(pads) % 2 != 0
+            or not all(isinstance(item, int) for item in pads)
+        ):
+            raise ValueError(f"pad.pads must be paired integers, got {pads!r}")
+        if len(pads) > 2 * rank:
+            raise ValueError(
+                f"pad has {len(pads)} values for a rank-{rank} input"
+            )
+        if any(item < 0 for item in pads):
+            raise ValueError(f"pad.pads must be non-negative, got {pads!r}")
+        width = [(0, 0)] * rank
+        for pair in range(len(pads) // 2):
+            # PyTorch lists the pad pairs from the last dimension backwards.
+            width[rank - 1 - pair] = (pads[2 * pair], pads[2 * pair + 1])
+        source_type = graph.value(op.inputs[0]).type
+        expected = tuple(
+            size + before + after
+            for size, (before, after) in zip(
+                value.shape, width, strict=True
+            )
+        )
+        output_type = graph.value(op.outputs[0]).type
+        if expected != output_type.shape:
+            raise ValueError(
+                f"pad output shape {output_type.shape} does not match the "
+                f"padded input {expected}"
+            )
+        fill = float(op.attrs.get("value", 0.0))
+        return mx.pad(
+            value,
+            width,
+            mode="constant",
+            constant_values=mx.array(fill, dtype=_MLX_DTYPES[source_type.dtype]),
+        )
+
     if op.op == "transpose":
         dim0 = int(op.attrs["dim0"])
         dim1 = int(op.attrs["dim1"])

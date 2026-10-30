@@ -1456,6 +1456,116 @@ def test_scatter_reduce_mean_rejects_integer_inputs() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("shape", "pads", "value"),
+    [
+        ((3,), (2, 1), 0.5),
+        ((2, 3), (1, 1, 2, 0), -1.25),
+        ((2, 3, 4), (1, 0, 2, 1, 0, 3), 2.5),
+    ],
+)
+def test_constant_pad_matches_pytorch(shape, pads, value) -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, pads, value=value)
+
+    torch.manual_seed(50)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["pad"]
+    assert result.plan.kernels == ()
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected)
+
+
+def test_constant_pad_fills_only_the_requested_border() -> None:
+    def fn(x):
+        # Padding pairs index the trailing dimensions first, so this pads the
+        # rows with two copies on top and one below while the columns are
+        # untouched.
+        return torch.nn.functional.pad(x, (0, 0, 2, 1), value=-3.0)
+
+    torch.manual_seed(51)
+    x = torch.randn(2, 4)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+    source = mx.array(x.numpy())
+    assert mx.array_equal(actual[:2], mx.full((2, 4), -3.0, dtype=actual.dtype))
+    assert mx.array_equal(actual[-1], mx.full((4,), -3.0, dtype=actual.dtype))
+    assert mx.array_equal(actual[2:4], source)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [
+        (torch.float16, 1.5),
+        (torch.float32, 1.5),
+        (torch.bfloat16, 1.5),
+        (torch.int64, 4),
+        (torch.bool, True),
+    ],
+)
+def test_constant_pad_preserves_the_source_dtype(dtype, value) -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (1, 2, 1, 1), value=value)
+
+    torch.manual_seed(52)
+    if dtype == torch.bool:
+        x = torch.rand(3, 2) > 0.5
+    elif dtype.is_floating_point:
+        x = torch.randn(3, 2).to(dtype)
+    else:
+        x = torch.randint(0, 8, (3, 2)).to(dtype)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(_torch_to_mlx(x))[0]
+    expected = mx.array(fn(x).float().numpy()).astype(actual.dtype)
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_constant_pad_with_no_growth_is_the_input() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (0, 0, 0, 0), value=7.0)
+
+    x = torch.randn(2, 3)
+    result = compile_callable(fn, (x,))
+    assert result.lowered_graph.ops == ()
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, mx.array(x.numpy()))
+
+
+def test_constant_pad_validates_pairs_against_the_rank_at_runtime() -> None:
+    values = {
+        "x": Value("x", TensorType((2, 3), DType.F32)),
+        "out": Value("out", TensorType((3, 4), DType.F32)),
+    }
+    graph = Graph(
+        ("x",),
+        values,
+        (Operation("pad", ("x",), ("out",), {"pads": (1, 1, 1, 1, 1, 1)}),),
+        ("out",),
+    )
+    plan = compile_graph(graph).plan
+    with pytest.raises(ValueError, match="6 values for a rank-2 input"):
+        plan(mx.zeros((2, 3)))
+
+
+def test_constant_pad_rejects_negative_pads() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (-1, 1))
+
+    with pytest.raises(NotImplementedError, match="crop the input"):
+        compile_callable(fn, (torch.randn(2, 3),))
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)
