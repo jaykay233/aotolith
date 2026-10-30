@@ -12,19 +12,7 @@ import mlx.core as mx
 from .backends import AppleMetalBackend, CompiledPlan
 from .capture import capture_fx
 from .ir import Graph
-from .passes import (
-    canonicalize_batched_matmul,
-    eliminate_common_subexpressions,
-    fuse_attention,
-    fuse_activation_epilogue,
-    fuse_gate_up_projection,
-    fuse_pointwise,
-    fuse_residual_epilogue,
-    fuse_rms_norm_epilogue,
-    fuse_rope,
-    fold_matmul_input_layouts,
-    simplify_layouts,
-)
+from .passes import rewrite
 
 # Container kinds recorded in a keyword template and in an artifact manifest.
 _KWARG_LIST = "list"
@@ -189,17 +177,7 @@ def compile_graph(
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
 
-    lowered = simplify_layouts(graph)
-    lowered = canonicalize_batched_matmul(lowered)
-    lowered = fuse_attention(lowered)
-    lowered = fold_matmul_input_layouts(lowered)
-    lowered = fuse_rope(lowered)
-    lowered = fuse_residual_epilogue(lowered)
-    lowered = fuse_pointwise(lowered)
-    lowered = fuse_gate_up_projection(lowered)
-    lowered = fuse_activation_epilogue(lowered)
-    lowered = eliminate_common_subexpressions(lowered)
-    lowered = fuse_rms_norm_epilogue(lowered)
+    lowered = rewrite(graph)
     plan = AppleMetalBackend(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,

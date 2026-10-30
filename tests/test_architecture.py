@@ -40,8 +40,24 @@ LAYERS: dict[str, int] = {
     "codegen.msl": 1,
     "ir.op": 1,  # Operation, built from types
     "planning": 1,
-    # Graph rewriting: knows operators and the IR, not the backend.
-    "passes": 1,
+    # Graph rewriting: knows operators and the IR, not the backend. The graph
+    # helpers and the dumb predicates underpin everything above them; the
+    # matchers read views, so they sit above `graph` but below the passes that
+    # call them; the pipeline order sits at the top, below only its own package.
+    "passes.graph": 1,
+    "passes.checks": 1,
+    "passes.matchers": 2,
+    "passes.matchers.view": 2,
+    "passes.matchers.matmul": 2,
+    "passes.matchers.norm": 2,
+    "passes.cse": 2,
+    "passes.matchers.attention": 3,
+    "passes.matchers.rope": 3,
+    "passes.layout": 3,
+    "passes.canonicalize": 4,
+    "passes.fusion": 4,
+    "passes": 5,
+    "passes.driver": 5,
     # The decomposition table: a filter over Torch's rules. It reaches back for
     # nothing, so capture can depend on it rather than the reverse.
     "decompose": 1,
@@ -132,7 +148,20 @@ MODULE_PATHS = {
     "selection": "selection.py",
     "_version": "_version.py",
     "planning": "planning.py",
-    "passes": "passes.py",
+    "passes": "passes/__init__.py",
+    "passes.graph": "passes/graph.py",
+    "passes.checks": "passes/checks.py",
+    "passes.matchers": "passes/matchers/__init__.py",
+    "passes.matchers.view": "passes/matchers/view.py",
+    "passes.matchers.matmul": "passes/matchers/matmul.py",
+    "passes.matchers.attention": "passes/matchers/attention.py",
+    "passes.matchers.rope": "passes/matchers/rope.py",
+    "passes.matchers.norm": "passes/matchers/norm.py",
+    "passes.layout": "passes/layout.py",
+    "passes.canonicalize": "passes/canonicalize.py",
+    "passes.cse": "passes/cse.py",
+    "passes.fusion": "passes/fusion.py",
+    "passes.driver": "passes/driver.py",
     "decompose": "decompose.py",
     "capture": "capture/__init__.py",
     "capture.tracer": "capture/tracer.py",
