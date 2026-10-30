@@ -68,6 +68,18 @@ _SUPPORTED_OPS = {
     "aten.addcdiv.default": "addcdiv",
     "aten.pow.Tensor_Tensor": "pow",
     "aten.pow.Tensor_Scalar": "pow",
+    "aten.logit.default": "logit",
+    "aten.erfc.default": "erfc",
+    "aten.frac.default": "frac",
+    "aten.sinc.default": "sinc",
+    "aten.hypot.default": "hypot",
+    "aten.copysign.Tensor": "copysign",
+    "aten.copysign.Scalar": "copysign",
+    "aten.copysign.Scalar_Scalar": "copysign",
+    "aten.xlogy.Tensor": "xlogy",
+    "aten.xlogy.Scalar_Self": "xlogy",
+    "aten.xlogy.Scalar_Other": "xlogy",
+    "aten.nan_to_num.default": "nan_to_num",
     "aten.pow.Scalar": "pow",
     "aten.neg.default": "neg",
     "aten.abs.default": "abs",
@@ -198,6 +210,22 @@ _NUMERIC_ATTRS = {
 }
 
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
+# Pointwise ops whose kernels only accept floating-point operands. PyTorch
+# promotes integer inputs to the operator's floating-point opmath dtype, so the
+# frontend inserts the same cast instead of rejecting the graph.
+_FLOAT_ONLY_POINTWISE_OPS = {
+    "logit",
+    "erfc",
+    "frac",
+    "sinc",
+    "hypot",
+    "copysign",
+    "xlogy",
+    "lerp",
+    "addcmul",
+    "addcdiv",
+    "nan_to_num",
+}
 _LOGICAL_BINARY_OPS = {"logical_and", "logical_or", "logical_xor"}
 _BITWISE_BINARY_OPS = {"bitwise_and", "bitwise_or", "bitwise_xor"}
 _BINARY_OPS = _COMPARISON_OPS | {
@@ -209,6 +237,9 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "floor_divide",
     "remainder",
     "fmod",
+    "hypot",
+    "copysign",
+    "xlogy",
     "pow",
     "maximum",
     "minimum",
@@ -672,7 +703,9 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 inputs = (inputs[0],) + _promote_pointwise_operands(
                     "where", inputs[1:], values, ops, _node_type(node).dtype
                 )
-            elif op_name in _PROMOTABLE_POINTWISE_OPS:
+            elif op_name in _PROMOTABLE_POINTWISE_OPS or (
+                op_name in _FLOAT_ONLY_POINTWISE_OPS
+            ):
                 inputs = _promote_pointwise_operands(
                     op_name, inputs, values, ops, _node_type(node).dtype
                 )
@@ -2976,6 +3009,10 @@ def _promoted_pointwise_dtype(
     if op_name == "div" and dtypes <= _INTEGRAL_DTYPES:
         # True division always produces a float, even for integer operands.
         return output_dtype if output_dtype in _FLOATING_DTYPES else None
+    if op_name in _FLOAT_ONLY_POINTWISE_OPS and dtypes <= _INTEGRAL_DTYPES:
+        # The kernel itself only takes floats, and PyTorch runs integer
+        # operands through its floating-point opmath path.
+        return output_dtype if output_dtype in _FLOATING_DTYPES else None
     if len(dtypes) == 1:
         return None
     if dtypes <= _INTEGRAL_DTYPES:
@@ -3402,6 +3439,38 @@ def _operation_inputs(
             {"value": value},
         )
 
+    if op == "nan_to_num":
+        if len(args) not in {1, 2, 3, 4}:
+            raise ValueError(
+                f"nan_to_num expects one to four arguments, got {len(args)}"
+            )
+        attrs: dict[str, object] = {}
+        for position, name in ((1, "nan"), (2, "posinf"), (3, "neginf")):
+            value = args[position] if len(args) > position else kwargs.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(
+                    f"nan_to_num.{name} must be a scalar, got {value!r}"
+                )
+            attrs[name] = float(value)
+        return ((_argument_ids(args[0], node_ids),), attrs)
+
+    if op == "logit":
+        if len(args) not in {1, 2}:
+            raise ValueError(f"logit expects one or two arguments, got {len(args)}")
+        attrs: dict[str, object] = {}
+        eps = args[1] if len(args) == 2 else kwargs.get("eps")
+        if eps is not None:
+            if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+                raise ValueError(f"logit.eps must be a scalar, got {eps!r}")
+            if not isfinite(eps) or eps < 0:
+                raise ValueError(
+                    f"logit.eps must be finite and non-negative, got {eps!r}"
+                )
+            attrs["eps"] = float(eps)
+        return ((_argument_ids(args[0], node_ids),), attrs)
+
     if op == "lerp":
         if len(args) != 3:
             raise ValueError(f"lerp expects three arguments, got {len(args)}")
@@ -3617,6 +3686,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("dims")
     if op == "pad":
         allowed.update({"value", "mode"})
+    if op == "nan_to_num":
+        allowed.update({"nan", "posinf", "neginf"})
     if op == "roll":
         allowed.update({"shifts", "dims"})
     if op in {"triu", "tril"}:

@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from math import ceil, isfinite, isinf, isnan, prod
+from math import ceil, isfinite, isinf, isnan, pi, prod
 from statistics import median
 from typing import Any
 
@@ -26,6 +26,7 @@ _MLX_DTYPES = {
     DType.I32: mx.int32,
     DType.I64: mx.int64,
 }
+_MLX_DTYPE_TO_DTYPE = {mlx_dtype: dtype for dtype, mlx_dtype in _MLX_DTYPES.items()}
 
 _ELEMENTS_PER_THREAD = 4
 _DTYPE_ITEMSIZE = {
@@ -64,6 +65,13 @@ _CONSTANT_POINTWISE_OPS = {
 }
 _INTEGRAL_DTYPES = {DType.I32, DType.I64}
 _FLOATING_DTYPES = {DType.F16, DType.BF16, DType.F32}
+# Largest finite value of each floating dtype, which is what `nan_to_num`
+# substitutes for an infinity when the caller does not name a replacement.
+_FINITE_LIMITS = {
+    DType.F16: 65504.0,
+    DType.BF16: 3.3895313892515355e38,
+    DType.F32: 3.4028234663852886e38,
+}
 # Views lower to MLX indexing; `pad` allocates, but it belongs to the same
 # runtime path because MLX already has a constant-pad kernel for it.
 _MLX_LAYOUT_OPS = LAYOUT_OPS | {"pad"}
@@ -128,6 +136,18 @@ inline float tsc_erf(float value) {
     float polynomial = (((((1.061405429f * t - 1.453152027f) * t)
         + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
     return sign * (1.0f - polynomial * metal::exp(-x * x));
+}
+
+inline float tsc_erfc(float value) {
+    // Abramowitz-Stegun 7.1.26, the same approximation tsc_erf uses. MSL has
+    // no erfc in the metal namespace, and `1 - tsc_erf(x)` would cancel away
+    // most of the digits in the tail.
+    float x = metal::abs(value);
+    float t = 1.0f / (1.0f + 0.3275911f * x);
+    float polynomial = (((((1.061405429f * t - 1.453152027f) * t)
+        + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+    float tail = polynomial * metal::exp(-x * x);
+    return value < 0.0f ? 2.0f - tail : tail;
 }
 
 inline float tsc_expm1(float value) {
@@ -219,6 +239,15 @@ inline float tsc_lerp_f32(float start, float end, float weight) {
     return metal::abs(weight) < 0.5f
         ? start + weight * (end - start)
         : end - (end - start) * (1.0f - weight);
+}
+
+inline float tsc_xlogy_f32(float value, float other) {
+    // ATen only short-circuits a zero left operand, and only when the right
+    // operand is not NaN, so 0 * log(-1) is 0 while 0 * log(NaN) stays NaN.
+    if (value == 0.0f && !metal::isnan(other)) {
+        return 0.0f;
+    }
+    return value * metal::log(other);
 }
 
 inline int tsc_neg_i32(int value) {
@@ -4119,6 +4148,47 @@ def _validate_pointwise_region(
                 raise ValueError("numeric masked_fill requires a numeric value")
             continue
 
+        if op.op in {"logit", "erfc", "frac", "sinc"}:
+            if len(input_types) != 1:
+                raise ValueError(f"{op.op} requires one tensor input")
+            if input_types[0].dtype not in _FLOATING_DTYPES:
+                raise ValueError(f"{op.op} requires a floating-point tensor")
+            if op.op == "logit" and "eps" in op.attrs:
+                eps = op.attrs["eps"]
+                if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+                    raise ValueError(f"logit.eps must be a scalar, got {eps!r}")
+            continue
+
+        if op.op in {"hypot", "copysign", "xlogy"}:
+            valid = len(input_types) == 2 or (
+                len(input_types) == 1 and "scalar" in op.attrs
+            )
+            if not valid:
+                raise ValueError(f"malformed binary pointwise op: {op.op}")
+            if any(
+                input_type.dtype not in _FLOATING_DTYPES
+                for input_type in input_types
+            ):
+                raise ValueError(
+                    f"{op.op} requires floating-point tensor operands"
+                )
+            continue
+
+        if op.op == "nan_to_num":
+            if len(input_types) != 1:
+                raise ValueError("nan_to_num requires one tensor input")
+            if output_type != input_types[0]:
+                raise ValueError("nan_to_num must preserve the input tensor type")
+            for name in ("nan", "posinf", "neginf"):
+                if name not in op.attrs:
+                    continue
+                value = op.attrs[name]
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ValueError(
+                        f"nan_to_num.{name} must be a scalar, got {value!r}"
+                    )
+            continue
+
         if op.op == "lerp":
             floating_inputs = len(input_types) == 3 or (
                 len(input_types) == 2 and "weight" in op.attrs
@@ -4561,6 +4631,10 @@ def _emit_pointwise_expression(
         if isinstance(value, (int, float)):
             return _msl_float_literal(float(value))
         raise ValueError(f"{op.op}.value must be scalar, got {value!r}")
+    if op.op == "nan_to_num" and output_dtype not in _FLOATING_DTYPES:
+        # ATen only substitutes non-finite values, and an integer tensor has
+        # none, so the lowering is the value itself.
+        return arguments[0]
     if op.op in {"eq", "ne", "lt", "le", "gt", "ge"}:
         left, right = _binary_operands(op, arguments, input_types)
         operator = {
@@ -4671,6 +4745,54 @@ def _emit_pointwise_expression(
     if op.op == "fmod":
         left, right = _binary_operands(op, arguments, input_types)
         return f"metal::fmod({left}, {right})"
+    if op.op == "hypot":
+        left, right = _binary_operands(op, arguments, input_types)
+        # MSL declares hypot in the global namespace, like log1p.
+        return f"hypot({left}, {right})"
+    if op.op == "copysign":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"metal::copysign({left}, {right})"
+    if op.op == "xlogy":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"tsc_xlogy_f32({left}, {right})"
+    if op.op == "logit":
+        value = arguments[0]
+        if "eps" in op.attrs:
+            eps = float(op.attrs["eps"])
+            lower = _msl_float_literal(eps)
+            upper = _msl_float_literal(1.0 - eps)
+            clamped = f"metal::min(metal::max({value}, {lower}), {upper})"
+            return f"metal::log({clamped} / (1.0f - ({clamped})))"
+        return f"metal::log(({value}) / (1.0f - ({value})))"
+    if op.op == "erfc":
+        return f"tsc_erfc({arguments[0]})"
+    if op.op == "frac":
+        value = arguments[0]
+        return f"({value} - metal::trunc({value}))"
+    if op.op == "sinc":
+        value = arguments[0]
+        scaled = f"3.14159265358979323846f * ({value})"
+        return (
+            f"(({value}) == 0.0f ? 1.0f : metal::sin({scaled}) / ({scaled}))"
+        )
+    if op.op == "nan_to_num":
+        value = arguments[0]
+        if input_types[0].dtype not in _FLOATING_DTYPES:
+            # ATen returns an integer tensor unchanged, and an elementwise
+            # select over the same value is that copy.
+            return value
+        limit = _FINITE_LIMITS[input_types[0].dtype]
+        nan_value = _msl_float_literal(float(op.attrs.get("nan", 0.0)))
+        posinf_value = _msl_float_literal(float(op.attrs.get("posinf", limit)))
+        neginf_value = _msl_float_literal(
+            float(op.attrs.get("neginf", -limit))
+        )
+        return (
+            f"(metal::isnan({value}) ? {nan_value} : "
+            f"(metal::isinf({value}) ? "
+            f"(({value}) > 0.0f ? {posinf_value} : {neginf_value}) : "
+            f"({value})))"
+        )
     if op.op == "lerp":
         if len(arguments) == 3:
             return f"tsc_lerp_f32({arguments[0]}, {arguments[1]}, {arguments[2]})"
@@ -6893,6 +7015,82 @@ def _evaluate_pointwise_mlx(
     if op.op == "atan2":
         left, right = _binary_mx_operands(op, arguments)
         return mx.arctan2(left, right)
+    if op.op == "fmod":
+        left, right = _binary_mx_operands(op, arguments)
+        # MLX has no fmod, and its remainder floored-adjusts the result, so
+        # rebuild the truncated form: fmod(a, b) = a - trunc(a / b) * b.
+        return left - mx.trunc(left / right) * right
+    if op.op == "hypot":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.sqrt(left * left + right * right)
+    if op.op == "copysign":
+        left, right = _binary_mx_operands(op, arguments)
+        negative = mx.less(right, 0.0) | (
+            (right == 0.0) & mx.less(mx.divide(1.0, right), 0.0)
+        )
+        return mx.where(negative, -mx.abs(left), mx.abs(left))
+    if op.op == "xlogy":
+        left, right = _binary_mx_operands(op, arguments)
+        return mx.where(
+            (left == 0.0) & ~mx.isnan(right),
+            mx.zeros_like(left),
+            left * mx.log(right),
+        )
+    if op.op == "lerp":
+        start, end = arguments[0], arguments[1]
+        weight = (
+            arguments[2]
+            if len(arguments) == 3
+            else float(op.attrs.get("weight", 1.0))
+        )
+        return mx.where(
+            mx.abs(weight) < 0.5,
+            start + weight * (end - start),
+            end - (end - start) * (1.0 - weight),
+        )
+    if op.op in {"addcmul", "addcdiv"}:
+        accumulator, left, right = arguments
+        value = float(op.attrs.get("value", 1.0))
+        scaled = value * left
+        return accumulator + (
+            scaled * right if op.op == "addcmul" else scaled / right
+        )
+    if op.op == "logit":
+        value = arguments[0]
+        if "eps" in op.attrs:
+            eps = float(op.attrs["eps"])
+            value = mx.minimum(mx.maximum(value, eps), 1.0 - eps)
+        return mx.log(value / (1.0 - value))
+    if op.op == "erfc":
+        return 1.0 - mx.erf(arguments[0])
+    if op.op == "frac":
+        return arguments[0] - mx.trunc(arguments[0])
+    if op.op == "sinc":
+        value = arguments[0]
+        scaled = pi * value
+        return mx.where(
+            value == 0.0,
+            mx.ones_like(value),
+            mx.sin(scaled) / scaled,
+        )
+    if op.op == "nan_to_num":
+        value = arguments[0]
+        dtype = _MLX_DTYPE_TO_DTYPE.get(value.dtype)
+        if dtype not in _FLOATING_DTYPES:
+            return value
+        limit = _FINITE_LIMITS[dtype]
+        nan_value = float(op.attrs.get("nan", 0.0))
+        posinf_value = float(op.attrs.get("posinf", limit))
+        neginf_value = float(op.attrs.get("neginf", -limit))
+        return mx.where(
+            mx.isnan(value),
+            nan_value,
+            mx.where(
+                mx.isinf(value),
+                mx.where(value > 0.0, posinf_value, neginf_value),
+                value,
+            ),
+        )
     if op.op == "neg":
         return -arguments[0]
     if op.op == "abs":

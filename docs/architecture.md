@@ -110,6 +110,14 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
 | `aten.logaddexp.default` | `logaddexp` |
 | `aten.atan2.default` | `atan2` |
+| `aten.copysign.Tensor`、`aten.copysign.Scalar`、`aten.copysign.Scalar_Scalar` | `copysign` |
+| `aten.xlogy.Tensor`、`aten.xlogy.Scalar_Self`、`aten.xlogy.Scalar_Other` | `xlogy`，左侧为 0 且右侧非 NaN 时短路成 0 |
+| `aten.logit.default` | `logit`，保留可选 `eps` 钳制 |
+| `aten.erfc.default` | `erfc`，复用 `tsc_erfc` 近似 |
+| `aten.frac.default` | `frac`，即 `x - trunc(x)` |
+| `aten.sinc.default` | `sinc`，`x == 0` 时返回 1 |
+| `aten.hypot.default` | `hypot`，生成全局 `hypot` |
+| `aten.nan_to_num.default` | `nan_to_num`，保留 `nan`/`posinf`/`neginf`；缺省值按输出 dtype 的有限上限补齐，整数输入是恒等 |
 | `aten.neg.default` | `neg` |
 | `aten.abs.default` | `abs` |
 | `aten.sigmoid.default` | `sigmoid` |
@@ -304,7 +312,9 @@ input_offset = (elem % 3) * 1
 
 混合 dtype 融合让 `(x > y) & mask -> where(condition, x + y, x - y)` 仍只生成一个 kernel。bool 输出使用 `mx.bool_` 分配，FP16/BF16/FP32 数值路径仍以 float 计算并 cast 回目标 dtype。
 
-精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。
+精确 GELU 和独立的 `erf` 使用 `_MSL_HEADER` 中的 Abramowitz-Stegun 近似。Apple MSL 没有 `metal::erf`，所以不能直接生成标准库调用。`erfc` 同样没有 `metal::erfc`，因此 `tsc_erfc` 直接复用 7.1.26 的同一多项式：把尾项 `poly * exp(-x²)` 当成 `erfc(|x|)`，负半轴用 `2 - tail`，避免 `1 - erf(x)` 在尾部丢掉有效位。`hypot` 和 `log1p` 一样声明在全局命名空间而不是 `metal::`，所以生成的是 `hypot(a, b)`。`copysign` 用 `metal::copysign`，`0`/`inf`/`NaN` 都按 IEEE 传播符号位。
+
+`logit` 生成 `log(x / (1 - x))`；带 `eps` 时先按 ATen 的规则把输入钳到 `[eps, 1 - eps]`，两个边界都在编译期算成字面量。`sinc` 在 `x == 0` 时直接返回 1，其余走 `sin(pi x) / (pi x)`，`frac` 是 `x - trunc(x)`（不是 `metal::fract` 的 floor 形式，所以负数保留负号）。`xlogy` 用 `tsc_xlogy_f32`：只有左操作数为 0 且右操作数不是 NaN 时才短路成 0，因此 `xlogy(0, -1)` 是 0 而 `xlogy(0, NaN)` 仍是 NaN，与 ATen 一致。`nan_to_num` 生成 `isnan ? nan : (isinf ? (x > 0 ? posinf : neginf) : x)`，缺省的 `posinf`/`neginf` 取该 dtype 的最大有限值（F16 是 65504，BF16/F32 是各自 `max`），整数输入在没有非有限值可替换时直接返回自身。这些算子和 `lerp`/`addcmul`/`addcdiv` 都只接受浮点 kernel，整数输入在捕获阶段插入 `cast` 提升到输出的浮点 dtype，与 PyTorch 对这些 op 的 opmath 提升一致。
 
 `round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
 

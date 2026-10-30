@@ -63,6 +63,27 @@ def _torch_to_mlx(value: torch.Tensor) -> mx.array:
     return mx.array(source).astype(_MLX_DTYPES[value.dtype])
 
 
+def _assert_values_match(
+    actual: mx.array,
+    expected: torch.Tensor,
+    *,
+    atol: float = 1e-6,
+    rtol: float = 1e-6,
+) -> None:
+    """Compare elementwise, keeping NaN and infinite expectations exact."""
+
+    mx.eval(actual)
+    got = actual.reshape(-1).tolist()
+    want = expected.reshape(-1).tolist()
+    for got_value, want_value in zip(got, want, strict=True):
+        if math.isnan(want_value):
+            assert math.isnan(got_value)
+        elif math.isinf(want_value):
+            assert got_value == want_value
+        else:
+            assert got_value == pytest.approx(want_value, abs=atol, rel=rtol)
+
+
 def _manual_gate_graph(dtype: DType = DType.F32) -> Graph:
     tensor_type = TensorType((3,), dtype)
     values = {
@@ -6210,6 +6231,131 @@ def test_addcmul_rejects_integer_operands() -> None:
             lambda acc, left, right: torch.addcmul(acc, left, right),
             (value, value, value),
         )
+
+
+def test_logit_matches_pytorch_with_and_without_eps() -> None:
+    value = torch.tensor([0.0, 1.0, 0.5, -0.0001, 0.25, 0.75, 1e-9])
+
+    cases = (
+        (torch.logit, None),
+        (lambda tensor: torch.logit(tensor, eps=1e-3), 1e-3),
+    )
+    for fn, eps in cases:
+        result = compile_callable(fn, (value,))
+        assert [op.op for op in result.lowered_graph.ops] == ["logit"]
+        assert "metal::log(" in result.plan.kernels[0].source
+        if eps is not None:
+            assert result.lowered_graph.ops[0].attrs["eps"] == eps
+
+        actual = result.plan(_torch_to_mlx(value))[0]
+        _assert_values_match(actual, fn(value))
+
+
+def test_logit_promotes_integer_inputs_like_pytorch() -> None:
+    value = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+    result = compile_callable(torch.logit, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["cast", "logit"]
+    actual = result.plan(_torch_to_mlx(value))[0]
+    _assert_values_match(actual, torch.logit(value))
+
+
+def test_erfc_frac_sinc_and_hypot_match_pytorch() -> None:
+    value = torch.tensor([-2.5, -1.5, -0.5, 0.0, 0.5, 1.0, 1.5, 2.5])
+    other = torch.tensor([3.0, -4.0, 0.5, 2.0, -2.0, 1.0, 0.25, -0.75])
+
+    cases = (
+        (torch.erfc, (value,), "tsc_erfc("),
+        (torch.frac, (value,), "metal::trunc("),
+        (torch.sinc, (value,), "metal::sin("),
+        (torch.hypot, (value, other), "hypot("),
+    )
+    for fn, inputs, marker in cases:
+        result = compile_callable(fn, inputs)
+        assert marker in result.plan.kernels[0].source
+        actual = result.plan(*(_torch_to_mlx(item) for item in inputs))[0]
+        _assert_values_match(actual, fn(*inputs))
+
+
+def test_sinc_returns_one_at_zero() -> None:
+    value = torch.tensor([0.0, 1e-8, -1e-8])
+
+    result = compile_callable(torch.sinc, (value,))
+    actual = result.plan(_torch_to_mlx(value))[0]
+    _assert_values_match(actual, torch.sinc(value), atol=1e-7, rtol=1e-7)
+
+
+def test_copysign_follows_the_magnitude_and_signed_zero() -> None:
+    magnitude = torch.tensor([3.0, -3.0, 0.0, -0.0, 2.5])
+    sign = torch.tensor(
+        [-1.0, 1.0, -0.0, -0.0, float("nan")], dtype=torch.float32
+    )
+
+    result = compile_callable(torch.copysign, (magnitude, sign))
+    assert "metal::copysign(" in result.plan.kernels[0].source
+    actual = result.plan(_torch_to_mlx(magnitude), _torch_to_mlx(sign))[0]
+    _assert_values_match(actual, torch.copysign(magnitude, sign))
+
+
+def test_xlogy_short_circuits_a_zero_left_operand() -> None:
+    value = torch.tensor([0.0, -0.0, 1.0, 2.0])
+    other = torch.tensor([-1.0, 3.0, 2.0, float("nan")])
+
+    result = compile_callable(torch.xlogy, (value, other))
+    assert "tsc_xlogy_f32(" in result.plan.kernels[0].source
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(other))[0]
+    _assert_values_match(actual, torch.xlogy(value, other))
+
+
+def test_xlogy_accepts_a_scalar_left_operand() -> None:
+    value = torch.tensor([0.5, 1.0, 2.0])
+
+    result = compile_callable(lambda tensor: torch.xlogy(2.0, tensor), (value,))
+    assert result.lowered_graph.ops[0].attrs["scalar"] == 2.0
+    actual = result.plan(_torch_to_mlx(value))[0]
+    _assert_values_match(actual, torch.xlogy(2.0, value))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_nan_to_num_uses_the_dtype_finite_limits(dtype) -> None:
+    value = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), 1.0, -2.5], dtype=dtype
+    )
+
+    result = compile_callable(torch.nan_to_num, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == ["nan_to_num"]
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = torch.nan_to_num(value)
+    mx.eval(actual)
+    assert actual.tolist() == expected.tolist()
+
+
+def test_nan_to_num_honours_explicit_replacements() -> None:
+    value = torch.tensor([float("nan"), float("inf"), -float("inf"), 1.0])
+
+    def fn(tensor):
+        return torch.nan_to_num(tensor, nan=7.0, posinf=8.0, neginf=-9.0)
+
+    result = compile_callable(fn, (value,))
+    assert result.lowered_graph.ops[0].attrs == {
+        "nan": 7.0,
+        "posinf": 8.0,
+        "neginf": -9.0,
+    }
+    actual = result.plan(_torch_to_mlx(value))[0]
+    mx.eval(actual)
+    assert actual.tolist() == [7.0, 8.0, -9.0, 1.0]
+
+
+def test_nan_to_num_is_a_identity_on_integer_tensors() -> None:
+    value = torch.tensor([1, 2, 3], dtype=torch.int64)
+
+    result = compile_callable(torch.nan_to_num, (value,))
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(torch.nan_to_num(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
