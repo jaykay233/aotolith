@@ -649,6 +649,22 @@ def _evaluate_mlx_op(
         axis = int(op.attrs["dim"]) % value.ndim
         shifted = value - mx.logsumexp(value, axis=axis, keepdims=True)
         return shifted.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op in {"var", "std"}:
+        value = env[op.inputs[0]]
+        dims = tuple(int(dim) % value.ndim for dim in op.attrs["dims"])
+        keepdim = bool(op.attrs.get("keepdim", False))
+        correction = int(op.attrs.get("correction", 1))
+        output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        # PyTorch accumulates the variance in float32 for half inputs, so a
+        # float32 pass is what keeps the two results within a few ulps.
+        compute = (
+            value
+            if value.dtype in (mx.float32, mx.float64)
+            else value.astype(mx.float32)
+        )
+        variance = mx.var(compute, axis=dims, keepdims=keepdim, ddof=correction)
+        result = variance if op.op == "var" else mx.sqrt(variance)
+        return result.astype(output_dtype)
     if op.op in {"argmax", "argmin"}:
         value = env[op.inputs[0]]
         operation = mx.argmax if op.op == "argmax" else mx.argmin
@@ -1453,6 +1469,8 @@ class AppleMetalBackend:
                 _validate_mlx_reduction_op(graph, op)
             elif op.op == "log_softmax":
                 _validate_log_softmax_op(graph, op)
+            elif op.op in {"var", "std"}:
+                _validate_variance_op(graph, op)
             elif op.op in {"argmax", "argmin"}:
                 _validate_arg_reduction_op(graph, op)
             elif op.op in {"sort", "argsort", "topk", "topk_indices"}:
@@ -7710,6 +7728,53 @@ def _validate_log_softmax_op(graph: Graph, op: Operation) -> None:
         raise ValueError(
             "log_softmax must preserve the input tensor type, got "
             f"{(output_type.shape, output_type.dtype.value)}"
+        )
+
+
+def _validate_variance_op(graph: Graph, op: Operation) -> None:
+    if len(op.inputs) != 1:
+        raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
+    input_type = graph.value(op.inputs[0]).type
+    output_type = graph.value(op.outputs[0]).type
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise ValueError(f"{op.op} does not support rank-0 tensors")
+    if input_type.dtype not in _FLOATING_DTYPES:
+        raise NotImplementedError(
+            f"{op.op} needs a floating-point input, got {input_type.dtype.value}"
+        )
+    dims = op.attrs.get("dims")
+    if not isinstance(dims, tuple) or not dims:
+        raise ValueError(f"{op.op}.dims must be a non-empty tuple, got {dims!r}")
+    if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims):
+        raise ValueError(f"{op.op}.dims must contain integers, got {dims!r}")
+    axes = tuple(int(dim) % rank for dim in dims)
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"{op.op}.dims repeats an axis: {dims!r}")
+    keepdim = op.attrs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{op.op}.keepdim must be a boolean, got {keepdim!r}")
+    correction = op.attrs.get("correction", 1)
+    if isinstance(correction, bool) or not isinstance(correction, int):
+        raise NotImplementedError(
+            f"{op.op}.correction must be an integer, got {correction!r}"
+        )
+    expected = (
+        tuple(1 if axis in axes else size for axis, size in enumerate(input_type.shape))
+        if keepdim
+        else tuple(
+            size for axis, size in enumerate(input_type.shape) if axis not in axes
+        )
+    )
+    if output_type.shape != expected:
+        raise ValueError(
+            f"{op.op} output shape {output_type.shape} does not match the "
+            f"reduced input {expected}"
+        )
+    if output_type.dtype != input_type.dtype:
+        raise ValueError(
+            f"{op.op} must preserve the input dtype, got "
+            f"{output_type.dtype.value} for a {input_type.dtype.value} input"
         )
 
 

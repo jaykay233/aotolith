@@ -77,6 +77,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.mean.default`、`aten.mean.dim` | `mean` |
 | `aten.prod.default`、`aten.prod.dim_int` | `prod`，走 MLX reduction，支持多轴与 `keepdim` |
 | `aten.amax.default`、`aten.amin.default` | `amax`、`amin`，走 MLX reduction，支持多轴与 `keepdim` |
+| `aten.var.*`、`aten.std.*`（`correction`/`dim`/`default` 三种拼法） | `var`、`std`，走 MLX，支持多轴、`keepdim` 与整数 `correction` |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
 | `aten.argmax.default`、`aten.argmin.default` | `argmax`、`argmin`，输出固定 I64 |
 | `aten.sort.default` | `sort` / `argsort`（按被读取的输出选择） |
@@ -518,6 +519,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - LayerNorm 的 mean/rstd 辅助输出会在被图读取时展开成 `mean` 加一段两次遍历的方差链（`sub`/`mul`/`mean`/`add eps`/`rsqrt`），因为 IR 的 op 都是单输出，naked kernel 只写归一化结果。它们只在真的被读取时才生成，不需要时不会多算；数值上与原 kernel 内部的 Welford 统计相差几个 ulp（实测 `1e-5` 以内）。只读 rstd/mean、不读主输出也是合法的
 - RMSNorm 的 pattern 覆盖 `F.rms_norm` 以及手写的常见写法：`pow(x, 2)` 或 `x * x` 求平方、`add_`/`add` 加 eps、`rsqrt` 或 `sqrt`+`div` 归一化、weight 在乘法任一侧，都折叠成同一个 `rms_norm`。未知的写法会退回普通 elementwise 图而不是报错，因此上游分解链变化只影响是否融合，不影响是否可编译
 - `sort`/`topk`/`argmax`/`argmin` 走 MLX 而不是生成 kernel。索引输出固定 I64；`sort` 的 `stable` 只做布尔校验，ties 的索引顺序沿用 MLX 的排序实现，PyTorch 的 `stable=True` 不保证一致（values 总是一致）。`topk` 的 `sorted=False` 仍然返回排序结果，PyTorch 对此只承诺相同的元素集合。NaN 排序位置与 PyTorch 相同（升序在末尾、降序在最前）。全 rank-0 的 `argmax` 返回 rank-0 索引；IR 不支持零长度维度，所以 `topk(k=0)` 在建立输出类型时就报错
+- `var`/`std` 走 MLX 的 `mx.var`，`dims`/`keepdim`/`correction` 保存在 attribute 中。三条 ATen 拼法（`var.correction`、`var.dim`、`var.default`，`std` 同理）在前端统一归一化，`unbiased` 会折算成 `correction`。`correction` 只接受整数，因为 MLX 的 `ddof` 只接受整数；`correction >= 归约元素数` 时与 PyTorch 一样得到 inf。FP16/BF16 输入先提升到 FP32 再归约，最后 cast 回输入 dtype，与 PyTorch 的累加精度一致
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持

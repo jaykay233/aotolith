@@ -1975,6 +1975,67 @@ def test_sorting_survives_an_artifact_round_trip(tmp_path) -> None:
         assert mx.array_equal(produced, mx.array(reference.numpy()))
 
 
+@pytest.mark.parametrize(
+    ("op_name", "fn"),
+    [
+        ("var", lambda value: torch.var(value)),
+        ("var", lambda value: torch.var(value, 1)),
+        ("var", lambda value: torch.var(value, -1, correction=0)),
+        ("var", lambda value: torch.var(value, -1, keepdim=True)),
+        ("var", lambda value: torch.var(value, [0, 2])),
+        ("std", lambda value: torch.std(value, -1)),
+        ("std", lambda value: torch.std(value, -1, correction=0)),
+        ("std", lambda value: torch.std(value, [1, 2], keepdim=True)),
+    ],
+)
+def test_variance_reductions_match_pytorch(op_name, fn) -> None:
+    torch.manual_seed(62)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [op_name]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_variance_uses_population_correction_when_asked() -> None:
+    torch.manual_seed(63)
+    x = torch.randn(4, 6)
+    for correction in (0, 1, 2):
+        fn = lambda value: torch.var(value, -1, correction=correction)
+        result = compile_callable(fn, (x,))
+        assert result.lowered_graph.ops[0].attrs["correction"] == correction
+        actual = result.plan(mx.array(x.numpy()))[0]
+        expected = mx.array(fn(x).numpy())
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("fn", [
+    lambda value: torch.var(value, -1),
+    lambda value: torch.std(value, -1),
+])
+def test_variance_supports_low_precision(fn) -> None:
+    torch.manual_seed(64)
+    x = torch.randn(2, 6, dtype=torch.float16)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mx.float16))[0]
+    expected = mx.array(fn(x.float()).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float16
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+def test_variance_rejects_non_integer_correction() -> None:
+    x = torch.randn(2, 4)
+    with pytest.raises(NotImplementedError, match="correction must be an integer"):
+        compile_callable(
+            lambda value: torch.var(value, -1, correction=0.5), (x,)
+        )
+
+
 def test_log_softmax_supports_low_precision() -> None:
     torch.manual_seed(55)
     x = torch.randn(2, 6, dtype=torch.float16)

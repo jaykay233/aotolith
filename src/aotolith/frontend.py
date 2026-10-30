@@ -272,6 +272,16 @@ _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 # operations, so each selection becomes its own operation and only the ones the
 # graph actually reads are emitted.
 _SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
+# PyTorch spells variance two ways depending on version and call style; both
+# normalize to one IR shape (dims, keepdim, correction).
+_VARIANCE_TARGETS = {
+    "aten.var.correction": "var",
+    "aten.var.dim": "var",
+    "aten.var.default": "var",
+    "aten.std.correction": "std",
+    "aten.std.dim": "std",
+    "aten.std.default": "std",
+}
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
@@ -502,6 +512,17 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = produced[index]
                     else:
                         dead_nodes.add(user)
+                continue
+            if target in _VARIANCE_TARGETS:
+                inputs, attrs, output_type = _variance_operation(node, node_ids)
+                output_id = f"v{len(ops)}"
+                ops.append(
+                    Operation(
+                        _VARIANCE_TARGETS[target], inputs, (output_id,), attrs
+                    )
+                )
+                node_ids[node] = output_id
+                values[output_id] = Value(output_id, output_type)
                 continue
             if target not in _SUPPORTED_OPS:
                 raise ValueError(f"unsupported FX target: {target}")
@@ -1661,6 +1682,72 @@ def _layer_norm_operation(
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
     return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _variance_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    """Normalize ``var``/``std`` spellings onto ``dims``/``keepdim``/``correction``."""
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{target} expects an input tensor")
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+
+    if target.endswith(".correction"):
+        dims = args[1] if len(args) > 1 else kwargs.get("dim")
+        correction = kwargs.get("correction", 1)
+        if correction is None:
+            correction = 1
+        keepdim = kwargs.get("keepdim", False)
+    elif target.endswith(".dim"):
+        dims = args[1] if len(args) > 1 else kwargs.get("dim")
+        unbiased = args[2] if len(args) > 2 else kwargs.get("unbiased", True)
+        correction = 1 if unbiased else 0
+        keepdim = args[3] if len(args) > 3 else kwargs.get("keepdim", False)
+    else:
+        unbiased = args[1] if len(args) > 1 else kwargs.get("unbiased", True)
+        correction = 1 if unbiased else 0
+        dims = None
+        keepdim = False
+
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{target}.keepdim must be a boolean, got {keepdim!r}")
+    if isinstance(correction, bool) or not isinstance(correction, int):
+        raise NotImplementedError(
+            f"{target}.correction must be an integer, got {correction!r}; MLX's "
+            "ddof only accepts integral degrees of freedom"
+        )
+
+    if dims is None:
+        normalized_dims = tuple(range(rank))
+    elif isinstance(dims, int) and not isinstance(dims, bool):
+        normalized_dims = (dims % rank,)
+    elif isinstance(dims, (tuple, list)) and dims and all(
+        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    ):
+        normalized_dims = tuple(dim % rank for dim in dims)
+    else:
+        raise ValueError(f"{target}.dim must contain integers, got {dims!r}")
+    if len(set(normalized_dims)) != len(normalized_dims):
+        raise ValueError(f"{target}.dim repeats an axis: {dims!r}")
+
+    return (
+        (_argument_ids(input_node, node_ids),),
+        {
+            "dims": normalized_dims,
+            "keepdim": keepdim,
+            "correction": correction,
+        },
+        _node_type(node),
+    )
 
 
 def _sort_operations(
