@@ -4828,11 +4828,13 @@ def test_a_device_that_rejects_tensor_core_kernels_still_compiles(
 def test_tensor_core_support_is_checked_per_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A device can load FP16 tensor ops and reject FP32 ones.
+    """A device can load FP16 tensor ops and reject bfloat16 ones.
 
-    Probing a single kernel would then keep the FP32 kernel that cannot load.
-    The FP32 tile here is `64x64x64` and the FP16 one `64x64x32`, so refusing by
-    kernel name simulates exactly that asymmetry.
+    bfloat16 needs hardware support that FP16 does not, and the two share one
+    kernel source with a different template type, so nothing in the emitted text
+    separates them: only the probe's dtype does. Refusing by template type
+    simulates a device with exactly that asymmetry, and a probe that ran once
+    and answered for both would keep the bfloat16 kernel it cannot load.
     """
 
     _require_tensor_cores()
@@ -4841,17 +4843,20 @@ def test_tensor_core_support_is_checked_per_dtype(
 
     create_kernel = metal_backend._metal_kernel
 
-    def refuse_float32_tiles(name, input_names, output_names, source, header):
+    def refuse_bfloat16_tiles(name, input_names, output_names, source, header):
         kernel = create_kernel(name, input_names, output_names, source, header)
-        if "tensorcore" not in name or "64x64x64" not in name:
+        if "tensorcore" not in name:
             return kernel
 
         def reject(*args, **kwargs):
-            raise RuntimeError(f"[metal::Device] Unable to load kernel {name}")
+            template = kwargs.get("template") or ()
+            if any(value == mx.bfloat16 for _, value in template):
+                raise RuntimeError(f"[metal::Device] Unable to load kernel {name}")
+            return kernel(*args, **kwargs)
 
         return reject
 
-    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_float32_tiles)
+    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_bfloat16_tiles)
 
     torch.manual_seed(39)
     half = (torch.randn(64, 64, dtype=torch.float16),) * 2
@@ -4863,7 +4868,7 @@ def test_tensor_core_support_is_checked_per_dtype(
     # The blocked flag is process-wide, so this is the last compile that can
     # still see tensor cores.
     torch.manual_seed(40)
-    single = (torch.randn(64, 64, dtype=torch.float32),) * 2
+    single = (torch.randn(64, 64, dtype=torch.bfloat16),) * 2
     float_plan = compile_callable(
         lambda x, weight: x @ weight, single, codegen_matmul=True
     ).plan
@@ -4872,7 +4877,38 @@ def test_tensor_core_support_is_checked_per_dtype(
     actual = float_plan(*(_torch_to_mlx(value) for value in single))[0]
     expected = _torch_to_mlx(single[0] @ single[1])
     mx.eval(actual, expected)
-    assert mx.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+    assert mx.allclose(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("shape", "transposed"),
+    [((512, 2048, 512), False), ((256, 256, 256), True)],
+)
+def test_float32_matmul_keeps_float32_accuracy(shape, transposed) -> None:
+    """f32 must not reach the tensor cores: they have no f32 mode.
+
+    A `T = float` `matmul2d` runs at bfloat16 precision — 1.6e-1 off on the
+    first shape here, the same distance MLX's own f32 matmul lands. Both are
+    tensor-core eligible shapes, so the assertion is that f32 stays on the
+    scalar kernel and matches PyTorch to f32 accuracy instead.
+    """
+
+    rows, reduction, columns = shape
+    torch.manual_seed(41)
+    left = torch.randn(rows, reduction, dtype=torch.float32)
+    right = torch.randn(reduction, columns, dtype=torch.float32)
+    fn = (
+        (lambda x, weight: x @ weight.T) if transposed
+        else (lambda x, weight: x @ weight)
+    )
+
+    result = compile_callable(fn, (left, right), codegen_matmul=True)
+    assert "tensorcore" not in result.plan.kernels[0].name
+
+    actual = result.plan(*(_torch_to_mlx(value) for value in (left, right)))[0]
+    expected = _torch_to_mlx(fn(left, right))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

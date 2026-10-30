@@ -364,7 +364,6 @@ _MPP_GEMM_TILE_ROW_MAJOR_WIDE = (64, 256, 1, 8, 32)
 _MPP_GEMM_TILE_ROW_MAJOR = (128, 64, 2, 2, 32)
 _MPP_GEMM_TILE_TALL = (128, 128, 2, 4, 32)
 # fp32 accumulation over a deep reduction stays on the 2x2 warp tile.
-_MPP_GEMM_TILE_F32 = _MPP_GEMM_TILE_ROW_MAJOR
 # Progressively smaller tiles; the selector walks this list so that a block
 # never exceeds the problem size (which would waste tensor-core work and force
 # boundary predication on exact shapes).
@@ -3056,7 +3055,7 @@ class AppleMetalBackend:
             rows, columns, reduction, output_type.dtype
         ) and _mpp_supported():
             mpp_config = _select_mpp_gemm_config(
-                rows, columns, reduction, output_type.dtype, transpose_right
+                rows, columns, reduction, transpose_right
             )
             (
                 mpp_block_rows,
@@ -5196,10 +5195,17 @@ def _supports_mpp_matmul(
     The reduction must be a multiple of the 16-wide MMA fragment so that every
     cooperative-tensor load stays fully in bounds; everything else is handled
     by predicated stores and clamped input reads.
+
+    Half and bfloat16 only. The hardware has no float32 tensor cores, so a
+    `T = float` `matmul2d` is executed at bf16 precision: on a 512x2048x512
+    f32 GEMM it lands 1.6e-1 away from PyTorch, the same distance MLX's own
+    f32 matmul lands, while the scalar tiled kernel matches bit for bit. That
+    is a silent accuracy loss in exchange for 1.6x, so f32 stays on the exact
+    path.
     """
 
     return (
-        dtype in {DType.F16, DType.BF16, DType.F32}
+        dtype in {DType.F16, DType.BF16}
         and rows >= 16
         and columns >= 16
         and reduction >= 16
@@ -5211,7 +5217,6 @@ def _select_mpp_gemm_config(
     rows: int,
     columns: int,
     reduction: int,
-    dtype: DType,
     transposed_right: bool = True,
 ) -> tuple[int, int, int, int, int]:
     """Pick the tensor-core block tile for one concrete matmul shape."""
@@ -5221,9 +5226,7 @@ def _select_mpp_gemm_config(
         if transposed_right
         else _MPP_GEMM_TILE_ROW_MAJOR_WIDE
     )
-    if dtype == DType.F32:
-        preferred = _MPP_GEMM_TILE_F32
-    elif not transposed_right and columns >= _MPP_GEMM_MAX_WIDE_COLUMNS:
+    if not transposed_right and columns >= _MPP_GEMM_MAX_WIDE_COLUMNS:
         preferred = _MPP_GEMM_TILE_TALL
     elif reduction >= 2048 and rows <= _MPP_GEMM_SKINNY_MAX_ROWS:
         preferred = (

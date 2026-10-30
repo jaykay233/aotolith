@@ -340,16 +340,18 @@ The generated tensor-core kernels beat MLX on matmul but still trail MLX's SDPA 
 
 | Benchmark | Aotolith | MLX | Ratio |
 |---|---|---|---|
-| matmul 512x2048x512 f32 | 89.4 us | 114.2 us | 1.28x |
-| matmul 512x2048x512 f16 | 64.8 us | 85.4 us | 1.32x |
-| matmul 512x2048x512 bf16 | 64.5 us | 76.6 us | 1.19x |
-| matmul 1024x4864x896 f16 | 372.9 us | 531.2 us | 1.42x |
-| matmul 4096x4096x4096 f16 | 5.51 ms | 5.45 ms | 0.99x |
+| matmul 512x2048x512 f32 | 367.4 us | 118.1 us | 0.32x |
+| matmul 512x2048x512 f16 | 60.9 us | 80.9 us | 1.33x |
+| matmul 512x2048x512 bf16 | 62.4 us | 82.2 us | 1.32x |
+| matmul 1024x4864x896 f16 | 373.0 us | 519.3 us | 1.39x |
+| matmul 4096x4096x4096 f16 | 5.53 ms | 5.66 ms | 1.02x |
 | attention 1x8x512x64 f16 causal | 35.2 us | 28.5 us | 0.81x |
 | attention 1x8x2048x128 f16 causal | 585.6 us | 461.6 us | 0.79x |
 | attention 1x64x4096x128 f16 causal | 16.3 ms | 13.2 ms | 0.81x |
 
 The matmul kernel drives MPP tensor-core `matmul2d` over tiled operands. Tiles are chosen from the output shape and the right operand layout: a transposed right operand is K-contiguous and rewards wide column blocks, while a row-major right operand strides through K and instead rewards a taller reduction step. Across 43 measured shape and layout combinations the selector stays within 5% of the fastest tile measured for that shape, and against MLX it averages 1.16x (transposed right operand) and 1.10x (row-major) with no shape below 1.01x. The largest shapes converge on parity because both implementations approach the same tensor-core throughput.
+
+The f32 row is the exception, and it is deliberate. The hardware has no float32 tensor cores: a `T = float` `matmul2d` runs at bfloat16 precision, which put that shape 1.6e-1 away from PyTorch — exactly where MLX's own f32 matmul lands. f32 therefore stays on the scalar tiled kernel, which matches PyTorch bit for bit and costs the 3.1x above. Half and bfloat16 are unaffected.
 
 The attention kernel is a register-resident FlashAttention pass: one simdgroup owns a 16-row query fragment and the full value width, so the online-softmax accumulators never leave registers, `Q` is staged once in threadgroup memory, and `K`/`V` stream straight from device memory. It reaches 16.8 TFLOPS on long sequences, but MLX's SDPA stays about 20% ahead on prefill shapes. Decode is a different problem: a one-row query has no use for tiled online softmax, so the backend emits a separate single-query kernel that keeps a whole head's scores in threadgroup memory, reduces `max` and `sum(exp)` in two levels, and accumulates values without rescaling. That kernel is why `--codegen-attention` no longer costs decode throughput: it is one launch per layer over a 192-slot cache and lands within noise of MLX's SDPA instead of 20% behind it. Staging `K`/`V` in threadgroup memory was measured 3x slower for the tiled prefill kernel: the tile is shared by only two simdgroups, and the per-tile barriers cost more than the duplicated device loads they replace. `CompiledPlan.selections` records which path each operation used and why a fallback occurred. Both kernels only cover FP16/BF16; anything else selects MLX.
 
@@ -376,7 +378,7 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 - Tensor-valued `example_kwargs` are promoted to graph inputs and passed by name. Keyword values that merely *contain* tensors (a list or dict of them) are rejected rather than captured as constants.
 - Shared parameter storage aliases are currently serialized as separate state entries. Correctness is preserved, but the artifact does not yet deduplicate aliased storage.
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
-- Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured matmul shapes. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
+- Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured FP16/BF16 matmul shapes. f32 is slower than MLX on purpose: it stays on the exact scalar kernel because the tensor cores have no f32 mode. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
 - The Qwen2 static-cache adapter implements SiLU MLP activation and a plain causal mask only. A config that selects another activation or sliding-window layers is rejected at compile time rather than compiled against the wrong semantics; the check reads the constructed layers rather than the config string, because the library normalises some of those fields away. The adapter verifies the activation numerically, which also catches a custom `act_fn` that the config does not describe.
 - The repository does not implement scheduler, continuous batching, preemption, paged KV cache, prefix cache, sampling policies, PD disaggregation, EP/MoE dispatch, EPLB, or serving APIs.

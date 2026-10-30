@@ -385,6 +385,7 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 `matmul`、`addmm` 的 GEMM 和 prefill attention 各有一条 `mpp::tensor_ops::matmul2d` 路径，用 Apple 的 tensor core 取代 `simdgroup_float8x8`：
 
 - GEMM 的 block tile 按输出 shape 和右操作数布局从测量得到的 tile 阶梯里选：右操作数转置时 K 连续，偏好宽的 column block；右操作数 row-major 时沿 K 跨步，偏好更高的 reduction step。warp 内用三个 cooperative tensor 分别承接左右操作数和 FP32 累加器，epilogue（bias、alpha/beta、`silu_mul`）在写回时执行
+- 这条路径只服务 FP16/BF16。硬件没有 float32 tensor core，`T = float` 的 `matmul2d` 实际按 bfloat16 精度执行：`512x2048x512` 的 f32 GEMM 因此偏离 PyTorch 1.6e-1，与 MLX 自己 f32 matmul 的偏差相同，而标量 tiled kernel 与 PyTorch 逐位一致（偏差 0）。所以 `_supports_mpp_matmul` 排除 F32，f32 留在标量路径上，代价是该 shape 比 MLX 慢 3.1x
 - attention 用一个 simdgroup 负责 `16` 行 query fragment，`Q` 只暂存一次到 threadgroup memory，`K`/`V` 直接从 device memory 读进 cooperative tensor，online softmax 的 `max`/`sum` 仍在寄存器里用 `simd_shuffle` 归约
 - 两条路径都以编译器自己的 `__HAVE_TENSOR__` 宏为前提（Apple GPU family 9 及以上）。更早的机型走上一节的 SIMD 路径
 - 这个宏只回答「GPU 有没有 tensor op」，不回答「这个 metallib 装得上」。半虚拟化 GPU（托管 CI、云 Mac）会定义宏，却以 `unsupported deferred-static-alloca-size function body` 拒绝加载。因此 `compile` 在选路之前会真正加载并求值一个已经生成好的 tensor-core kernel；失败就把整个 graph 重新 lower 一次，改走 SIMD 路径，并把原因写进 `selections` 的 `reason`。代价是每次编译多一次 launch（kernel 已缓存时约 0.25 ms），换来的是首次 matmul 不会抛出一句带 mangled 符号的 `RuntimeError`
