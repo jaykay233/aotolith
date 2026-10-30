@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from math import isfinite, prod
 from typing import Any
 
+from .decompose import aten_decompositions
 from .ir import DType, Graph, Operation, TensorType, Value
 
 _SUPPORTED_OPS = {
@@ -28,6 +29,10 @@ _SUPPORTED_OPS = {
     "aten.squeeze.dim": "squeeze",
     "aten.clone.default": "contiguous",
     "aten.alias.default": "alias",
+    # ``detach`` only severs autograd edges, which the IR does not model, so it
+    # is a pure alias. Torch's own composites emit it (``nanmean`` detaches the
+    # non-NaN count), and an empty placeholder is still skipped above.
+    "aten.detach.default": "alias",
     # A tensor literal built inside ``forward`` reaches the graph as a constant
     # plus this fresh-copy marker. The copy carries no arithmetic, and every
     # in-place op is legalized before it reaches the IR, so rebinding the value
@@ -442,6 +447,74 @@ _INPLACE_SCATTER_TARGETS = {
     "aten.scatter_reduce_.two": "aten.scatter_reduce.two",
     "aten.index_add_.default": "aten.index_add.default",
 }
+# ``all``/``any`` are comparisons plus a reduction, computed as one pass over
+# the masks rather than by materialising the boolean difference.
+_AND_OR_TARGETS = frozenset(
+    {
+        "aten.all.default",
+        "aten.all.dim",
+        "aten.all.dims",
+        "aten.any.default",
+        "aten.any.dim",
+        "aten.any.dims",
+    }
+)
+# Rejected with a message naming dropout. Decomposing it would silently
+# accept a random operator whose mask the IR cannot represent, so the explicit
+# refusal has to survive the decomposition table.
+_BERNOULLI_TARGET = "aten.bernoulli_.float"
+_LAYER_NORM_TARGET = "aten.native_layer_norm.default"
+_SQUEEZE_ALL_TARGET = "aten.squeeze.default"
+# Composites whose Torch decomposition is correct but wasteful: `count_nonzero`
+# counts a mask the graph already holds without comparing again, and `all`/`any`
+# fold the mask into the reduction instead of materialising the boolean
+# difference. The hand-written lowering is shorter, so it stays.
+_COUNT_NONZERO_TARGETS = frozenset(
+    {"aten.count_nonzero.default", "aten.count_nonzero.dim_IntList"}
+)
+
+# Every ATen target this module lowers itself, in one set. `decompose` subtracts
+# it from Torch's core decomposition table: an operator with a dedicated
+# lowering keeps it, and only the operators this module does not know are
+# rewritten into ones it does.
+NATIVE_TARGETS: frozenset[str] = frozenset(
+    set(_SUPPORTED_OPS)
+    | set(_EMPTY_COPY_TARGETS)
+    | _DIRECT_ATTENTION_TARGETS
+    | _SEQUENCE_VIEW_TARGETS
+    | _SORT_TARGETS
+    | set(_EXTREMUM_DIM_TARGETS)
+    | set(_VARIANCE_TARGETS)
+    | set(_PAD_MODE_TARGETS)
+    | _INPLACE_TARGETS
+    | set(_INPLACE_SCATTER_TARGETS)
+    | _AND_OR_TARGETS
+    | _SCATTER_TARGETS
+    | _COUNT_NONZERO_TARGETS
+    | {
+        _SELECT_TARGET,
+        _INDEX_TARGET,
+        _MATRIX_TRANSPOSE_TARGET,
+        _STACK_TARGET,
+        _SCATTER_ADD_TARGET,
+        _SCATTER_REDUCE_TARGET,
+        _INDEX_ADD_TARGET,
+        _LOGSIGMOID_TARGET,
+        _NANSUM_TARGET,
+        _REPEAT_TARGET,
+        _DIAGONAL_TARGET,
+        _DIAGONAL_COPY_TARGET,
+        _VECTOR_NORM_TARGET,
+        _CONSTANT_PAD_TARGET,
+        _DOT_TARGET,
+        _MV_TARGET,
+        _TRACE_TARGET,
+        _LOGSUMEXP_TARGET,
+        _BERNOULLI_TARGET,
+        _LAYER_NORM_TARGET,
+        _SQUEEZE_ALL_TARGET,
+    }
+)
 
 
 def capture_fx(
@@ -469,7 +542,11 @@ def capture_fx(
     # every operator on the example inputs, so tracing a large matmul costs a
     # full CPU matmul and compile time scales with the problem size.
     try:
-        traced = make_fx(fn, tracing_mode="fake")(*example_inputs)
+        traced = make_fx(
+            fn,
+            tracing_mode="fake",
+            decomposition_table=aten_decompositions(),
+        )(*example_inputs)
     except AssertionError as exc:
         if "Please convert all Tensors to FakeTensors" not in str(exc):
             raise
