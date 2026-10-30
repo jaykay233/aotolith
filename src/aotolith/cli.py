@@ -112,6 +112,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="keyword arguments for --module construction",
     )
     compile_parser.add_argument("--output-key")
+    compile_parser.add_argument(
+        "--forward-kwarg",
+        action="append",
+        default=[],
+        metavar="NAME=JSON",
+        help=(
+            "keyword argument for the traced forward pass; tensor specs are "
+            "promoted to graph inputs, may be repeated"
+        ),
+    )
     compile_parser.add_argument("--trust-remote-code", action="store_true")
     compile_parser.add_argument("--revision")
     compile_parser.add_argument("--torch-dtype", default="float32")
@@ -140,6 +150,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON file containing a list of positional tensor specs",
     )
+    run_parser.add_argument(
+        "--kwarg",
+        action="append",
+        default=[],
+        metavar="NAME=JSON",
+        help=(
+            "tensor keyword input for the plan, in NAME=JSON form; may be "
+            "repeated"
+        ),
+    )
     run_parser.add_argument("--output", type=Path)
     return parser
 
@@ -166,6 +186,11 @@ def _compile(args: argparse.Namespace) -> int:
     }
 
     if args.callable:
+        if args.forward_kwarg:
+            raise ValueError(
+                "--forward-kwarg needs --module or --hf-model: a traced "
+                "callable takes its arguments positionally"
+            )
         function = _import_target(args.callable)
         compiled = compile_callable(function, torch_inputs, **common)
     elif args.module:
@@ -173,6 +198,7 @@ def _compile(args: argparse.Namespace) -> int:
         compiled = compile_module(
             module,
             torch_inputs,
+            example_kwargs=_torch_forward_kwargs(args.forward_kwarg),
             output_key=args.output_key,
             **common,
         )
@@ -186,6 +212,7 @@ def _compile(args: argparse.Namespace) -> int:
         compiled = compile_module(
             module,
             torch_inputs,
+            example_kwargs=_torch_forward_kwargs(args.forward_kwarg),
             output_key=args.output_key,
             **common,
         )
@@ -230,10 +257,12 @@ def _verify(args: argparse.Namespace) -> int:
 def _run(args: argparse.Namespace) -> int:
     specs = _load_input_specs(args.input, args.input_file)
     inputs = tuple(_mlx_input(spec) for spec in specs)
+    kwarg_specs = _load_named_specs(args.kwarg)
+    kwargs = {name: _mlx_input(spec) for name, spec in kwarg_specs.items()}
     compiled = load_compiled_module(
         args.artifact, require_device_match=args.require_device_match
     )
-    outputs = compiled(*inputs)
+    outputs = compiled(*inputs, **kwargs)
     result = _encode_outputs(outputs)
     payload = json.dumps(result, indent=2, ensure_ascii=False)
     if args.output is None:
@@ -245,13 +274,13 @@ def _run(args: argparse.Namespace) -> int:
 
 def _artifact_summary(compiled: Any) -> dict[str, Any]:
     plan = compiled.plan
+    is_module = isinstance(compiled, CompiledModulePlan)
     return {
-        "entrypoint": "module" if isinstance(compiled, CompiledModulePlan) else "callable",
+        "entrypoint": "module" if is_module else "callable",
         "input_count": (
-            compiled.input_count
-            if isinstance(compiled, CompiledModulePlan)
-            else len(plan.graph.inputs)
+            compiled.input_count if is_module else len(plan.graph.inputs)
         ),
+        "tensor_kwargs": list(compiled.tensor_kwarg_names) if is_module else [],
         "lowered_ops": len(plan.graph.ops),
         "kernels": len(plan.kernels),
         "native_selections": sum(
@@ -285,6 +314,27 @@ def _load_input_specs(
         raise ValueError("at least one --input or --input-file is required")
     normalized = [_normalize_tensor_spec(spec) for spec in specs]
     return normalized
+
+
+def _load_named_specs(literals: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """Parse repeated ``NAME=JSON`` tensor specs into normalized specs."""
+
+    specs: dict[str, dict[str, Any]] = {}
+    for literal in literals:
+        name, separator, payload = literal.partition("=")
+        if not separator or not name:
+            raise ValueError(
+                f"keyword tensor spec must use NAME=JSON syntax: {literal!r}"
+            )
+        if name in specs:
+            raise ValueError(f"duplicate keyword tensor spec for {name!r}")
+        specs[name] = _normalize_tensor_spec(json.loads(payload))
+    return specs
+
+
+def _torch_forward_kwargs(literals: Sequence[str]) -> dict[str, Any] | None:
+    specs = _load_named_specs(literals)
+    return {name: _torch_inputs([spec])[0] for name, spec in specs.items()} or None
 
 
 def _normalize_tensor_spec(spec: object) -> dict[str, Any]:

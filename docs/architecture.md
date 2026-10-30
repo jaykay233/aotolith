@@ -20,7 +20,7 @@
 
 1. 模型前端：tiny Llama/Qwen 风格 `nn.Module` 可以直接编译；logits 与 PyTorch 对齐；编译计划不持有或依赖原始 Python 模型对象。
 2. 编译产物：manifest、图、ABI、权重布局和 kernel 可以落盘，并在新进程中重新加载；版本不兼容时明确失败；同一输入和 compiler version 产生可复现结果。
-3. 编译器质量：可以查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 的数值行为一致；autotune 保存 profile 依据和最终选择。
+3. 编译器质量：可以查看 liveness/buffer plan、kernel 选择和 fallback 原因；原生 kernel 与 fallback 在支持的 dtype 上数值一致（f32 matmul 是唯一例外：原生标量 kernel 与 PyTorch 逐位一致，而这条 GPU 上 MLX 自己的 f32 matmul 只有 bf16 精度，所以两边不相等，见第 14 节）；autotune 保存 profile 依据和最终选择。
 
 请求调度、continuous batching、paged KV allocator、prefix cache、抢占、采样策略、PD 分离和 serving API 由外部推理系统负责。EP/MoE 的 rank 放置、expert dispatch、EPLB、通信调度和负载均衡也不是编译器职责；编译器只表达 MoE 计算和静态布局契约。
 

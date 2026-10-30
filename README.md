@@ -319,7 +319,9 @@ aoto run model.aoto --input-file inputs.json --output outputs.json
 
 Use repeated `--input '<json>'` arguments instead of `--input-file` when convenient. `--callable MODULE:ATTR` traces a function, `--module MODULE:ATTR` accepts an `nn.Module`, class, or factory, and `--hf-model` loads a HuggingFace causal language model. `python -m aotolith` provides the same commands when the console script is not on `PATH`.
 
-Artifacts use format version 4 and ABI version 1.2. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
+A tensor keyword argument becomes a graph input, written here as `NAME=<json spec>`: `aoto compile ... --forward-kwarg position_ids='{"shape":[1,4],"dtype":"int64","data":[[0,1,2,3]]}'` and `aoto run ... --kwarg position_ids=...`. `aoto inspect` lists them under `entrypoint.kwargs`.
+
+Artifacts use format version 4 and ABI version 1.3. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
 
 Strict GPU matching is optional. `--require-device-match` or `require_device_match=True` rejects an artifact compiled for another Apple GPU model; the default allows execution on another Apple Silicon device after rebuilding kernels.
 
