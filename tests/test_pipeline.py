@@ -6358,6 +6358,71 @@ def test_nan_to_num_is_a_identity_on_integer_tensors() -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_dot_mv_and_trace_reuse_existing_lowerings() -> None:
+    torch.manual_seed(31)
+    left = torch.randn(6)
+    right = torch.randn(6)
+    matrix = torch.randn(3, 4)
+    vector = torch.randn(4)
+    square = torch.randn(4, 4)
+    rectangular = torch.randn(3, 5)
+
+    cases = (
+        (torch.dot, (left, right), ["mul", "sum"]),
+        (torch.mv, (matrix, vector), ["reshape", "matmul", "reshape"]),
+        (torch.trace, (square,), ["reshape", "slice", "sum"]),
+        (torch.trace, (rectangular,), ["reshape", "slice", "sum"]),
+    )
+    for fn, inputs, expected_ops in cases:
+        result = compile_callable(fn, inputs)
+        assert [op.op for op in result.lowered_graph.ops] == expected_ops
+
+        actual = result.plan(*(_torch_to_mlx(item) for item in inputs))[0]
+        expected = fn(*inputs)
+        mx.eval(actual)
+        assert actual.shape == tuple(expected.shape)
+        assert actual.reshape(-1).tolist() == pytest.approx(
+            expected.reshape(-1).tolist(), abs=1e-5, rel=1e-5
+        )
+
+
+def test_trace_slices_the_short_diagonal_of_a_rectangular_matrix() -> None:
+    matrix = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+
+    result = compile_callable(torch.trace, (matrix,))
+    assert result.lowered_graph.ops[1].attrs == {
+        "dim": 0,
+        "start": 0,
+        "end": 18,
+        "step": 6,
+    }
+
+    actual = result.plan(_torch_to_mlx(matrix))[0]
+    expected = _torch_to_mlx(torch.trace(matrix))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+    assert actual.item() == 0.0 + 6.0 + 12.0
+
+
+@pytest.mark.parametrize("decimals", [1, 2, -1])
+def test_round_with_decimals_matches_pytorch(decimals: int) -> None:
+    value = torch.tensor([1.2345, -1.2345, 2.55, -2.55, 0.0, 15.0, 0.06])
+
+    result = compile_callable(
+        lambda tensor: torch.round(tensor, decimals=decimals), (value,)
+    )
+    assert [op.op for op in result.lowered_graph.ops] == ["round"]
+    assert result.lowered_graph.ops[0].attrs == {"decimals": decimals}
+    assert "metal::rint(" in result.plan.kernels[0].source
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = torch.round(value, decimals=decimals)
+    mx.eval(actual)
+    assert actual.tolist() == pytest.approx(
+        expected.tolist(), abs=1e-6, rel=1e-6
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_integer_bitwise_ops_fuse_with_tensor_and_scalar_operands(dtype) -> None:
     left = torch.tensor([-9, -4, -1, 0, 1, 4, 9], dtype=dtype)

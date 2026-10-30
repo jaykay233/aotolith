@@ -4898,7 +4898,15 @@ def _emit_pointwise_expression(
     if op.op == "ceil":
         return f"metal::ceil({arguments[0]})"
     if op.op == "round":
-        return f"metal::rint({arguments[0]})"
+        decimals = int(op.attrs.get("decimals", 0))
+        if not decimals:
+            return f"metal::rint({arguments[0]})"
+        # ATen rescales, rounds to nearest-even on the scaled value, and
+        # rescales back, which is the only way `decimals` can work without a
+        # decimal floating-point type.
+        scale = _msl_float_literal(10.0**decimals)
+        value = arguments[0]
+        return f"(metal::rint(({value}) * {scale}) / {scale})"
     if op.op == "trunc":
         return f"metal::trunc({arguments[0]})"
     if op.op == "sign":
@@ -7151,7 +7159,11 @@ def _evaluate_pointwise_mlx(
     if op.op == "ceil":
         return mx.ceil(arguments[0])
     if op.op == "round":
-        return mx.round(arguments[0])
+        decimals = int(op.attrs.get("decimals", 0))
+        if not decimals:
+            return mx.round(arguments[0])
+        scale = 10.0**decimals
+        return mx.round(arguments[0] * scale) / scale
     if op.op == "trunc":
         return mx.trunc(arguments[0])
     if op.op == "sign":

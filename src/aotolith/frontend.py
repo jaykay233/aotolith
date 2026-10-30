@@ -99,6 +99,7 @@ _SUPPORTED_OPS = {
     "aten.floor.default": "floor",
     "aten.ceil.default": "ceil",
     "aten.round.default": "round",
+    "aten.round.decimals": "round",
     "aten.trunc.default": "trunc",
     "aten.sign.default": "sign",
     "aten.square.default": "square",
@@ -346,6 +347,9 @@ _INPLACE_TARGETS = {"aten.add_.Tensor"}
 _CONSTANT_PAD_TARGET = "aten.constant_pad_nd.default"
 # `logsumexp` is a composite in ATen: a stable max shift plus a log-sum, with
 # infinite maxima replaced by zero so a saturated row keeps its limit.
+_DOT_TARGET = "aten.dot.default"
+_MV_TARGET = "aten.mv.default"
+_TRACE_TARGET = "aten.trace.default"
 _LOGSUMEXP_TARGET = "aten.logsumexp.default"
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
@@ -595,6 +599,18 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = produced[index]
                     else:
                         dead_nodes.add(user)
+                continue
+            if target in (_DOT_TARGET, _MV_TARGET, _TRACE_TARGET):
+                builder = {
+                    _DOT_TARGET: _dot_operations,
+                    _MV_TARGET: _mv_operations,
+                    _TRACE_TARGET: _trace_operations,
+                }[target]
+                lowered_ops, output_id = builder(node, node_ids, len(ops))
+                for operation, value in lowered_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
                 continue
             if target in {_DIAGONAL_TARGET, _DIAGONAL_COPY_TARGET}:
                 diagonal_ops, output_id = _diagonal_operations(
@@ -1840,6 +1856,154 @@ def _layer_norm_operation(
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
     return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _dot_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.dot`` into a fused multiply plus a full reduction."""
+
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"dot expects two arguments, got {len(args)}")
+    output_type = _node_type(node)
+    left_type = _node_type(args[0])
+    inputs = tuple(_argument_ids(argument, node_ids) for argument in args)
+
+    product_id = f"v{first_op_index}"
+    operations: list[tuple[Operation, Value]] = [
+        (
+            Operation("mul", inputs, (product_id,), {}),
+            Value(product_id, TensorType(left_type.shape, output_type.dtype)),
+        )
+    ]
+    output_id = f"v{first_op_index + 1}"
+    operations.append(
+        (
+            Operation(
+                "sum",
+                (product_id,),
+                (output_id,),
+                {"dims": (0,), "keepdim": False},
+            ),
+            Value(output_id, output_type),
+        )
+    )
+    return tuple(operations), output_id
+
+
+def _mv_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.mv`` into reshape plus a rank-2 ``matmul``."""
+
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"mv expects two arguments, got {len(args)}")
+    matrix_id = _argument_ids(args[0], node_ids)
+    vector_id = _argument_ids(args[1], node_ids)
+    matrix_type = _node_type(args[0])
+    if len(matrix_type.shape) != 2:
+        raise ValueError(
+            f"mv requires a rank-2 matrix, got shape {matrix_type.shape}"
+        )
+    rows, columns = matrix_type.shape
+    vector_type = _node_type(args[1])
+    if vector_type.shape != (columns,):
+        raise ValueError(
+            f"mv vector shape {vector_type.shape} does not match the matrix "
+            f"reduction size {columns}"
+        )
+    dtype = matrix_type.dtype
+
+    operations: list[tuple[Operation, Value]] = []
+    column_id = f"v{first_op_index}"
+    operations.append(
+        (
+            Operation("reshape", (vector_id,), (column_id,), {"shape": (columns, 1)}),
+            Value(column_id, TensorType((columns, 1), vector_type.dtype)),
+        )
+    )
+    product_id = f"v{first_op_index + 1}"
+    operations.append(
+        (
+            Operation("matmul", (matrix_id, column_id), (product_id,), {}),
+            Value(product_id, TensorType((rows, 1), dtype)),
+        )
+    )
+    output_id = f"v{first_op_index + 2}"
+    operations.append(
+        (
+            Operation("reshape", (product_id,), (output_id,), {"shape": (rows,)}),
+            Value(output_id, _node_type(node)),
+        )
+    )
+    return tuple(operations), output_id
+
+
+def _trace_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.trace`` into a diagonal strided slice plus a reduction."""
+
+    args = getattr(node, "args", ())
+    if len(args) != 1:
+        raise ValueError(f"trace expects one argument, got {len(args)}")
+    input_id = _argument_ids(args[0], node_ids)
+    input_type = _node_type(args[0])
+    if len(input_type.shape) != 2:
+        raise ValueError(
+            f"trace requires a rank-2 matrix, got shape {input_type.shape}"
+        )
+    rows, columns = input_type.shape
+    length = min(rows, columns)
+    dtype = input_type.dtype
+
+    operations: list[tuple[Operation, Value]] = []
+    flattened_id = f"v{first_op_index}"
+    operations.append(
+        (
+            Operation(
+                "reshape",
+                (input_id,),
+                (flattened_id,),
+                {"shape": (rows * columns,)},
+            ),
+            Value(flattened_id, TensorType((rows * columns,), dtype)),
+        )
+    )
+    step = columns + 1
+    diagonal_id = f"v{first_op_index + 1}"
+    operations.append(
+        (
+            Operation(
+                "slice",
+                (flattened_id,),
+                (diagonal_id,),
+                {"dim": 0, "start": 0, "end": length * step, "step": step},
+            ),
+            Value(diagonal_id, TensorType((length,), dtype)),
+        )
+    )
+    output_id = f"v{first_op_index + 2}"
+    operations.append(
+        (
+            Operation(
+                "sum",
+                (diagonal_id,),
+                (output_id,),
+                {"dims": (0,), "keepdim": False},
+            ),
+            Value(output_id, _node_type(node)),
+        )
+    )
+    return tuple(operations), output_id
 
 
 def _diagonal_operations(
@@ -3439,6 +3603,17 @@ def _operation_inputs(
             {"value": value},
         )
 
+    if op == "round":
+        if len(args) not in {1, 2}:
+            raise ValueError(f"round expects one or two arguments, got {len(args)}")
+        decimals = args[1] if len(args) == 2 else kwargs.get("decimals", 0)
+        if not isinstance(decimals, int) or isinstance(decimals, bool):
+            raise ValueError(f"round.decimals must be an integer, got {decimals!r}")
+        attrs: dict[str, object] = {}
+        if decimals:
+            attrs["decimals"] = decimals
+        return ((_argument_ids(args[0], node_ids),), attrs)
+
     if op == "nan_to_num":
         if len(args) not in {1, 2, 3, 4}:
             raise ValueError(
@@ -3688,6 +3863,8 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.update({"value", "mode"})
     if op == "nan_to_num":
         allowed.update({"nan", "posinf", "neginf"})
+    if op == "round":
+        allowed.add("decimals")
     if op == "roll":
         allowed.update({"shifts", "dims"})
     if op in {"triu", "tril"}:

@@ -141,6 +141,10 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.floor.default` | `floor` |
 | `aten.ceil.default` | `ceil` |
 | `aten.round.default` | `round` |
+| `aten.round.decimals` | `round`，保留 `decimals`，输出前按 `10**decimals` 缩放再还原 |
+| `aten.dot.default` | 展开成 `mul -> sum`，不生成新算子 |
+| `aten.mv.default` | 展开成 `reshape -> matmul -> reshape`，向量作为 `(n, 1)` 列参与 |
+| `aten.trace.default` | 展开成 `reshape -> slice -> sum`，与 `diagonal` 同一个 strided view |
 | `aten.trunc.default` | `trunc` |
 | `aten.sign.default` | `sign` |
 | `aten.square.default` | `square` |
@@ -316,7 +320,7 @@ input_offset = (elem % 3) * 1
 
 `logit` 生成 `log(x / (1 - x))`；带 `eps` 时先按 ATen 的规则把输入钳到 `[eps, 1 - eps]`，两个边界都在编译期算成字面量。`sinc` 在 `x == 0` 时直接返回 1，其余走 `sin(pi x) / (pi x)`，`frac` 是 `x - trunc(x)`（不是 `metal::fract` 的 floor 形式，所以负数保留负号）。`xlogy` 用 `tsc_xlogy_f32`：只有左操作数为 0 且右操作数不是 NaN 时才短路成 0，因此 `xlogy(0, -1)` 是 0 而 `xlogy(0, NaN)` 仍是 NaN，与 ATen 一致。`nan_to_num` 生成 `isnan ? nan : (isinf ? (x > 0 ? posinf : neginf) : x)`，缺省的 `posinf`/`neginf` 取该 dtype 的最大有限值（F16 是 65504，BF16/F32 是各自 `max`），整数输入在没有非有限值可替换时直接返回自身。这些算子和 `lerp`/`addcmul`/`addcdiv` 都只接受浮点 kernel，整数输入在捕获阶段插入 `cast` 提升到输出的浮点 dtype，与 PyTorch 对这些 op 的 opmath 提升一致。
 
-`round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
+`round` 生成 `metal::rint`，与 PyTorch 一样采用 ties-to-even；带 `decimals` 时先乘 `10**decimals`、取 ties-to-even 再除回去，与 ATen 在没有十进制浮点类型时的做法一致。Apple MSL 同样没有可用的 `expm1`，因此 `_MSL_HEADER` 提供 `tsc_expm1`：|x| <= 0.5 时使用七阶 Taylor 展开，其他范围回退到 `exp(x) - 1`。`log1p` 使用 MSL 的全局函数，不在 `metal` 命名空间中。
 
 `softplus` 使用 threshold 分段公式：`beta * x > threshold` 时直接返回 `x`，否则计算 `log1p(exp(beta * x)) / beta`。`logsigmoid` 使用 `min(x, 0) - log1p(exp(-abs(x)))`，避免正输入时直接计算 `log(sigmoid(x))` 溢出。`mish` 计算 `x * tanh(softplus(x, 1, 20))`，在 `x > 20` 时直接返回 `x`。`hardsigmoid` 计算 `min(max(x + 3, 0), 6) / 6`；`threshold` 仅在 `x > threshold` 时保留输入，否则返回 `value`，两者都显式传播 NaN。这些路径都复用 `_MSL_HEADER` 中的 helper，并能与其他 pointwise op 融合。
 
@@ -553,6 +557,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - RMSNorm 的 pattern 覆盖 `F.rms_norm` 以及手写的常见写法：`pow(x, 2)` 或 `x * x` 求平方、`add_`/`add` 加 eps、`rsqrt` 或 `sqrt`+`div` 归一化、weight 在乘法任一侧，都折叠成同一个 `rms_norm`。未知的写法会退回普通 elementwise 图而不是报错，因此上游分解链变化只影响是否融合，不影响是否可编译
 - `sort`/`topk`/`argmax`/`argmin` 走 MLX 而不是生成 kernel。索引输出固定 I64；`sort` 的 `stable` 只做布尔校验，ties 的索引顺序沿用 MLX 的排序实现，PyTorch 的 `stable=True` 不保证一致（values 总是一致）。`topk` 的 `sorted=False` 仍然返回排序结果，PyTorch 对此只承诺相同的元素集合。NaN 排序位置与 PyTorch 相同（升序在末尾、降序在最前）。全 rank-0 的 `argmax` 返回 rank-0 索引；IR 不支持零长度维度，所以 `topk(k=0)` 在建立输出类型时就报错
 - `var`/`std` 走 MLX 的 `mx.var`，`dims`/`keepdim`/`correction` 保存在 attribute 中。三条 ATen 拼法（`var.correction`、`var.dim`、`var.default`，`std` 同理）在前端统一归一化，`unbiased` 会折算成 `correction`。整数 `correction` 直接作为 `ddof` 传给 `mx.var`；小数 `correction` 因为 MLX 的 `ddof` 只接受整数，改算有偏方差再乘 `n / (n - correction)`（`n` 是实际被归约的元素数），这正是 ATen 的定义。`correction >= 归约元素数` 时与 PyTorch 一样得到 inf，非有限的 `correction` 在捕获期报错。FP16/BF16 输入先提升到 FP32 再归约，最后 cast 回输入 dtype，与 PyTorch 的累加精度一致
+- `dot`、`mv`、`trace` 都是既有算子的组合，没有新 kernel：`dot` 是 `mul -> sum`（整轴归约），`mv` 把向量 reshape 成 `(n, 1)` 后走 `matmul` 再把结果 reshape 回 `(m,)`，`trace` 复用 `diagonal` 的 strided view——整块 flatten 后按 `columns + 1` 取步长，再对这条对角线做 `sum`，因此矩形输入取的是较短的那条对角线，和 `torch.trace` 一致
 - `repeat`/`tile` 没有独立 op：每根轴拆成 `(repeat, size)` 后广播，因此 lowering 是 `reshape -> expand -> reshape`，不产生 kernel，也不需要复制。repeats 比 rank 短或长都按 PyTorch 的规则左补 1；全部为 1 时整条链消失；`repeat=0` 会产生 IR 不建模的空维度，在捕获期报错
 - `vector_norm` 走 MLX 的 `mx.linalg.norm`。MLX 只接受单个 norm 轴，所以 Runtime 先把被归约的轴 permute 到末尾并合并成一条，调用后再按 `keepdim` reshape 回去，因此任意轴集合都能用一份实现覆盖；`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`。FP16/BF16 输入同样先提升到 FP32 再归约
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
