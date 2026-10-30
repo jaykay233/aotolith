@@ -74,7 +74,6 @@ def test_a_composite_the_frontend_never_named_compiles() -> None:
 @pytest.mark.parametrize(
     "call",
     [
-        pytest.param(lambda value: torch.special.entr(value), id="entr"),
         pytest.param(lambda value: torch.nn.functional.celu(value), id="celu"),
         pytest.param(
             lambda value: torch.nn.functional.huber_loss(
@@ -93,6 +92,12 @@ def test_a_composite_the_frontend_never_named_compiles() -> None:
             id="mse",
         ),
         pytest.param(lambda value: torch.nn.functional.glu(value, dim=-1), id="glu"),
+        pytest.param(
+            lambda value: torch.nn.functional.binary_cross_entropy_with_logits(
+                value, torch.zeros_like(value)
+            ),
+            id="bce_with_logits",
+        ),
     ],
 )
 def test_decomposed_composites_run_on_metal(call) -> None:
