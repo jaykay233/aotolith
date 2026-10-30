@@ -222,6 +222,8 @@ python examples/qwen_static_cache_benchmark.py \
 
 （Qwen2.5-0.5B-Instruct、128 prompt token、greedy、batch 1、BF16、11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。这份构建多次运行下来，`--codegen-matmul` 的 decode 落在 240.0-240.2 token/s——这个配置稳定到可以读到小数点后一位——而 `--codegen-attention` 那行在 229.8-238.2 之间波动，prefill 在 11.6k-12.8k 之间波动。不加原生 attention 时 prefill 稳定在 13.0k 左右，加上后降到约 12.4k，这是 attention kernel 在 prefill 形状上 tile 更慢所致，不是 decode 的代价。`mlx_lm` 基线在同样几次运行里读到 190.5-195.0 token/s。）
 
+token 一致不等于数字一致，两条路径离参考实现的距离也不同：在同一个模型的 24 层前向上，原生 kernel 的 logits 相对 PyTorch 平均 0.043、最大 0.38，而全走 MLX fallback 是平均 0.081、最大 1.5。也就是说打开 codegen 是把算术语义往 PyTorch 靠，而不是相反——所以它是个吞吐决策，不是精度决策。
+
 和 `mlx_lm` 对比应该看 `decode_async`，因为两者都把 host 循环摊到了多个 token 上；`decode_sync_each_step` 每个 token 都要同步一次设备，任何服务循环都不会这么做。异步路径此前落后于同步路径，现在反超，因为每个 step 只强制一次设备同步。
 
 decode 现在受权重带宽限制，而不是受 host 限制。构建一个 step 只需 0.98 ms Python，GPU 需要约 4.1 ms，所以 host 完全被异步队列盖住；在 plan 展开之前 host 要 6.2 ms，那时它才是瓶颈。一个 step 要流式读取 991 MB 权重（24 层的 `qkv` 2.07 MB、`o_proj` 1.61 MB、一个 17.4 MB 的成对 gate/up 矩阵、8.73 MB 的 `down`，再加 272 MB 的 LM head），按实测 4.17 ms 每个 token 算是 238 GB/s。

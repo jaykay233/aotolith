@@ -224,7 +224,7 @@ python examples/qwen_static_cache_benchmark.py \
 
 `decode_async` is the figure to compare against `mlx_lm`, because both amortize the host loop across tokens; `decode_sync_each_step` pays a device sync every token, which no serving loop needs. The async path used to trail the synchronous one and now leads it, because the plan only forces a single device sync per step.
 
-All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer.
+All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer. Agreeing on tokens is not the same as agreeing on numbers, and the two paths are not equally close to the reference: on the same model's 24-layer forward, the native kernels land a mean 0.043 / max 0.38 from PyTorch's logits, the MLX fallback a mean 0.081 / max 1.5. So enabling code generation moves the arithmetic toward PyTorch rather than away from it, which makes it a throughput decision and not an accuracy one.
 
 Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.1 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at the measured 4.17 ms per token is 238 GB/s.
 
