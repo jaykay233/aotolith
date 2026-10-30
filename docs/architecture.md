@@ -30,7 +30,7 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 
 `capture_fx` 调用 `make_fx(fn)(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata。
 
-模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；后续状态布局阶段需要把 storage alias 纳入 ABI。
+模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；它们在运行期和 artifact 里共享同一份 buffer 和 payload，见第 15 节。
 
 HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。其余关键字参数仍是 tracing 期常量；值里嵌套 tensor（list/dict 等）目前明确报错而不是静默当成常量。
 
@@ -507,7 +507,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA
 - 原生 attention 仅在 FP16/BF16 且 head dim 能被 8 整除时使用 SIMD matrix 计算 QK/PV；64-key tile 仅在同样条件成立时使用 8/16 元素向量加载，不满足条件的单个阶段回退到标量路径
 - attention tile 只按 sequence 和静态 shared-memory 预算在 `8×32`、`16×32`、`24×32`、`16×64`、`24×64` 间选择；autotune 当前比较 op 级别的 Metal/MLX 实现，还没有搜索 tile 参数
-- 共享 parameter storage alias 现在按多个 state entry 序列化；数值正确，但尚未在 state ABI 中去重或保留 alias 关系
+- 共享 parameter storage alias 会在运行时和 artifact 两处共享：`compile_module` 对同一个 tensor 只转换一次，别名共享一个 MLX buffer；`save_compiled` 让别名指向同一个 `state/*.bin` 和 digest，`load_compiled_module` 按文件名缓存，恢复同样的共享关系。图里仍然每个名字一个输入，因为 tracing 就是按位置产生 placeholders 的。视图（共享 storage 但 strides 不同，如 `t` 与 `t.t()`）不合并
 - 当前 artifact target 只有 `apple-metal`，没有跨厂商 target 或 host runtime ABI
 - NVIDIA Triton/CUDA backend 尚未实现
 
@@ -515,8 +515,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 
 模型前端、静态内存复用、kernel selection、autotune 和 artifact 加载链已经打通。后续工作集中在 ABI 完整性和编译器质量：
 
-1. 在 state ABI 中保留共享 storage alias，并验证 alias 与 buffer lifetime 的组合。
-2. 增加符号 shape 和有限控制流，同时保留静态 shape 路径的严格 verifier。
-3. 把 op 级 autotune 扩展成 shape-aware backend policy，生成可复现的 benchmark report。
-4. 改进原生 matmul、attention 的 tile 和流水，扩大真实模型、dtype、算子与 Apple GPU 覆盖。
-5. 在核心 ABI 稳定后增加其他 backend；当前不为跨厂商兼容性做推测性抽象。
+1. 增加符号 shape 和有限控制流，同时保留静态 shape 路径的严格 verifier。
+2. 把 op 级 autotune 扩展成 shape-aware backend policy，生成可复现的 benchmark report。
+3. 改进原生 matmul、attention 的 tile 和流水，扩大真实模型、dtype、算子与 Apple GPU 覆盖。
+4. 在核心 ABI 稳定后增加其他 backend；当前不为跨厂商兼容性做推测性抽象。

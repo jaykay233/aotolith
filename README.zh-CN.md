@@ -374,7 +374,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 
 - shape 和 dtype 在编译期固定，不支持动态 shape、符号维度和控制流。
 - tensor-valued `example_kwargs` 会被提升为图输入、按名字传入；值里只是**包含** tensor（list/dict 等）的关键字参数会明确报错，而不是被当作常量捕获。
-- 共享参数 storage alias 目前会按多个 state entry 序列化。数值结果不受影响，但 artifact 还没有去重这些 aliased storage。
+- 共享参数只绑定一次：同一个 tensor 在两个名字下共享同一个 MLX buffer 和同一份 artifact payload。图里仍然每个名字一个输入，因为 tracing 就是这么产生的。只共享 storage 但内容不同的视图（如 tensor 和它的 `.t()`）不会被合并。
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
 - 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 FP16/BF16 matmul shape 上都快于 MLX；f32 则是刻意比 MLX 慢——tensor core 没有 f32 模式，所以它留在与 PyTorch 逐位一致的标量 kernel 上。`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢约 20%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。
 - 原生 attention 要求 rank-3/4 输入、Q/K/V dtype 一致，并在文档规定的 mask 和 head dimension 约束内支持 MHA/GQA/MQA；其他情况回退到 MLX SDPA。
@@ -408,10 +408,9 @@ PyTorch 对越界的 embedding／gather 下标抛出 `IndexError`，而 MLX 会�
 
 ## Roadmap
 
-1. 在 state ABI 中保留共享 storage alias，而不是重复序列化相同参数的视图。
-2. 增加符号 shape 和有限控制流，同时保留静态 shape 的严格校验。
-3. 把逐 op autotune 扩展成 shape-aware backend policy 和可复现 benchmark report。
-4. 提升原生 matmul、attention 的性能，再扩展模型、dtype、算子和 GPU 覆盖；PyTorch 数值对齐仍是验收条件。
+1. 增加符号 shape 和有限控制流，同时保留静态 shape 的严格校验。
+2. 把逐 op autotune 扩展成 shape-aware backend policy 和可复现 benchmark report。
+3. 提升原生 matmul、attention 的性能，再扩展模型、dtype、算子和 GPU 覆盖；PyTorch 数值对齐仍是验收条件。
 
 ## 仓库结构
 

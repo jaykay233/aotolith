@@ -376,7 +376,7 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 
 - Shapes and dtypes are fixed at compile time. Dynamic shapes, symbolic dimensions, and control flow are not supported.
 - Tensor-valued `example_kwargs` are promoted to graph inputs and passed by name. Keyword values that merely *contain* tensors (a list or dict of them) are rejected rather than captured as constants.
-- Shared parameter storage aliases are currently serialized as separate state entries. Correctness is preserved, but the artifact does not yet deduplicate aliased storage.
+- Tied parameters are bound once: a tensor reachable under two names shares one MLX buffer and one artifact payload. The graph still has an input per name, because that is what tracing produced. Views that share storage without sharing contents (a tensor and its `.t()`) are kept separate.
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
 - Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured FP16/BF16 matmul shapes. f32 is slower than MLX on purpose: it stays on the exact scalar kernel because the tensor cores have no f32 mode. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.
 - Native attention requires rank-3/4 inputs with matching dtypes and supports MHA/GQA/MQA under the documented mask and head-dimension constraints. Other cases fall back to MLX SDPA.
@@ -410,10 +410,9 @@ PyTorch raises `IndexError` for out-of-range embedding and gather indices, while
 
 ## Roadmap
 
-1. Preserve shared storage aliases in the state ABI instead of serializing duplicate parameter views.
-2. Add symbolic shapes and limited control flow without weakening static-shape validation.
-3. Expand autotuning from per-op candidate timing to shape-aware backend policies and reproducible benchmark reports.
-4. Improve native matmul and attention performance, then broaden model, dtype, operator, and GPU coverage while keeping PyTorch parity as the acceptance gate.
+1. Add symbolic shapes and limited control flow without weakening static-shape validation.
+2. Expand autotuning from per-op candidate timing to shape-aware backend policies and reproducible benchmark reports.
+3. Improve native matmul and attention performance, then broaden model, dtype, operator, and GPU coverage while keeping PyTorch parity as the acceptance gate.
 
 ## Repository Layout
 

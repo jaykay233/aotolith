@@ -159,6 +159,97 @@ def test_artifact_rejects_incompatible_abi(tmp_path: Path) -> None:
         raise AssertionError("incompatible artifact ABI was accepted")
 
 
+def test_artifact_writes_aliased_state_once(tmp_path: Path) -> None:
+    """A tied parameter is one buffer and must become one payload.
+
+    Writing it twice doubles the largest tensor in the model on disk, and the
+    two entries describe identical bytes, so one file with two references is
+    the same information. The loader has to restore the alias too, or a plan
+    loaded from disk would hold two copies of what the compiled plan shared.
+    """
+
+    class TiedArtifactModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            shared = torch.randn(8, 8).to(torch.bfloat16)
+            self.left = torch.nn.Parameter(shared)
+            self.right = torch.nn.Parameter(shared)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value @ self.left + value @ self.right
+
+    torch.manual_seed(30)
+    model = TiedArtifactModule().eval()
+    value = torch.randn(2, 8).to(torch.bfloat16)
+    with torch.no_grad():
+        expected = model(value)
+    compiled = compile_module(model, (value,))
+    assert compiled._state_values[0] is compiled._state_values[1]
+
+    artifact_path = compiled.save(tmp_path / "tied.aoto")
+    with zipfile.ZipFile(artifact_path) as archive:
+        state_files = [
+            name for name in archive.namelist() if name.startswith("state/")
+        ]
+        manifest = json.loads(archive.read("manifest.json"))
+
+    assert len(state_files) == 1
+    entries = manifest["entrypoint"]["state"]
+    assert [entry["name"] for entry in entries] == ["left", "right"]
+    assert entries[0]["file"] == entries[1]["file"]
+    assert entries[0]["digest"] == entries[1]["digest"]
+
+    from aotolith import load_compiled_module
+
+    loaded = load_compiled_module(artifact_path)
+    assert loaded._state_values[0] is loaded._state_values[1]
+    actual = loaded(value)[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array(expected.float().numpy()), atol=1e-2, rtol=1e-2)
+
+
+def test_artifact_loads_the_previous_abi_layout(tmp_path: Path) -> None:
+    """A 1.2 artifact has no `entrypoint.kwargs` and must still load.
+
+    That field is the only difference between the layouts: without it every
+    public input still comes before the state, so the same state values bind at
+    the same offsets. Accepting the old version only on paper would be worse
+    than not accepting it, because the failure would be a misbound plan.
+    """
+
+    torch.manual_seed(29)
+    model = TinyArtifactModule().eval()
+    value = torch.randn(1, 4)
+    with torch.no_grad():
+        expected = model(value)
+    artifact_path = compile_module(model, (value,)).save(tmp_path / "full.aoto")
+    old_path = tmp_path / "abi-1.2.aoto"
+
+    with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
+        old_path, "w"
+    ) as destination:
+        for name in source.namelist():
+            payload = source.read(name)
+            if name == "manifest.json":
+                manifest = json.loads(payload)
+                assert manifest["abi_version"] == ABI_VERSION
+                manifest["abi_version"] = "1.2"
+                manifest["entrypoint"].pop("kwargs")
+                payload = json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode()
+            destination.writestr(name, payload)
+
+    from aotolith import load_compiled_module
+
+    loaded = load_compiled_module(old_path)
+    assert loaded.tensor_kwarg_names == ()
+    assert loaded.state_names == ("weight", "bias")
+    actual = loaded(value)[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
+
+
 def test_artifact_rejects_unsupported_target(tmp_path: Path) -> None:
     model = TinyArtifactModule().eval()
     value = torch.randn(1, 4)

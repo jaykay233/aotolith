@@ -237,7 +237,7 @@ def compile_module(
     state_values = tuple(state.values())
     input_count = len(example_inputs)
     forward_input_count = input_count + len(tensor_kwarg_names)
-    bound_values = tuple(_torch_tensor_to_mlx(value) for value in state_values)
+    bound_values = _unique_mlx_state(state_values)
 
     def functional_forward(*args: Any) -> Any:
         inputs = tuple(args[:input_count])
@@ -282,6 +282,38 @@ def compile_module(
         _state_values=bound_values,
         tensor_kwarg_names=tuple(tensor_kwarg_names),
     )
+
+
+def _unique_mlx_state(values: Sequence[Any]) -> tuple[mx.array, ...]:
+    """Convert each distinct state tensor once so aliases share one buffer.
+
+    `named_parameters(remove_duplicate=False)` reports a tensor under every name
+    it is reachable by, and a tied LM head is the common case. Converting each
+    name separately would keep a second copy of the largest tensor in the model
+    — 272 MB for a 0.5B model with a 151936x896 embedding — while the two graph
+    inputs it feeds compute exactly the same numbers.
+
+    The key includes strides because sharing a data pointer is not enough: a
+    square tensor and its `.t()` view have the same pointer and shape but
+    different contents. Identical pointer, dtype, shape and strides do mean
+    identical elements.
+    """
+
+    converted: dict[tuple[Any, ...], mx.array] = {}
+    unique: list[mx.array] = []
+    for value in values:
+        key = (
+            value.data_ptr(),
+            value.dtype,
+            tuple(value.shape),
+            tuple(value.stride()),
+        )
+        array = converted.get(key)
+        if array is None:
+            array = _torch_tensor_to_mlx(value)
+            converted[key] = array
+        unique.append(array)
+    return tuple(unique)
 
 
 def _contains_tensor(value: Any) -> bool:

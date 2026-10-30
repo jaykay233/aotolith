@@ -116,25 +116,33 @@ def save_compiled(
 
     state_entries: list[dict[str, object]] = []
     state_payloads: list[tuple[str, bytes]] = []
+    # Aliased state (a tied LM head is the usual case) shares one buffer at run
+    # time, so it should share one payload here: two entries pointing at the
+    # same file and digest describe the same bytes exactly, and the loader
+    # recognises that without any new manifest field.
+    shared_payloads: dict[int, tuple[str, str]] = {}
     for index, (name, array) in enumerate(
         zip(state_names, state_values, strict=True)
     ):
         mx.eval(array)
         shape = tuple(int(dim) for dim in array.shape)
         dtype = _dtype_from_mlx(array.dtype)
-        raw = _array_bytes(array)
-        file_name = f"state/{index:05d}.bin"
+        payload = shared_payloads.get(id(array))
+        if payload is None:
+            raw = _array_bytes(array)
+            payload = (f"state/{index:05d}.bin", _digest(raw))
+            shared_payloads[id(array)] = payload
+            state_payloads.append((payload[0], raw))
         state_entries.append(
             {
                 "name": name,
                 "shape": list(shape),
                 "dtype": dtype.value,
-                "nbytes": len(raw),
-                "file": file_name,
-                "digest": _digest(raw),
+                "nbytes": array.nbytes,
+                "file": payload[0],
+                "digest": payload[1],
             }
         )
-        state_payloads.append((file_name, raw))
 
     try:
         device = mx.device_info()
@@ -281,9 +289,19 @@ def load_compiled_module(
             raise ArtifactCompatibilityError("manifest graph outputs do not match graph")
 
         state_entries = manifest["entrypoint"]["state"]
-        state_values = tuple(
-            _decode_state_array(archive, entry) for entry in state_entries
-        )
+        loaded_state: dict[str, mx.array] = {}
+        state_values: list[mx.array] = []
+        for entry in state_entries:
+            # Aliased entries point at the same payload file, and decoding it
+            # once keeps them aliased in memory the way they were at run time.
+            file_name = entry["file"] if isinstance(entry, Mapping) else None
+            array = loaded_state.get(file_name)
+            if array is None:
+                array = _decode_state_array(archive, entry)
+                if file_name is not None:
+                    loaded_state[file_name] = array
+            state_values.append(array)
+        state_values = tuple(state_values)
         stored_kernels = tuple(
             _decode_kernel(item)
             for item in _load_json_list(kernels_payload)

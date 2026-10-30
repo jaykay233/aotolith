@@ -399,6 +399,77 @@ def test_tensor_keyword_arguments_survive_an_artifact_round_trip(
     assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
 
 
+def test_tied_state_shares_one_buffer() -> None:
+    """Tied weights are one tensor under two names and should cost one buffer.
+
+    `remove_duplicate=False` keeps both names because the graph binds them
+    separately, but converting each name on its own would keep a second copy of
+    the largest tensor in the model: 272 MB for a 0.5B model's embedding.
+    """
+
+    class TiedModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            shared = torch.randn(8, 8).to(torch.bfloat16)
+            self.left = torch.nn.Parameter(shared)
+            self.right = torch.nn.Parameter(shared)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value @ self.left + value @ self.right
+
+    torch.manual_seed(26)
+    module = TiedModule().eval()
+    value = _bf16(2, 8)
+    with torch.no_grad():
+        expected = module(value)
+
+    compiled = compile_module(module, (value,))
+
+    assert compiled.state_names == ("left", "right")
+    left, right = compiled._state_values
+    assert left is right
+
+    actual = compiled(_to_mlx(value))[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+
+def test_a_transposed_view_is_not_treated_as_aliased_state() -> None:
+    """Sharing a data pointer is not sharing contents.
+
+    A square tensor and its `.t()` view have the same pointer, shape and dtype
+    and different strides. Deduplicating on the pointer alone would make one of
+    them silently compute with the other's numbers.
+    """
+
+    class TransposedView(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            base = torch.randn(8, 8).to(torch.bfloat16)
+            self.direct = torch.nn.Parameter(base)
+            self.transposed = torch.nn.Parameter(base.t())
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value @ self.direct + value @ self.transposed
+
+    torch.manual_seed(27)
+    module = TransposedView().eval()
+    assert module.direct.data_ptr() == module.transposed.data_ptr()
+    assert module.direct.stride() != module.transposed.stride()
+
+    value = _bf16(2, 8)
+    with torch.no_grad():
+        expected = module(value)
+    compiled = compile_module(module, (value,))
+
+    direct, transposed = compiled._state_values
+    assert direct is not transposed
+
+    actual = compiled(_to_mlx(value))[0]
+    mx.eval(actual)
+    assert mx.allclose(actual, _to_mlx(expected), atol=1e-2, rtol=1e-2)
+
+
 def test_nested_tensor_keyword_arguments_are_rejected_by_name() -> None:
     module = _MaskedScaleModule().eval()
     with pytest.raises(NotImplementedError, match=r"\['mask'\]"):
