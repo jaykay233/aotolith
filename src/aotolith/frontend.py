@@ -2240,11 +2240,16 @@ def _variance_operation(
 
     if not isinstance(keepdim, bool):
         raise ValueError(f"{target}.keepdim must be a boolean, got {keepdim!r}")
-    if isinstance(correction, bool) or not isinstance(correction, int):
+    if isinstance(correction, bool) or not isinstance(correction, (int, float)):
         raise NotImplementedError(
-            f"{target}.correction must be an integer, got {correction!r}; MLX's "
-            "ddof only accepts integral degrees of freedom"
+            f"{target}.correction must be a number, got {correction!r}"
         )
+    if isinstance(correction, float) and not isfinite(correction):
+        raise ValueError(
+            f"{target}.correction must be finite, got {correction!r}"
+        )
+    if isinstance(correction, float) and correction.is_integer():
+        correction = int(correction)
 
     if dims is None:
         normalized_dims = tuple(range(rank))

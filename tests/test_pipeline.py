@@ -2193,12 +2193,67 @@ def test_variance_supports_low_precision(fn) -> None:
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
-def test_variance_rejects_non_integer_correction() -> None:
+def test_variance_rejects_a_non_finite_correction() -> None:
     x = torch.randn(2, 4)
-    with pytest.raises(NotImplementedError, match="correction must be an integer"):
+    with pytest.raises(ValueError, match="must be finite"):
         compile_callable(
-            lambda value: torch.var(value, -1, correction=0.5), (x,)
+            lambda value: torch.var(value, -1, correction=float("inf")), (x,)
         )
+
+
+@pytest.mark.parametrize(
+    ("op_name", "correction"),
+    [
+        ("var", 0.5),
+        ("var", 1.5),
+        ("var", -0.5),
+        ("std", 0.5),
+        ("std", 1.5),
+        ("std", -0.5),
+    ],
+)
+def test_variance_supports_a_fractional_correction(op_name, correction) -> None:
+    # ATen applies a fractional correction as biased variance * n / (n - c);
+    # MLX's ddof is integral, so the backend scales the biased pass instead.
+    def fn(value):
+        return getattr(torch, op_name)(value, -1, correction=correction)
+
+    torch.manual_seed(65)
+    x = torch.randn(3, 5, 4)
+    result = compile_callable(fn, (x,))
+    assert result.lowered_graph.ops[0].attrs["correction"] == correction
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_fractional_correction_uses_the_reduced_element_count() -> None:
+    # The scale reads the number of elements actually reduced, so reducing two
+    # axes at once gives 20 / 19.5 rather than the trailing-axis 4 / 3.5.
+    def fn(value):
+        return torch.var(value, dim=(1, 2), correction=0.5, keepdim=True)
+
+    torch.manual_seed(66)
+    x = torch.randn(3, 4, 5)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (3, 1, 1)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_fractional_correction_equal_to_the_count_yields_inf() -> None:
+    x = torch.randn(2, 4)
+
+    def fn(value):
+        return torch.var(value, -1, correction=4.0)
+
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert bool(mx.all(mx.isinf(actual)))
 
 
 @pytest.mark.parametrize(

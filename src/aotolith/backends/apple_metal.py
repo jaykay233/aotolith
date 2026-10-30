@@ -680,7 +680,7 @@ def _evaluate_mlx_op(
         value = env[op.inputs[0]]
         dims = tuple(int(dim) % value.ndim for dim in op.attrs["dims"])
         keepdim = bool(op.attrs.get("keepdim", False))
-        correction = int(op.attrs.get("correction", 1))
+        correction = op.attrs.get("correction", 1)
         output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
         # PyTorch accumulates the variance in float32 for half inputs, so a
         # float32 pass is what keeps the two results within a few ulps.
@@ -689,7 +689,7 @@ def _evaluate_mlx_op(
             if value.dtype in (mx.float32, mx.float64)
             else value.astype(mx.float32)
         )
-        variance = mx.var(compute, axis=dims, keepdims=keepdim, ddof=correction)
+        variance = _mlx_variance(compute, dims, keepdim, correction)
         result = variance if op.op == "var" else mx.sqrt(variance)
         return result.astype(output_dtype)
     if op.op in {"argmax", "argmin"}:
@@ -7805,6 +7805,27 @@ def _validate_vector_norm_op(graph: Graph, op: Operation) -> None:
         )
 
 
+def _mlx_variance(
+    value: mx.array,
+    dims: tuple[int, ...],
+    keepdim: bool,
+    correction: int | float,
+) -> mx.array:
+    """Return the corrected sample variance, integral or fractional correction.
+
+    MLX's ``ddof`` takes an integer, so a fractional correction is applied the
+    way ATen defines it: the biased variance times ``n / (n - correction)``.
+    """
+
+    if isinstance(correction, int):
+        return mx.var(value, axis=dims, keepdims=keepdim, ddof=correction)
+    count = 1
+    for dim in dims:
+        count *= value.shape[dim]
+    scale = count / (count - correction)
+    return mx.var(value, axis=dims, keepdims=keepdim) * scale
+
+
 def _validate_variance_op(graph: Graph, op: Operation) -> None:
     if len(op.inputs) != 1:
         raise ValueError(f"{op.op} expects one input, got {len(op.inputs)}")
@@ -7829,10 +7850,12 @@ def _validate_variance_op(graph: Graph, op: Operation) -> None:
     if not isinstance(keepdim, bool):
         raise ValueError(f"{op.op}.keepdim must be a boolean, got {keepdim!r}")
     correction = op.attrs.get("correction", 1)
-    if isinstance(correction, bool) or not isinstance(correction, int):
+    if isinstance(correction, bool) or not isinstance(correction, (int, float)):
         raise NotImplementedError(
-            f"{op.op}.correction must be an integer, got {correction!r}"
+            f"{op.op}.correction must be a number, got {correction!r}"
         )
+    if isinstance(correction, float) and not isfinite(correction):
+        raise ValueError(f"{op.op}.correction must be finite, got {correction!r}")
     expected = (
         tuple(1 if axis in axes else size for axis, size in enumerate(input_type.shape))
         if keepdim
