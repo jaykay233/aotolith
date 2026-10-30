@@ -511,7 +511,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `prod`/`amax`/`amin` 走 MLX reduction 而不是生成 kernel，支持任意非空轴集合与 `keepdim`；`amax`/`amin` 与 PyTorch 逐位一致，`prod` 因为乘法顺序不同可能在 float 上相差几个 ulp，整数乘法按位宽回绕。`log_softmax` 走 MLX 的 log-sum-exp，只接受浮点输入；重复轴会在 lowering 期报错
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 的 mean/rstd 辅助输出会在被图读取时展开成 `mean` 加一段两次遍历的方差链（`sub`/`mul`/`mean`/`add eps`/`rsqrt`），因为 IR 的 op 都是单输出，naked kernel 只写归一化结果。它们只在真的被读取时才生成，不需要时不会多算；数值上与原 kernel 内部的 Welford 统计相差几个 ulp（实测 `1e-5` 以内）。只读 rstd/mean、不读主输出也是合法的
-- RMSNorm 依赖当前 PyTorch FX 分解形态；上游改变分解链后需要同步更新 pattern
+- RMSNorm 的 pattern 覆盖 `F.rms_norm` 以及手写的常见写法：`pow(x, 2)` 或 `x * x` 求平方、`add_`/`add` 加 eps、`rsqrt` 或 `sqrt`+`div` 归一化、weight 在乘法任一侧，都折叠成同一个 `rms_norm`。未知的写法会退回普通 elementwise 图而不是报错，因此上游分解链变化只影响是否融合，不影响是否可编译
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持

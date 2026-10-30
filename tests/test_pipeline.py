@@ -6585,6 +6585,49 @@ def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
     assert mx.allclose(actual, expected, atol=5e-4, rtol=5e-4)
 
 
+@pytest.mark.parametrize(
+    ("weighted", "fn"),
+    [
+        (False, lambda value, weight: value * torch.rsqrt(
+            value.pow(2).mean(-1, keepdim=True) + 1e-6
+        )),
+        (False, lambda value, weight: value / torch.sqrt(
+            value.pow(2).mean(-1, keepdim=True) + 1e-6
+        )),
+        (False, lambda value, weight: value * torch.rsqrt(
+            (value * value).mean(-1, keepdim=True) + 1e-6
+        )),
+        (False, lambda value, weight: value * torch.rsqrt(
+            torch.add(value.pow(2).mean(-1, keepdim=True), 1e-6)
+        )),
+        (True, lambda value, weight: weight * (
+            value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
+        )),
+        (True, lambda value, weight: (
+            value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
+        ) * weight),
+    ],
+)
+def test_rms_norm_folds_the_common_decomposition_spellings(weighted, fn) -> None:
+    torch.manual_seed(79)
+    x = torch.randn(3, 4, 6)
+    weight = torch.randn(6)
+
+    result = compile_callable(fn, (x, weight))
+    assert [op.op for op in result.lowered_graph.ops] == ["rms_norm"]
+    attrs = result.lowered_graph.ops[0].attrs
+    assert attrs["normalized_shape"] == (6,)
+    assert attrs["eps"] == pytest.approx(1e-6)
+    assert attrs["has_weight"] is weighted
+
+    actual = result.plan(mx.array(x.numpy()), mx.array(weight.numpy()))[0]
+    expected = torch.nn.functional.rms_norm(
+        x, (6,), weight if weighted else None, eps=1e-6
+    )
+    mx.eval(actual)
+    assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-6, rtol=1e-6)
+
+
 def test_rms_norm_with_weight_and_multidimensional_shape() -> None:
     torch.manual_seed(67)
     x = torch.randn(2, 3, 4, 7)

@@ -1743,6 +1743,40 @@ def _logsigmoid_operation(
     return (_argument_ids(args[0], node_ids),), {}, output_node
 
 
+def _rms_norm_square_base(square_node: object) -> object | None:
+    """Return the tensor RMSNorm squares, or ``None`` if it does not square."""
+
+    args = getattr(square_node, "args", ())
+    if str(getattr(square_node, "target", "")) == "aten.pow.Tensor_Scalar":
+        if len(args) != 2:
+            return None
+        exponent = args[1]
+        if isinstance(exponent, bool) or not isinstance(exponent, (int, float)):
+            return None
+        if exponent != 2:
+            return None
+        return args[0]
+    if len(args) != 2 or args[0] is not args[1]:
+        return None
+    return args[0]
+
+
+def _rms_norm_normalized_input(
+    normalized: object,
+    compute_input: object,
+    scale: object,
+    scale_op: str,
+) -> object | None:
+    """Match ``x * rsqrt(var)`` and ``x / sqrt(var)`` spellings."""
+
+    args = getattr(normalized, "args", ())
+    if len(args) != 2 or args[0] is not compute_input or args[1] is not scale:
+        return None
+    target = str(getattr(normalized, "target", ""))
+    expected = "aten.mul.Tensor" if scale_op == "aten.rsqrt.default" else "aten.div.Tensor"
+    return compute_input if target == expected else None
+
+
 def _rms_norm_operation(
     node: object,
     node_ids: dict[object, str],
@@ -1754,27 +1788,25 @@ def _rms_norm_operation(
 ] | None:
     target = str(getattr(node, "target", ""))
     cast_input = None
-    if target == "aten.pow.Tensor_Scalar":
-        pow_node = node
+    square_targets = {"aten.pow.Tensor_Scalar", "aten.mul.Tensor"}
+    if target in square_targets:
+        square_node = node
     elif target == "aten._to_copy.default":
-        pow_users = [
+        square_users = [
             user
             for user in getattr(node, "users", {})
-            if str(user.target) == "aten.pow.Tensor_Scalar"
+            if str(user.target) in square_targets
         ]
-        if len(pow_users) != 1:
+        if len(square_users) != 1:
             return None
-        pow_node = pow_users[0]
+        square_node = square_users[0]
         cast_input = node
     else:
         return None
-    if pow_node is None or str(pow_node.target) != "aten.pow.Tensor_Scalar":
-        return None
 
-    pow_args = pow_node.args
-    if len(pow_args) != 2 or pow_args[1] != 2:
+    compute_input = _rms_norm_square_base(square_node)
+    if compute_input is None:
         return None
-    compute_input = pow_args[0]
     if cast_input is not None:
         cast_args = cast_input.args
         if len(cast_args) != 1 or compute_input is not cast_input:
@@ -1790,11 +1822,11 @@ def _rms_norm_operation(
     else:
         input_value = compute_input
 
-    mean = _single_user(pow_node)
+    mean = _single_user(square_node)
     if mean is None or str(mean.target) != "aten.mean.dim":
         return None
     mean_args = mean.args
-    if len(mean_args) != 3 or mean_args[0] is not pow_node:
+    if len(mean_args) != 3 or mean_args[0] is not square_node:
         return None
     if mean_args[2] is not True:
         return None
@@ -1807,7 +1839,11 @@ def _rms_norm_operation(
         return None
 
     add_eps = _single_user(mean)
-    if add_eps is None or str(add_eps.target) != "aten.add_.Scalar":
+    if add_eps is None or str(add_eps.target) not in {
+        "aten.add_.Scalar",
+        "aten.add.Scalar",
+        "aten.add.Tensor",
+    }:
         return None
     add_args = add_eps.args
     if len(add_args) != 2 or add_args[0] is not mean:
@@ -1816,21 +1852,22 @@ def _rms_norm_operation(
     if not isinstance(eps, (int, float)) or isinstance(eps, bool):
         return None
 
-    rsqrt = _single_user(add_eps)
-    if rsqrt is None or str(rsqrt.target) != "aten.rsqrt.default":
+    scale = _single_user(add_eps)
+    if scale is None or str(scale.target) not in {
+        "aten.rsqrt.default",
+        "aten.sqrt.default",
+    }:
         return None
-    if len(rsqrt.args) != 1 or rsqrt.args[0] is not add_eps:
+    if len(scale.args) != 1 or scale.args[0] is not add_eps:
         return None
+    scale_op = str(scale.target)
 
-    normalized = _single_user(rsqrt)
-    if normalized is None or str(normalized.target) != "aten.mul.Tensor":
+    normalized = _single_user(scale)
+    if normalized is None or _rms_norm_normalized_input(
+        normalized, compute_input, scale, scale_op
+    ) is None:
         return None
-    normalized_args = normalized.args
-    if len(normalized_args) != 2:
-        return None
-    if normalized_args[0] is not compute_input or normalized_args[1] is not rsqrt:
-        return None
-    if cast_input is not None and set(cast_input.users) != {pow_node, normalized}:
+    if cast_input is not None and set(cast_input.users) != {square_node, normalized}:
         return None
 
     input_type = _node_type(input_value)
@@ -1856,8 +1893,15 @@ def _rms_norm_operation(
         and str(weighted_output.target) == "aten.mul.Tensor"
     ):
         weighted_args = weighted_output.args
-        if len(weighted_args) == 2 and weighted_args[0] is normalized:
-            candidate_weight = weighted_args[1]
+        position = (
+            0
+            if len(weighted_args) == 2 and weighted_args[0] is normalized
+            else 1
+            if len(weighted_args) == 2 and weighted_args[1] is normalized
+            else None
+        )
+        if position is not None:
+            candidate_weight = weighted_args[1 - position]
             try:
                 weight_type = _node_type(candidate_weight)
             except ValueError:
@@ -1891,7 +1935,7 @@ def _rms_norm_operation(
         "eps": float(eps),
         "has_weight": weight is not None,
     }
-    folded_nodes = [pow_node, mean, add_eps, rsqrt, normalized]
+    folded_nodes = [square_node, mean, add_eps, scale, normalized]
     if cast_input is not None:
         folded_nodes.insert(0, cast_input)
     if weight is not None:
