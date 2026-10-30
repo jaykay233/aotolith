@@ -231,12 +231,13 @@ _SCATTER_ADD_TARGET = "aten.scatter_add.default"
 _SCATTER_REDUCE_TARGET = "aten.scatter_reduce.two"
 _INDEX_ADD_TARGET = "aten.index_add.default"
 # `scatter_reduce` renames the two reductions whose accumulation is not an
-# addition; `mean` needs a per-output count that no single MLX scatter does.
+# addition; `mean` accumulates counts alongside the values.
 _SCATTER_REDUCE_NAMES = {
     "sum": "add",
     "prod": "prod",
     "amax": "amax",
     "amin": "amin",
+    "mean": "mean",
 }
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
@@ -1295,15 +1296,10 @@ def _scatter_reduce_attrs(
         )
     if reduce_name is None:
         reduce_name = kwargs.get("reduce", "sum")
-    if reduce_name == "mean":
-        raise NotImplementedError(
-            "scatter_reduce reduce='mean' is not supported: it needs a "
-            "per-output element count that a scatter cannot accumulate"
-        )
     if reduce_name not in _SCATTER_REDUCE_NAMES:
         raise ValueError(
             f"scatter_reduce.reduce {reduce_name!r} is not supported; expected "
-            f"one of {sorted([*_SCATTER_REDUCE_NAMES, 'mean'])}"
+            f"one of {sorted(_SCATTER_REDUCE_NAMES)}"
         )
     include_self = kwargs.get("include_self", True)
     if not isinstance(include_self, bool):

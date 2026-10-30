@@ -52,7 +52,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
 | `aten.scatter_add.default` | `scatter`，`reduce=add` |
-| `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin` |
+| `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin`/`mean` |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
 | `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
@@ -153,7 +153,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 `scatter` 输入为 `source, indices`，`aten.scatter.src` 额外接收 update tensor，`aten.scatter.value` 把 scalar 写入 `value` attribute。source、indices 和 update 必须同 rank；indices 的每个非 scatter 轴不能大于 source；update 的每一维不能小于 indices，与 PyTorch 的 `index.size(d) <= src.size(d)` 约束一致。输出始终保持 source 的 shape 和 dtype。Runtime 检查索引范围，把 update 截到 indices shape，调用 `mx.put_along_axis`，再复制 source 并写回更新区域，因此不会修改输入。重复索引的胜者与 PyTorch 一样不做确定性保证。
 
-`aten.scatter_add.default` 和 `aten.scatter_reduce.two` 复用同一个 `scatter` op，只是多带 `reduce` attribute（`add`、`prod`、`amax`、`amin`）和 `include_self` bool。MLX 没有会归约的 `put_along_axis`，所以 Runtime 换成 advanced indexing：非 scatter 轴各取一段 `arange` 网格并广播到 indices shape，得到和 scatter 形式一一对应的坐标，再用 `array.at[...]` 的 `add`/`multiply`/`maximum`/`minimum` 完成累加。`include_self=False` 表示被写到的位置只由 update 归约，不能被 source 参与，因此先以该归约的单位元（0、1、∓inf）建累加器，再用 `put_along_axis` 写出的 mask 把未写到的位置拼回 source。`amax`/`amin` 的单位元是 ±inf，整数输入会因此显式报错。`reduce='mean'` 需要每个输出位置的计数，单次 scatter 无法累计，前端直接报错而不是近似。重复索引的累加顺序不做确定性保证，与 CUDA 的 `scatter_add` 一致。
+`aten.scatter_add.default` 和 `aten.scatter_reduce.two` 复用同一个 `scatter` op，只是多带 `reduce` attribute（`add`、`prod`、`amax`、`amin`、`mean`）和 `include_self` bool。MLX 没有会归约的 `put_along_axis`，所以 Runtime 换成 advanced indexing：非 scatter 轴各取一段 `arange` 网格并广播到 indices shape，得到和 scatter 形式一一对应的坐标，再用 `array.at[...]` 的 `add`/`multiply`/`maximum`/`minimum` 完成累加。`include_self=False` 表示被写到的位置只由 update 归约，不能被 source 参与，因此先以该归约的单位元（0、1、∓inf）建累加器，再用 `put_along_axis` 写出的 mask 把未写到的位置拼回 source。`amax`/`amin` 的单位元是 ±inf，整数输入会因此显式报错。`reduce='mean'` 不是单次归约：Runtime 用同一个坐标网格再累加一份写入次数（`include_self=True` 时初值为 1，否则为 0），然后逐位置做 `总和 / max(次数, 1)`，最后只在被写到的位置上覆盖 source，所以未被写到的位置保留原值。重复索引的累加顺序不做确定性保证，与 CUDA 的 `scatter_add` 一致。
 
 `aten.index_add.default` 单独 lowering 成 `index_add` op：index 必须是 1-D，update 形状是 source 在 `dim` 轴替换成 index 长度后的形状，`alpha` 作为 attribute 保留。Runtime 检查范围后用 `source.at[..., indices].add(update * alpha)` 一次完成，输出仍是新的 tensor，不修改输入。
 
@@ -501,7 +501,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `arange` 的 I32/I64 输出要求整数 start/end/step，并在 kernel 内用 int64 计算，超过 2^53 的值不会经过浮点。FP16/BF16/F32 输出接受任意有限边界：kernel 在编译期把 double 常量拆成 float 头尾，再用 fma 残差和 two-sum 重建 `start + index * step`，所以整数步长以及 0.1、0.25 这类步长与 PyTorch 逐位一致，其余步长在实测中不超过序列量级的 1 ulp（PyTorch 自己的 CPU 实现用的也是有限精度中间量，同样会偏离精确实数）。整型输出配小数边界会明确报错
 - bool tensor 支持比较、logical、bitwise、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；I32/I64 tensor 除作为 embedding/index_select/gather/scatter indices 外，也支持上述整数 pointwise 集合
 - 整数 pointwise 当前要求输入、tensor 边界和输出同宽；I32 与 I64 混合、除 `torch.square` 特殊形式外的整数 `pow`、true division 和不在支持集合内的算子会明确报错。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
-- scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`，含 `include_self=False`）都支持；`reduce='mean'` 需要逐输出计数，尚未实现。`index_add` 只接受 1-D index。`scatter_`/`scatter_add_`/`scatter_reduce_`/`index_add_` 与 `add_` 一样做 SSA legalization：只允许被改写的原值在图内只有一个消费者，编译后的调用返回更新后的值，不会回写调用方仍然持有的那块 tensor，因此调用方必须使用返回值。重复索引的累加顺序不做确定性保证
+- scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`/`mean`，含 `include_self=False`）都支持；`mean` 需要浮点输入，因为它要同时累计写入次数并做除法。`index_add` 只接受 1-D index。`scatter_`/`scatter_add_`/`scatter_reduce_`/`index_add_` 与 `add_` 一样做 SSA legalization：只允许被改写的原值在图内只有一个消费者，编译后的调用返回更新后的值，不会回写调用方仍然持有的那块 tensor，因此调用方必须使用返回值。重复索引的累加顺序不做确定性保证
 - softmax 支持任意单轴。PyTorch 的 `softmax` 本身只接受单个 `dim`，多轴形式总是展开成 reshape + 单轴 softmax + reshape，这条链路可以正常编译
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - LayerNorm/RMSNorm 只支持连续尾维 reduction

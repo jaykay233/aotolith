@@ -655,7 +655,7 @@ def _evaluate_mlx_op(
 
 # MLX accumulates a scatter through ``array.at[...]``; the method name and the
 # value a fresh accumulator starts from are the whole difference between the
-# reductions. ``mean`` has no entry because it needs a per-output count.
+# reductions.
 _SCATTER_REDUCE_METHODS = {
     "add": "add",
     "prod": "multiply",
@@ -668,7 +668,70 @@ _SCATTER_REDUCE_IDENTITIES = {
     "amax": float("-inf"),
     "amin": float("inf"),
 }
-_SCATTER_REDUCES = frozenset(_SCATTER_REDUCE_METHODS)
+# `mean` is not a single MLX reduce: it accumulates the values and the number
+# of writes, then divides, so it is handled next to the methods rather than in
+# them.
+_SCATTER_REDUCES = frozenset({*_SCATTER_REDUCE_METHODS, "mean"})
+
+
+def _scatter_coordinates(
+    source_shape: tuple[int, ...], indices: mx.array, axis: int
+) -> tuple[tuple[slice, ...], tuple[int, ...], tuple[Any, ...]]:
+    """Return the written region, its shape and one index per scatter axis."""
+
+    rank = len(source_shape)
+    region = tuple(
+        slice(0, indices.shape[dim]) if dim != axis else slice(None)
+        for dim in range(rank)
+    )
+    region_shape = tuple(
+        source_shape[dim] if dim == axis else indices.shape[dim]
+        for dim in range(rank)
+    )
+    grid: list[Any] = []
+    for dim in range(rank):
+        if dim == axis:
+            grid.append(indices)
+            continue
+        view = [1] * rank
+        view[dim] = indices.shape[dim]
+        grid.append(mx.arange(indices.shape[dim]).reshape(view))
+    return region, region_shape, tuple(grid)
+
+
+def _mlx_scatter_mean(
+    source: mx.array,
+    indices: mx.array,
+    values: Any,
+    axis: int,
+    include_self: bool,
+) -> mx.array:
+    """Accumulate values and write counts, then divide the two sums.
+
+    ``include_self`` puts one self element on every output position, so the
+    untouched part of the source keeps its value under a count of one. Without
+    it an untouched position has no count at all and keeps the source value.
+    """
+
+    region, region_shape, grid = _scatter_coordinates(source.shape, indices, axis)
+    ones = mx.ones(indices.shape, dtype=source.dtype)
+    base = 1.0 if include_self else 0.0
+    totals = mx.full(region_shape, 0.0, dtype=source.dtype)
+    counts = mx.full(region_shape, base, dtype=source.dtype)
+    if include_self:
+        totals = source[region]
+    totals = totals.at[grid].add(values)
+    counts = counts.at[grid].add(ones)
+    means = totals / mx.maximum(counts, 1.0)
+    written = mx.put_along_axis(
+        mx.zeros(region_shape, dtype=mx.bool_),
+        indices,
+        mx.ones(indices.shape, dtype=mx.bool_),
+        axis=axis,
+    )
+    output = mx.array(source)
+    output[region] = mx.where(written, means, source[region])
+    return output
 
 
 def _mlx_scatter_reduce(
@@ -692,27 +755,13 @@ def _mlx_scatter_reduce(
     identity and are then spliced over the untouched source region.
     """
 
+    if reduce == "mean":
+        return _mlx_scatter_mean(source, indices, values, axis, include_self)
     method = _SCATTER_REDUCE_METHODS[reduce]
-    rank = len(source.shape)
-    region = tuple(
-        slice(0, indices.shape[dim]) if dim != axis else slice(None)
-        for dim in range(rank)
-    )
-    region_shape = tuple(
-        source.shape[dim] if dim == axis else indices.shape[dim]
-        for dim in range(rank)
-    )
-    grid: list[Any] = []
-    for dim in range(rank):
-        if dim == axis:
-            grid.append(indices)
-            continue
-        view = [1] * rank
-        view[dim] = indices.shape[dim]
-        grid.append(mx.arange(indices.shape[dim]).reshape(view))
+    region, region_shape, grid = _scatter_coordinates(source.shape, indices, axis)
     if include_self:
         accumulator = source[region]
-        updated = getattr(accumulator.at[tuple(grid)], method)(values)
+        updated = getattr(accumulator.at[grid], method)(values)
         output = mx.array(source)
         output[region] = updated
         return output
@@ -721,7 +770,7 @@ def _mlx_scatter_reduce(
         _SCATTER_REDUCE_IDENTITIES[reduce],
         dtype=source.dtype,
     )
-    updated = getattr(accumulator.at[tuple(grid)], method)(values)
+    updated = getattr(accumulator.at[grid], method)(values)
     written = mx.put_along_axis(
         mx.zeros(region_shape, dtype=mx.bool_),
         indices,
@@ -7309,6 +7358,15 @@ def _validate_scatter_op(graph: Graph, op: Operation) -> None:
         if not isinstance(include_self, bool):
             raise ValueError(
                 f"scatter.include_self must be a boolean, got {include_self!r}"
+            )
+        if reduce == "mean" and source_type.dtype not in {
+            DType.F16,
+            DType.BF16,
+            DType.F32,
+        }:
+            raise NotImplementedError(
+                "scatter.reduce=mean needs a floating-point input, got "
+                f"{source_type.dtype.value}"
             )
         if not include_self and reduce in {"amax", "amin"}:
             if source_type.dtype not in {DType.F16, DType.BF16, DType.F32}:

@@ -1392,16 +1392,68 @@ def test_index_add_rejects_a_multi_dimensional_index() -> None:
         compile_graph(graph)
 
 
-def test_scatter_reduce_mean_is_rejected_rather_than_approximated() -> None:
+def test_scatter_reduce_mean_divides_by_the_number_of_writes() -> None:
+    """`mean` accumulates the values and a matching write count, then divides.
+
+    Index 0 receives two writes in row 0, which is the case a single
+    accumulation would get wrong, and row 3 receives none.
+    """
+
     def fn(source, indices, update):
         return source.scatter_reduce(0, indices, update, reduce="mean")
 
     source = torch.zeros(4, 2)
-    indices = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64)
-    update = torch.ones(2, 2)
+    indices = torch.tensor([[0, 1], [0, 1], [2, 0]], dtype=torch.int64)
+    update = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    result = compile_callable(fn, (source, indices, update))
 
-    with pytest.raises(NotImplementedError, match="reduce='mean'"):
-        compile_callable(fn, (source, indices, update))
+    assert "scatter" in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(
+        _torch_to_mlx(source), _torch_to_mlx(indices), _torch_to_mlx(update)
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    # Row 0 column 0 is (1 + 3) / 2, row 2 column 0 is 5 / 1, row 3 is
+    # untouched and keeps the zero source value.
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert mx.allclose(actual[3], mx.zeros((2,), dtype=mx.float32))
+
+
+def test_scatter_reduce_mean_without_self_only_counts_writes() -> None:
+    def fn(source, indices, update):
+        return source.scatter_reduce(
+            1, indices, update, reduce="mean", include_self=False
+        )
+
+    source = torch.full((3, 4), 7.0)
+    indices = torch.tensor([[0, 1], [2, 2], [0, 0]], dtype=torch.int64)
+    update = torch.tensor([[1.0, 3.0], [5.0, 9.0], [2.0, 4.0]])
+    result = compile_callable(fn, (source, indices, update))
+
+    actual = result.plan(
+        _torch_to_mlx(source), _torch_to_mlx(indices), _torch_to_mlx(update)
+    )[0]
+    expected = _torch_to_mlx(fn(source, indices, update))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    # Columns 1-3 received no write in row 2 and keep the source value.
+    assert mx.allclose(actual[2][1:], mx.array([7.0, 7.0, 7.0]))
+
+
+def test_scatter_reduce_mean_rejects_integer_inputs() -> None:
+    def fn(source, indices, update):
+        return source.scatter_reduce(0, indices, update, reduce="mean")
+
+    with pytest.raises(NotImplementedError, match="needs a floating-point input"):
+        compile_callable(
+            fn,
+            (
+                torch.zeros(4, dtype=torch.int64),
+                torch.tensor([0, 1], dtype=torch.int64),
+                torch.ones(2, dtype=torch.int64),
+            ),
+        )
 
 
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
