@@ -208,6 +208,56 @@ def test_artifact_writes_aliased_state_once(tmp_path: Path) -> None:
     assert mx.allclose(actual, mx.array(expected.float().numpy()), atol=1e-2, rtol=1e-2)
 
 
+def test_artifact_rejects_a_keyword_input_that_does_not_match_the_graph(
+    tmp_path: Path,
+) -> None:
+    """`entrypoint.kwargs` is validated against the graph like state is.
+
+    Without this check a manifest could describe the keyword at one shape while
+    the serialized graph expects another, and the plan would bind a buffer of
+    the wrong size to that input.
+    """
+
+    from aotolith import load_compiled_module
+
+    torch.manual_seed(31)
+    model = _MaskedArtifactModule().eval()
+    value = torch.randn(2, 4)
+    artifact_path = compile_module(
+        model,
+        (value,),
+        example_kwargs={"mask": torch.randn(2, 4)},
+    ).save(tmp_path / "kwargs.aoto")
+
+    cases = {
+        "shape": (lambda entry: entry.update({"shape": [4, 2]}), "keyword 'mask'"),
+        "dtype": (
+            lambda entry: entry.update({"dtype": "f16"}),
+            "keyword 'mask'",
+        ),
+    }
+    for name, (mutate, message) in cases.items():
+        tampered_path = tmp_path / f"kwargs-{name}.aoto"
+        with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
+            tampered_path, "w"
+        ) as destination:
+            for entry_name in source.namelist():
+                payload = source.read(entry_name)
+                if entry_name == "manifest.json":
+                    manifest = json.loads(payload)
+                    mutate(manifest["entrypoint"]["kwargs"][0])
+                    payload = json.dumps(
+                        manifest, sort_keys=True, separators=(",", ":")
+                    ).encode()
+                destination.writestr(entry_name, payload)
+        try:
+            load_compiled_module(tampered_path)
+        except ArtifactCompatibilityError as exc:
+            assert message in str(exc)
+        else:
+            raise AssertionError(f"tampered keyword {name} was accepted")
+
+
 def test_artifact_loads_the_previous_abi_layout(tmp_path: Path) -> None:
     """A 1.2 artifact has no `entrypoint.kwargs` and must still load.
 
@@ -463,3 +513,17 @@ def test_artifact_strict_device_match_rejects_other_profile(
         assert "artifact device mismatch" in str(exc)
     else:
         raise AssertionError("strict device matching accepted another profile")
+
+
+class _MaskedArtifactModule(torch.nn.Module):
+    """Takes a tensor keyword so the artifact has a promoted keyword input."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(
+        self, value: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        output = value @ self.weight
+        return output if mask is None else output * mask
