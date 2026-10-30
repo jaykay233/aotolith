@@ -28,7 +28,7 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 
 ## 1. FX 捕获
 
-`capture_fx` 调用 `make_fx(fn)(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata。
+`capture_fx` 调用 `make_fx(fn, tracing_mode="fake", decomposition_table=aten_decompositions())(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata；`decomposition_table` 把前端不认识的算子先改写成前端认识的形式，见本节末尾的 “Legalization”。
 
 模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；它们在运行期和 artifact 里共享同一份 buffer 和 payload，见第 15 节。
 
@@ -232,6 +232,17 @@ reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因�
 `F.scaled_dot_product_attention` 可能落到通用 ATen op，也可能被拍平成 CPU/CUDA flash 或 efficient attention 的内部 target。这些 target 的参数顺序和输出个数不同，前端按 target 分别读取 `attn_mask`、`dropout_p`、`is_causal`、`scale` 和关键字参数 `enable_gqa`。当前只接受主输出；辅助 logsumexp、debug mask 等输出被使用时直接报错。dropout 非零也会报错。`enable_gqa` 只做布尔校验，实际 head 分组关系由 Q/K/V 的静态 shape 决定；部分 CPU SDPA 路径在 tracing 后会丢掉这个参数并落到 flash target。
 
 FP16/BF16 的 CPU SDPA 分解图常把 Q/K/V 转成 FP32 计算，再把结果转回输入 dtype。frontend 将这些节点保留为 `cast`。attention fusion 只在输入 cast 来自同一种低精度 dtype、输出 cast 又回到同一 dtype 时吸收整条内部 round-trip；显式 `to(bfloat16)` 或 `to(float32)` 等用户 cast 仍作为独立节点执行，不能被错误地改写成另一种 attention dtype。
+
+### Legalization：ATen 分解表
+
+`make_fx` 接受 `decomposition_table`，在 tracing 的过程中就把一个算子改写成语义等价的一组更小算子。`decompose.py` 拿 Torch 的 `core_aten_decompositions()`（941 条规则）作为这张表，减去前端自己 lower 的 target：**前端认识 `_SUPPORTED_OPS` 和各个特例常量里的每个 target，这些不会被分解**。
+
+这样分的理由是两个方向的需求不同：
+
+- 前端自己 lower 的算子，分解只会变差。attention、`layer_norm`、`softmax` 有自己的 Metal kernel；`arange` 用 fma 余项加两次求和重建浮点序列，让结果只舍入一次；`sum`/`var` 要按各自 schema 归一化 `dim`/`keepdim`。把这些换成展开图是纯损失，所以它们在 `NATIVE_TARGETS` 里，且 `tests/test_decompose.py` 断言这张表和分解表没有交集。
+- 前端不认识的算子，分解是免费的覆盖面。`celu`、`glu`、`huber_loss`、`smooth_l1_loss`、`mse_loss`、`binary_cross_entropy_with_logits` 现在直接可编译，因为它们展开后的算子都已经支持；后续新算子只需补叶子算子（如 `lgamma`、`i0`、`erfinv`、`signbit`），不必再手写一整棵复合树。诊断信息也因此从“958 个不认识的复合算子名”收敛到“缺哪几个叶子算子”。
+
+分解得到的一条经验：有些组合 lowering 在分解表里已经有了完全相同的写法，`dot` 就是 `mul` 加一次全轴归约，所以 `_dot_operations` 已经删掉；但 `mv`、`trace`、`nansum`、`logsumexp`、`count_nonzero`、`all`/`any` 保留手写版本——`mv` 走 rank-2 matmul（分解会先物化一整块逐元素乘积），`trace` 用 strided 对角线视图（分解会复制对角线），`logsumexp` 用 `isinf` 而不是 `abs`+`eq`，`nansum` 的分解对整数输入会无条件发 `isnan`。判断标准是展开后的 IR 是否至少同样好，而不是“能不能删掉”。
 
 ## 2. SSA IR
 
