@@ -5,13 +5,13 @@ layer that first needed to know it: ``silu`` is elementwise whether a fusion
 pass is deciding whether it may join a region, an IR contract is choosing a
 default dtype rule, or the backend is picking a kernel family. Keeping these
 sets inside one of those consumers forces every other consumer to import it,
-which is how ``op_defs`` ended up importing the graph rewriter purely to read a
-set of names.
+which is how the contract table ended up importing the graph rewriter purely to
+read a set of names.
 
 So the classification lives here, at the bottom of the stack, next to nothing
 else. The three users are:
 
-* ``op_defs`` - every pointwise operator shares one contract shape, and the
+* ``ir.ops`` - every pointwise operator shares one contract shape, and the
   constant producers share one attribute rule.
 * ``passes`` - fusion may only absorb an operator that runs elementwise, and
   layout folding only moves pure views.

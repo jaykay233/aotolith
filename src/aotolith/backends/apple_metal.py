@@ -14,14 +14,14 @@ from typing import Any
 import mlx.core as mx
 
 from ..ir import DType, Graph, Operation, TensorType
-from ..op_defs import (
+from ..ir.ops import (
     OP_CONTRACTS,
     check_integer_constant,
     check_operation,
     integer_constant_value,
 )
-from ..op_defs import FLOATING_DTYPES as _FLOATING_DTYPES
-from ..op_defs import INTEGRAL_DTYPES as _INTEGRAL_DTYPES
+from ..ir.ops import FLOATING_DTYPES as _FLOATING_DTYPES
+from ..ir.ops import INTEGRAL_DTYPES as _INTEGRAL_DTYPES
 from ..planning import StoragePlan, plan_storage
 from ..shapes import can_broadcast as _can_broadcast
 from ..selection import KernelBenchmark, KernelSelection

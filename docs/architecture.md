@@ -254,9 +254,11 @@ IR 定义在 `ir.py`：
 
 这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
 
-每个 IR op 的操作数个数、必备 attribute、输出个数、dtype 和 shape 规则集中声明在 `op_defs.py`，由 `check_operation()` 一次性校验：`OpContract` 用 `arity`、`attrs`、`rank`、`dtype`、`shape`、`outputs` 六个字段描述通用规则，字段表达不了的算子间约束（scatter 的 index/update 相容性、embedding 的浮点 weight 加整型 indices、layout op 的目标 shape）放在该算子自己的 `extra` 钩子里。后端在 lowering 之前统一跑一遍校验，然后只根据 op 名决定“能否生成 kernel”，不再让每个 `elif` 分支各自重写 rank/dtype/shape 前置检查。新增一个算子因此是一行声明加至多一个钩子，`tests/test_planning.py` 里有一条测试要求 `POINTWISE_OPS` 和 `LAYOUT_OPS` 的每个名字都已注册，避免新算子绕过校验。
+每个 IR op 的操作数个数、必备 attribute、输出个数、dtype 和 shape 规则集中声明在 `ir/ops/`，由 `check_operation()` 一次性校验：`OpContract` 用 `arity`、`attrs`、`rank`、`dtype`、`shape`、`outputs` 六个字段描述通用规则，字段表达不了的算子间约束（scatter 的 index/update 相容性、embedding 的浮点 weight 加整型 indices、layout op 的目标 shape）放在该算子自己的 `extra` 钩子里。后端在 lowering 之前统一跑一遍校验，然后只根据 op 名决定“能否生成 kernel”，不再让每个 `elif` 分支各自重写 rank/dtype/shape 前置检查。新增一个算子因此是一行声明加至多一个钩子，`tests/test_planning.py` 里有一条测试要求 `POINTWISE_OPS` 和 `LAYOUT_OPS` 的每个名字都已注册，避免新算子绕过校验。
 
-算子的执行类别（pointwise / layout / constant）单独定义在 `op_sets.py`，而不是留在某个消费者里。这三个集合有三个读者：`op_defs.py` 用它们生成默认 contract，`passes.py` 用它们判断融合与折叠是否合法，`backends/apple_metal.py` 用它们分派 kernel。以前它们住在 `passes.py` 里，于是 `op_defs` 和 backend 都必须反过来导入图重写模块才能读到一组名字——`tests/test_architecture.py` 现在按层断言 import 只能指向更低层，这类反向依赖会直接让测试失败。
+表按算子族分文件，一族一个模块、各自导出 `CONTRACTS`：`rules.py` 只放规则词汇（`OpContract` 与那几个枚举）和“怎么校验一个 contract”，`shared.py` 放各钩子共用的小工具，`reduction.py`（归约、scan、排序）、`elementwise.py`（逐元素与 cast/triu/cat）、`indexing.py`（gather/scatter 一族）、`kernels.py`（自带手写 kernel 的算子）、`view.py`（形状操作与 `LAYOUT_RULES`）、`constants.py`（`arange` 一类无操作数的算子）各写自己的行，`table.py` 把它们拼起来并补上逐元素算子和常量算子的生成默认值。族之间互不 import，所以改 attention 的校验不会牵扯到 view 表；`table.py` 是唯一要求全表一致的地方，重复声明同一个算子会直接抛错。也正因为 `rules.py` 不知道“哪个算子对应哪条 contract”，`check_operation` 被拆成两步：`rules.check_contract` 校验一条 contract，`table.check_operation` 负责查表。
+
+算子的执行类别（pointwise / layout / constant）单独定义在 `op_sets.py`，而不是留在某个消费者里。这三个集合有三个读者：`ir/ops/table.py` 用它们生成默认 contract，`passes.py` 用它们判断融合与折叠是否合法，`backends/apple_metal.py` 用它们分派 kernel。以前它们住在 `passes.py` 里，于是 contract 表和 backend 都必须反过来导入图重写模块才能读到一组名字——`tests/test_architecture.py` 现在按层断言 import 只能指向更低层，这类反向依赖会直接让测试失败。
 
 ## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
 

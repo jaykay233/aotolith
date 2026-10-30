@@ -123,9 +123,7 @@ def save_compiled(
     selections_bytes = _canonical_json(
         [_encode_selection(selection) for selection in result.plan.selections]
     )
-    storage_bytes = _canonical_json(
-        _encode_storage_plan(result.plan.storage_plan)
-    )
+    storage_bytes = _canonical_json(_encode_storage_plan(result.plan.storage_plan))
 
     state_entries: list[dict[str, object]] = []
     state_payloads: list[tuple[str, bytes]] = []
@@ -134,9 +132,7 @@ def save_compiled(
     # same file and digest describe the same bytes exactly, and the loader
     # recognises that without any new manifest field.
     shared_payloads: dict[int, tuple[str, str]] = {}
-    for index, (name, array) in enumerate(
-        zip(state_names, state_values, strict=True)
-    ):
+    for index, (name, array) in enumerate(zip(state_names, state_values, strict=True)):
         mx.eval(array)
         shape = tuple(int(dim) for dim in array.shape)
         dtype = _dtype_from_mlx(array.dtype)
@@ -215,13 +211,9 @@ def save_compiled(
         with zipfile.ZipFile(
             temporary_path, "w", compression=zipfile.ZIP_DEFLATED
         ) as archive:
-            _write_zip_entry(
-                archive, "manifest.json", _canonical_json(manifest)
-            )
+            _write_zip_entry(archive, "manifest.json", _canonical_json(manifest))
             _write_zip_entry(archive, "input_graph.json", input_graph_bytes)
-            _write_zip_entry(
-                archive, "lowered_graph.json", lowered_graph_bytes
-            )
+            _write_zip_entry(archive, "lowered_graph.json", lowered_graph_bytes)
             _write_zip_entry(archive, "kernels.json", kernels_bytes)
             _write_zip_entry(
                 archive,
@@ -258,9 +250,7 @@ def load_compiled_module(
     artifact_path = Path(path)
     with _open_artifact(artifact_path) as archive:
         manifest = _read_json(archive, "manifest.json")
-        _validate_manifest(
-            manifest, require_device_match=require_device_match
-        )
+        _validate_manifest(manifest, require_device_match=require_device_match)
         payloads = manifest["payloads"]
         graph_payload = _read_payload(
             archive,
@@ -299,7 +289,9 @@ def load_compiled_module(
         if list(lowered_graph.inputs) != manifest["graph"]["inputs"]:
             raise ArtifactCompatibilityError("manifest graph inputs do not match graph")
         if list(lowered_graph.outputs) != manifest["graph"]["outputs"]:
-            raise ArtifactCompatibilityError("manifest graph outputs do not match graph")
+            raise ArtifactCompatibilityError(
+                "manifest graph outputs do not match graph"
+            )
 
         state_entries = manifest["entrypoint"]["state"]
         loaded_state: dict[str, mx.array] = {}
@@ -316,16 +308,12 @@ def load_compiled_module(
             state_values.append(array)
         state_values = tuple(state_values)
         stored_kernels = tuple(
-            _decode_kernel(item)
-            for item in _load_json_list(kernels_payload)
+            _decode_kernel(item) for item in _load_json_list(kernels_payload)
         )
         stored_selections = tuple(
-            _decode_selection(item)
-            for item in _load_json_list(selections_payload)
+            _decode_selection(item) for item in _load_json_list(selections_payload)
         )
-        stored_storage = _decode_storage_plan(
-            _load_json_bytes(storage_payload)
-        )
+        stored_storage = _decode_storage_plan(_load_json_bytes(storage_payload))
 
     compile_options = manifest["compile_options"]
     backend = AppleMetalBackend(
@@ -387,9 +375,7 @@ def read_artifact_manifest(
 
     with _open_artifact(Path(path)) as archive:
         manifest = _read_json(archive, "manifest.json")
-        _validate_manifest(
-            manifest, require_device_match=require_device_match
-        )
+        _validate_manifest(manifest, require_device_match=require_device_match)
         return dict(manifest)
 
 
@@ -449,10 +435,7 @@ def _validate_device_profile(profile: object) -> None:
         ) from exc
     current_name = current.get("device_name")
     current_architecture = current.get("architecture")
-    if (
-        current_name != stored_name
-        or current_architecture != stored_architecture
-    ):
+    if current_name != stored_name or current_architecture != stored_architecture:
         raise ArtifactCompatibilityError(
             "artifact device mismatch: "
             f"compiled for {stored_name!r} ({stored_architecture!r}), "
@@ -498,17 +481,12 @@ def _validate_entrypoint_layout(
     state_offset = input_count + len(kwarg_entries)
     if len(graph.inputs) != state_offset + len(state_values):
         raise ArtifactCompatibilityError(
-            "artifact input count does not match graph inputs, keyword "
-            "inputs and state"
+            "artifact input count does not match graph inputs, keyword inputs and state"
         )
     for index, entry in enumerate(kwarg_entries):
         if not isinstance(entry, Mapping):
-            raise ArtifactCompatibilityError(
-                "artifact keyword entry is invalid"
-            )
-        _check_input_type(
-            graph, graph.inputs[input_count + index], entry, "keyword"
-        )
+            raise ArtifactCompatibilityError("artifact keyword entry is invalid")
+        _check_input_type(graph, graph.inputs[input_count + index], entry, "keyword")
     _validate_kwarg_paths(kwarg_entries)
     for index, (entry, value) in enumerate(
         zip(state_entries, state_values, strict=True)
@@ -602,9 +580,7 @@ def _decode_kwarg_path(
     path: list[tuple[str, Any]] = []
     for step in raw:
         if not isinstance(step, (list, tuple)) or len(step) != 2:
-            raise ArtifactCompatibilityError(
-                "artifact keyword path step is invalid"
-            )
+            raise ArtifactCompatibilityError("artifact keyword path step is invalid")
         kind, key = step
         if kind not in (_KWARG_LIST, _KWARG_TUPLE, _KWARG_DICT):
             raise ArtifactCompatibilityError(
@@ -754,8 +730,7 @@ def _encode_attr(value: object) -> object:
         return {
             "$kind": "dict",
             "items": [
-                [_encode_attr(key), _encode_attr(item)]
-                for key, item in value.items()
+                [_encode_attr(key), _encode_attr(item)] for key, item in value.items()
             ],
         }
     if isinstance(value, Operation):
@@ -781,9 +756,7 @@ def _decode_attr(value: object) -> object:
         items = [_decode_attr(item) for item in value["items"]]
         return tuple(items) if kind == "tuple" else items
     if kind == "dict":
-        return {
-            _decode_attr(key): _decode_attr(item) for key, item in value["items"]
-        }
+        return {_decode_attr(key): _decode_attr(item) for key, item in value["items"]}
     if kind == "operation":
         return Operation(
             str(value["op"]),
@@ -895,9 +868,7 @@ def _decode_selection(payload: Mapping[str, Any]) -> KernelSelection:
                     else float(item["median_seconds"])
                 ),
                 min_seconds=(
-                    None
-                    if item["min_seconds"] is None
-                    else float(item["min_seconds"])
+                    None if item["min_seconds"] is None else float(item["min_seconds"])
                 ),
                 error=None if item["error"] is None else str(item["error"]),
             )
@@ -1008,9 +979,7 @@ def _array_bytes(array: mx.array) -> bytes:
     return bytes(memoryview(contiguous))
 
 
-def _decode_state_array(
-    archive: zipfile.ZipFile, entry: Mapping[str, Any]
-) -> mx.array:
+def _decode_state_array(archive: zipfile.ZipFile, entry: Mapping[str, Any]) -> mx.array:
     try:
         file_name = _safe_payload_name(entry["file"])
         shape = tuple(int(dim) for dim in entry["shape"])
@@ -1102,9 +1071,7 @@ def _safe_payload_name(name: object) -> str:
     return path.as_posix()
 
 
-def _write_zip_entry(
-    archive: zipfile.ZipFile, name: str, payload: bytes
-) -> None:
+def _write_zip_entry(archive: zipfile.ZipFile, name: str, payload: bytes) -> None:
     info = zipfile.ZipInfo(name, date_time=_ZIP_TIMESTAMP)
     info.compress_type = zipfile.ZIP_DEFLATED
     info.external_attr = 0o644 << 16

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 
-def can_broadcast(
-    input_shape: tuple[int, ...], output_shape: tuple[int, ...]
-) -> bool:
+def can_broadcast(input_shape: tuple[int, ...], output_shape: tuple[int, ...]) -> bool:
     """Whether ``input_shape`` broadcasts to ``output_shape``."""
 
     if len(input_shape) > len(output_shape):

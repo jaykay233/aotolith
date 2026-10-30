@@ -111,14 +111,10 @@ def test_decode_token_rejects_out_of_vocabulary_token() -> None:
 
     for invalid in (64, -1, 4096):
         with pytest.raises(IndexError, match="index out of range"):
-            runtime.decode_token(
-                mx.array([[invalid]], dtype=mx.int64), cache, 4
-            )
+            runtime.decode_token(mx.array([[invalid]], dtype=mx.int64), cache, 4)
 
     # The strict check must not change the valid path.
-    logits, next_cache = runtime.decode_token(
-        mx.array([[7]], dtype=mx.int64), cache, 4
-    )
+    logits, next_cache = runtime.decode_token(mx.array([[7]], dtype=mx.int64), cache, 4)
     mx.eval(logits, next_cache)
     assert logits.shape == (1, 1, 64)
     assert next_cache.shape == cache.shape
@@ -135,9 +131,7 @@ def test_decode_token_can_skip_the_token_bounds_check() -> None:
     token = mx.array([[7]], dtype=mx.int64)
 
     strict_logits, strict_cache = runtime.decode_token(token, cache, 4)
-    lax_logits, lax_cache = runtime.decode_token(
-        token, cache, 4, verify_token=False
-    )
+    lax_logits, lax_cache = runtime.decode_token(token, cache, 4, verify_token=False)
     mx.eval(strict_logits, strict_cache, lax_logits, lax_cache)
     assert mx.array_equal(strict_logits, lax_logits)
     assert mx.array_equal(strict_cache, lax_cache)
@@ -204,21 +198,15 @@ def test_decode_step_uses_the_position_of_the_token_it_embeds() -> None:
 
     logits, compact_cache = runtime.prefill_ids(prompt)
     mx.eval(logits, compact_cache)
-    assert mx.allclose(
-        logits, mx.array(prefill_logits.numpy()), atol=1e-5, rtol=1e-5
-    )
+    assert mx.allclose(logits, mx.array(prefill_logits.numpy()), atol=1e-5, rtol=1e-5)
     cache = runtime.pad_cache(compact_cache)
     token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
     mx.eval(token, cache)
     assert int(token.item()) == first
 
-    step_logits, next_cache = runtime.decode_token(
-        token, cache, len(prompt) + 1
-    )
+    step_logits, next_cache = runtime.decode_token(token, cache, len(prompt) + 1)
     mx.eval(step_logits, next_cache)
-    assert mx.allclose(
-        step_logits, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5
-    )
+    assert mx.allclose(step_logits, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
 
 
 def test_decode_step_writes_only_the_newest_slot() -> None:
@@ -230,12 +218,8 @@ def test_decode_step_writes_only_the_newest_slot() -> None:
     cache = runtime.pad_cache(compact_cache)
     mx.eval(cache)
 
-    first_cache = runtime.decode_token(
-        mx.array([[7]], dtype=mx.int64), cache, 5
-    )[1]
-    second_cache = runtime.decode_token(
-        mx.array([[11]], dtype=mx.int64), cache, 5
-    )[1]
+    first_cache = runtime.decode_token(mx.array([[7]], dtype=mx.int64), cache, 5)[1]
+    second_cache = runtime.decode_token(mx.array([[11]], dtype=mx.int64), cache, 5)[1]
     mx.eval(first_cache, second_cache)
 
     capacity = runtime.cache_capacity
@@ -252,6 +236,7 @@ def test_decode_step_writes_only_the_newest_slot() -> None:
         first_cache[..., : runtime.prompt_length - 1, :],
         cache[..., 1 : runtime.prompt_length, :],
     )
+
 
 def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() -> None:
     """Autotune must skip the MLX comparison, not fail, when there is none.
@@ -283,9 +268,7 @@ def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() ->
     for selection in normalized:
         # No MLX reference exists, so only the kernel is benchmarked.
         assert selection.is_native
-        assert [item.candidate for item in selection.benchmarks] == [
-            "metal_kernel"
-        ]
+        assert [item.candidate for item in selection.benchmarks] == ["metal_kernel"]
         assert "only valid candidate" in selection.reason
 
     tokens = runtime.greedy_generate(
@@ -293,6 +276,7 @@ def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() ->
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 6)
+
 
 @pytest.mark.parametrize("hidden_act", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_adapter_matches_pytorch_for_supported_activations(hidden_act) -> None:

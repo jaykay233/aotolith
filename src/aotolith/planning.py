@@ -56,9 +56,7 @@ def plan_storage(graph: Graph) -> StoragePlan:
     output_set = set(graph.outputs)
     input_set = set(graph.inputs)
     producers = {
-        value_id: index
-        for index, op in enumerate(graph.ops)
-        for value_id in op.outputs
+        value_id: index for index, op in enumerate(graph.ops) for value_id in op.outputs
     }
     active_values = input_set | set(producers)
     if active_values != set(graph.values):

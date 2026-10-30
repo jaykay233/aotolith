@@ -89,9 +89,7 @@ def test_unrolled_runner_keeps_the_index_bounds_contract() -> None:
     result = compile_callable(fn, (table, indices))
 
     # Build the unrolled runner on valid indices first.
-    valid = result.plan(
-        mx.array(table.numpy()), mx.array(indices.numpy())
-    )[0]
+    valid = result.plan(mx.array(table.numpy()), mx.array(indices.numpy()))[0]
     mx.eval(valid)
     assert result.plan._runner is not None
 
@@ -152,7 +150,6 @@ def test_runtime_arena_reuses_a_planned_slot() -> None:
     assert stats.reuse_count == 1
 
 
-
 def test_every_operator_the_backend_executes_has_a_contract() -> None:
     """The registry is only a guarantee if nothing can bypass it.
 
@@ -161,7 +158,7 @@ def test_every_operator_the_backend_executes_has_a_contract() -> None:
     verification. This test fails as soon as that happens.
     """
 
-    from aotolith.op_defs import OP_CONTRACTS
+    from aotolith.ir.ops import OP_CONTRACTS
     from aotolith.passes import LAYOUT_OPS, POINTWISE_OPS
 
     registered = set(OP_CONTRACTS)
@@ -171,7 +168,7 @@ def test_every_operator_the_backend_executes_has_a_contract() -> None:
 
 
 def test_contracts_reject_unknown_operators_by_name() -> None:
-    from aotolith.op_defs import contract_for
+    from aotolith.ir.ops import contract_for
 
     with pytest.raises(KeyError, match="not_really_an_op"):
         contract_for("not_really_an_op")
@@ -180,7 +177,7 @@ def test_contracts_reject_unknown_operators_by_name() -> None:
 def test_contract_reports_the_number_of_values_an_operator_writes() -> None:
     """A multi-output operator is pinned to its own arity of results."""
 
-    from aotolith.op_defs import check_operation
+    from aotolith.ir.ops import check_operation
 
     tensor_type = TensorType((2, 4), DType.F32)
     values = {

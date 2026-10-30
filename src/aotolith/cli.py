@@ -155,10 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME=JSON",
-        help=(
-            "tensor keyword input for the plan, in NAME=JSON form; may be "
-            "repeated"
-        ),
+        help=("tensor keyword input for the plan, in NAME=JSON form; may be repeated"),
     )
     run_parser.add_argument("--output", type=Path)
     return parser
@@ -277,15 +274,12 @@ def _artifact_summary(compiled: Any) -> dict[str, Any]:
     is_module = isinstance(compiled, CompiledModulePlan)
     return {
         "entrypoint": "module" if is_module else "callable",
-        "input_count": (
-            compiled.input_count if is_module else len(plan.graph.inputs)
-        ),
+        "input_count": (compiled.input_count if is_module else len(plan.graph.inputs)),
         "tensor_kwargs": list(compiled.tensor_kwarg_names) if is_module else [],
         "lowered_ops": len(plan.graph.ops),
         "kernels": len(plan.kernels),
         "native_selections": sum(
-            selection.implementation == "metal_kernel"
-            for selection in plan.selections
+            selection.implementation == "metal_kernel" for selection in plan.selections
         ),
         "fallback_selections": sum(
             selection.implementation == "mlx" for selection in plan.selections
@@ -385,9 +379,9 @@ def _torch_inputs(specs: Sequence[dict[str, Any]]) -> tuple[Any, ...]:
 
 
 def _mlx_input(spec: dict[str, Any]) -> mx.array:
-    return mx.array(
-        spec["data"], dtype=_MLX_DTYPES[spec["dtype"]]
-    ).reshape(spec["shape"])
+    return mx.array(spec["data"], dtype=_MLX_DTYPES[spec["dtype"]]).reshape(
+        spec["shape"]
+    )
 
 
 def _encode_outputs(outputs: Sequence[mx.array]) -> list[dict[str, Any]]:

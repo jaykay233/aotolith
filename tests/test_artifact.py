@@ -137,9 +137,10 @@ def test_artifact_rejects_incompatible_abi(tmp_path: Path) -> None:
     artifact_path = compile_module(model, (value,)).save(tmp_path / "abi.aoto")
     tampered_path = tmp_path / "tampered.aoto"
 
-    with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
-        tampered_path, "w"
-    ) as destination:
+    with (
+        zipfile.ZipFile(artifact_path) as source,
+        zipfile.ZipFile(tampered_path, "w") as destination,
+    ):
         for name in source.namelist():
             payload = source.read(name)
             if name == "manifest.json":
@@ -189,9 +190,7 @@ def test_artifact_writes_aliased_state_once(tmp_path: Path) -> None:
 
     artifact_path = compiled.save(tmp_path / "tied.aoto")
     with zipfile.ZipFile(artifact_path) as archive:
-        state_files = [
-            name for name in archive.namelist() if name.startswith("state/")
-        ]
+        state_files = [name for name in archive.namelist() if name.startswith("state/")]
         manifest = json.loads(archive.read("manifest.json"))
 
     assert len(state_files) == 1
@@ -239,9 +238,10 @@ def test_artifact_rejects_a_keyword_input_that_does_not_match_the_graph(
     }
     for name, (mutate, message) in cases.items():
         tampered_path = tmp_path / f"kwargs-{name}.aoto"
-        with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
-            tampered_path, "w"
-        ) as destination:
+        with (
+            zipfile.ZipFile(artifact_path) as source,
+            zipfile.ZipFile(tampered_path, "w") as destination,
+        ):
             for entry_name in source.namelist():
                 payload = source.read(entry_name)
                 if entry_name == "manifest.json":
@@ -276,9 +276,10 @@ def test_artifact_loads_the_previous_abi_layout(tmp_path: Path) -> None:
     artifact_path = compile_module(model, (value,)).save(tmp_path / "full.aoto")
     old_path = tmp_path / "abi-1.2.aoto"
 
-    with zipfile.ZipFile(artifact_path) as source, zipfile.ZipFile(
-        old_path, "w"
-    ) as destination:
+    with (
+        zipfile.ZipFile(artifact_path) as source,
+        zipfile.ZipFile(old_path, "w") as destination,
+    ):
         for name in source.namelist():
             payload = source.read(name)
             if name == "manifest.json":
@@ -431,9 +432,10 @@ def _rewrite_artifact(
     destination_path: Path,
     replacements: dict[str, bytes],
 ) -> None:
-    with zipfile.ZipFile(source_path) as source, zipfile.ZipFile(
-        destination_path, "w"
-    ) as destination:
+    with (
+        zipfile.ZipFile(source_path) as source,
+        zipfile.ZipFile(destination_path, "w") as destination,
+    ):
         for name in source.namelist():
             payload = replacements.get(name, source.read(name))
             destination.writestr(name, payload)

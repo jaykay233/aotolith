@@ -140,23 +140,15 @@ class CompiledModulePlan:
             verify_index_bounds=verify_index_bounds,
         )
 
-    def _tensor_kwarg_values(
-        self, supplied: Mapping[str, Any]
-    ) -> tuple[Any, ...]:
+    def _tensor_kwarg_values(self, supplied: Mapping[str, Any]) -> tuple[Any, ...]:
         """Return the promoted keyword inputs in graph order."""
 
-        missing = [
-            name for name in self.tensor_kwarg_names if name not in supplied
-        ]
+        missing = [name for name in self.tensor_kwarg_names if name not in supplied]
         if missing:
-            raise ValueError(
-                "missing tensor keyword inputs: " + ", ".join(missing)
-            )
+            raise ValueError("missing tensor keyword inputs: " + ", ".join(missing))
         unexpected = sorted(set(supplied) - set(self.tensor_kwarg_names))
         if unexpected:
-            raise ValueError(
-                "unexpected keyword inputs: " + ", ".join(unexpected)
-            )
+            raise ValueError("unexpected keyword inputs: " + ", ".join(unexpected))
         values: list[Any] = []
         for name, template in zip(
             self.tensor_kwarg_names, self._kwarg_templates(), strict=True
@@ -178,8 +170,7 @@ class CompiledModulePlan:
             return self.tensor_kwarg_templates
         if self.tensor_kwarg_templates:
             raise ValueError(
-                "tensor keyword templates do not match the tensor keyword "
-                "names"
+                "tensor keyword templates do not match the tensor keyword names"
             )
         return tuple(_KwargLeaf() for _ in self.tensor_kwarg_names)
 
@@ -396,9 +387,7 @@ def _compile_module_graph(
 
     def functional_forward(*args: Any) -> Any:
         inputs = tuple(args[:input_count])
-        bound_state = dict(
-            zip(state_names, args[forward_input_count:], strict=True)
-        )
+        bound_state = dict(zip(state_names, args[forward_input_count:], strict=True))
         call_kwargs = dict(static_kwargs)
         promoted = iter(args[input_count:forward_input_count])
         for name, template in zip(
@@ -433,9 +422,7 @@ def _compile_module_graph(
         autotune=autotune,
         autotune_warmup=autotune_warmup,
         autotune_iterations=autotune_iterations,
-        autotune_inputs=(
-            traced_inputs + state_values if autotune else None
-        ),
+        autotune_inputs=(traced_inputs + state_values if autotune else None),
     )
     bound_values = _unique_mlx_state((*state_values, *constants))
     return CompiledModulePlan(
@@ -533,20 +520,13 @@ def _build_kwarg_value(node: Any, values: Iterator[Any]) -> Any:
             return node.factory(*items)
         return items if node.kind == _KWARG_LIST else tuple(items)
     if isinstance(node, _KwargMapping):
-        return {
-            key: _build_kwarg_value(child, values)
-            for key, child in node.items
-        }
+        return {key: _build_kwarg_value(child, values) for key, child in node.items}
     if isinstance(node, _KwargStatic):
         return node.value
-    raise TypeError(
-        f"unknown keyword template {type(node).__name__}"
-    )
+    raise TypeError(f"unknown keyword template {type(node).__name__}")
 
 
-def _collect_kwarg_tensors(
-    node: Any, value: Any, sink: list[Any], where: str
-) -> None:
+def _collect_kwarg_tensors(node: Any, value: Any, sink: list[Any], where: str) -> None:
     """Append the tensors inside one supplied keyword value, in graph order.
 
     The supplied value has to mirror the traced nesting exactly: same container
@@ -581,25 +561,20 @@ def _collect_kwarg_tensors(
         expected = [key for key, _ in node.items]
         if list(value) != expected:
             raise ValueError(
-                f"{where} expected a mapping with keys {expected}, got "
-                f"{list(value)}"
+                f"{where} expected a mapping with keys {expected}, got {list(value)}"
             )
         for key, child in node.items:
             _collect_kwarg_tensors(child, value[key], sink, f"{where}[{key!r}]")
         return
     if isinstance(node, _KwargStatic):
-        if type(value) is not type(node.value) or not _values_match(
-            value, node.value
-        ):
+        if type(value) is not type(node.value) or not _values_match(value, node.value):
             raise ValueError(
                 f"{where} is not a tensor, so it was captured as a constant "
                 f"while tracing ({node.value!r}); pass the traced value back "
                 "or compile again with the value you need"
             )
         return
-    raise TypeError(
-        f"unknown keyword template {type(node).__name__}"
-    )
+    raise TypeError(f"unknown keyword template {type(node).__name__}")
 
 
 def _values_match(left: Any, right: Any) -> bool:
@@ -645,8 +620,7 @@ def _kwarg_template_from_paths(
         if any(len(path) == depth for path in members):
             if len(members) != 1:
                 raise ValueError(
-                    "artifact keyword path mixes a tensor leaf with nested "
-                    "tensors"
+                    "artifact keyword path mixes a tensor leaf with nested tensors"
                 )
             return _KwargLeaf()
         kind = members[0][depth][0]
@@ -655,9 +629,7 @@ def _kwarg_template_from_paths(
             for path in members:
                 step_kind, key = path[depth]
                 if step_kind != _KWARG_DICT:
-                    raise ValueError(
-                        "artifact keyword path changes container kind"
-                    )
+                    raise ValueError("artifact keyword path changes container kind")
                 grouped.setdefault(key, []).append(path)
             return _KwargMapping(
                 tuple(
@@ -666,31 +638,20 @@ def _kwarg_template_from_paths(
                 )
             )
         if kind not in (_KWARG_LIST, _KWARG_TUPLE):
-            raise ValueError(
-                f"artifact keyword path has unknown container {kind!r}"
-            )
+            raise ValueError(f"artifact keyword path has unknown container {kind!r}")
         indexed: dict[int, list[Sequence[tuple[str, Any]]]] = {}
         for path in members:
             step_kind, key = path[depth]
             if step_kind != kind:
-                raise ValueError(
-                    "artifact keyword path changes container kind"
-                )
+                raise ValueError("artifact keyword path changes container kind")
             if not isinstance(key, int) or isinstance(key, bool):
-                raise ValueError(
-                    "artifact keyword path has a non-integer index"
-                )
+                raise ValueError("artifact keyword path has a non-integer index")
             indexed.setdefault(key, []).append(path)
         if sorted(indexed) != list(range(len(indexed))):
-            raise ValueError(
-                "artifact keyword path skips a container index"
-            )
+            raise ValueError("artifact keyword path skips a container index")
         return _KwargSequence(
             kind,
-            tuple(
-                build(depth + 1, indexed[index])
-                for index in range(len(indexed))
-            ),
+            tuple(build(depth + 1, indexed[index]) for index in range(len(indexed))),
         )
 
     if not paths:
@@ -750,7 +711,6 @@ def _contains_tensor(value: Any) -> bool:
     return contains(value)
 
 
-
 def _select_module_output(output: Any, output_key: str | None) -> Any:
     try:
         import torch
@@ -783,8 +743,7 @@ def _select_module_output(output: Any, output_key: str | None) -> Any:
             isinstance(value, torch.Tensor) for value in selected
         ):
             raise ValueError(
-                "module sequence outputs must be a non-empty tuple or list "
-                "of tensors"
+                "module sequence outputs must be a non-empty tuple or list of tensors"
             )
         return tuple(selected)
     if not isinstance(selected, torch.Tensor):

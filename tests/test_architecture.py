@@ -2,8 +2,8 @@
 
 Each module sits at a numbered layer, and a module may only import from a
 strictly lower one. This is what keeps a layer reachable on its own: the point
-of the check is not tidiness, it is that ``op_defs`` can be imported without
-pulling in the graph rewriter, and the backend can be imported without pulling
+of the check is not tidiness, it is that the contract table can be imported
+without pulling in the graph rewriter, and the backend can be imported without pulling
 in what the rewrite pipeline happens to look like today.
 
 The layers here are the compiler's own, not the eventual package layout. When
@@ -33,10 +33,19 @@ LAYERS: dict[str, int] = {
     "ir.types": 0,
     "ir.op": 1,  # Operation, built from types
     "ir.graph": 2,  # Graph, built from both
+    "ir.ops": 3,  # the contract table, over the whole IR
+    "ir.ops.rules": 3,
+    "ir.ops.shared": 3,
+    "ir.ops.view": 3,
+    "ir.ops.constants": 3,
+    "ir.ops.reduction": 3,
+    "ir.ops.elementwise": 3,
+    "ir.ops.indexing": 3,
+    "ir.ops.kernels": 3,
+    "ir.ops.table": 4,  # assembles every family
     "selection": 0,
     "_version": 0,
     # Facts about the operator set, expressed in terms of the IR types.
-    "op_defs": 1,
     "planning": 1,
     # Graph rewriting: knows operators and the IR, not the backend.
     "passes": 1,
@@ -63,9 +72,18 @@ MODULE_PATHS = {
     "ir.types": "ir/types.py",
     "ir.op": "ir/op.py",
     "ir.graph": "ir/graph.py",
+    "ir.ops": "ir/ops/__init__.py",
+    "ir.ops.rules": "ir/ops/rules.py",
+    "ir.ops.shared": "ir/ops/shared.py",
+    "ir.ops.view": "ir/ops/view.py",
+    "ir.ops.constants": "ir/ops/constants.py",
+    "ir.ops.reduction": "ir/ops/reduction.py",
+    "ir.ops.elementwise": "ir/ops/elementwise.py",
+    "ir.ops.indexing": "ir/ops/indexing.py",
+    "ir.ops.kernels": "ir/ops/kernels.py",
+    "ir.ops.table": "ir/ops/table.py",
     "selection": "selection.py",
     "_version": "_version.py",
-    "op_defs": "op_defs.py",
     "planning": "planning.py",
     "passes": "passes.py",
     "decompose": "decompose.py",
@@ -142,10 +160,15 @@ def test_every_module_in_the_table_exists() -> None:
 
 
 def test_the_operator_registry_does_not_import_the_pass_pipeline() -> None:
-    # This was a real backwards edge: op_defs read POINTWISE_OPS out of
-    # passes.py to build its default contracts.
-    imported = _module_level_imports(MODULE_PATHS["op_defs"])
-    assert "passes" not in imported
+    # This was a real backwards edge: the contract table read POINTWISE_OPS out
+    # of passes.py to build its default contracts. Now no module under ir/ops
+    # reaches for a rewrite.
+    for module in ("ir.ops.table", "ir.ops.rules", "ir.ops.reduction"):
+        imported = _module_level_imports(MODULE_PATHS[module])
+        assert "passes" not in imported
+        assert not any(
+            name == "passes" or name.startswith("passes.") for name in imported
+        )
 
 
 def test_the_backend_does_not_import_the_pass_pipeline() -> None:

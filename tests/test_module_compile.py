@@ -48,9 +48,7 @@ def test_compile_module_binds_registered_buffer_and_does_not_retain_module() -> 
     class BufferModule(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.register_buffer(
-                "offset", torch.arange(4, dtype=torch.float32)
-            )
+            self.register_buffer("offset", torch.arange(4, dtype=torch.float32))
 
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return value + self.offset
@@ -384,7 +382,9 @@ def test_inplace_scatter_returns_the_update_without_writing_back() -> None:
     compiled = compile_callable(forward, (value, indices, update))
 
     actual = _run_single_output(compiled, value, indices, update)
-    assert mx.allclose(actual, mx.array(forward(value.clone(), indices, update).numpy()))
+    assert mx.allclose(
+        actual, mx.array(forward(value.clone(), indices, update).numpy())
+    )
     # SSA legalization returns the updated value; the tensor the caller still
     # holds is untouched, which the documentation states explicitly.
     assert mx.array_equal(mx.array(value.numpy()), mx.zeros(3))
@@ -417,12 +417,8 @@ def test_tiny_huggingface_llama_logits_match_pytorch() -> None:
         codegen_matmul=True,
         codegen_attention=True,
     )
-    assert {"matmul", "attention"} <= {
-        kernel.kind for kernel in compiled.plan.kernels
-    }
-    assert {"cumsum", "index"} <= {
-        op.op for op in compiled.input_graph.ops
-    }
+    assert {"matmul", "attention"} <= {kernel.kind for kernel in compiled.plan.kernels}
+    assert {"cumsum", "index"} <= {op.op for op in compiled.input_graph.ops}
 
     del model
     gc.collect()
@@ -537,9 +533,7 @@ def test_huggingface_llama_compiles_with_the_default_cache_setting() -> None:
 
 def test_compile_module_supports_multiple_tensor_outputs() -> None:
     class MultiOutputModule(torch.nn.Module):
-        def forward(
-            self, value: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        def forward(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return value + 1, value * 2
 
     module = MultiOutputModule().eval()
@@ -568,9 +562,7 @@ class _MaskedScaleModule(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.randn(8, 8).to(torch.bfloat16)
-        )
+        self.weight = torch.nn.Parameter(torch.randn(8, 8).to(torch.bfloat16))
 
     def forward(
         self,
@@ -843,8 +835,7 @@ def test_nested_tensor_keywords_survive_an_artifact_round_trip(
     artifact = compiled.save(tmp_path / "paired.aoto")
     manifest = read_artifact_manifest(artifact)
     assert [
-        (entry["name"], entry["path"])
-        for entry in manifest["entrypoint"]["kwargs"]
+        (entry["name"], entry["path"]) for entry in manifest["entrypoint"]["kwargs"]
     ] == [
         ("position_embeddings", [["tuple", 0]]),
         ("position_embeddings", [["tuple", 1]]),

@@ -12,9 +12,7 @@ class TinyCliModule(torch.nn.Module):
                 dtype=torch.float32,
             )
         )
-        self.bias = torch.nn.Parameter(
-            torch.tensor([0.25, -0.5], dtype=torch.float32)
-        )
+        self.bias = torch.nn.Parameter(torch.tensor([0.25, -0.5], dtype=torch.float32))
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return torch.relu(value @ self.weight + self.bias)
@@ -35,9 +33,7 @@ class MaskedCliModule(torch.nn.Module):
                 dtype=torch.float32,
             )
         )
-        self.bias = torch.nn.Parameter(
-            torch.tensor([0.25, -0.5], dtype=torch.float32)
-        )
+        self.bias = torch.nn.Parameter(torch.tensor([0.25, -0.5], dtype=torch.float32))
 
     def forward(
         self, value: torch.Tensor, mask: torch.Tensor | None = None

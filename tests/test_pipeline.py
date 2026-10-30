@@ -154,9 +154,7 @@ def test_single_token_mlp_pairs_gate_and_up_into_one_projection() -> None:
     )
     result = compile_callable(mlp, torch_inputs, codegen_matmul=True)
     assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
-    assert (
-        result.lowered_graph.ops[0].attrs.get("epilogue") == "silu_mul_paired"
-    )
+    assert result.lowered_graph.ops[0].attrs.get("epilogue") == "silu_mul_paired"
 
     inputs = tuple(mx.array(value.numpy()) for value in torch_inputs)
     actual = result.plan(*inputs)[0]
@@ -310,9 +308,7 @@ def test_comparison_ops_produce_metal_boolean_outputs(op_name) -> None:
     assert mx.array_equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_boolean_predicates_and_where_fuse_into_one_kernel(dtype) -> None:
     def fn(left, right, enabled):
         condition = (left > right) & (left < 0.5)
@@ -419,11 +415,11 @@ def test_bitwise_boolean_scalars_fuse_with_numeric_selection() -> None:
     torch.manual_seed(19)
     value = torch.randn(29)
     result = compile_callable(fn, (value,))
-    assert [
-        op.op
-        for op in result.input_graph.ops
-        if op.op.startswith("bitwise_")
-    ] == ["bitwise_and", "bitwise_or", "bitwise_xor"]
+    assert [op.op for op in result.input_graph.ops if op.op.startswith("bitwise_")] == [
+        "bitwise_and",
+        "bitwise_or",
+        "bitwise_xor",
+    ]
     assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
     assert len(result.plan.kernels) == 1
 
@@ -448,9 +444,7 @@ def test_isnan_and_isinf_fuse_into_boolean_output() -> None:
     assert mx.array_equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_masked_fill_lowers_broadcast_boolean_mask(dtype) -> None:
     def fn(value, mask):
         return value.masked_fill(mask, float("-inf"))
@@ -697,9 +691,7 @@ def test_common_subexpression_elimination_rewrites_fused_region_boundaries() -> 
     torch.manual_seed(46)
     inputs = (torch.randn(2, 3), torch.randn(3, 4), torch.randn(4))
     actual = result.plan(*(mx.array(value.numpy()) for value in inputs))
-    projected = mx.matmul(
-        mx.array(inputs[0].numpy()), mx.array(inputs[1].numpy())
-    )
+    projected = mx.matmul(mx.array(inputs[0].numpy()), mx.array(inputs[1].numpy()))
     expected = projected / (1.0 + mx.exp(-projected)) * mx.array(inputs[2].numpy())
     mx.eval(*actual, expected)
     assert actual[0] is actual[1]
@@ -763,13 +755,7 @@ def test_layout_ops_match_pytorch() -> None:
 
 def test_identity_and_inverse_layouts_are_eliminated() -> None:
     def fn(x):
-        return (
-            x.reshape(2, 3)
-            .transpose(0, 1)
-            .transpose(0, 1)
-            .reshape(3, 2)
-            .clone()
-        )
+        return x.reshape(2, 3).transpose(0, 1).transpose(0, 1).reshape(3, 2).clone()
 
     x = torch.randn(2, 3)
     result = compile_callable(fn, (x,))
@@ -906,9 +892,7 @@ def test_embedding_uses_mlx_gather_without_a_kernel(index_dtype) -> None:
     assert mx.array_equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("dim", "index_dtype"), [(1, torch.int64), (-1, torch.int32)]
-)
+@pytest.mark.parametrize(("dim", "index_dtype"), [(1, torch.int64), (-1, torch.int32)])
 def test_index_select_uses_mlx_gather_without_a_kernel(dim, index_dtype) -> None:
     def fn(source, indices):
         return torch.index_select(source, dim=dim, index=indices)
@@ -956,9 +940,7 @@ def test_deferred_bounds_checks_cover_every_lookup() -> None:
     right = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     left_indices = torch.tensor([0, 3], dtype=torch.int64)
     right_indices = torch.tensor([0, 1], dtype=torch.int64)
-    result = compile_callable(
-        fn, (left, left_indices, right, right_indices)
-    )
+    result = compile_callable(fn, (left, left_indices, right, right_indices))
 
     valid_inputs = (left, left_indices, right, right_indices)
     actual = result.plan(*(_torch_to_mlx(value) for value in valid_inputs))[0]
@@ -988,9 +970,7 @@ def test_deferred_bounds_checks_reduce_before_combining() -> None:
     right = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     left_indices = torch.tensor([0, 2, 1], dtype=torch.int64)
     right_indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-    result = compile_callable(
-        fn, (left, left_indices, right, right_indices)
-    )
+    result = compile_callable(fn, (left, left_indices, right, right_indices))
 
     valid = (left, left_indices, right, right_indices)
     outputs = result.plan(*(_torch_to_mlx(value) for value in valid))
@@ -1134,9 +1114,7 @@ def test_scatter_does_not_mutate_the_input_tensor() -> None:
     source_mlx = _torch_to_mlx(source)
     original = _torch_to_mlx(source)
 
-    actual = result.plan(
-        source_mlx, _torch_to_mlx(indices), _torch_to_mlx(update)
-    )[0]
+    actual = result.plan(source_mlx, _torch_to_mlx(indices), _torch_to_mlx(update))[0]
     mx.eval(actual, source_mlx, original)
     assert mx.array_equal(source_mlx, original)
     assert mx.array_equal(actual, _torch_to_mlx(fn(source, indices, update)))
@@ -1155,9 +1133,7 @@ def test_scatter_rejects_out_of_range_indices(invalid) -> None:
     with pytest.raises(IndexError, match="index out of range"):
         result.plan(
             source_mlx,
-            _torch_to_mlx(
-                torch.tensor([invalid, [0, 1]], dtype=torch.int64)
-            ),
+            _torch_to_mlx(torch.tensor([invalid, [0, 1]], dtype=torch.int64)),
         )
 
 
@@ -1969,9 +1945,7 @@ def test_reduction_family_matches_pytorch(fn, shape, op_name) -> None:
     result = compile_callable(fn, (x,))
     assert [op.op for op in result.lowered_graph.ops] == [op_name]
     assert result.plan.kernels == ()
-    assert [selection.implementation for selection in result.plan.selections] == [
-        "mlx"
-    ]
+    assert [selection.implementation for selection in result.plan.selections] == ["mlx"]
 
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(fn(x).numpy())
@@ -2095,9 +2069,7 @@ def test_sort_emits_only_the_selection_the_graph_reads() -> None:
     torch.manual_seed(58)
     x = torch.randn(3, 5)
 
-    values_only = compile_callable(
-        lambda value: torch.sort(value, dim=-1).values, (x,)
-    )
+    values_only = compile_callable(lambda value: torch.sort(value, dim=-1).values, (x,))
     assert [op.op for op in values_only.lowered_graph.ops] == ["sort"]
 
     indices_only = compile_callable(
@@ -2117,9 +2089,7 @@ def test_sort_orders_nan_like_pytorch() -> None:
             (x,),
         )
         actual = result.plan(mx.array(x.numpy()))[0]
-        expected = mx.array(
-            torch.sort(x, dim=-1, descending=descending).values.numpy()
-        )
+        expected = mx.array(torch.sort(x, dim=-1, descending=descending).values.numpy())
         mx.eval(actual, expected)
         same = mx.equal(actual, expected) | (mx.isnan(actual) & mx.isnan(expected))
         assert bool(mx.all(same))
@@ -2203,15 +2173,13 @@ def test_extremum_with_dim_matches_pytorch(reduction, dim, keepdim) -> None:
     reference = getattr(torch, reduction)(x, dim=dim, keepdim=keepdim)
 
     values = compile_callable(
-        lambda value: getattr(torch, reduction)(
-            value, dim=dim, keepdim=keepdim
-        ).values,
+        lambda value: getattr(torch, reduction)(value, dim=dim, keepdim=keepdim).values,
         (x,),
     )
     indices = compile_callable(
-        lambda value: getattr(torch, reduction)(
-            value, dim=dim, keepdim=keepdim
-        ).indices,
+        lambda value: (
+            getattr(torch, reduction)(value, dim=dim, keepdim=keepdim).indices
+        ),
         (x,),
     )
     assert [op.op for op in values.lowered_graph.ops] == [f"a{reduction}"]
@@ -2283,9 +2251,7 @@ def test_extremum_without_dim_reduces_every_axis() -> None:
     torch.manual_seed(64)
     x = torch.randn(3, 4, 2)
     for reduction in ("max", "min"):
-        result = compile_callable(
-            lambda value: getattr(torch, reduction)(value), (x,)
-        )
+        result = compile_callable(lambda value: getattr(torch, reduction)(value), (x,))
         assert [op.op for op in result.lowered_graph.ops] == [f"a{reduction}"]
         actual = result.plan(mx.array(x.numpy()))[0]
         mx.eval(actual)
@@ -2368,10 +2334,13 @@ def test_variance_uses_population_correction_when_asked() -> None:
         assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize("fn", [
-    lambda value: torch.var(value, -1),
-    lambda value: torch.std(value, -1),
-])
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda value: torch.var(value, -1),
+        lambda value: torch.std(value, -1),
+    ],
+)
 def test_variance_supports_low_precision(fn) -> None:
     torch.manual_seed(64)
     x = torch.randn(2, 6, dtype=torch.float16)
@@ -2553,9 +2522,7 @@ def test_diagonal_matches_pytorch(shape, offset, dim1, dim2) -> None:
 
 def test_diagonal_reads_the_expected_elements() -> None:
     source = mx.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    result = compile_callable(
-        lambda value: torch.diagonal(value), (torch.zeros(2, 3),)
-    )
+    result = compile_callable(lambda value: torch.diagonal(value), (torch.zeros(2, 3),))
     mx.eval(result.plan(source))
     assert result.plan(source)[0].tolist() == [1.0, 5.0]
     shifted = compile_callable(
@@ -2566,9 +2533,7 @@ def test_diagonal_reads_the_expected_elements() -> None:
 
 def test_diagonal_rejects_an_offset_with_no_elements() -> None:
     with pytest.raises(NotImplementedError, match="no elements"):
-        compile_callable(
-            lambda value: torch.diagonal(value, 4), (torch.randn(3, 3),)
-        )
+        compile_callable(lambda value: torch.diagonal(value, 4), (torch.randn(3, 3),))
 
 
 def test_masked_fill_with_a_tensor_value_lowers_to_where() -> None:
@@ -2603,11 +2568,12 @@ def test_masked_fill_with_a_tensor_value_lowers_to_where() -> None:
 def test_repeat_and_tile_lower_to_layout_operations(shape, repeats) -> None:
     torch.manual_seed(65)
     x = torch.randn(shape)
-    for fn in (lambda value: value.repeat(*repeats), lambda value: value.tile(*repeats)):
+    for fn in (
+        lambda value: value.repeat(*repeats),
+        lambda value: value.tile(*repeats),
+    ):
         result = compile_callable(fn, (x,))
-        assert all(
-            op.op in {"reshape", "expand"} for op in result.lowered_graph.ops
-        )
+        assert all(op.op in {"reshape", "expand"} for op in result.lowered_graph.ops)
         actual = result.plan(mx.array(x.numpy()))[0]
         expected = mx.array(fn(x).numpy())
         mx.eval(actual, expected)
@@ -2670,9 +2636,7 @@ def test_vector_norm_folds_into_functional_normalize() -> None:
     ]
     assert result.lowered_graph.ops[0].attrs["ord"] == 2.0
     actual = result.plan(mx.array(x.numpy()))[0]
-    expected = mx.array(
-        torch.nn.functional.normalize(x, dim=-1, eps=1e-9).numpy()
-    )
+    expected = mx.array(torch.nn.functional.normalize(x, dim=-1, eps=1e-9).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -3015,9 +2979,7 @@ def test_direct_scaled_dot_product_attention_explicit_scale() -> None:
 
 
 @pytest.mark.parametrize("codegen_attention", [False, True])
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_direct_scaled_dot_product_attention_distinct_value_head_dim(
     codegen_attention, dtype
 ) -> None:
@@ -3037,9 +2999,7 @@ def test_direct_scaled_dot_product_attention_distinct_value_head_dim(
         torch.randn(2, 2, 4, 6, dtype=dtype),
         torch.randn(2, 1, 3, 4, dtype=dtype) * 0.2,
     )
-    result = compile_callable(
-        fn, inputs, codegen_attention=codegen_attention
-    )
+    result = compile_callable(fn, inputs, codegen_attention=codegen_attention)
 
     input_ops = [op.op for op in result.input_graph.ops]
     assert input_ops.count("mul") == 2
@@ -3065,9 +3025,7 @@ def test_direct_scaled_dot_product_attention_distinct_value_head_dim(
 
 
 @pytest.mark.parametrize("codegen_attention", [False, True])
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_attention_zeroes_fully_masked_rows(codegen_attention, dtype) -> None:
     def fn(query, key, value, mask):
         return torch.nn.functional.scaled_dot_product_attention(
@@ -3081,9 +3039,7 @@ def test_attention_zeroes_fully_masked_rows(codegen_attention, dtype) -> None:
         torch.randn(2, 2, 4, 6, dtype=dtype),
         torch.full((2, 1, 3, 4), -torch.inf, dtype=dtype),
     )
-    result = compile_callable(
-        fn, inputs, codegen_attention=codegen_attention
-    )
+    result = compile_callable(fn, inputs, codegen_attention=codegen_attention)
     assert "safe_softmax" in [op.op for op in result.input_graph.ops]
     assert result.lowered_graph.ops[0].attrs["safe_softmax"] is True
 
@@ -3109,9 +3065,7 @@ def test_attention_preserves_explicit_low_precision_cast(codegen_attention) -> N
         torch.randn(2, 3, 5, 8, dtype=torch.float16),
         torch.randn(2, 3, 5, 6, dtype=torch.float16),
     )
-    result = compile_callable(
-        fn, inputs, codegen_attention=codegen_attention
-    )
+    result = compile_callable(fn, inputs, codegen_attention=codegen_attention)
 
     lowered_ops = result.lowered_graph.ops
     assert [op.op for op in lowered_ops] == ["cast", "cast", "cast", "attention"]
@@ -3140,9 +3094,7 @@ def test_attention_preserves_explicit_float32_compute(codegen_attention) -> None
         torch.randn(2, 3, 5, 8, dtype=torch.float16),
         torch.randn(2, 3, 5, 6, dtype=torch.float16),
     )
-    result = compile_callable(
-        fn, inputs, codegen_attention=codegen_attention
-    )
+    result = compile_callable(fn, inputs, codegen_attention=codegen_attention)
 
     lowered_ops = result.lowered_graph.ops
     assert [op.op for op in lowered_ops] == ["cast", "cast", "cast", "attention"]
@@ -3258,6 +3210,7 @@ def test_native_attention_uses_tensor_core_when_query_tile_fits(
     dtype, tolerance
 ) -> None:
     _require_tensor_cores()
+
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(query, key, value)
 
@@ -3289,6 +3242,7 @@ def test_native_attention_uses_tensor_core_when_query_tile_fits(
 
 def test_native_attention_tensor_core_grouped_query_with_mask() -> None:
     _require_tensor_cores()
+
     def fn(query, key, value, mask):
         return torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=mask, enable_gqa=True
@@ -3404,6 +3358,7 @@ def test_native_attention_drops_the_key_clamp_for_cross_attention() -> None:
 )
 def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> None:
     _require_tensor_cores()
+
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(
             query,
@@ -3413,9 +3368,7 @@ def test_native_attention_uses_long_sequence_query_tile(dtype, tolerance) -> Non
         )
 
     torch.manual_seed(67)
-    inputs = tuple(
-        torch.randn(1, 1, 769, 128, dtype=dtype) for _ in range(3)
-    )
+    inputs = tuple(torch.randn(1, 1, 769, 128, dtype=dtype) for _ in range(3))
     result = compile_callable(fn, inputs, codegen_attention=True)
     kernel = result.plan.kernels[0]
     source = kernel.source
@@ -3923,10 +3876,7 @@ def test_native_decode_attention_launches_one_threadgroup_per_head(
         expected = (weights @ reference_value).to(torch.float32)
 
         actual = result.plan(
-            *(
-                mx.array(tensor.numpy())
-                for tensor in (query, key, value, mask)
-            )
+            *(mx.array(tensor.numpy()) for tensor in (query, key, value, mask))
         )[0]
         mx.eval(actual)
         assert mx.isfinite(actual).all().item()
@@ -3956,12 +3906,16 @@ def test_decomposed_grouped_query_attention_is_fused(key_value_heads) -> None:
     def fn(query, key, value):
         batch, query_heads, sequence, head_dim = query.shape
         groups = query_heads // key_value_heads
-        key = key[:, :, None].expand(
-            batch, key_value_heads, groups, sequence, head_dim
-        ).reshape(batch, query_heads, sequence, head_dim)
-        value = value[:, :, None].expand(
-            batch, key_value_heads, groups, sequence, head_dim
-        ).reshape(batch, query_heads, sequence, head_dim)
+        key = (
+            key[:, :, None]
+            .expand(batch, key_value_heads, groups, sequence, head_dim)
+            .reshape(batch, query_heads, sequence, head_dim)
+        )
+        value = (
+            value[:, :, None]
+            .expand(batch, key_value_heads, groups, sequence, head_dim)
+            .reshape(batch, query_heads, sequence, head_dim)
+        )
         scores = torch.matmul(query, key.transpose(-2, -1)) * (head_dim**-0.5)
         probabilities = torch.softmax(scores, dim=-1)
         return torch.matmul(probabilities, value)
@@ -4058,9 +4012,15 @@ def test_multi_head_attention_end_to_end_on_metal() -> None:
     actual = result.plan(*mlx_inputs)[0]
     query, key, value = mlx_inputs
     batch, sequence, heads, head_dim = query.shape
-    query = mx.reshape(mx.transpose(query, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
-    key = mx.reshape(mx.transpose(key, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
-    value = mx.reshape(mx.transpose(value, (0, 2, 1, 3)), (batch * heads, sequence, head_dim))
+    query = mx.reshape(
+        mx.transpose(query, (0, 2, 1, 3)), (batch * heads, sequence, head_dim)
+    )
+    key = mx.reshape(
+        mx.transpose(key, (0, 2, 1, 3)), (batch * heads, sequence, head_dim)
+    )
+    value = mx.reshape(
+        mx.transpose(value, (0, 2, 1, 3)), (batch * heads, sequence, head_dim)
+    )
     scores = mx.matmul(query, mx.swapaxes(key, 1, 2)) / (head_dim**0.5)
     probabilities = mx.softmax(scores, axis=-1)
     expected = mx.matmul(probabilities, value)
@@ -4081,9 +4041,7 @@ def test_two_layer_decoder_transformer_end_to_end_on_metal() -> None:
     sequence_length = 5
 
     def rms_norm(value, weight):
-        return torch.nn.functional.rms_norm(
-            value, (hidden_size,), weight, eps=1e-6
-        )
+        return torch.nn.functional.rms_norm(value, (hidden_size,), weight, eps=1e-6)
 
     def apply_rope(value, cosine, sine):
         half = value.shape[-1] // 2
@@ -4109,9 +4067,9 @@ def test_two_layer_decoder_transformer_end_to_end_on_metal() -> None:
         query = query.reshape(
             batch_size, sequence_length, num_heads, head_dim
         ).transpose(1, 2)
-        key = key.reshape(
-            batch_size, sequence_length, num_heads, head_dim
-        ).transpose(1, 2)
+        key = key.reshape(batch_size, sequence_length, num_heads, head_dim).transpose(
+            1, 2
+        )
         attention_value = attention_value.reshape(
             batch_size, sequence_length, num_heads, head_dim
         ).transpose(1, 2)
@@ -4154,9 +4112,9 @@ def test_two_layer_decoder_transformer_end_to_end_on_metal() -> None:
         torch.randn(hidden_size, vocabulary_size),
     ]
 
-    frequencies = torch.arange(
-        sequence_length, dtype=torch.float32
-    )[:, None] / torch.pow(
+    frequencies = torch.arange(sequence_length, dtype=torch.float32)[
+        :, None
+    ] / torch.pow(
         torch.tensor(10000.0),
         torch.arange(0, head_dim, 2, dtype=torch.float32)[None, :] / head_dim,
     )
@@ -4384,7 +4342,9 @@ def test_activation_folds_through_reshape_chain() -> None:
     result = compile_callable(mlp, inputs, codegen_matmul=True)
     lowered = [op.op for op in result.lowered_graph.ops]
     assert "fused_elementwise" not in lowered
-    assert any(op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops)
+    assert any(
+        op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops
+    )
 
     actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
     expected = mx.array(mlp(*inputs).numpy())
@@ -4506,9 +4466,7 @@ def test_non_adjacent_advanced_indexing_matches_pytorch(fn) -> None:
     expected = fn(sample, a, b)
     result = compile_callable(fn, (sample, a, b))
     assert "index" in [op.op for op in result.lowered_graph.ops]
-    actual = result.plan(_torch_to_mlx(sample), _torch_to_mlx(a), _torch_to_mlx(b))[
-        0
-    ]
+    actual = result.plan(_torch_to_mlx(sample), _torch_to_mlx(a), _torch_to_mlx(b))[0]
     mx.eval(actual)
     assert actual.shape == tuple(expected.shape)
     assert mx.array_equal(actual, _torch_to_mlx(expected))
@@ -4757,9 +4715,7 @@ def test_sum_accepts_a_none_dim_like_the_decompositions() -> None:
     torch.manual_seed(86)
     x = torch.randn(2, 3, 4)
     for keepdim in (False, True):
-        result = compile_callable(
-            lambda value: torch.sum(value, None, keepdim), (x,)
-        )
+        result = compile_callable(lambda value: torch.sum(value, None, keepdim), (x,))
         actual = result.plan(mx.array(x.numpy()))[0]
         expected = mx.array(torch.sum(x, None, keepdim).numpy())
         mx.eval(actual, expected)
@@ -4879,36 +4835,36 @@ def test_transformer_decoder_block_compiles_and_runs() -> None:
     ):
         batch, sequence, hidden = x.shape
         heads, head_dim = 4, hidden // 4
-        normalized = torch.nn.functional.rms_norm(
-            x, (hidden,), norm_weight, eps=1e-6
+        normalized = torch.nn.functional.rms_norm(x, (hidden,), norm_weight, eps=1e-6)
+        query = (
+            (normalized @ query_weight)
+            .reshape(batch, sequence, heads, head_dim)
+            .transpose(1, 2)
         )
-        query = (normalized @ query_weight).reshape(
-            batch, sequence, heads, head_dim
-        ).transpose(1, 2)
-        key = (normalized @ key_weight).reshape(
-            batch, sequence, heads, head_dim
-        ).transpose(1, 2)
-        value = (normalized @ value_weight).reshape(
-            batch, sequence, heads, head_dim
-        ).transpose(1, 2)
-        scores = torch.matmul(query, key.transpose(-2, -1)) * (
-            head_dim**-0.5
-        ) + causal_mask
+        key = (
+            (normalized @ key_weight)
+            .reshape(batch, sequence, heads, head_dim)
+            .transpose(1, 2)
+        )
+        value = (
+            (normalized @ value_weight)
+            .reshape(batch, sequence, heads, head_dim)
+            .transpose(1, 2)
+        )
+        scores = (
+            torch.matmul(query, key.transpose(-2, -1)) * (head_dim**-0.5) + causal_mask
+        )
         probabilities = torch.softmax(scores, dim=-1)
         attention = torch.matmul(probabilities, value)
         attention = attention.transpose(1, 2).reshape(batch, sequence, hidden)
         x = x + attention @ output_weight
 
-        normalized = torch.nn.functional.rms_norm(
-            x, (hidden,), norm_weight, eps=1e-6
-        )
+        normalized = torch.nn.functional.rms_norm(x, (hidden,), norm_weight, eps=1e-6)
         mlp = torch.nn.functional.silu(normalized @ gate_weight) * (
             normalized @ up_weight
         )
         x = x + mlp @ down_weight
-        return torch.nn.functional.rms_norm(
-            x, (hidden,), norm_weight, eps=1e-6
-        )
+        return torch.nn.functional.rms_norm(x, (hidden,), norm_weight, eps=1e-6)
 
     torch.manual_seed(43)
     batch, sequence, hidden, heads = 2, 6, 16, 4
@@ -4930,7 +4886,9 @@ def test_transformer_decoder_block_compiles_and_runs() -> None:
     assert "softmax" not in lowered_ops
     assert {"matmul", "rms_norm"} <= set(lowered_ops)
     assert "fused_elementwise" not in lowered_ops
-    assert any(op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops)
+    assert any(
+        op.attrs.get("epilogue") == "silu_mul" for op in result.lowered_graph.ops
+    )
 
     mlx_inputs = tuple(mx.array(value.numpy()) for value in inputs)
     actual = result.plan(*mlx_inputs)[0]
@@ -4948,9 +4906,11 @@ def test_transformer_decoder_block_compiles_and_runs() -> None:
     ) = mlx_inputs
 
     def normalized(value):
-        return value * mx.rsqrt(
-            mx.mean(value * value, axis=-1, keepdims=True) + 1e-6
-        ) * norm_weight
+        return (
+            value
+            * mx.rsqrt(mx.mean(value * value, axis=-1, keepdims=True) + 1e-6)
+            * norm_weight
+        )
 
     hidden_state = normalized(x)
     query = mx.transpose(
@@ -4966,8 +4926,7 @@ def test_transformer_decoder_block_compiles_and_runs() -> None:
         (0, 2, 1, 3),
     )
     probabilities = mx.softmax(
-        mx.matmul(query, mx.swapaxes(key, -1, -2)) * (head_dim**-0.5)
-        + causal_mask,
+        mx.matmul(query, mx.swapaxes(key, -1, -2)) * (head_dim**-0.5) + causal_mask,
         axis=-1,
     )
     attention = mx.reshape(
@@ -5254,9 +5213,7 @@ def test_additional_unary_ops_are_generated_as_metal_kernels(
         ),
         (
             "softplus",
-            lambda value: torch.nn.functional.softplus(
-                value, beta=2.0, threshold=10.0
-            ),
+            lambda value: torch.nn.functional.softplus(value, beta=2.0, threshold=10.0),
             "tsc_softplus(",
             {"beta": 2.0, "threshold": 10.0},
         ),
@@ -5506,15 +5463,15 @@ def test_atan2_preserves_signed_zero_and_infinite_quadrants() -> None:
             )
 
 
-@pytest.mark.parametrize("keyword_arguments", [False, True], ids=["positional", "keyword"])
+@pytest.mark.parametrize(
+    "keyword_arguments", [False, True], ids=["positional", "keyword"]
+)
 def test_threshold_matches_pytorch_arguments_and_boundaries(
     keyword_arguments,
 ) -> None:
     def fn(value):
         if keyword_arguments:
-            return torch.ops.aten.threshold.default(
-                value, threshold=0.25, value=-2.0
-            )
+            return torch.ops.aten.threshold.default(value, threshold=0.25, value=-2.0)
         return torch.ops.aten.threshold.default(value, 0.25, -2.0)
 
     value = torch.tensor(
@@ -5589,9 +5546,7 @@ def test_numerical_pointwise_ops_support_low_precision(dtype) -> None:
         *(mx.array(value.float().numpy(), dtype=mlx_dtype) for value in inputs)
     )[0]
     expected = mx.array(
-        _numerical_pointwise_chain(
-            *(value.float() for value in inputs)
-        ).numpy(),
+        _numerical_pointwise_chain(*(value.float() for value in inputs)).numpy(),
         dtype=mlx_dtype,
     )
     mx.eval(actual, expected)
@@ -5804,9 +5759,7 @@ def test_clamp_variants_match_pytorch(mode) -> None:
         fn = lambda value: torch.clamp(value, max=0.0)
         inputs = (x,)
     elif mode == "tensor_bounds":
-        fn = lambda value, lower, upper: torch.clamp(
-            value, min=lower, max=upper
-        )
+        fn = lambda value, lower, upper: torch.clamp(value, min=lower, max=upper)
         inputs = (x, torch.randn(1, 3), torch.randn(2, 1))
     else:
         fn = lambda value: torch.nn.functional.hardtanh(value, -0.5, 0.75)
@@ -5881,9 +5834,7 @@ def test_clamp_propagates_nan(nan_bound) -> None:
 def test_clamp_supports_low_precision(dtype) -> None:
     torch.manual_seed(26)
     x = torch.randn(2, 3, 7, dtype=dtype)
-    result = compile_callable(
-        lambda value: torch.clamp(value, min=-0.5, max=0.5), (x,)
-    )
+    result = compile_callable(lambda value: torch.clamp(value, min=-0.5, max=0.5), (x,))
     mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
     actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
     expected = mx.array(
@@ -5952,9 +5903,7 @@ def test_additional_activations_preserve_signed_zero(activation) -> None:
     for actual_value, expected_value in zip(
         actual_values[:2], expected_values[:2], strict=True
     ):
-        assert math.copysign(1.0, actual_value) == math.copysign(
-            1.0, expected_value
-        )
+        assert math.copysign(1.0, actual_value) == math.copysign(1.0, expected_value)
     assert math.isnan(actual_values[2]) == math.isnan(expected_values[2])
     finite = mx.isfinite(actual) & mx.isfinite(expected)
     assert mx.allclose(
@@ -6373,9 +6322,7 @@ def test_like_and_new_fill_support_integer_outputs() -> None:
 
 @pytest.mark.parametrize("value", [-(2**63), 2**63 - 1])
 def test_integer_scalar_constant_preserves_int64_precision(value: int) -> None:
-    result = compile_callable(
-        lambda: torch.scalar_tensor(value, dtype=torch.int64), ()
-    )
+    result = compile_callable(lambda: torch.scalar_tensor(value, dtype=torch.int64), ())
 
     actual = result.plan()[0]
     mx.eval(actual)
@@ -6396,9 +6343,7 @@ def test_integer_pointwise_ops_fuse_and_wrap(dtype) -> None:
 
     result = compile_callable(fn, (value,))
     assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
-    assert [kernel.kind for kernel in result.plan.kernels] == [
-        "fused_elementwise"
-    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["fused_elementwise"]
 
     actual = result.plan(_torch_to_mlx(value))[0]
     expected = _torch_to_mlx(fn(value))
@@ -6438,9 +6383,7 @@ def test_integer_scalar_operands_wrap_without_float_rounding(
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("divisor", [3, -3])
-def test_integer_floor_divide_and_remainder_match_pytorch(
-    dtype, divisor: int
-) -> None:
+def test_integer_floor_divide_and_remainder_match_pytorch(dtype, divisor: int) -> None:
     info = torch.iinfo(dtype)
     value = torch.tensor(
         [info.min, info.max, -7, -6, -1, 0, 1, 6, 7],
@@ -6481,9 +6424,7 @@ def test_integer_minimum_floor_division_by_negative_one_wraps(dtype) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("divisor", [3.0, -3.0, 2.5])
 def test_float_floor_divide_and_remainder_match_pytorch(dtype, divisor) -> None:
-    value = torch.tensor(
-        [-7.5, -6.0, -1.0, 0.0, 1.0, 6.0, 7.5, 9.0], dtype=dtype
-    )
+    value = torch.tensor([-7.5, -6.0, -1.0, 0.0, 1.0, 6.0, 7.5, 9.0], dtype=dtype)
 
     def fn(tensor):
         quotient = torch.floor_divide(tensor, divisor)
@@ -6518,9 +6459,7 @@ def test_scalar_dividend_remainder_matches_pytorch() -> None:
     assert actual.tolist() == [-1.0, 0.0, 0.0, 2.0, 0.0, 0.0]
 
     integers = torch.tensor([-3, -2, 2, 3], dtype=torch.int32)
-    int_result = compile_callable(
-        lambda value: torch.remainder(7, value), (integers,)
-    )
+    int_result = compile_callable(lambda value: torch.remainder(7, value), (integers,))
     int_actual = int_result.plan(_torch_to_mlx(integers))[0]
     int_expected = _torch_to_mlx(torch.remainder(7, integers))
     mx.eval(int_actual, int_expected)
@@ -6705,9 +6644,7 @@ def test_isclose_with_equal_nan_flips_only_the_nan_comparison() -> None:
         lambda tensor: torch.isclose(tensor, tensor, equal_nan=True), (value,)
     )
     actual = result.plan(_torch_to_mlx(value))[0]
-    expected = _torch_to_mlx(
-        torch.isclose(value, value, equal_nan=True)
-    )
+    expected = _torch_to_mlx(torch.isclose(value, value, equal_nan=True))
     mx.eval(actual, expected)
     assert actual.tolist() == expected.tolist() == [True, True]
 
@@ -6743,7 +6680,10 @@ def test_heaviside_keeps_an_integer_dtype() -> None:
 
 def test_heaviside_rejects_boolean_operands() -> None:
     with pytest.raises(ValueError, match="boolean tensor operands"):
-        compile_callable(torch.heaviside, (torch.ones(3, dtype=torch.bool), torch.zeros(3, dtype=torch.bool)))
+        compile_callable(
+            torch.heaviside,
+            (torch.ones(3, dtype=torch.bool), torch.zeros(3, dtype=torch.bool)),
+        )
 
 
 def test_float_remainder_keeps_the_divisor_sign() -> None:
@@ -6820,7 +6760,9 @@ def test_lerp_switches_branch_near_one_half() -> None:
         (start, end, torch.tensor([0.6, 0.6])),
     )
     actual = result.plan(
-        _torch_to_mlx(start), _torch_to_mlx(end), _torch_to_mlx(torch.tensor([0.6, 0.6]))
+        _torch_to_mlx(start),
+        _torch_to_mlx(end),
+        _torch_to_mlx(torch.tensor([0.6, 0.6])),
     )[0]
     expected = torch.lerp(start, end, torch.tensor([0.6, 0.6]))
     mx.eval(actual)
@@ -6938,9 +6880,7 @@ def test_sinc_returns_one_at_zero_and_near_zero() -> None:
 
 def test_copysign_follows_the_magnitude_and_signed_zero() -> None:
     magnitude = torch.tensor([3.0, -3.0, 0.0, -0.0, 2.5])
-    sign = torch.tensor(
-        [-1.0, 1.0, -0.0, -0.0, float("nan")], dtype=torch.float32
-    )
+    sign = torch.tensor([-1.0, 1.0, -0.0, -0.0, float("nan")], dtype=torch.float32)
 
     result = compile_callable(torch.copysign, (magnitude, sign))
     assert "metal::copysign(" in result.plan.kernels[0].source
@@ -7069,9 +7009,7 @@ def test_round_with_decimals_matches_pytorch(decimals: int) -> None:
     actual = result.plan(_torch_to_mlx(value))[0]
     expected = torch.round(value, decimals=decimals)
     mx.eval(actual)
-    assert actual.tolist() == pytest.approx(
-        expected.tolist(), abs=1e-6, rel=1e-6
-    )
+    assert actual.tolist() == pytest.approx(expected.tolist(), abs=1e-6, rel=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -7448,9 +7386,7 @@ def test_metal_matmul_supports_low_precision(dtype) -> None:
     ("dtype", "simdgroup_type"),
     [(torch.float16, "half"), (torch.bfloat16, "bfloat")],
 )
-def test_metal_matmul_uses_simdgroup_for_complete_blocks(
-    dtype, simdgroup_type
-) -> None:
+def test_metal_matmul_uses_simdgroup_for_complete_blocks(dtype, simdgroup_type) -> None:
     torch.manual_seed(30)
     inputs = (torch.randn(64, 35, dtype=dtype), torch.randn(35, 64, dtype=dtype))
     result = compile_callable(lambda x, weight: x @ weight, inputs, codegen_matmul=True)
@@ -7664,7 +7600,8 @@ def test_float32_matmul_keeps_float32_accuracy(shape, transposed) -> None:
     left = torch.randn(rows, reduction, dtype=torch.float32)
     right = torch.randn(reduction, columns, dtype=torch.float32)
     fn = (
-        (lambda x, weight: x @ weight.T) if transposed
+        (lambda x, weight: x @ weight.T)
+        if transposed
         else (lambda x, weight: x @ weight)
     )
 
@@ -7898,9 +7835,7 @@ def test_metal_matmul_broadcast_combines_with_transpose() -> None:
     )
 
     def fn(left, right):
-        return left.transpose(-2, -1).expand(2, 3, 7, 5) @ right.expand(
-            2, 3, 5, 4
-        )
+        return left.transpose(-2, -1).expand(2, 3, 7, 5) @ right.expand(2, 3, 5, 4)
 
     result = compile_callable(fn, inputs, codegen_matmul=True)
     assert [op.op for op in result.lowered_graph.ops] == ["matmul"]
@@ -8098,9 +8033,7 @@ def test_safe_softmax_returns_zero_for_fully_masked_rows() -> None:
     assert [kernel.kind for kernel in result.plan.kernels] == ["safe_softmax"]
 
     actual = result.plan(mx.array(x.numpy()))[0]
-    expected = mx.array(
-        torch.ops.aten._safe_softmax.default(x, -1).numpy()
-    )
+    expected = mx.array(torch.ops.aten._safe_softmax.default(x, -1).numpy())
     mx.eval(actual, expected)
     assert mx.array_equal(actual[0], mx.zeros((7,)))
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
@@ -8132,9 +8065,7 @@ def test_metal_softmax_supports_non_last_dimension(dim, stride) -> None:
     assert f"col * {stride}u" in kernel.source
 
     actual = result.plan(mx.array(x.numpy()))[0]
-    expected = mx.array(
-        torch.nn.functional.softmax(x, dim=dim).numpy()
-    )
+    expected = mx.array(torch.nn.functional.softmax(x, dim=dim).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -8191,9 +8122,7 @@ def test_layer_norm_with_affine_parameters() -> None:
     bias = torch.randn(300)
 
     def fn(value, scale, shift):
-        return torch.nn.functional.layer_norm(
-            value, (300,), scale, shift, eps=1e-5
-        )
+        return torch.nn.functional.layer_norm(value, (300,), scale, shift, eps=1e-5)
 
     result = compile_callable(fn, (x, weight, bias))
     assert [op.op for op in result.input_graph.ops] == ["layer_norm"]
@@ -8230,9 +8159,7 @@ def test_layer_norm_without_affine_and_multidimensional_shape() -> None:
     assert "metal_layer_norm_16_0" == result.plan.kernels[0].name
 
     actual = result.plan(mx.array(x.numpy()))[0]
-    expected = mx.array(
-        torch.nn.functional.layer_norm(x, (3, 4), eps=1e-3).numpy()
-    )
+    expected = mx.array(torch.nn.functional.layer_norm(x, (3, 4), eps=1e-3).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -8257,7 +8184,9 @@ def test_layer_norm_supports_low_precision(dtype) -> None:
         )
     )[0]
     expected = mx.array(
-        torch.nn.functional.layer_norm(x.float(), (7,), weight.float(), bias.float()).numpy()
+        torch.nn.functional.layer_norm(
+            x.float(), (7,), weight.float(), bias.float()
+        ).numpy()
     )
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
@@ -8355,9 +8284,7 @@ def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
 
     def fn(value, weight, scale, shift):
         projected = value @ weight
-        normalized = torch.nn.functional.layer_norm(
-            projected, (8,), scale, shift
-        )
+        normalized = torch.nn.functional.layer_norm(projected, (8,), scale, shift)
         return torch.nn.functional.silu(normalized)
 
     result = compile_callable(fn, inputs)
@@ -8380,24 +8307,45 @@ def test_layer_norm_composes_with_matmul_and_pointwise() -> None:
 @pytest.mark.parametrize(
     ("weighted", "fn"),
     [
-        (False, lambda value, weight: value * torch.rsqrt(
-            value.pow(2).mean(-1, keepdim=True) + 1e-6
-        )),
-        (False, lambda value, weight: value / torch.sqrt(
-            value.pow(2).mean(-1, keepdim=True) + 1e-6
-        )),
-        (False, lambda value, weight: value * torch.rsqrt(
-            (value * value).mean(-1, keepdim=True) + 1e-6
-        )),
-        (False, lambda value, weight: value * torch.rsqrt(
-            torch.add(value.pow(2).mean(-1, keepdim=True), 1e-6)
-        )),
-        (True, lambda value, weight: weight * (
-            value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
-        )),
-        (True, lambda value, weight: (
-            value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
-        ) * weight),
+        (
+            False,
+            lambda value, weight: (
+                value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
+            ),
+        ),
+        (
+            False,
+            lambda value, weight: (
+                value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6)
+            ),
+        ),
+        (
+            False,
+            lambda value, weight: (
+                value * torch.rsqrt((value * value).mean(-1, keepdim=True) + 1e-6)
+            ),
+        ),
+        (
+            False,
+            lambda value, weight: (
+                value
+                * torch.rsqrt(torch.add(value.pow(2).mean(-1, keepdim=True), 1e-6))
+            ),
+        ),
+        (
+            True,
+            lambda value, weight: (
+                weight
+                * (value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6))
+            ),
+        ),
+        (
+            True,
+            lambda value, weight: (
+                (value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + 1e-6))
+                * weight
+            ),
+        ),
     ],
 )
 def test_rms_norm_folds_the_common_decomposition_spellings(weighted, fn) -> None:
@@ -8426,9 +8374,7 @@ def test_rms_norm_with_weight_and_multidimensional_shape() -> None:
     weight = torch.randn(4, 7)
 
     def fn(value, scale):
-        return torch.nn.functional.rms_norm(
-            value, (4, 7), scale, eps=1e-6
-        )
+        return torch.nn.functional.rms_norm(value, (4, 7), scale, eps=1e-6)
 
     result = compile_callable(fn, (x, weight))
     assert [op.op for op in result.input_graph.ops] == ["rms_norm"]
@@ -8453,18 +8399,14 @@ def test_rms_norm_without_weight() -> None:
     torch.manual_seed(71)
     x = torch.randn(2, 3, 300)
     result = compile_callable(
-        lambda value: torch.nn.functional.rms_norm(
-            value, (300,), None, eps=1e-5
-        ),
+        lambda value: torch.nn.functional.rms_norm(value, (300,), None, eps=1e-5),
         (x,),
     )
     assert result.input_graph.ops[0].attrs["has_weight"] is False
     assert result.plan.kernels[0].name == "metal_rms_norm_256_0"
 
     actual = result.plan(mx.array(x.numpy()))[0]
-    expected = mx.array(
-        torch.nn.functional.rms_norm(x, (300,), None, eps=1e-5).numpy()
-    )
+    expected = mx.array(torch.nn.functional.rms_norm(x, (300,), None, eps=1e-5).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -8475,22 +8417,15 @@ def test_rms_norm_supports_low_precision(dtype) -> None:
     x = torch.randn(2, 3, 7, dtype=dtype)
     weight = torch.randn(7, dtype=dtype)
     result = compile_callable(
-        lambda value, scale: torch.nn.functional.rms_norm(
-            value, (7,), scale, eps=1e-6
-        ),
+        lambda value, scale: torch.nn.functional.rms_norm(value, (7,), scale, eps=1e-6),
         (x, weight),
     )
     mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
     actual = result.plan(
-        *(
-            mx.array(value.float().numpy(), dtype=mlx_dtype)
-            for value in (x, weight)
-        )
+        *(mx.array(value.float().numpy(), dtype=mlx_dtype) for value in (x, weight))
     )[0]
     expected = mx.array(
-        torch.nn.functional.rms_norm(
-            x.float(), (7,), weight.float(), eps=1e-6
-        ).numpy()
+        torch.nn.functional.rms_norm(x.float(), (7,), weight.float(), eps=1e-6).numpy()
     )
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
@@ -8506,9 +8441,7 @@ def test_rms_norm_composes_with_matmul_and_pointwise() -> None:
 
     def fn(value, weight, scale):
         projected = value @ weight
-        normalized = torch.nn.functional.rms_norm(
-            projected, (8,), scale, eps=1e-6
-        )
+        normalized = torch.nn.functional.rms_norm(projected, (8,), scale, eps=1e-6)
         return torch.nn.functional.silu(normalized)
 
     result = compile_callable(fn, inputs)
@@ -8554,9 +8487,7 @@ def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
 
     def fn(value):
         squared = value.square()
-        normalized = value * torch.rsqrt(
-            squared.mean(dim=-1, keepdim=True) + 1e-6
-        )
+        normalized = value * torch.rsqrt(squared.mean(dim=-1, keepdim=True) + 1e-6)
         return normalized, squared
 
     result = compile_callable(fn, (x,))
@@ -8574,9 +8505,7 @@ def test_rms_norm_pattern_requires_single_use_intermediates() -> None:
 
 @pytest.mark.parametrize("reduction", ["sum", "mean"])
 @pytest.mark.parametrize("dtype_override", [False, True])
-def test_default_reductions_reduce_all_dimensions(
-    reduction, dtype_override
-) -> None:
+def test_default_reductions_reduce_all_dimensions(reduction, dtype_override) -> None:
     torch.manual_seed(82)
     dtype = torch.float16 if dtype_override else torch.float32
     x = torch.randn(2, 3, 4, dtype=dtype)
@@ -8601,9 +8530,7 @@ def test_default_reductions_reduce_all_dimensions(
     }
 
     mlx_dtype = mx.float16 if dtype_override else mx.float32
-    actual = result.plan(
-        mx.array(x.float().numpy(), dtype=mlx_dtype)
-    )[0]
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
     expected = mx.array(fn(x).float().numpy())
     mx.eval(actual, expected)
     assert actual.shape == ()
@@ -8674,9 +8601,7 @@ def test_mean_reduces_contiguous_interior_dimensions() -> None:
 def test_sum_reduces_leading_dimension() -> None:
     torch.manual_seed(95)
     x = torch.randn(3, 4, 5)
-    result = compile_callable(
-        lambda value: torch.sum(value, dim=0), (x,)
-    )
+    result = compile_callable(lambda value: torch.sum(value, dim=0), (x,))
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(torch.sum(x, dim=0).numpy())
     mx.eval(actual, expected)
@@ -8687,9 +8612,7 @@ def test_sum_reduces_leading_dimension() -> None:
 def test_sum_can_reduce_all_dimensions() -> None:
     torch.manual_seed(96)
     x = torch.randn(2, 3, 4)
-    result = compile_callable(
-        lambda value: torch.sum(value, dim=(0, 1, 2)), (x,)
-    )
+    result = compile_callable(lambda value: torch.sum(value, dim=(0, 1, 2)), (x,))
     actual = result.plan(mx.array(x.numpy()))[0]
     expected = mx.array(torch.sum(x).numpy())
     mx.eval(actual, expected)
@@ -8707,9 +8630,7 @@ def test_mean_supports_low_precision(dtype) -> None:
 
     result = compile_callable(fn, (x,))
     mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
-    actual = result.plan(
-        mx.array(x.float().numpy(), dtype=mlx_dtype)
-    )[0]
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
     expected = mx.array(torch.mean(x.float(), dim=-1).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
@@ -8793,9 +8714,7 @@ def test_reduction_supports_float32_dtype_override(reduction, dtype) -> None:
     assert "out[output_index] = (O)" in kernel.source
 
     mlx_dtype = mx.bfloat16 if dtype == torch.bfloat16 else mx.float16
-    actual = result.plan(
-        mx.array(x.float().numpy(), dtype=mlx_dtype)
-    )[0]
+    actual = result.plan(mx.array(x.float().numpy(), dtype=mlx_dtype))[0]
     expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert actual.dtype == mx.float32

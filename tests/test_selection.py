@@ -27,8 +27,7 @@ def test_kernel_selection_records_native_and_fallback_ops() -> None:
         for selection in selections
     )
     assert any(
-        selection.op == "matmul" and not selection.is_native
-        for selection in selections
+        selection.op == "matmul" and not selection.is_native for selection in selections
     )
 
     input_arrays = tuple(mx.array(value.numpy()) for value in inputs)

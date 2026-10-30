@@ -128,12 +128,10 @@ def test_cached_prefill_decode_generates_tokens_on_metal() -> None:
         mx.eval(*decode_actual)
 
         reference_sequence.append(fed_token)
-        reference_tokens = torch.tensor(
-            [reference_sequence], dtype=torch.int32
-        )
-        reference_positions = torch.arange(
-            len(reference_sequence), dtype=torch.int64
-        )[None, :]
+        reference_tokens = torch.tensor([reference_sequence], dtype=torch.int32)
+        reference_positions = torch.arange(len(reference_sequence), dtype=torch.int64)[
+            None, :
+        ]
         reference_logits = transformer_forward(
             reference_tokens,
             reference_positions,
@@ -151,9 +149,7 @@ def test_cached_prefill_decode_generates_tokens_on_metal() -> None:
         )
 
         actual_next_token = next_token(decode_actual[0])
-        reference_next_token = next_token(
-            mx.array(reference_logits.detach().numpy())
-        )
+        reference_next_token = next_token(mx.array(reference_logits.detach().numpy()))
         assert actual_next_token == reference_next_token
         generated_tokens.append(actual_next_token)
         reference_generated_tokens.append(reference_next_token)
@@ -182,9 +178,7 @@ def test_padded_batch_prefill_decode_tracks_valid_lengths() -> None:
         prompt_positions,
         cosine,
         sine,
-        make_prefill_mask(
-            prompts.shape[0], prompts.shape[1], initial_valid_lengths
-        ),
+        make_prefill_mask(prompts.shape[0], prompts.shape[1], initial_valid_lengths),
         *weights,
     )
     prefill_result = compile_callable(
@@ -214,9 +208,7 @@ def test_padded_batch_prefill_decode_tracks_valid_lengths() -> None:
             sine,
             *weights,
         )[:, -1, :]
-        reference_token = next_token(
-            mx.array(reference_logits.detach().numpy())
-        )
+        reference_token = next_token(mx.array(reference_logits.detach().numpy()))
         actual_token = next_token(prefill_actual[0][row : row + 1])
         assert actual_token == reference_token
         generated_tokens[row].append(actual_token)
@@ -246,9 +238,7 @@ def test_padded_batch_prefill_decode_tracks_valid_lengths() -> None:
 
     caches = prefill_actual[1:]
     for step in range(3):
-        current_valid_lengths = tuple(
-            length + step for length in initial_valid_lengths
-        )
+        current_valid_lengths = tuple(length + step for length in initial_valid_lengths)
         decode_actual = decode_result.plan(
             mx.array(
                 [[tokens[-1]] for tokens in generated_tokens],
@@ -274,9 +264,7 @@ def test_padded_batch_prefill_decode_tracks_valid_lengths() -> None:
             reference_sequence.append(generated_tokens[row][-1])
             reference_logits = transformer_forward(
                 torch.tensor([reference_sequence], dtype=torch.int32),
-                torch.arange(
-                    len(reference_sequence), dtype=torch.int64
-                )[None, :],
+                torch.arange(len(reference_sequence), dtype=torch.int64)[None, :],
                 cosine,
                 sine,
                 *weights,
@@ -289,9 +277,7 @@ def test_padded_batch_prefill_decode_tracks_valid_lengths() -> None:
                 rtol=1e-4,
             )
             actual_token = next_token(decode_actual[0][row : row + 1])
-            reference_token = next_token(
-                mx.array(reference_logits.detach().numpy())
-            )
+            reference_token = next_token(mx.array(reference_logits.detach().numpy()))
             assert actual_token == reference_token
             generated_tokens[row].append(actual_token)
             reference_generated_tokens[row].append(reference_token)

@@ -86,7 +86,6 @@ def _validate_no_sliding_attention(model: torch.nn.Module) -> None:
         )
 
 
-
 def _rms_norm(
     value: torch.Tensor,
     weight: torch.Tensor,
@@ -134,19 +133,16 @@ class _Qwen2StaticBase(torch.nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.num_key_value_heads = int(config.num_key_value_heads)
         self.head_dim = int(
-            getattr(config, "head_dim", None)
-            or self.hidden_size // self.num_heads
+            getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
         )
         self.rms_norm_eps = float(config.rms_norm_eps)
         self.rope_theta = float(getattr(config, "rope_theta", 10000.0))
 
-        frequencies = torch.arange(
-            cache_capacity, dtype=torch.float32
-        )[:, None] / torch.pow(
+        frequencies = torch.arange(cache_capacity, dtype=torch.float32)[
+            :, None
+        ] / torch.pow(
             torch.tensor(self.rope_theta, dtype=torch.float32),
-            torch.arange(
-                0, self.head_dim, 2, dtype=torch.float32
-            )[None, :]
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32)[None, :]
             / self.head_dim,
         )
         frequencies = torch.cat((frequencies, frequencies), dim=-1).to(
@@ -195,9 +191,7 @@ class _Qwen2StaticBase(torch.nn.Module):
         layer_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.model.model.layers[layer_index]
-        normalized = _rms_norm(
-            hidden, layer.input_layernorm.weight, self.rms_norm_eps
-        )
+        normalized = _rms_norm(hidden, layer.input_layernorm.weight, self.rms_norm_eps)
         projected = F.linear(
             normalized,
             self.get_buffer(f"qkv_weight_{layer_index}"),
@@ -275,9 +269,7 @@ class _Qwen2StaticBase(torch.nn.Module):
         return hidden + down
 
     def _logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = _rms_norm(
-            hidden, self.model.model.norm.weight, self.rms_norm_eps
-        )
+        hidden = _rms_norm(hidden, self.model.model.norm.weight, self.rms_norm_eps)
         # The benchmark and serving path only need the next-token distribution.
         hidden = hidden[:, -1:, :]
         return F.linear(hidden, self.model.lm_head.weight, None)
@@ -294,9 +286,7 @@ class Qwen2PrefillModule(_Qwen2StaticBase):
         hidden = self._embed(input_ids)
         cache_values: list[torch.Tensor] = []
         for layer_index, layer in enumerate(self.model.model.layers):
-            query, key, value = self._project_qkv(
-                hidden, positions, layer_index
-            )
+            query, key, value = self._project_qkv(hidden, positions, layer_index)
             attention_output = F.scaled_dot_product_attention(
                 query,
                 key,
@@ -331,9 +321,7 @@ class Qwen2DecodeModule(_Qwen2StaticBase):
         hidden = self._embed(input_ids)
         next_cache_values: list[torch.Tensor] = []
         for layer_index, layer in enumerate(self.model.model.layers):
-            query, key, value = self._project_qkv(
-                hidden, positions, layer_index
-            )
+            query, key, value = self._project_qkv(hidden, positions, layer_index)
             # One append moves key and value together: the cache already stores
             # both at the same slots, so a single copy replaces two.
             #
@@ -390,8 +378,7 @@ class Qwen2StaticCacheRuntime:
         ids = _as_input_ids(input_ids)
         if ids.shape != (1, self.prompt_length):
             raise ValueError(
-                f"expected prompt shape (1, {self.prompt_length}), "
-                f"got {ids.shape}"
+                f"expected prompt shape (1, {self.prompt_length}), got {ids.shape}"
             )
         positions = mx.arange(self.prompt_length, dtype=mx.int64)[None, :]
         logits, cache = self.prefill(ids, positions)
@@ -408,12 +395,10 @@ class Qwen2StaticCacheRuntime:
         )
         if compact_cache.shape != expected:
             raise ValueError(
-                f"expected compact cache shape {expected}, "
-                f"got {compact_cache.shape}"
+                f"expected compact cache shape {expected}, got {compact_cache.shape}"
             )
         padding = mx.zeros(
-            expected[:4] + (self.cache_capacity - self.prompt_length,)
-            + expected[5:],
+            expected[:4] + (self.cache_capacity - self.prompt_length,) + expected[5:],
             dtype=compact_cache.dtype,
         )
         return mx.concatenate((padding, compact_cache), axis=4)
@@ -472,17 +457,14 @@ class Qwen2StaticCacheRuntime:
         steps = self.max_new_tokens if max_new_tokens is None else max_new_tokens
         if steps < 0 or steps > self.max_new_tokens:
             raise ValueError(
-                f"max_new_tokens must be in [0, {self.max_new_tokens}], "
-                f"got {steps}"
+                f"max_new_tokens must be in [0, {self.max_new_tokens}], got {steps}"
             )
         if steps == 0:
             return mx.zeros((1, 0), dtype=mx.int64)
 
         logits, compact_cache = self.prefill_ids(input_ids)
         cache = self.pad_cache(compact_cache)
-        token = mx.argmax(
-            logits[:, -1, :], axis=-1, keepdims=True
-        ).astype(mx.int64)
+        token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
         if sync_each_step:
             mx.eval(token, cache)
         generated = [token.reshape(-1)]
@@ -494,9 +476,7 @@ class Qwen2StaticCacheRuntime:
             logits, cache = self.decode_token(
                 token, cache, valid_length, verify_token=False
             )
-            token = mx.argmax(
-                logits[:, -1, :], axis=-1, keepdims=True
-            ).astype(mx.int64)
+            token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
             if sync_each_step:
                 mx.eval(token, cache)
             generated.append(token.reshape(-1))
@@ -529,7 +509,9 @@ def compile_qwen2_static_cache(
     """
 
     if prompt_length <= 0 or max_new_tokens < 0:
-        raise ValueError("prompt_length must be positive and max_new_tokens non-negative")
+        raise ValueError(
+            "prompt_length must be positive and max_new_tokens non-negative"
+        )
     if getattr(model, "training", False):
         raise ValueError("compile_qwen2_static_cache requires model.eval()")
     cache_capacity = prompt_length + max_new_tokens
@@ -539,12 +521,8 @@ def compile_qwen2_static_cache(
             f"position embeddings ({model.config.max_position_embeddings})"
         )
 
-    prefill_module = Qwen2PrefillModule(
-        model, cache_capacity=cache_capacity
-    ).eval()
-    decode_module = Qwen2DecodeModule(
-        model, cache_capacity=cache_capacity
-    ).eval()
+    prefill_module = Qwen2PrefillModule(model, cache_capacity=cache_capacity).eval()
+    decode_module = Qwen2DecodeModule(model, cache_capacity=cache_capacity).eval()
     example_ids = torch.zeros((1, prompt_length), dtype=torch.int64)
     example_positions = torch.arange(prompt_length, dtype=torch.int64)[None, :]
     prefill = compile_module(
@@ -578,9 +556,7 @@ def compile_qwen2_static_cache(
         autotune=autotune,
     )
 
-    masks = np.zeros(
-        (cache_capacity, 1, 1, 1, cache_capacity), dtype=np.bool_
-    )
+    masks = np.zeros((cache_capacity, 1, 1, 1, cache_capacity), dtype=np.bool_)
     for valid_length in range(1, cache_capacity + 1):
         masks[valid_length - 1, :, :, :, -valid_length:] = True
     runtime = Qwen2StaticCacheRuntime(
