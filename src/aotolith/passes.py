@@ -4,116 +4,7 @@ from collections.abc import Callable
 from math import prod
 
 from .ir import DType, Graph, Operation, TensorType, Value
-
-POINTWISE_OPS = {
-    "silu",
-    "gelu",
-    "softplus",
-    "mish",
-    "logsigmoid",
-    "mul",
-    "add",
-    "sub",
-    "rsub",
-    "div",
-    "floor_divide",
-    "remainder",
-    "fmod",
-    "lerp",
-    "addcmul",
-    "addcdiv",
-    "logit",
-    "erfc",
-    "frac",
-    "sinc",
-    "lgamma",
-    "i0",
-    "signbit",
-    "hypot",
-    "copysign",
-    "xlogy",
-    "nan_to_num",
-    "pow",
-    "neg",
-    "abs",
-    "sigmoid",
-    "tanh",
-    "relu",
-    "exp",
-    "expm1",
-    "exp2",
-    "log",
-    "log2",
-    "log10",
-    "log1p",
-    "erf",
-    "sin",
-    "cos",
-    "floor",
-    "ceil",
-    "round",
-    "trunc",
-    "sign",
-    "square",
-    "sqrt",
-    "rsqrt",
-    "reciprocal",
-    "clamp",
-    "clamp_min",
-    "clamp_max",
-    "leaky_relu",
-    "elu",
-    "hardswish",
-    "hardsigmoid",
-    "threshold",
-    "eq",
-    "ne",
-    "lt",
-    "le",
-    "gt",
-    "ge",
-    "logical_and",
-    "logical_or",
-    "logical_xor",
-    "logical_not",
-    "bitwise_and",
-    "bitwise_or",
-    "bitwise_xor",
-    "bitwise_not",
-    "isnan",
-    "isinf",
-    "where",
-    "masked_fill",
-    "maximum",
-    "minimum",
-    "logaddexp",
-    "atan2",
-    "heaviside",
-    "scalar_tensor",
-    "zeros",
-    "ones",
-    "full",
-    "new_zeros",
-    "new_ones",
-    "new_full",
-    "zeros_like",
-    "ones_like",
-    "full_like",
-}
-
-LAYOUT_OPS = {
-    "reshape",
-    "transpose",
-    "permute",
-    "expand",
-    "slice",
-    "flip",
-    "roll",
-    "unsqueeze",
-    "squeeze",
-    "contiguous",
-    "alias",
-}
+from .op_sets import LAYOUT_OPS, POINTWISE_OPS
 
 
 def simplify_layouts(graph: Graph) -> Graph:
@@ -612,7 +503,9 @@ def fuse_residual_epilogue(graph: Graph) -> Graph:
                 view_id, TensorType(product_shape, residual_type.dtype)
             )
             inserted.setdefault(product_index, []).append(
-                Operation("reshape", (residual_id,), (view_id,), {"shape": product_shape})
+                Operation(
+                    "reshape", (residual_id,), (view_id,), {"shape": product_shape}
+                )
             )
             residual_id = view_id
         left_id, right_id = product.inputs
@@ -653,16 +546,13 @@ def fuse_residual_epilogue(graph: Graph) -> Graph:
     return result
 
 
-def _fresh_value_id(
-    prefix: str, graph: Graph, extra_values: dict[str, Value]
-) -> str:
+def _fresh_value_id(prefix: str, graph: Graph, extra_values: dict[str, Value]) -> str:
     candidate = prefix
     suffix = 0
     while candidate in graph.values or candidate in extra_values:
         suffix += 1
         candidate = f"{prefix}_{suffix}"
     return candidate
-
 
 
 def _trace_add_operand_to_matmul(
@@ -913,7 +803,11 @@ def fuse_activation_epilogue(graph: Graph) -> Graph:
             continue
         gate_id = activation.inputs[0]
         other_id = next(
-            (value_id for value_id in multiply.inputs if value_id != activation.outputs[0]),
+            (
+                value_id
+                for value_id in multiply.inputs
+                if value_id != activation.outputs[0]
+            ),
             None,
         )
         if other_id is None:
@@ -930,9 +824,10 @@ def fuse_activation_epilogue(graph: Graph) -> Graph:
         product_index, product_chain, _ = product
         gate_op = graph.ops[gate_index]
         product_op = graph.ops[product_index]
-        if graph.value(gate_op.outputs[0]).type != graph.value(
-            product_op.outputs[0]
-        ).type:
+        if (
+            graph.value(gate_op.outputs[0]).type
+            != graph.value(product_op.outputs[0]).type
+        ):
             continue
         # The epilogue reads the gate at the projection's own output index, so
         # the two chains must be pure reshapes that preserve element order.
@@ -1027,9 +922,7 @@ def fuse_rms_norm_epilogue(graph: Graph) -> Graph:
     for norm_index, norm in enumerate(graph.ops):
         if norm.op != "rms_norm":
             continue
-        plan = _match_rms_norm_consumers(
-            graph, norm_index, norm, consumers, output_set
-        )
+        plan = _match_rms_norm_consumers(graph, norm_index, norm, consumers, output_set)
         if plan is None:
             continue
         projection_rewrites, layout_rewrites = plan
@@ -1128,9 +1021,7 @@ def _match_rms_norm_consumers(
         inputs = projection.inputs
         if left_id == norm.outputs[0]:
             # ``rms_norm`` preserves shape, so the raw source can stand in.
-            inputs = (
-                inputs[:left_position] + (source_id,) + inputs[left_position + 1 :]
-            )
+            inputs = inputs[:left_position] + (source_id,) + inputs[left_position + 1 :]
         rewrites[projection_index] = Operation(
             projection.op, inputs + (weight_id,), projection.outputs, attrs
         )
@@ -1187,7 +1078,11 @@ def fuse_pointwise(graph: Graph) -> Graph:
                 op = graph.ops[index]
                 for value_id in op.inputs:
                     producer = producers.get(value_id)
-                    if producer is None or producer in members or producer not in pointwise:
+                    if (
+                        producer is None
+                        or producer in members
+                        or producer not in pointwise
+                    ):
                         continue
                     producer_output = graph.ops[producer].outputs[0]
                     if producer_output in output_set:
@@ -1262,9 +1157,7 @@ def eliminate_common_subexpressions(graph: Graph) -> Graph:
             if inputs == op.inputs and attrs is op.attrs
             else Operation(op.op, inputs, op.outputs, attrs)
         )
-        output_types = tuple(
-            graph.value(value_id).type for value_id in op.outputs
-        )
+        output_types = tuple(graph.value(value_id).type for value_id in op.outputs)
         key = (
             current.op,
             current.inputs,
@@ -1276,9 +1169,7 @@ def eliminate_common_subexpressions(graph: Graph) -> Graph:
         )
         existing = common.get(key)
         if existing is not None:
-            for value_id, replacement in zip(
-                current.outputs, existing, strict=True
-            ):
+            for value_id, replacement in zip(current.outputs, existing, strict=True):
                 aliases[value_id] = replacement
             continue
         common[key] = current.outputs
@@ -1475,9 +1366,7 @@ def _is_identity_layout(graph: Graph, op: Operation) -> bool:
         if input_type.shape != output_type.shape:
             return False
         shifts = _roll_shifts_by_axis(op, input_type.shape)
-        return shifts is not None and _roll_shift_is_identity(
-            shifts, input_type.shape
-        )
+        return shifts is not None and _roll_shift_is_identity(shifts, input_type.shape)
     if op.op == "pad":
         if input_type.shape != output_type.shape:
             return False
@@ -1576,9 +1465,7 @@ def _match_attention(
     consumers: dict[str, list[int]],
     matched: set[int],
 ) -> tuple[int, set[int], Operation] | None:
-    pv_match = _match_attention_product(
-        graph, pv_index, producers, consumers, matched
-    )
+    pv_match = _match_attention_product(graph, pv_index, producers, consumers, matched)
     if pv_match is None:
         return None
     replacement_index, probability_id, value_id, internal = pv_match
@@ -1586,7 +1473,10 @@ def _match_attention(
     if probability_index is None or probability_index in matched:
         return None
     probability = graph.ops[probability_index]
-    if probability.op not in {"softmax", "safe_softmax"} or len(probability.inputs) != 1:
+    if (
+        probability.op not in {"softmax", "safe_softmax"}
+        or len(probability.inputs) != 1
+    ):
         return None
     probability_type = graph.value(probability.outputs[0]).type
     rank = len(probability_type.shape)
@@ -1628,7 +1518,9 @@ def _match_attention(
                 continue
         break
 
-    parsed_scale = _parse_scale(graph.ops[producers[stage]]) if stage in producers else None
+    parsed_scale = (
+        _parse_scale(graph.ops[producers[stage]]) if stage in producers else None
+    )
     if parsed_scale is not None and not has_scale:
         scale_index = producers[stage]
         scale = parsed_scale
@@ -1710,9 +1602,9 @@ def _match_attention(
         intermediate.update(casts)
 
     replacement_output = graph.ops[replacement_index].outputs[0]
-    internal_values = {
-        graph.ops[index].outputs[0] for index in intermediate
-    } - {replacement_output}
+    internal_values = {graph.ops[index].outputs[0] for index in intermediate} - {
+        replacement_output
+    }
     if internal_values.intersection(graph.outputs):
         return None
     for internal_value_id in internal_values:
@@ -1815,7 +1707,11 @@ def _match_attention_product(
         value_base.shape[-2],
     ):
         return None
-    if value_type.shape != (prod(batch_heads), value_base.shape[-2], value_base.shape[-1]):
+    if value_type.shape != (
+        prod(batch_heads),
+        value_base.shape[-2],
+        value_base.shape[-1],
+    ):
         return None
 
     expected_output_shape = probability_base.shape[:-1] + (value_base.shape[-1],)
@@ -1882,11 +1778,15 @@ def _match_grouped_kv(
     expanded_type = graph.value(expand.outputs[0]).type
     if len(original_type.shape) != 4 or len(unsqueezed_type.shape) != 5:
         return None
-    if unsqueezed_type.shape != original_type.shape[:2] + (1,) + original_type.shape[2:]:
+    if (
+        unsqueezed_type.shape
+        != original_type.shape[:2] + (1,) + original_type.shape[2:]
+    ):
         return None
-    if expanded_type.shape != original_type.shape[:2] + (
-        expanded_type.shape[2],
-    ) + original_type.shape[2:]:
+    if (
+        expanded_type.shape
+        != original_type.shape[:2] + (expanded_type.shape[2],) + original_type.shape[2:]
+    ):
         return None
     if expanded_type.shape[2] < 2:
         return None
@@ -1922,19 +1822,17 @@ def _match_internal_float32_casts(
     if output_cast.op != "cast" or output_cast.inputs != (replacement_output,):
         return None
     output_type = graph.value(output_cast.outputs[0]).type
-    if (
-        output_type.shape != replacement_type.shape
-        or output_type.dtype not in {DType.F16, DType.BF16}
-    ):
+    if output_type.shape != replacement_type.shape or output_type.dtype not in {
+        DType.F16,
+        DType.BF16,
+    }:
         return None
 
     casts: set[int] = set()
     stripped_ids: list[str] = []
     source_dtypes: set[DType] = set()
     for input_id in (query_id, key_id, value_id):
-        stripped = _strip_float32_input_cast(
-            input_id, graph, producers, matched, casts
-        )
+        stripped = _strip_float32_input_cast(input_id, graph, producers, matched, casts)
         if stripped is None:
             return None
         stripped_id, source_dtype = stripped
@@ -1950,9 +1848,7 @@ def _match_internal_float32_casts(
         if mask_type.dtype == output_type.dtype:
             pass
         elif mask_type.dtype == DType.F32:
-            stripped = _strip_float32_input_cast(
-                mask, graph, producers, matched, casts
-            )
+            stripped = _strip_float32_input_cast(mask, graph, producers, matched, casts)
             if stripped is None or stripped[1] != output_type.dtype:
                 return None
             stripped_mask = stripped[0]
@@ -2019,10 +1915,7 @@ def _looks_like_score_value(
     if _parse_scale(op) is None:
         return False
     producer_index = producers.get(op.inputs[0])
-    return (
-        producer_index is not None
-        and graph.ops[producer_index].op == "matmul"
-    )
+    return producer_index is not None and graph.ops[producer_index].op == "matmul"
 
 
 def _valid_attention_shapes(
@@ -2067,7 +1960,9 @@ def _can_broadcast_to(shape: tuple[int, ...], output: tuple[int, ...]) -> bool:
 
 
 def _producers(graph: Graph) -> dict[str, int]:
-    return {value_id: index for index, op in enumerate(graph.ops) for value_id in op.outputs}
+    return {
+        value_id: index for index, op in enumerate(graph.ops) for value_id in op.outputs
+    }
 
 
 def _consumers(graph: Graph) -> dict[str, list[int]]:
@@ -2082,7 +1977,9 @@ def _transpose_axes(op: Operation, rank: int) -> tuple[int, int] | None:
     dim0, dim1 = op.attrs.get("dim0"), op.attrs.get("dim1")
     if not _valid_ints((dim0, dim1)):
         return None
-    normalized = tuple(int(dim) + rank if int(dim) < 0 else int(dim) for dim in (dim0, dim1))
+    normalized = tuple(
+        int(dim) + rank if int(dim) < 0 else int(dim) for dim in (dim0, dim1)
+    )
     if any(dim < 0 or dim >= rank for dim in normalized):
         return None
     return normalized
@@ -2092,9 +1989,7 @@ def _normalized_dims(op: Operation, rank: int) -> tuple[int, ...] | None:
     dims = op.attrs.get("dims")
     if not isinstance(dims, (tuple, list)) or not all(_valid_int(dim) for dim in dims):
         return None
-    normalized = tuple(
-        int(dim) + rank if int(dim) < 0 else int(dim) for dim in dims
-    )
+    normalized = tuple(int(dim) + rank if int(dim) < 0 else int(dim) for dim in dims)
     if any(dim < 0 or dim >= rank for dim in normalized):
         return None
     return normalized
@@ -2204,8 +2099,7 @@ def _normalized_fused_region(
         return None
 
     boundary = {
-        value_id: ("argument", index)
-        for index, value_id in enumerate(op.inputs)
+        value_id: ("argument", index) for index, value_id in enumerate(op.inputs)
     }
     internal: dict[str, object] = {}
     normalized_ops: list[object] = []

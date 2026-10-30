@@ -256,6 +256,8 @@ IR 定义在 `ir.py`：
 
 每个 IR op 的操作数个数、必备 attribute、输出个数、dtype 和 shape 规则集中声明在 `op_defs.py`，由 `check_operation()` 一次性校验：`OpContract` 用 `arity`、`attrs`、`rank`、`dtype`、`shape`、`outputs` 六个字段描述通用规则，字段表达不了的算子间约束（scatter 的 index/update 相容性、embedding 的浮点 weight 加整型 indices、layout op 的目标 shape）放在该算子自己的 `extra` 钩子里。后端在 lowering 之前统一跑一遍校验，然后只根据 op 名决定“能否生成 kernel”，不再让每个 `elif` 分支各自重写 rank/dtype/shape 前置检查。新增一个算子因此是一行声明加至多一个钩子，`tests/test_planning.py` 里有一条测试要求 `POINTWISE_OPS` 和 `LAYOUT_OPS` 的每个名字都已注册，避免新算子绕过校验。
 
+算子的执行类别（pointwise / layout / constant）单独定义在 `op_sets.py`，而不是留在某个消费者里。这三个集合有三个读者：`op_defs.py` 用它们生成默认 contract，`passes.py` 用它们判断融合与折叠是否合法，`backends/apple_metal.py` 用它们分派 kernel。以前它们住在 `passes.py` 里，于是 `op_defs` 和 backend 都必须反过来导入图重写模块才能读到一组名字——`tests/test_architecture.py` 现在按层断言 import 只能指向更低层，这类反向依赖会直接让测试失败。
+
 ## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
 
 `simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、只翻转 singleton 轴的 `flip`、所有 shift 对对应维取模后为零的 `roll`、所有 (before, after) 都为零的 `pad`、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute`、重复的 `flip` 以及 shift 相消的 `roll` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。

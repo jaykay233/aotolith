@@ -22,7 +22,8 @@ from enum import Enum
 from math import ceil, isfinite, prod
 
 from .ir import DType, Graph, Operation, TensorType
-from .passes import POINTWISE_OPS as _POINTWISE_OPS
+from .op_sets import CONSTANT_OPS as _CONSTANT_OPS
+from .op_sets import POINTWISE_OPS as _POINTWISE_OPS
 from .shapes import broadcast_shapes, can_broadcast
 
 FLOATING_DTYPES = frozenset({DType.F16, DType.BF16, DType.F32})
@@ -97,12 +98,9 @@ def reduced_shape(
 
     if keepdim:
         return tuple(
-            1 if position in axes else size
-            for position, size in enumerate(shape)
+            1 if position in axes else size for position, size in enumerate(shape)
         )
-    return tuple(
-        size for position, size in enumerate(shape) if position not in axes
-    )
+    return tuple(size for position, size in enumerate(shape) if position not in axes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +138,7 @@ class AttrSpec:
             if value is None:
                 return None
             if not isinstance(value, int) or isinstance(value, bool):
-                raise ValueError(
-                    f"{label} must be an integer or None, got {value!r}"
-                )
+                raise ValueError(f"{label} must be an integer or None, got {value!r}")
             return normalize_axis(value, rank, label)
         elif kind is AttrKind.AXES:
             return normalize_axes(value, rank, label)
@@ -150,25 +146,19 @@ class AttrSpec:
             if not isinstance(value, tuple) or not all(
                 isinstance(dim, int) and not isinstance(dim, bool) for dim in value
             ):
-                raise ValueError(
-                    f"{label} must be a tuple of integers, got {value!r}"
-                )
+                raise ValueError(f"{label} must be a tuple of integers, got {value!r}")
         elif kind is AttrKind.INT_OR_NONE:
             if value is None:
                 return None
             if not isinstance(value, int) or isinstance(value, bool):
-                raise ValueError(
-                    f"{label} must be an integer or None, got {value!r}"
-                )
+                raise ValueError(f"{label} must be an integer or None, got {value!r}")
         elif kind is AttrKind.LITERAL:
             if not isinstance(value, (bool, int, float)):
                 raise ValueError(f"{label} must be a scalar, got {value!r}")
         return value
 
 
-def normalized_axes(
-    graph: Graph, op: Operation, attribute: str
-) -> tuple[int, ...]:
+def normalized_axes(graph: Graph, op: Operation, attribute: str) -> tuple[int, ...]:
     """The axes ``attribute`` names, resolved against the first operand."""
 
     rank = len(graph.value(op.inputs[0]).type.shape)
@@ -287,8 +277,7 @@ def check_operation(graph: Graph, op: Operation) -> None:
     if contract.dtype is DtypeRule.FLOATING_IN:
         if input_type.dtype not in FLOATING_DTYPES:
             raise NotImplementedError(
-                f"{op.op} needs a floating-point input, got "
-                f"{input_type.dtype.value}"
+                f"{op.op} needs a floating-point input, got {input_type.dtype.value}"
             )
     elif contract.dtype is DtypeRule.PRESERVE:
         if output_type.dtype != input_type.dtype:
@@ -341,9 +330,7 @@ def _check_scan_shape(graph: Graph, op: Operation) -> None:
     input_shape = graph.value(op.inputs[0]).type.shape
     output_shape = graph.value(op.outputs[0]).type.shape
     if output_shape != input_shape:
-        raise ValueError(
-            f"{op.op} output shape {output_shape} != {input_shape}"
-        )
+        raise ValueError(f"{op.op} output shape {output_shape} != {input_shape}")
 
 
 def _check_correction(graph: Graph, op: Operation) -> None:
@@ -380,9 +367,7 @@ def _check_cat(graph: Graph, op: Operation) -> None:
     expected = list(output_type.shape)
     expected[axis] = sum(input_type.shape[axis] for input_type in input_types)
     if tuple(expected) != output_type.shape:
-        raise ValueError(
-            f"cat output shape {output_type.shape} != {tuple(expected)}"
-        )
+        raise ValueError(f"cat output shape {output_type.shape} != {tuple(expected)}")
 
 
 def _check_arange(graph: Graph, op: Operation) -> None:
@@ -425,9 +410,7 @@ def integer_constant_value(op: Operation, dtype: DType) -> int:
     converted = int(value)
     bits = 32 if dtype == DType.I32 else 64
     if not -(1 << (bits - 1)) <= converted <= (1 << (bits - 1)) - 1:
-        raise ValueError(
-            f"{op.op}.value {value!r} overflows {dtype.value}"
-        )
+        raise ValueError(f"{op.op}.value {value!r} overflows {dtype.value}")
     return converted
 
 
@@ -493,34 +476,26 @@ def _check_topk(graph: Graph, op: Operation) -> None:
     _no_boolean_operand(graph, op)
     input_type = graph.value(op.inputs[0]).type
     output_type = graph.value(op.outputs[0]).type
-    expected_dtype = (
-        DType.I64 if op.op == "topk_indices" else input_type.dtype
-    )
+    expected_dtype = DType.I64 if op.op == "topk_indices" else input_type.dtype
     if output_type.dtype != expected_dtype:
         raise ValueError(
-            f"{op.op} must return {expected_dtype.value}, got "
-            f"{output_type.dtype.value}"
+            f"{op.op} must return {expected_dtype.value}, got {output_type.dtype.value}"
         )
     _check_topk_window(graph, op, output_type.shape)
 
 
-def _check_topk_window(
-    graph: Graph, op: Operation, shape: tuple[int, ...]
-) -> None:
+def _check_topk_window(graph: Graph, op: Operation, shape: tuple[int, ...]) -> None:
     input_type = graph.value(op.inputs[0]).type
     rank = len(input_type.shape)
     axis = normalize_axis(op.attrs["dim"], rank, f"{op.op}.dim")
     k = op.attrs["k"]
     if k > input_type.shape[axis]:
         raise ValueError(
-            f"{op.op}.k {k} exceeds dimension {axis} of size "
-            f"{input_type.shape[axis]}"
+            f"{op.op}.k {k} exceeds dimension {axis} of size {input_type.shape[axis]}"
         )
     expected = input_type.shape[:axis] + (k,) + input_type.shape[axis + 1 :]
     if shape != expected:
-        raise ValueError(
-            f"{op.op} output shape {shape} does not match {expected}"
-        )
+        raise ValueError(f"{op.op} output shape {shape} does not match {expected}")
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +557,7 @@ def _check_embedding(graph: Graph, op: Operation) -> None:
     weight_type = graph.value(op.inputs[0]).type
     indices_type = graph.value(op.inputs[1]).type
     if len(weight_type.shape) != 2:
-        raise ValueError(
-            f"embedding weight must have rank 2, got {weight_type.shape}"
-        )
+        raise ValueError(f"embedding weight must have rank 2, got {weight_type.shape}")
     if weight_type.dtype not in FLOATING_DTYPES:
         raise ValueError(
             f"embedding weight must be floating point, got {weight_type.dtype.value}"
@@ -749,7 +722,6 @@ def _check_scatter(graph: Graph, op: Operation) -> None:
             )
 
 
-
 def _check_index_add(graph: Graph, op: Operation) -> None:
     source_type = graph.value(op.inputs[0]).type
     dim, _ = _positive_dim(graph, op)
@@ -760,8 +732,7 @@ def _check_index_add(graph: Graph, op: Operation) -> None:
     indices_type = graph.value(op.inputs[1]).type
     if len(indices_type.shape) != 1:
         raise NotImplementedError(
-            "index_add requires a 1-D index tensor, got "
-            f"{indices_type.shape}"
+            f"index_add requires a 1-D index tensor, got {indices_type.shape}"
         )
     _index_tensor(graph, op.inputs[1], "index_add indices")
     update_type = graph.value(op.inputs[2]).type
@@ -796,8 +767,7 @@ def _check_rope(graph: Graph, op: Operation) -> None:
             raise ValueError("rope table dtype must match the source dtype")
         if not can_broadcast(table_type.shape, output_type.shape):
             raise ValueError(
-                f"rope table {table_type.shape} cannot broadcast "
-                f"to {output_type.shape}"
+                f"rope table {table_type.shape} cannot broadcast to {output_type.shape}"
             )
         if table_type.shape[-1] not in (1, columns):
             raise ValueError(
@@ -837,27 +807,17 @@ def _check_attention(graph: Graph, op: Operation) -> None:
             f"attention output shape {output_type.shape} != {expected_output_shape}"
         )
     if not (
-        query_type.dtype
-        == key_type.dtype
-        == value_type.dtype
-        == output_type.dtype
+        query_type.dtype == key_type.dtype == value_type.dtype == output_type.dtype
     ):
-        raise NotImplementedError(
-            "attention requires identical Q/K/V/output dtypes"
-        )
+        raise NotImplementedError("attention requires identical Q/K/V/output dtypes")
     if op.attrs.get("causal") and len(op.inputs) == 4:
-        raise ValueError(
-            "attention cannot combine an explicit mask with causal mode"
-        )
+        raise ValueError("attention cannot combine an explicit mask with causal mode")
     if len(op.inputs) == 4:
         mask_type = graph.value(op.inputs[3]).type
         score_shape = (
             (query_shape[0], query_shape[-2], key_shape[-2])
             if len(query_shape) == 3
-            else (
-                query_shape[:1]
-                + (query_shape[-3], query_shape[-2], key_shape[-2])
-            )
+            else (query_shape[:1] + (query_shape[-3], query_shape[-2], key_shape[-2]))
         )
         if mask_type.dtype not in {query_type.dtype, DType.BOOL}:
             raise NotImplementedError(
@@ -963,8 +923,7 @@ def _roll_shape(op: Operation, shape: tuple[int, ...]) -> tuple[int, ...]:
     if dims is None:
         if len(shifts) != 1:
             raise ValueError(
-                "roll without dims requires exactly one shift, got "
-                f"{len(shifts)}"
+                f"roll without dims requires exactly one shift, got {len(shifts)}"
             )
         return shape
     if len(dims) != len(shifts):
@@ -982,9 +941,7 @@ def _axes(
     values = op.attrs[attribute]
     if not values:
         raise ValueError(f"{label} must not be empty")
-    normalized = tuple(
-        normalize_axis(dim, len(shape), label) for dim in values
-    )
+    normalized = tuple(normalize_axis(dim, len(shape), label) for dim in values)
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"{label} contains duplicate axes: {values}")
     return normalized
@@ -1023,28 +980,13 @@ def _check_layout(graph: Graph, op: Operation) -> None:
     output_shape = graph.value(op.outputs[0]).type.shape
     expected = LAYOUT_RULES[op.op](op, input_shape)
     if expected != output_shape:
-        raise ValueError(
-            f"{op.op} output shape {output_shape} != {expected}"
-        )
+        raise ValueError(f"{op.op} output shape {output_shape} != {expected}")
 
 
 _ARANGE_ATTRS = (
     AttrSpec("start", AttrKind.FINITE_NUMBER),
     AttrSpec("end", AttrKind.FINITE_NUMBER),
     AttrSpec("step", AttrKind.FINITE_NUMBER),
-)
-
-_CONSTANT_OPS = (
-    "scalar_tensor",
-    "zeros",
-    "ones",
-    "full",
-    "new_zeros",
-    "new_ones",
-    "new_full",
-    "zeros_like",
-    "ones_like",
-    "full_like",
 )
 
 
@@ -1225,12 +1167,18 @@ OP_CONTRACTS: dict[str, OpContract] = {
         arity=(3, 4), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
     ),
     "fused_elementwise": OpContract(
-        arity=(1, 8), rank=(0, 8), dtype=DtypeRule.ANY,
-        shape=ShapeRule.FREE, native=True,
+        arity=(1, 8),
+        rank=(0, 8),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        native=True,
     ),
     "layer_norm": OpContract(
-        arity=(1, 3), dtype=DtypeRule.ANY, shape=ShapeRule.FREE,
-        outputs=(1, 3), native=True,
+        arity=(1, 3),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        outputs=(1, 3),
+        native=True,
     ),
     "rms_norm": OpContract(
         arity=(1, 2), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
@@ -1360,9 +1308,7 @@ OP_CONTRACTS: dict[str, OpContract] = {
         attrs=(AttrSpec("dim", AttrKind.INT),),
         extra=_check_layout,
     ),
-    "contiguous": OpContract(
-        arity=(1, 1), shape=ShapeRule.FREE, extra=_check_layout
-    ),
+    "contiguous": OpContract(arity=(1, 1), shape=ShapeRule.FREE, extra=_check_layout),
     "alias": OpContract(arity=(1, 1), shape=ShapeRule.FREE, extra=_check_layout),
     # -- constants --------------------------------------------------------
     "arange": OpContract(

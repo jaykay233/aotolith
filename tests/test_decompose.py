@@ -7,12 +7,8 @@ import pytest
 import torch
 
 from aotolith import compile_callable
-from aotolith.decompose import aten_decompositions, is_kept_native, native_targets
+from aotolith.decompose import aten_decompositions
 from aotolith.frontend import NATIVE_TARGETS, capture_fx
-
-
-def test_native_targets_is_the_frontends_own_list() -> None:
-    assert native_targets() == NATIVE_TARGETS
 
 
 def test_attention_and_layer_norm_are_never_decomposed() -> None:
@@ -24,13 +20,33 @@ def test_attention_and_layer_norm_are_never_decomposed() -> None:
         "aten._softmax.default",
         "aten.gelu.default",
     ):
-        assert is_kept_native(target)
+        assert target in NATIVE_TARGETS
 
 
 def test_the_table_does_not_rewrite_an_operator_the_frontend_lowers() -> None:
-    table = aten_decompositions()
+    table = aten_decompositions(NATIVE_TARGETS)
     overlap = {str(target) for target in table} & NATIVE_TARGETS
     assert overlap == set()
+
+
+def test_an_empty_keep_set_is_the_whole_table() -> None:
+    # The default proves nothing about the frontend's table but does pin the
+    # baseline: every rule Torch ships reaches the caller unless it is kept.
+    assert len(aten_decompositions()) > 900
+    assert len(aten_decompositions(frozenset())) == len(aten_decompositions())
+
+
+def test_keeping_a_target_removes_only_that_rule() -> None:
+    baseline = aten_decompositions()
+    kept = "aten.celu.default"
+    reduced = aten_decompositions(frozenset({kept}))
+    removed = sum(1 for target in baseline if str(target) == kept)
+    assert removed >= 1
+    assert len(reduced) == len(baseline) - removed
+    # Everything else survives, by target name.
+    assert {str(target) for target in reduced} == {
+        str(target) for target in baseline if str(target) != kept
+    }
 
 
 def test_attention_still_reaches_the_backend_as_one_operation() -> None:
@@ -45,7 +61,7 @@ def test_attention_still_reaches_the_backend_as_one_operation() -> None:
 
 
 def test_the_table_covers_the_long_tail() -> None:
-    table = {str(target) for target in aten_decompositions()}
+    table = {str(target) for target in aten_decompositions(NATIVE_TARGETS)}
     # A sample of operators no backend would implement by hand.
     for target in (
         "aten.huber_loss.default",
@@ -58,8 +74,8 @@ def test_the_table_covers_the_long_tail() -> None:
         assert target in table
 
 
-def test_the_table_is_built_once() -> None:
-    assert aten_decompositions() is aten_decompositions()
+def test_the_table_is_built_once_per_keep_set() -> None:
+    assert aten_decompositions(NATIVE_TARGETS) is aten_decompositions(NATIVE_TARGETS)
 
 
 def test_a_composite_the_frontend_never_named_compiles() -> None:

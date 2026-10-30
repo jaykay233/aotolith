@@ -16,16 +16,21 @@ Two reasons to use it rather than hand-writing every lowering:
   the result goes through the same layout simplification, pointwise fusion
   and dtype promotion. There is no second code path to keep correct.
 
-The frontend keeps the operators it lowers itself. For those a decomposition
-would be a regression rather than a shortcut: it replaces a dedicated Metal
-kernel (``attention``, ``layer_norm``, ``softmax``), an exact emulation
-(``arange`` rebuilds its float sequence from the fma residual and a two-sum so
-it rounds once, the way PyTorch's double expression does), or a lowering whose
-attribute normalisation the rest of the compiler relies on (``sum``/``var``
-spell their axes and ``keepdim`` differently in each schema). ``_KEEP_NATIVE``
-names all of them and is derived from the frontend itself, so it cannot drift:
-that module's ``NATIVE_TARGETS`` is the single list of targets it lowers, and a
-test asserts the two sets are disjoint.
+Which operators keep their own lowering is the *caller's* decision, passed in
+as ``keep``. This module deliberately does not know the frontend's operator
+table: the table is a fact about capture, and reaching back for it would make
+capture and legalization import each other. The frontend already owns the list
+(``frontend.NATIVE_TARGETS``), so it passes it in and the dependency points one
+way.
+
+For the operators that are kept, a decomposition would be a regression rather
+than a shortcut: it replaces a dedicated Metal kernel (``attention``,
+``layer_norm``, ``softmax``), an exact emulation (``arange`` rebuilds its float
+sequence from the fma residual and a two-sum so it rounds once, the way
+PyTorch's double expression does), or a lowering whose attribute normalisation
+the rest of the compiler relies on (``sum``/``var`` spell their axes and
+``keepdim`` differently in each schema). A test asserts the two sets stay
+disjoint.
 """
 
 from __future__ import annotations
@@ -37,42 +42,32 @@ from typing import Any
 # while tracing, so its signature is only meaningful to ``make_fx``.
 Decomposition = Callable[..., Any]
 
-_CACHE: dict[object, Decomposition] | None = None
+# Keyed by the keep set, since the table is a function of it. Building the
+# table walks Torch's registries and ``asdict``-copies each rule, which is far
+# more expensive than the compile that follows it.
+_CACHE: dict[frozenset[str], dict[object, Decomposition]] = {}
 
 
-def native_targets() -> frozenset[str]:
-    """Every ATen target the frontend lowers itself."""
+def aten_decompositions(
+    keep: frozenset[str] = frozenset(),
+) -> dict[object, Decomposition]:
+    """Torch's core decomposition table minus the targets in ``keep``.
 
-    from .frontend import NATIVE_TARGETS
-
-    return frozenset(NATIVE_TARGETS)
-
-
-def aten_decompositions() -> dict[object, Decomposition]:
-    """The decomposition table handed to ``make_fx``.
-
-    Torch's full table minus the targets the frontend lowers natively, so an
-    operator with a dedicated kernel keeps it. Cached because building the
-    table walks Torch's registries and ``asdict``-copies each rule.
+    ``keep`` holds the ATen target names, as strings, whose own lowering is
+    better than the decomposition: a fused kernel, an exact emulation, or a
+    normalization the rest of the compiler depends on.
     """
 
-    global _CACHE
-    if _CACHE is not None:
-        return _CACHE
+    cached = _CACHE.get(keep)
+    if cached is not None:
+        return cached
 
     from torch._decomp import core_aten_decompositions
 
-    keep_native = native_targets()
     table: dict[object, Decomposition] = {
         target: rule
         for target, rule in core_aten_decompositions().items()
-        if str(target) not in keep_native
+        if str(target) not in keep
     }
-    _CACHE = table
+    _CACHE[keep] = table
     return table
-
-
-def is_kept_native(target: str) -> bool:
-    """Whether ``target`` keeps its own lowering instead of decomposing."""
-
-    return target in native_targets()

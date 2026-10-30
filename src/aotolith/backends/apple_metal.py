@@ -25,7 +25,8 @@ from ..op_defs import INTEGRAL_DTYPES as _INTEGRAL_DTYPES
 from ..planning import StoragePlan, plan_storage
 from ..shapes import can_broadcast as _can_broadcast
 from ..selection import KernelBenchmark, KernelSelection
-from ..passes import LAYOUT_OPS, POINTWISE_OPS
+from ..op_sets import CONSTANT_OPS as _CONSTANT_POINTWISE_OPS
+from ..op_sets import LAYOUT_OPS, POINTWISE_OPS
 
 _MLX_DTYPES = {
     DType.F16: mx.float16,
@@ -77,18 +78,6 @@ _BITWISE_POINTWISE_OPS = {
 # only take floats, but ``signbit`` is defined for integers too - it is a bit
 # test, not a comparison, so -0.0 reports true where ``x < 0`` would not.
 _NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf", "signbit"}
-_CONSTANT_POINTWISE_OPS = {
-    "scalar_tensor",
-    "zeros",
-    "ones",
-    "full",
-    "new_zeros",
-    "new_ones",
-    "new_full",
-    "zeros_like",
-    "ones_like",
-    "full_like",
-}
 # Largest finite value of each floating dtype, which is what `nan_to_num`
 # substitutes for an infinity when the caller does not name a replacement.
 _FINITE_LIMITS = {

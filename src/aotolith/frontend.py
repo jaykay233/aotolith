@@ -555,7 +555,7 @@ def capture_fx(
         traced = make_fx(
             fn,
             tracing_mode="fake",
-            decomposition_table=aten_decompositions(),
+            decomposition_table=aten_decompositions(NATIVE_TARGETS),
         )(*example_inputs)
     except AssertionError as exc:
         if "Please convert all Tensors to FakeTensors" not in str(exc):
