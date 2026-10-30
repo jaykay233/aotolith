@@ -583,7 +583,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
-- Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 激活必须是 SiLU（在构造好的 `mlp.act_fn` 上做数值比较，而不是读 `hidden_act`，因为库会把它归一化甚至替换掉），且不能有 sliding-window 层（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）。不满足时抛 `NotImplementedError`。这两种情况此前会静默产出错误数值：融合后的 MLP 硬编码了 `silu(gate) * up`，mask 则由适配层自己构造为普通 causal mask
+- Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 走每层自己的 `mlp.act_fn`（因此 `silu`、两种 `gelu` 拼法以及其他 pointwise 激活都按模型本身的算式编译；`silu_mul` 的 matmul epilogue 折叠仍只识别 `silu`，`gelu` MLP 会多出一条独立的 pointwise kernel），构造时把该激活单独跑一遍捕获，无法 lower 的激活（例如带参数的 `PReLU`）在模型捕获之前就以点名该层的消息报错。sliding-window 层仍然被拒绝（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）：适配层的 mask 由自己构造，普通 causal mask 与窗口 mask 语义不同，而当前 transformers 版本自身的 sliding 路径在同一条 cache 上就会抛 `TypeError`，没有可对照的参考实现
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
 - attention 不支持 dropout 或辅助输出；原生 MSL attention 要求 Q/K 和 V 的 head dim 不超过 256，超出后回退到 MLX SDPA

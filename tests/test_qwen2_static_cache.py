@@ -294,12 +294,13 @@ def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() ->
     mx.eval(tokens)
     assert tokens.shape == (1, 6)
 
-def test_adapter_refuses_a_mlp_activation_it_does_not_implement() -> None:
-    """A GELU model has the same layout, so nothing downstream would notice.
+@pytest.mark.parametrize("hidden_act", ["silu", "gelu", "gelu_pytorch_tanh"])
+def test_adapter_matches_pytorch_for_supported_activations(hidden_act) -> None:
+    """The MLP calls the layer's own activation, so every lowerable one works.
 
-    The fused MLP hardcodes ``silu(gate) * up``. Without this check a model with
-    ``hidden_act="gelu"`` compiles, runs, and returns numbers that are wrong by
-    far more than the test tolerance.
+    ``silu`` is the Qwen2 default, but ``Qwen2Config`` accepts others and the
+    layer layout is identical, so the compiled logits have to follow the config
+    rather than a hardcoded ``silu``.
     """
 
     transformers = pytest.importorskip("transformers")
@@ -311,11 +312,61 @@ def test_adapter_refuses_a_mlp_activation_it_does_not_implement() -> None:
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=32,
-        hidden_act="gelu",
+        tie_word_embeddings=True,
+        hidden_act=hidden_act,
+    )
+    torch.manual_seed(24)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    expected_logits, expected_tokens = _reference_tokens(model, input_ids, 5)
+
+    runtime = compile_qwen2_static_cache(
+        model,
+        prompt_length=4,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+
+    logits, _ = runtime.prefill_ids(input_ids.tolist())
+    mx.eval(logits)
+    assert mx.allclose(
+        logits,
+        mx.array(expected_logits.numpy()),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    tokens = runtime.greedy_generate(
+        input_ids.tolist(), max_new_tokens=5, sync_each_step=True
+    )
+    mx.eval(tokens)
+    assert tokens.tolist() == [expected_tokens]
+
+
+def test_adapter_refuses_a_mlp_activation_it_does_not_implement() -> None:
+    """A parameterised activation is not pointwise, so capture must not proceed.
+
+    The adapter now calls the layer's own ``act_fn``, which covers every
+    activation the compiler can lower. ``PReLU`` carries a parameter and is not
+    one of them; the pre-flight capture turns that into a message naming the
+    layer instead of a bare "unsupported FX target" from inside the model.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
     )
     model = transformers.Qwen2ForCausalLM(config).eval()
+    for layer in model.model.layers:
+        layer.mlp.act_fn = torch.nn.PReLU(config.intermediate_size)
 
-    with pytest.raises(NotImplementedError, match="silu MLP activation"):
+    with pytest.raises(NotImplementedError, match="cannot lower the MLP activation"):
         compile_qwen2_static_cache(model, prompt_length=4, max_new_tokens=4)
 
 

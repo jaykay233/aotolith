@@ -23,27 +23,27 @@ import torch
 import torch.nn.functional as F
 
 from ..compiler import CompiledModulePlan, compile_module
+from ..frontend import capture_fx
 
-# Probe points for the activation check below. They span the range where SiLU
-# and the other activations a Qwen2 config can select disagree, including a
-# negative input, where SiLU is not monotonic.
+# Probe points for the activation pre-flight check below. They span the range
+# where activations differ, including a negative input, where SiLU is not
+# monotonic.
 _ACTIVATION_PROBES = (0.25, -0.75, 1.5, -2.5, 3.0, -6.0)
-_ACTIVATION_TOLERANCE = 1e-5
 
 
 def _validate_activation(model: torch.nn.Module) -> None:
-    """Reject a model whose MLP activation is not the one the adapter hardcodes.
+    """Reject an MLP activation that the compiler cannot lower.
 
-    ``_finish_layer`` computes ``silu(gate) * up``, but ``Qwen2Config`` accepts
-    any ``hidden_act``, and the resulting model still has the same layer layout.
-    Nothing downstream would notice a GELU model: it would compile, run, and
-    return numbers that are quietly wrong. Comparing the module's own activation
-    against SiLU catches that, and it reads the constructed layer rather than the
-    config string, which the library may have normalised or replaced.
+    ``_finish_layer`` calls the layer's own ``act_fn``, so the traced graph is
+    the model's computation for every activation the compiler can lower -
+    ``silu``, both ``gelu`` spellings, ``relu`` and the rest of the pointwise
+    set all work. What still needs rejecting is a function that is not a
+    pointwise op at all: running it through the same capture the compiler uses
+    turns that into a message naming the configured activation instead of a
+    bare "unsupported FX target" from inside the model's capture.
     """
 
     probe = torch.tensor(_ACTIVATION_PROBES, dtype=torch.float32)
-    expected = probe * torch.sigmoid(probe)
     for index, layer in enumerate(model.model.layers):
         activation = getattr(layer.mlp, "act_fn", None)
         if activation is None:
@@ -51,17 +51,15 @@ def _validate_activation(model: torch.nn.Module) -> None:
                 f"layer {index} has no mlp.act_fn; the static-cache adapter "
                 "requires a gated MLP"
             )
-        with torch.no_grad():
-            actual = activation(probe)
-        if not torch.allclose(
-            actual, expected, atol=_ACTIVATION_TOLERANCE, rtol=0.0
-        ):
+        try:
+            capture_fx(activation, (probe,))
+        except Exception as error:  # noqa: BLE001 - re-raised with context
             name = getattr(model.config, "hidden_act", "<unknown>")
             raise NotImplementedError(
-                "the static-cache adapter only implements silu MLP activation, "
-                f"but this model uses {name!r}: its layers are fused around "
-                "silu(gate) * up, so compiling it would return wrong numbers"
-            )
+                "the static-cache adapter cannot lower the MLP activation "
+                f"{type(activation).__name__} (config hidden_act {name!r}) "
+                f"used by layer {index}: {error}"
+            ) from error
 
 
 def _validate_no_sliding_attention(model: torch.nn.Module) -> None:
@@ -270,7 +268,10 @@ class _Qwen2StaticBase(torch.nn.Module):
         )
         gate = F.linear(normalized, layer.mlp.gate_proj.weight, None)
         up = F.linear(normalized, layer.mlp.up_proj.weight, None)
-        down = F.linear(F.silu(gate) * up, layer.mlp.down_proj.weight, None)
+        # The layer's own activation, so the traced graph is the model's
+        # computation for every activation the compiler can lower; the
+        # projection epilogue fold below recognizes ``silu`` only.
+        down = F.linear(layer.mlp.act_fn(gate) * up, layer.mlp.down_proj.weight, None)
         return hidden + down
 
     def _logits(self, hidden: torch.Tensor) -> torch.Tensor:
