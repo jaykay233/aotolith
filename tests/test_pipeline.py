@@ -1666,6 +1666,61 @@ def test_matching_dtypes_are_not_cast() -> None:
     assert mx.array_equal(actual, mx.array(fn(a, b).numpy()))
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_integer_pow_matches_pytorch_exactly(dtype) -> None:
+    def fn(base, exponent):
+        return base**exponent
+
+    base = torch.tensor([2, 3, -2, 0, 7], dtype=dtype)
+    exponent = torch.tensor([3, 4, 3, 0, 1], dtype=dtype)
+    result = compile_callable(fn, (base, exponent))
+    assert [op.op for op in result.lowered_graph.ops] == ["pow"]
+    actual = result.plan(_torch_to_mlx(base), _torch_to_mlx(exponent))[0]
+    expected = mx.array(fn(base, exponent).numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("fn", "values"),
+    [
+        (lambda base: base**3, [2, -3, 0]),
+        (lambda base: base**0, [2, -3, 0]),
+        (lambda base: 2**base, [3, 4, 0]),
+    ],
+)
+def test_integer_pow_accepts_a_scalar_operand(fn, values) -> None:
+    base = torch.tensor(values, dtype=torch.int64)
+    result = compile_callable(fn, (base,))
+    actual = result.plan(_torch_to_mlx(base))[0]
+    expected = mx.array(fn(base).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_integer_pow_wraps_like_pytorch() -> None:
+    def fn(base):
+        return base**70
+
+    base = torch.tensor([2, 3], dtype=torch.int64)
+    result = compile_callable(fn, (base,))
+    actual = result.plan(_torch_to_mlx(base))[0]
+    expected_value = fn(base)
+    expected = mx.array(expected_value.numpy())
+    mx.eval(actual, expected)
+    assert expected_value.tolist() == [0, 2293070008301402073]
+    assert mx.array_equal(actual, expected)
+
+
+def test_integer_pow_rejects_a_negative_scalar_exponent() -> None:
+    def fn(base):
+        return base**-1
+
+    with pytest.raises(ValueError, match="negative exponent raises"):
+        compile_callable(fn, (torch.tensor([2], dtype=torch.int64),))
+
+
 def test_embedding_composes_with_matmul_and_pointwise_fusion() -> None:
     def fn(indices, embedding, projection):
         hidden = torch.nn.functional.embedding(indices, embedding)

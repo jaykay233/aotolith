@@ -72,6 +72,7 @@ _INTEGER_POINTWISE_OPS = {
     "sub",
     "rsub",
     "mul",
+    "pow",
     "neg",
     "abs",
     "sign",
@@ -273,6 +274,40 @@ inline long tsc_remainder_i64(long dividend, long divisor) {
         remainder += divisor;
     }
     return remainder;
+}
+
+inline int tsc_pow_i32(int base, int exponent) {
+    if (exponent < 0) {
+        return 0;
+    }
+    int result = 1;
+    int factor = base;
+    unsigned remaining = (unsigned)exponent;
+    while (remaining != 0u) {
+        if ((remaining & 1u) != 0u) {
+            result = tsc_mul_i32(result, factor);
+        }
+        factor = tsc_mul_i32(factor, factor);
+        remaining >>= 1u;
+    }
+    return result;
+}
+
+inline long tsc_pow_i64(long base, long exponent) {
+    if (exponent < 0L) {
+        return 0L;
+    }
+    long result = 1L;
+    long factor = base;
+    unsigned long remaining = (unsigned long)exponent;
+    while (remaining != 0UL) {
+        if ((remaining & 1UL) != 0UL) {
+            result = tsc_mul_i64(result, factor);
+        }
+        factor = tsc_mul_i64(factor, factor);
+        remaining >>= 1UL;
+    }
+    return result;
 }
 """
 
@@ -3987,6 +4022,7 @@ def _validate_integer_pointwise_op(
         "sub",
         "rsub",
         "mul",
+        "pow",
         "maximum",
         "minimum",
         "floor_divide",
@@ -4005,6 +4041,11 @@ def _validate_integer_pointwise_op(
             if not isinstance(scalar, int) or isinstance(scalar, bool):
                 raise ValueError(
                     f"integer {op.op} scalar must be an integer, got {scalar!r}"
+                )
+            if op.op == "pow" and scalar < 0:
+                raise ValueError(
+                    "integer pow with a negative exponent raises in PyTorch, "
+                    f"got {scalar}"
                 )
         else:
             raise ValueError(f"malformed integer binary op: {op.op}")
@@ -4583,10 +4624,12 @@ def _emit_integer_pointwise_expression(
         value = arguments[0]
         return f"({ctype})(~({unsigned_ctype})({value}))"
 
-    if op.op in {"add", "sub", "rsub", "mul"}:
+    if op.op in {"add", "sub", "rsub", "mul", "pow"}:
         left, right = _binary_operands(op, arguments, input_types)
         if op.op == "mul":
             return f"tsc_mul_{suffix}({left}, {right})"
+        if op.op == "pow":
+            return f"tsc_pow_{suffix}({left}, {right})"
         alpha = op.attrs.get("alpha", 1)
         if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
             raise ValueError(f"integer {op.op}.alpha must be an integer")
