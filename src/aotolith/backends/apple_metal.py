@@ -241,6 +241,18 @@ inline float tsc_lerp_f32(float start, float end, float weight) {
         : end - (end - start) * (1.0f - weight);
 }
 
+inline float tsc_sinc(float value) {
+    float scaled = 3.14159265358979323846f * value;
+    if (metal::abs(value) < 1.0e-4f) {
+        // Metal's sin can flush an argument this small to zero, which would
+        // turn sinc(1e-8) into 0 instead of the 1 ATen returns. The series is
+        // exact to well below one ulp over this window.
+        float square = scaled * scaled;
+        return 1.0f - square / 6.0f + square * square / 120.0f;
+    }
+    return metal::sin(scaled) / scaled;
+}
+
 inline float tsc_xlogy_f32(float value, float other) {
     // ATen only short-circuits a zero left operand, and only when the right
     // operand is not NaN, so 0 * log(-1) is 0 while 0 * log(NaN) stays NaN.
@@ -4770,11 +4782,7 @@ def _emit_pointwise_expression(
         value = arguments[0]
         return f"({value} - metal::trunc({value}))"
     if op.op == "sinc":
-        value = arguments[0]
-        scaled = f"3.14159265358979323846f * ({value})"
-        return (
-            f"(({value}) == 0.0f ? 1.0f : metal::sin({scaled}) / ({scaled}))"
-        )
+        return f"tsc_sinc({arguments[0]})"
     if op.op == "nan_to_num":
         value = arguments[0]
         if input_types[0].dtype not in _FLOATING_DTYPES:

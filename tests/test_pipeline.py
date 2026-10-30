@@ -6267,7 +6267,7 @@ def test_erfc_frac_sinc_and_hypot_match_pytorch() -> None:
     cases = (
         (torch.erfc, (value,), "tsc_erfc("),
         (torch.frac, (value,), "metal::trunc("),
-        (torch.sinc, (value,), "metal::sin("),
+        (torch.sinc, (value,), "tsc_sinc("),
         (torch.hypot, (value, other), "hypot("),
     )
     for fn, inputs, marker in cases:
@@ -6277,12 +6277,17 @@ def test_erfc_frac_sinc_and_hypot_match_pytorch() -> None:
         _assert_values_match(actual, fn(*inputs))
 
 
-def test_sinc_returns_one_at_zero() -> None:
-    value = torch.tensor([0.0, 1e-8, -1e-8])
+def test_sinc_returns_one_at_zero_and_near_zero() -> None:
+    # GPU sin can flush a 1e-8 argument to zero, so the small-argument branch
+    # has to reproduce ATen's exact 1 there rather than 0/pi_x.
+    value = torch.tensor([0.0, -0.0, 1e-8, -1e-8, 1e-5])
 
     result = compile_callable(torch.sinc, (value,))
+    assert "tsc_sinc(" in result.plan.kernels[0].source
     actual = result.plan(_torch_to_mlx(value))[0]
-    _assert_values_match(actual, torch.sinc(value), atol=1e-7, rtol=1e-7)
+    expected = torch.sinc(value)
+    mx.eval(actual)
+    assert actual.tolist() == expected.tolist()
 
 
 def test_copysign_follows_the_magnitude_and_signed_zero() -> None:
