@@ -243,6 +243,8 @@ IR 定义在 `ir.py`：
 
 这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
 
+每个 IR op 的操作数个数、必备 attribute、输出个数、dtype 和 shape 规则集中声明在 `op_defs.py`，由 `check_operation()` 一次性校验：`OpContract` 用 `arity`、`attrs`、`rank`、`dtype`、`shape`、`outputs` 六个字段描述通用规则，字段表达不了的算子间约束（scatter 的 index/update 相容性、embedding 的浮点 weight 加整型 indices、layout op 的目标 shape）放在该算子自己的 `extra` 钩子里。后端在 lowering 之前统一跑一遍校验，然后只根据 op 名决定“能否生成 kernel”，不再让每个 `elif` 分支各自重写 rank/dtype/shape 前置检查。新增一个算子因此是一行声明加至多一个钩子，`tests/test_planning.py` 里有一条测试要求 `POINTWISE_OPS` 和 `LAYOUT_OPS` 的每个名字都已注册，避免新算子绕过校验。
+
 ## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
 
 `simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、只翻转 singleton 轴的 `flip`、所有 shift 对对应维取模后为零的 `roll`、所有 (before, after) 都为零的 `pad`、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute`、重复的 `flip` 以及 shift 相消的 `roll` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。

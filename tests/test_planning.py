@@ -151,3 +151,63 @@ def test_runtime_arena_reuses_a_planned_slot() -> None:
     ]
     assert stats.reuse_count == 1
 
+
+
+def test_every_operator_the_backend_executes_has_a_contract() -> None:
+    """The registry is only a guarantee if nothing can bypass it.
+
+    A new pointwise or layout operator reaches the runtime through the shared
+    sets in ``passes``, so those names are where an operator could slip past
+    verification. This test fails as soon as that happens.
+    """
+
+    from aotolith.op_defs import OP_CONTRACTS
+    from aotolith.passes import LAYOUT_OPS, POINTWISE_OPS
+
+    registered = set(OP_CONTRACTS)
+    for group in (POINTWISE_OPS, LAYOUT_OPS):
+        missing = sorted(group - registered)
+        assert not missing, f"no contract registered for {missing}"
+
+
+def test_contracts_reject_unknown_operators_by_name() -> None:
+    from aotolith.op_defs import contract_for
+
+    with pytest.raises(KeyError, match="not_really_an_op"):
+        contract_for("not_really_an_op")
+
+
+def test_contract_reports_the_number_of_values_an_operator_writes() -> None:
+    """A multi-output operator is pinned to its own arity of results."""
+
+    from aotolith.op_defs import check_operation
+
+    tensor_type = TensorType((2, 4), DType.F32)
+    values = {
+        "x": Value("x", tensor_type),
+        "out": Value("out", tensor_type),
+        "second": Value("second", tensor_type),
+        "third": Value("third", tensor_type),
+    }
+    attrs = {
+        "normalized_shape": (4,),
+        "eps": 1e-5,
+        "has_weight": False,
+        "has_bias": False,
+    }
+    one_output = Graph(
+        ("x",),
+        values,
+        (Operation("layer_norm", ("x",), ("out",), attrs),),
+        ("out",),
+    )
+    check_operation(one_output, one_output.ops[0])
+
+    too_many = Graph(
+        ("x",),
+        values,
+        (Operation("neg", ("x",), ("out", "second")),),
+        ("out",),
+    )
+    with pytest.raises(ValueError, match="neg must produce 1 results, got 2"):
+        check_operation(too_many, too_many.ops[0])
