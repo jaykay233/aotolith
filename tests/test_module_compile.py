@@ -127,6 +127,117 @@ def test_inplace_add_rejects_aliasing_observer() -> None:
         compile_callable(forward, (torch.arange(5, dtype=torch.float32),))
 
 
+def _run_single_output(compiled, *tensors: torch.Tensor) -> mx.array:
+    output = compiled.plan(*[mx.array(tensor.numpy()) for tensor in tensors])[0]
+    mx.eval(output)
+    return output
+
+
+def test_inplace_index_add_is_legalized_when_unobserved() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        base = value.clone()
+        base.index_add_(0, indices, update)
+        return base * 2
+
+    value = torch.zeros(4)
+    indices = torch.tensor([0, 2])
+    update = torch.randn(2)
+    compiled = compile_callable(forward, (value, indices, update))
+    assert "index_add" in [op.op for op in compiled.input_graph.ops]
+
+    actual = _run_single_output(compiled, value, indices, update)
+    expected = forward(value, indices, update)
+    assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-6, rtol=1e-6)
+
+
+def test_inplace_scatter_add_accumulates_duplicate_indices() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        base = value.clone()
+        base.scatter_add_(1, indices, update)
+        return base
+
+    value = torch.zeros(2, 3)
+    indices = torch.tensor([[0, 2, 2]])
+    update = torch.tensor([[1.0, 2.0, 4.0]])
+    compiled = compile_callable(forward, (value, indices, update))
+    scatter = [op for op in compiled.input_graph.ops if op.op == "scatter"]
+    assert [op.attrs for op in scatter] == [
+        {"dim": 1, "reduce": "add", "include_self": True}
+    ]
+
+    actual = _run_single_output(compiled, value, indices, update)
+    # The duplicate index 2 must accumulate 2 + 4 instead of keeping the last
+    # write, the same way the functional `scatter_add` does.
+    assert mx.allclose(actual, mx.array(forward(value, indices, update).numpy()))
+
+
+def test_inplace_scatter_value_is_legalized() -> None:
+    def forward(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        base = value.clone()
+        base.scatter_(1, indices, 5.0)
+        return base
+
+    value = torch.zeros(2, 3)
+    indices = torch.tensor([[0, 2]])
+    compiled = compile_callable(forward, (value, indices))
+    actual = _run_single_output(compiled, value, indices)
+    assert mx.array_equal(actual, mx.array(forward(value, indices).numpy()))
+
+
+@pytest.mark.parametrize("reduce_name", ["amax", "prod"])
+def test_inplace_scatter_reduce_is_legalized(reduce_name: str) -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        base = value.clone()
+        base.scatter_reduce_(1, indices, update, reduce_name)
+        return base
+
+    value = torch.zeros(2, 3)
+    indices = torch.tensor([[0, 2, 2]])
+    update = torch.tensor([[1.0, 2.0, 4.0]])
+    compiled = compile_callable(forward, (value, indices, update))
+    actual = _run_single_output(compiled, value, indices, update)
+    assert mx.allclose(actual, mx.array(forward(value, indices, update).numpy()))
+
+
+def test_inplace_scatter_rejects_aliasing_observer() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        observed = value + 1
+        mutated = value.index_add_(0, indices, update)
+        return observed, mutated
+
+    with pytest.raises(NotImplementedError, match="aliasing observers"):
+        compile_callable(
+            forward, (torch.zeros(3), torch.tensor([0, 1]), torch.randn(2))
+        )
+
+
+def test_inplace_scatter_returns_the_update_without_writing_back() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        value.index_add_(0, indices, update)
+        return value
+
+    value = torch.zeros(3)
+    indices = torch.tensor([0, 2])
+    update = torch.tensor([1.5, 2.5])
+    compiled = compile_callable(forward, (value, indices, update))
+
+    actual = _run_single_output(compiled, value, indices, update)
+    assert mx.allclose(actual, mx.array(forward(value.clone(), indices, update).numpy()))
+    # SSA legalization returns the updated value; the tensor the caller still
+    # holds is untouched, which the documentation states explicitly.
+    assert mx.array_equal(mx.array(value.numpy()), mx.zeros(3))
+
+
 def test_tiny_huggingface_llama_logits_match_pytorch() -> None:
     transformers = pytest.importorskip("transformers")
     config = transformers.LlamaConfig(

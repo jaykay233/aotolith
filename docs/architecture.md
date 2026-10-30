@@ -54,6 +54,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.scatter_add.default` | `scatter`，`reduce=add` |
 | `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin` |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
+| `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
@@ -500,8 +501,8 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `arange` 目前只支持整数 start/end/step 和 I32/I64 输出；浮点 `arange` 尚未实现
 - bool tensor 支持比较、logical、bitwise、`isnan`/`isinf`、bool mask、`where` 和 `masked_fill`；I32/I64 tensor 除作为 embedding/index_select/gather/scatter indices 外，也支持上述整数 pointwise 集合
 - 整数 pointwise 当前要求输入、tensor 边界和输出同宽；I32 与 I64 混合、除 `torch.square` 特殊形式外的整数 `pow`、true division 和不在支持集合内的算子会明确报错。`floor_divide`/`remainder` 不生成逐元素除零检查，调用方必须保证除数非零
-- scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`，含 `include_self=False`）都支持；`reduce='mean'` 需要逐输出计数，尚未实现。`index_add` 只接受 1-D index，`index_add_` 这类原地形式不做 SSA legalization。重复索引的累加顺序不做确定性保证
-- softmax 支持任意单轴，但不支持一次对多个轴做 softmax
+- scatter 的写入语义和 `reduce`（`add`/`prod`/`amax`/`amin`，含 `include_self=False`）都支持；`reduce='mean'` 需要逐输出计数，尚未实现。`index_add` 只接受 1-D index。`scatter_`/`scatter_add_`/`scatter_reduce_`/`index_add_` 与 `add_` 一样做 SSA legalization：只允许被改写的原值在图内只有一个消费者，编译后的调用返回更新后的值，不会回写调用方仍然持有的那块 tensor，因此调用方必须使用返回值。重复索引的累加顺序不做确定性保证
+- softmax 支持任意单轴。PyTorch 的 `softmax` 本身只接受单个 `dim`，多轴形式总是展开成 reshape + 单轴 softmax + reshape，这条链路可以正常编译
 - sum/mean 支持任意非空维度集合，以及 FP16/BF16/FP32 输出 dtype 覆盖
 - LayerNorm/RMSNorm 只支持连续尾维 reduction
 - LayerNorm 只支持主输出，不支持直接使用 mean/rstd

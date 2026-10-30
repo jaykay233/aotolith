@@ -240,6 +240,15 @@ _SCATTER_REDUCE_NAMES = {
 }
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
+# `make_fx` keeps the in-place spelling of every scatter family operator, so
+# each one is legalized into the functional op with the same lowering.
+_INPLACE_SCATTER_TARGETS = {
+    "aten.scatter_.src": "aten.scatter.src",
+    "aten.scatter_.value": "aten.scatter.value",
+    "aten.scatter_add_.default": "aten.scatter_add.default",
+    "aten.scatter_reduce_.two": "aten.scatter_reduce.two",
+    "aten.index_add_.default": "aten.index_add.default",
+}
 
 
 def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
@@ -365,6 +374,10 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
+            canonical_target = _INPLACE_SCATTER_TARGETS.get(target, target)
+            if canonical_target != target:
+                _validate_inplace_legalization(node)
+                target = canonical_target
             if target in _SCATTER_TARGETS or target in {
                 _SCATTER_ADD_TARGET,
                 _SCATTER_REDUCE_TARGET,
@@ -1083,6 +1096,12 @@ def _broadcast_shapes(
     return tuple(result)
 
 
+def _canonical_scatter_target(target: str) -> str:
+    """Map an in-place scatter spelling onto its functional ATen target."""
+
+    return _INPLACE_SCATTER_TARGETS.get(target, target)
+
+
 def _validate_inplace_legalization(node: object) -> None:
     args = getattr(node, "args", ())
     if not args:
@@ -1158,7 +1177,7 @@ def _scatter_operation(
 ) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
     args = getattr(node, "args", ())
     kwargs = dict(getattr(node, "kwargs", {}))
-    target = str(getattr(node, "target", ""))
+    target = _canonical_scatter_target(str(getattr(node, "target", "")))
     reduce_name: object = None
     if target == _SCATTER_REDUCE_TARGET:
         # `scatter_reduce` carries its reduction as a positional argument.

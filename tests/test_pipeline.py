@@ -1193,6 +1193,34 @@ def test_moe_combine_routes_tokens_with_index_add() -> None:
     assert mx.array_equal(actual[2], mx.zeros((3,), dtype=mx.float32))
 
 
+def test_moe_combine_written_with_inplace_index_add_matches_pytorch() -> None:
+    """The same combine written with ``index_add_`` is legalized, not rejected."""
+
+    def fn(tokens, expert_ids, weights):
+        contributions = tokens * weights[:, None]
+        combined = torch.zeros(4, tokens.shape[-1], dtype=tokens.dtype)
+        combined.index_add_(0, expert_ids, contributions)
+        return combined
+
+    torch.manual_seed(51)
+    tokens = torch.randn(5, 3)
+    expert_ids = torch.tensor([0, 1, 0, 3, 0], dtype=torch.int64)
+    weights = torch.tensor([0.5, 1.5, -0.25, 2.0, 0.75])
+    result = compile_callable(fn, (tokens, expert_ids, weights))
+
+    assert "index_add" in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(
+        _torch_to_mlx(tokens),
+        _torch_to_mlx(expert_ids),
+        _torch_to_mlx(weights),
+    )[0]
+    expected = _torch_to_mlx(fn(tokens, expert_ids, weights))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert mx.array_equal(actual[2], mx.zeros((3,), dtype=mx.float32))
+
+
 @pytest.mark.parametrize(
     ("reduce", "expected_reduce"),
     [("sum", "add"), ("prod", "prod"), ("amax", "amax"), ("amin", "amin")],
@@ -5740,6 +5768,28 @@ def test_metal_softmax_supports_non_last_dimension(dim, stride) -> None:
     expected = mx.array(
         torch.nn.functional.softmax(x, dim=dim).numpy()
     )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_multi_axis_softmax_compiles_through_reshape() -> None:
+    """`softmax` takes one `dim`; the multi-axis form is flatten + reshape."""
+
+    def fn(value):
+        flat = value.reshape(value.shape[0], -1)
+        return torch.nn.functional.softmax(flat, dim=-1).reshape(value.shape)
+
+    torch.manual_seed(40)
+    x = torch.randn(2, 3, 4)
+    result = compile_callable(fn, (x,))
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "reshape",
+        "softmax",
+        "reshape",
+    ]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
     mx.eval(actual, expected)
     assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
