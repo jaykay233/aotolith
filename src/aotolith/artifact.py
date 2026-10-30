@@ -24,7 +24,11 @@ if TYPE_CHECKING:
 
 ARTIFACT_FORMAT = "aotolith"
 FORMAT_VERSION = 4
-ABI_VERSION = "1.2"
+ABI_VERSION = "1.3"
+# 1.3 added `entrypoint.kwargs`, the tensor-valued keyword inputs promoted to
+# graph inputs. Artifacts without that field are the 1.2 layout, where every
+# public input comes before the state, so they still load.
+_SUPPORTED_ABI_VERSIONS = ("1.2", "1.3")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _MLX_DTYPES = {
     DType.F16: mx.float16,
@@ -60,11 +64,13 @@ def save_compiled(
     if is_module:
         result = compiled.compilation
         input_count = compiled.input_count
+        tensor_kwarg_names = compiled.tensor_kwarg_names
         state_names = compiled.state_names
         state_values = compiled._state_values
     else:
         result = compiled
         input_count = len(result.plan.graph.inputs)
+        tensor_kwarg_names = ()
         state_names = ()
         state_values = ()
 
@@ -73,8 +79,26 @@ def save_compiled(
             f"artifact has {len(state_names)} state names but "
             f"{len(state_values)} state arrays"
         )
-    if len(result.plan.graph.inputs) != input_count + len(state_values):
-        raise ValueError("graph inputs do not match public inputs and module state")
+    if len(result.plan.graph.inputs) != (
+        input_count + len(tensor_kwarg_names) + len(state_values)
+    ):
+        raise ValueError(
+            "graph inputs do not match public inputs, tensor keyword inputs "
+            "and module state"
+        )
+
+    kwarg_entries: list[dict[str, object]] = []
+    for index, name in enumerate(tensor_kwarg_names):
+        value_type = result.plan.graph.value(
+            result.plan.graph.inputs[input_count + index]
+        ).type
+        kwarg_entries.append(
+            {
+                "name": name,
+                "shape": list(value_type.shape),
+                "dtype": value_type.dtype.value,
+            }
+        )
 
     lowered_graph_json = _encode_graph(result.lowered_graph)
     input_graph_json = _encode_graph(result.input_graph)
@@ -126,6 +150,7 @@ def save_compiled(
         "entrypoint": {
             "kind": "module" if is_module else "callable",
             "input_count": input_count,
+            "kwargs": kwarg_entries,
             "state": state_entries,
         },
         "compile_options": {
@@ -302,10 +327,12 @@ def load_compiled_module(
         autotune_iterations=int(compile_options.get("autotune_iterations", 7)),
     )
     state_names = tuple(str(entry["name"]) for entry in state_entries)
+    kwarg_entries = manifest["entrypoint"].get("kwargs", [])
     input_count = int(manifest["entrypoint"]["input_count"])
     _validate_entrypoint_layout(
         lowered_graph,
         input_count=input_count,
+        kwarg_entries=kwarg_entries,
         state_entries=state_entries,
         state_values=state_values,
     )
@@ -314,6 +341,9 @@ def load_compiled_module(
         input_count=input_count,
         state_names=state_names,
         _state_values=state_values,
+        tensor_kwarg_names=tuple(
+            str(entry["name"]) for entry in kwarg_entries
+        ),
     )
 
 
@@ -344,9 +374,10 @@ def _validate_manifest(
             "artifact format version mismatch: "
             f"expected {FORMAT_VERSION}, got {manifest.get('format_version')!r}"
         )
-    if manifest.get("abi_version") != ABI_VERSION:
+    if manifest.get("abi_version") not in _SUPPORTED_ABI_VERSIONS:
         raise ArtifactCompatibilityError(
-            f"artifact ABI mismatch: expected {ABI_VERSION}, "
+            "artifact ABI mismatch: expected one of "
+            f"{list(_SUPPORTED_ABI_VERSIONS)}, "
             f"got {manifest.get('abi_version')!r}"
         )
     if manifest.get("target") != "apple-metal":
@@ -425,21 +456,34 @@ def _validate_entrypoint_layout(
     graph: Graph,
     *,
     input_count: int,
+    kwarg_entries: object,
     state_entries: object,
     state_values: tuple[mx.array, ...],
 ) -> None:
+    if not isinstance(kwarg_entries, list):
+        raise ArtifactCompatibilityError("artifact keyword entries are invalid")
     if not isinstance(state_entries, list):
         raise ArtifactCompatibilityError("artifact state entries are invalid")
-    if input_count < 0 or len(graph.inputs) != input_count + len(state_values):
+    state_offset = input_count + len(kwarg_entries)
+    if len(graph.inputs) != state_offset + len(state_values):
         raise ArtifactCompatibilityError(
-            "artifact input count does not match graph inputs and state"
+            "artifact input count does not match graph inputs, keyword "
+            "inputs and state"
+        )
+    for index, entry in enumerate(kwarg_entries):
+        if not isinstance(entry, Mapping):
+            raise ArtifactCompatibilityError(
+                "artifact keyword entry is invalid"
+            )
+        _check_input_type(
+            graph, graph.inputs[input_count + index], entry, "keyword"
         )
     for index, (entry, value) in enumerate(
         zip(state_entries, state_values, strict=True)
     ):
         if not isinstance(entry, Mapping):
             raise ArtifactCompatibilityError("artifact state entry is invalid")
-        expected = graph.value(graph.inputs[input_count + index]).type
+        expected = graph.value(graph.inputs[state_offset + index]).type
         actual_shape = tuple(int(dim) for dim in value.shape)
         actual_dtype = _dtype_from_mlx(value.dtype)
         if actual_shape != expected.shape or actual_dtype != expected.dtype:
@@ -448,6 +492,20 @@ def _validate_entrypoint_layout(
                 f"{actual_shape}/{actual_dtype.value}, expected "
                 f"{expected.shape}/{expected.dtype.value}"
             )
+
+
+def _check_input_type(
+    graph: Graph, input_id: str, entry: Mapping[str, Any], kind: str
+) -> None:
+    expected = graph.value(input_id).type
+    shape = entry.get("shape")
+    dtype = entry.get("dtype")
+    if list(expected.shape) != shape or expected.dtype.value != dtype:
+        raise ArtifactCompatibilityError(
+            f"{kind} {entry.get('name')!r} has shape/dtype "
+            f"{shape}/{dtype}, expected "
+            f"{list(expected.shape)}/{expected.dtype.value}"
+        )
 
 
 def _validate_rebuilt_plan(

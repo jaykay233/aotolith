@@ -154,6 +154,20 @@ mx.eval(logits)
 
 上面的 config 里 `use_cache` 保持默认的 `True`。这是可以编译的：cache 初始为空，而零长度的 concatenate 操作数不贡献任何内容，前端会把它折掉，所以编出来的图和 `use_cache=False` 完全一样。一个 plan 就是一次没有隐藏状态的前向，模型返回的 cache 不属于它；要做带 cache 的 decode 请用下面的静态 cache adapter。
 
+tensor 类型的关键字参数会变成图输入，因此调用方可以每次传入不同的值，而不是把它固化进图里：
+
+```python
+position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+compiled = aoto.compile_module(
+    model,
+    (input_ids,),
+    example_kwargs={"position_ids": position_ids},
+)
+logits = compiled(input_ids, position_ids=position_ids)[0]
+```
+
+非 tensor 的关键字参数在 tracing 期固定；值里只是**包含** tensor 的关键字参数会明确报错，不会被静默当成常量捕获。
+
 ### 编译 Qwen2.5 静态 KV Cache
 
 `aotolith.models.qwen2` 提供 Qwen2/Qwen2.5 的单请求静态图适配层。它把预填和逐 token 解码拆成两张图，用固定容量的 KV Cache 连接，并包含 Qwen2 的 RMSNorm、RoPE、GQA、SwiGLU 和 LM head。
@@ -357,7 +371,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 ## 已知限制
 
 - shape 和 dtype 在编译期固定，不支持动态 shape、符号维度和控制流。
-- tensor-valued keyword arguments 目前不会提升为图输入。
+- tensor-valued `example_kwargs` 会被提升为图输入、按名字传入；值里只是**包含** tensor（list/dict 等）的关键字参数会明确报错，而不是被当作常量捕获。
 - 共享参数 storage alias 目前会按多个 state entry 序列化。数值结果不受影响，但 artifact 还没有去重这些 aliased storage。
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
 - 原生 kernel 的覆盖范围仍窄于 MLX。`codegen_matmul` 仍默认关闭只是因为它还在实验阶段，在实测的 matmul shape 上都快于 MLX；`codegen_attention` 在 prefill 形态上比 MLX 的 SDPA 慢约 20%，但在单 query 的 decode 路径上与它持平，因为专用 kernel 用整 head 的 threadgroup 归约取代了分块 online softmax。

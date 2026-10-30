@@ -154,6 +154,20 @@ mx.eval(logits)
 
 The config above leaves `use_cache` at its default of `True`. That is accepted: the cache starts empty, a zero-length concatenation operand contributes nothing, and the frontend folds it away, so the compiled graph is the same one `use_cache=False` produces. A plan is a single forward pass with no hidden state, so the cache the model returns is not part of it; cached decoding needs the static-cache adapter below.
 
+A tensor keyword argument becomes a graph input, so a caller can change it per call instead of compiling it into the graph:
+
+```python
+position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+compiled = aoto.compile_module(
+    model,
+    (input_ids,),
+    example_kwargs={"position_ids": position_ids},
+)
+logits = compiled(input_ids, position_ids=position_ids)[0]
+```
+
+Non-tensor keyword arguments stay fixed at trace time, and a keyword whose value only *contains* tensors is rejected rather than silently captured as a constant.
+
 ### Compile a Qwen2.5 Static KV Cache
 
 `aotolith.models.qwen2` provides a single-request static-graph adapter for Qwen2/Qwen2.5. It separates prefill and one-token decode into two graphs connected by a fixed-capacity KV cache, and implements Qwen2 RMSNorm, RoPE, GQA, SwiGLU, and the LM head.
@@ -359,7 +373,7 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 ## Known Limitations
 
 - Shapes and dtypes are fixed at compile time. Dynamic shapes, symbolic dimensions, and control flow are not supported.
-- Tensor-valued keyword arguments are not graph inputs yet.
+- Tensor-valued `example_kwargs` are promoted to graph inputs and passed by name. Keyword values that merely *contain* tensors (a list or dict of them) are rejected rather than captured as constants.
 - Shared parameter storage aliases are currently serialized as separate state entries. Correctness is preserved, but the artifact does not yet deduplicate aliased storage.
 - The artifact ABI accepts only the `apple-metal` target. Cross-vendor artifacts and host-runtime ABI compatibility are not implemented.
 - Native kernel coverage remains narrower than MLX. `codegen_matmul` stays opt-in only because it is still experimental, and it beats MLX across the measured matmul shapes. `codegen_attention` trails MLX's SDPA by about 20% on prefill shapes but matches it on the single-query decode path, where the dedicated kernel replaces tiled online softmax with a whole-head threadgroup reduction.

@@ -51,6 +51,10 @@ class CompiledModulePlan:
     input_count: int
     state_names: tuple[str, ...]
     _state_values: tuple[mx.array, ...]
+    # Tensor-valued ``example_kwargs``, promoted to graph inputs so callers can
+    # pass them by name and change them per call. In ``graph.inputs`` they sit
+    # between the positional inputs and the bound state.
+    tensor_kwarg_names: tuple[str, ...] = ()
 
     @property
     def plan(self) -> CompiledPlan:
@@ -70,7 +74,10 @@ class CompiledModulePlan:
         return save_compiled(self, path)
 
     def __call__(
-        self, *inputs: Any, verify_index_bounds: bool = True
+        self,
+        *inputs: Any,
+        verify_index_bounds: bool = True,
+        **tensor_kwargs: Any,
     ) -> tuple[mx.array, ...]:
         if len(inputs) != self.input_count:
             raise ValueError(
@@ -78,9 +85,29 @@ class CompiledModulePlan:
             )
         return self.plan(
             *inputs,
+            *self._tensor_kwarg_values(tensor_kwargs),
             *self._state_values,
             verify_index_bounds=verify_index_bounds,
         )
+
+    def _tensor_kwarg_values(
+        self, supplied: Mapping[str, Any]
+    ) -> tuple[Any, ...]:
+        """Return the promoted keyword inputs in graph order."""
+
+        missing = [
+            name for name in self.tensor_kwarg_names if name not in supplied
+        ]
+        if missing:
+            raise ValueError(
+                "missing tensor keyword inputs: " + ", ".join(missing)
+            )
+        unexpected = sorted(set(supplied) - set(self.tensor_kwarg_names))
+        if unexpected:
+            raise ValueError(
+                "unexpected keyword inputs: " + ", ".join(unexpected)
+            )
+        return tuple(supplied[name] for name in self.tensor_kwarg_names)
 
 
 def compile_graph(
@@ -181,13 +208,27 @@ def compile_module(
         raise ValueError("compile_module requires module.eval()")
 
     kwargs = dict(example_kwargs or {})
-    tensor_kwargs = [
-        name for name, value in kwargs.items() if isinstance(value, torch.Tensor)
-    ]
-    if tensor_kwargs:
+    static_kwargs: dict[str, Any] = {}
+    tensor_kwarg_names: list[str] = []
+    tensor_kwarg_values: list[Any] = []
+    nested: list[str] = []
+    for name, value in kwargs.items():
+        if isinstance(value, torch.Tensor):
+            tensor_kwarg_names.append(name)
+            tensor_kwarg_values.append(value)
+        elif _contains_tensor(value):
+            nested.append(name)
+        else:
+            static_kwargs[name] = value
+    if nested:
         raise NotImplementedError(
-            "tensor-valued example_kwargs are not graph inputs yet: "
-            f"{tensor_kwargs}"
+            "example_kwargs values that contain tensors are not graph inputs "
+            f"yet: {nested}"
+        )
+    if "verify_index_bounds" in tensor_kwarg_names:
+        raise ValueError(
+            "a tensor keyword input cannot be named 'verify_index_bounds': "
+            "the compiled plan uses that name for its own argument"
         )
 
     state = dict(module.named_parameters(remove_duplicate=False))
@@ -195,25 +236,34 @@ def compile_module(
     state_names = tuple(state)
     state_values = tuple(state.values())
     input_count = len(example_inputs)
+    forward_input_count = input_count + len(tensor_kwarg_names)
     bound_values = tuple(_torch_tensor_to_mlx(value) for value in state_values)
 
     def functional_forward(*args: Any) -> Any:
         inputs = tuple(args[:input_count])
-        bound_state = dict(zip(state_names, args[input_count:], strict=True))
+        bound_state = dict(
+            zip(state_names, args[forward_input_count:], strict=True)
+        )
+        call_kwargs = dict(static_kwargs)
+        call_kwargs.update(
+            zip(tensor_kwarg_names, args[input_count:forward_input_count])
+        )
         with torch.no_grad():
             output = torch.func.functional_call(
                 module,
                 bound_state,
                 inputs,
-                kwargs=kwargs,
+                kwargs=call_kwargs,
                 strict=True,
             )
         return _select_module_output(output, output_key)
 
+    traced_inputs = tuple(example_inputs) + tuple(tensor_kwarg_values)
+
     result = compile_graph(
         capture_fx(
             functional_forward,
-            tuple(example_inputs) + state_values,
+            traced_inputs + state_values,
         ),
         target=target,
         codegen_matmul=codegen_matmul,
@@ -222,7 +272,7 @@ def compile_module(
         autotune_warmup=autotune_warmup,
         autotune_iterations=autotune_iterations,
         autotune_inputs=(
-            tuple(example_inputs) + state_values if autotune else None
+            traced_inputs + state_values if autotune else None
         ),
     )
     return CompiledModulePlan(
@@ -230,7 +280,29 @@ def compile_module(
         input_count=input_count,
         state_names=state_names,
         _state_values=bound_values,
+        tensor_kwarg_names=tuple(tensor_kwarg_names),
     )
+
+
+def _contains_tensor(value: Any) -> bool:
+    """Return whether a keyword value holds a tensor below its top level."""
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is required for compile_module") from exc
+
+    def contains(item: Any) -> bool:
+        if isinstance(item, torch.Tensor):
+            return True
+        if isinstance(item, Mapping):
+            return any(contains(child) for child in item.values())
+        if isinstance(item, (list, tuple, set)):
+            return any(contains(child) for child in item)
+        return False
+
+    return contains(value)
+
 
 
 def _select_module_output(output: Any, output_key: str | None) -> Any:

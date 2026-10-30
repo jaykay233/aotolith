@@ -32,7 +32,7 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 
 模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；后续状态布局阶段需要把 storage alias 纳入 ABI。
 
-HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 尚未提升为图输入，当前只接受可被 tracing 捕获的静态关键字参数。
+HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。其余关键字参数仍是 tracing 期常量；值里嵌套 tensor（list/dict 等）目前明确报错而不是静默当成常量。
 
 两层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 
@@ -461,7 +461,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ## 14. 编译产物、校验与加载
 
-`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 4、ABI version 1.2，包含：
+`CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 4、ABI version 1.3，包含：
 
 | 文件 | 内容 |
 |---|---|
@@ -473,7 +473,9 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 | `storage_plan.json` | live interval、slot、release point、峰值活跃字节和 arena 大小 |
 | `state/*.bin` | module 参数和 buffer 的 MLX 原始字节，每个 state entry 记录名称、shape、dtype、nbytes 和 digest |
 
-两张图、kernel table、selection table、storage plan 和每个 state tensor 都使用 SHA-256 digest。`read_artifact_manifest()` 只校验 manifest 中的格式、ABI、target 和可选 device profile；`load_compiled_module()` 还会读取并校验全部 payload，反序列化 IR，检查入口的 public input/state 布局，再根据 lowered graph 和已保存的 selection 重建 kernel。
+ABI 1.3 增加了 `entrypoint.kwargs`，记录被提升为图输入的 tensor 关键字参数。图输入顺序是 public inputs、这些关键字输入、state；`entrypoint.input_count` 仍然只数 public inputs，因此读取 1.2 产物（没有该字段）时布局与旧版一致。
+
+两张图、kernel table、selection table、storage plan 和每个 state tensor 都使用 SHA-256 digest。`read_artifact_manifest()` 只校验 manifest 中的格式、ABI、target 和可选 device profile；`load_compiled_module()` 还会读取并校验全部 payload，反序列化 IR，检查入口的 public input、关键字输入和 state 布局，再根据 lowered graph 和已保存的 selection 重建 kernel。
 
 加载时使用 `autotune=False` 和 `selection_overrides`。这样可以验证序列化 selection 仍与当前 backend 的可重建 plan 一致，同时不重新执行 benchmark。校验内容包括 kernel artifact、selection key、storage plan、state shape/dtype 和 graph inputs/outputs；任一不匹配都会抛出 `ArtifactCompatibilityError`。
 
