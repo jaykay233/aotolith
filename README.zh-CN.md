@@ -460,11 +460,24 @@ PyTorch 对越界的 embedding／gather 下标抛出 `IndexError`，而 MLX 会�
 ## 仓库结构
 
 ```text
-src/aotolith/   编译器前端、IR、passes、planner、selection 和 Metal backend
+src/aotolith/
+  capture/          FX 追踪（make_fx、fake mode、分解表保留集）
+  legalize/         FX → 核心 op：ATen target 表、逐族 lowering
+  ir/               typed SSA IR 与逐族算子契约表
+  target/           这条 GPU 能编译什么：能力查询与 tile 选择
+  codegen/          MSL 发射，一族一个模块
+  runtime/          越界检查、MLX 回退、计划执行
+  passes/           图重写：matcher、layout、fusion、CSE，以及它们的执行顺序
+  planning.py       算子合法性与存储计划
+  op_sets.py        每个算子的执行类别（pointwise / layout / constant）
+  selection.py      原生 kernel 与 MLX 回退之间的选择
+  backends/         Apple Metal backend，把 codegen/runtime/target 拼起来
 tests/                               IR、lowering、数值对齐、生成和 planner 测试
 examples/                            可运行的模型、kernel 和静态 KV Cache 示例
 docs/architecture.md                 详细实现说明与已知边界
 ```
+
+`tests/test_architecture.py` 给每个模块一个层号，import 指向同层或更高层会直接失败，所以任何一个 package 都可以单独读。
 
 ## 参与贡献
 

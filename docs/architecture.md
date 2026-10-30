@@ -26,6 +26,27 @@
 
 KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contract。编译器可以 lower cache 读写和规划静态内存，但不管理 page table、分配、回收或跨请求复用。
 
+## 0.5 代码分层与依赖方向
+
+`src/aotolith/` 的模块按层摆放，`tests/test_architecture.py` 给每个模块一个层号，并断言 import 只能指向严格更低的层。这条规则不是整洁偏好，而是「某一层能不能单独被读懂」的保证：读算子契约表不需要把图重写器拖进来，查设备能力不需要知道 codegen 长什么样，改一个 pointwise 表达式不会牵扯 attention 的实现。
+
+```text
+op_sets / shapes / ir.types / selection / _version      纯数据与词汇
+codegen.dtypes / codegen.msl / ir.op                    最小可编译单元：dtype 表、kernel 头
+ir.graph / capture.tracer / legalize.targets            图、追踪、target 字面量
+ir.ops.* / target.*                                     逐族契约表、设备能力
+codegen.expr / reduction / pointwise / index            按族发射 MSL
+legalize.* / capture（组合点）                          FX → 核心 op
+codegen.norm → matmul → attention                       组合更复杂的 kernel
+runtime.bounds / runtime.mlx_ops / runtime.plan         越界检查、MLX 回退、计划执行
+backends/apple.py                                       把上面三者拼成一个后端
+artifact.py / compiler.py                               图 → 产物、整条流水线
+```
+
+唯一的例外是包自己的 `__init__.py` 可以再导出同包的子模块，这正是 `ir/__init__.py`、`codegen/__init__.py` 的做法。
+
+分层检查抓到的都是真实的反向依赖，不是纸面上的：`target` 为了回答「这条 GPU 能不能编译 tensor-core kernel」而要编译一段 kernel，于是 kernel 头和 dtype 表被下移到第 1 层，成为 `target` 也能读的最小单元；`artifact.py` 与 `compiler.py` 曾经排在被它们序列化的 backend 之下，现在排在它之上；`passes` 曾经是单文件、层号很低，拆成包之后按 `graph`/`matchers`/单个 pass/`driver` 排成一段阶梯。
+
 ## 1. FX 捕获
 
 `capture_fx` 调用 `make_fx(fn, tracing_mode="fake", decomposition_table=aten_decompositions())(*example_inputs)`。`make_fx` 执行一次函数并记录 ATen 算子，同时为每个节点保留具体的 tensor metadata；`decomposition_table` 把前端不认识的算子先改写成前端认识的形式，见本节末尾的 “Legalization”。
@@ -275,9 +296,19 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 
 表按算子族分文件，一族一个模块、各自导出 `CONTRACTS`：`rules.py` 只放规则词汇（`OpContract` 与那几个枚举）和“怎么校验一个 contract”，`shared.py` 放各钩子共用的小工具，`reduction.py`（归约、scan、排序）、`elementwise.py`（逐元素与 cast/triu/cat）、`indexing.py`（gather/scatter 一族）、`kernels.py`（自带手写 kernel 的算子）、`view.py`（形状操作与 `LAYOUT_RULES`）、`constants.py`（`arange` 一类无操作数的算子）各写自己的行，`table.py` 把它们拼起来并补上逐元素算子和常量算子的生成默认值。族之间互不 import，所以改 attention 的校验不会牵扯到 view 表；`table.py` 是唯一要求全表一致的地方，重复声明同一个算子会直接抛错。也正因为 `rules.py` 不知道“哪个算子对应哪条 contract”，`check_operation` 被拆成两步：`rules.check_contract` 校验一条 contract，`table.check_operation` 负责查表。
 
-算子的执行类别（pointwise / layout / constant）单独定义在 `op_sets.py`，而不是留在某个消费者里。这三个集合有三个读者：`ir/ops/table.py` 用它们生成默认 contract，`passes.py` 用它们判断融合与折叠是否合法，`backends/apple_metal.py` 用它们分派 kernel。以前它们住在 `passes.py` 里，于是 contract 表和 backend 都必须反过来导入图重写模块才能读到一组名字——`tests/test_architecture.py` 现在按层断言 import 只能指向更低层，这类反向依赖会直接让测试失败。
+算子的执行类别（pointwise / layout / constant）单独定义在 `op_sets.py`，而不是留在某个消费者里。这三个集合有三个读者：`ir/ops/table.py` 用它们生成默认 contract，`passes/` 用它们判断融合与折叠是否合法，`backends/apple.py` 用它们分派 kernel。以前它们住在 `passes.py` 里，于是 contract 表和 backend 都必须反过来导入图重写模块才能读到一组名字——`tests/test_architecture.py` 现在按层断言 import 只能指向更低层，这类反向依赖会直接让测试失败。
 
 ## 3. Layout 简化与折叠、matmul 规范化与 attention 融合
+
+图重写在 `passes/`，按「证明」和「改写」分开放：
+
+- `passes/graph.py` 放对图本身的问题：谁生产这个 value、谁消费它、某个 op 的输出 shape、怎么重建一段子图。所有 matcher 和所有 pass 都从这里取，避免各自实现一份导致行为不一致。
+- `passes/checks.py` 放最笨的谓词：attribute 是不是合法的整数、静态 shape 能不能 broadcast。它们不看图。
+- `passes/matchers/` 一族一个模块（`attention`、`rope`、`norm`、`matmul`、`view`），只判断「这段子图是不是我要的形状」，命中就返回匹配结果，否则返回 `None`，自己不写回图。
+- `layout.py`、`canonicalize.py`、`fusion.py`、`cse.py` 才是改写，每个 pass 一个函数，签名统一是 `Graph -> Graph`。
+- `driver.py` 拥有顺序。以前这 11 步是 `compile_graph` 里的 11 行赋值，顺序的理由写不出来也没法单独测；现在 `PIPELINE` 是一个带名字的元组，每一步旁边写着它为什么在这个位置，`tests/test_passes.py` 钉住这个序列。`compiler.py` 只调用 `rewrite(graph)`。
+
+每一步为什么排在这个位置，写在 `passes/driver.py` 的 `PIPELINE` 里那一步的注释上；下面几节讲的是各步的匹配条件，以及它最终生成什么。
 
 `simplify_layouts` 先删除不改变数据的 layout op，包括 shape 相同的 `reshape/expand/squeeze`、交换同一轴的 `transpose`、恒等 `permute`、完整 slice、只翻转 singleton 轴的 `flip`、所有 shift 对对应维取模后为零的 `roll`、所有 (before, after) 都为零的 `pad`、`alias` 和 `contiguous`。连续且互逆的 `transpose/permute`、重复的 `flip` 以及 shift 相消的 `roll` 会折叠掉，连续的 `unsqueeze/squeeze` 在恢复原 shape 时也会被消除，相邻 `reshape` 会合并成从最早输入到最终 shape 的一次 reshape。删除前仍会解析轴和检查静态 shape，非法轴不会被当成恒等操作跳过。
 

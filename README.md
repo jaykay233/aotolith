@@ -461,18 +461,23 @@ PyTorch raises `IndexError` for out-of-range embedding and gather indices, while
 
 ```text
 src/aotolith/
-  capture/          FX tracing only (make_fx, fake mode, decomposition table)
+  capture/          FX tracing only (make_fx, fake mode, decomposition keep set)
   legalize/         FX -> core ops: ATen target tables, per-family lowerings
   ir/               typed SSA IR, plus the per-family operator contract table
-  passes.py         graph rewrites: layout folding, fusion, CSE
-  planning.py       operation legality and the execution plan
+  target/           what this GPU can compile: capabilities, tile ladders
+  codegen/          MSL emission, one module per operator family
+  runtime/          index-bound checks, the MLX fallback, plan execution
+  passes/           graph rewrites: matchers, layout, fusion, CSE, and the order they run in
+  planning.py       operation legality and the storage plan
   op_sets.py        how each operator executes (pointwise / layout / constant)
   selection.py      native kernel vs MLX fallback
-  backends/         Metal codegen and the MLX runtime
+  backends/         the Apple Metal backend, composing codegen/runtime/target
 tests/                                IR, lowering, numerical parity, generation, and planner tests
 examples/                             Runnable model, kernel, and static KV-cache examples
 docs/architecture.md                  Detailed implementation notes and known boundaries
 ```
+
+`tests/test_architecture.py` gives every module a layer and fails if an import points at the same or a higher one, so a package can be read on its own.
 
 ## Contributing
 
