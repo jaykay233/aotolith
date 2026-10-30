@@ -1572,6 +1572,112 @@ def test_constant_pad_rejects_negative_pads() -> None:
 
 
 @pytest.mark.parametrize(
+    ("shape", "pads", "mode"),
+    [
+        ((3, 8), (2, 1), "reflect"),
+        ((4, 6), (0, 3), "reflect"),
+        ((3, 8), (3, 2), "replicate"),
+        ((2, 5, 7), (1, 2, 0, 1), "reflect"),
+        ((2, 5, 7), (0, 2, 3, 1), "replicate"),
+        ((2, 3, 4, 5), (1, 0, 2, 1), "reflect"),
+        ((2, 3, 4, 5), (2, 2, 1, 3), "replicate"),
+    ],
+)
+def test_reflect_and_replicate_pad_match_pytorch(shape, pads, mode) -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, pads, mode=mode)
+
+    torch.manual_seed(53)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    # The padding is a pure view chain: no kernel copies the border.
+    assert result.plan.kernels == ()
+    assert {op.op for op in result.lowered_graph.ops} <= {
+        "slice",
+        "flip",
+        "expand",
+        "cat",
+    }
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected)
+
+
+def test_reflect_pad_mirrors_the_border_without_repeating_it() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (2, 2), mode="reflect")
+
+    source = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
+    result = compile_callable(fn, (torch.zeros(1, 5),))
+    actual = result.plan(source)[0]
+    mx.eval(actual)
+    # [1, 2, 3, 4, 5] padded by two mirrors the inner values on both sides and
+    # never writes the edge value twice in a row, which is what separates
+    # reflection from replication.
+    assert actual.tolist() == [[3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0]]
+
+
+def test_replicate_pad_repeats_the_border() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (2, 1), mode="replicate")
+
+    source = mx.array([[1.0, 2.0, 3.0]])
+    result = compile_callable(fn, (torch.zeros(1, 3),))
+    actual = result.plan(source)[0]
+    mx.eval(actual)
+    assert actual.tolist() == [[1.0, 1.0, 1.0, 2.0, 3.0, 3.0]]
+
+
+@pytest.mark.parametrize(
+    ("shape", "pads", "mode"),
+    [
+        ((2, 6), (-1, -2), "reflect"),
+        ((2, 6), (0, -2), "reflect"),
+        ((2, 6), (-2, -1), "replicate"),
+        ((2, 4, 6), (-1, 2, 1, -1), "replicate"),
+        ((2, 4, 6), (-2, 1, 0, 0), "reflect"),
+        ((3, 5, 7), (1, -2, -1, 2), "reflect"),
+    ],
+)
+def test_reflect_and_replicate_pad_crop_like_pytorch(shape, pads, mode) -> None:
+    # Negative entries crop the padded extent, so a mirror window stays anchored
+    # on the uncropped border instead of the surviving slice.
+    def fn(x):
+        return torch.nn.functional.pad(x, pads, mode=mode)
+
+    torch.manual_seed(54)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    assert result.plan.kernels == ()
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected)
+
+
+def test_reflect_pad_composes_with_a_matmul_tail() -> None:
+    # A padded activation feeding a linear layer stays in one graph, so the
+    # border pieces are concatenated once and read straight into the kernel.
+    def fn(x, w):
+        return torch.nn.functional.pad(x, (1, 2), mode="reflect") @ w
+
+    torch.manual_seed(55)
+    x = torch.randn(3, 4)
+    w = torch.randn(7, 5)
+    result = compile_callable(fn, (x, w))
+    actual = result.plan(mx.array(x.numpy()), mx.array(w.numpy()))[0]
+    expected = mx.array(fn(x, w).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    # A matmul tail accumulates in a different order than torch, so compare the
+    # fused graph at a relative tolerance that still catches a wrong border.
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize(
     "fn",
     [
         lambda a, b: a / b,

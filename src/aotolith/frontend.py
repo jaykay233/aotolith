@@ -285,6 +285,14 @@ _VARIANCE_TARGETS = {
 # ``repeat`` and ``tile`` share this ATen target; it lowers to layout ops.
 _REPEAT_TARGET = "aten.repeat.default"
 _VECTOR_NORM_TARGET = "aten.linalg_vector_norm.default"
+# Reflect and replicate padding have no IR op: they are separable, so each axis
+# becomes a slice/flip (reflect) or slice/expand (replicate) plus a concat.
+_PAD_MODE_TARGETS = {
+    "aten.reflection_pad1d.default": ("reflect", 1),
+    "aten.reflection_pad2d.default": ("reflect", 2),
+    "aten.replication_pad1d.default": ("replicate", 1),
+    "aten.replication_pad2d.default": ("replicate", 2),
+}
 _INPLACE_TARGETS = {"aten.add_.Tensor"}
 # `make_fx` keeps the in-place spelling of every scatter family operator, so
 # each one is legalized into the functional op with the same lowering.
@@ -515,6 +523,15 @@ def capture_fx(fn: Callable[..., Any], example_inputs: Sequence[Any]) -> Graph:
                         node_ids[user] = produced[index]
                     else:
                         dead_nodes.add(user)
+                continue
+            if target in _PAD_MODE_TARGETS:
+                padding_ops, output_id = _padding_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in padding_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
                 continue
             if target == _REPEAT_TARGET:
                 repeat_ops, output_id = _repeat_operations(
@@ -1703,6 +1720,176 @@ def _layer_norm_operation(
     input_type = _node_type(node.args[0])
     output_type = TensorType(input_type.shape, input_type.dtype)
     return tuple(inputs), attrs, output_type, frozenset(wanted)
+
+
+def _padding_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower reflect/replicate padding into slice, flip/expand and cat."""
+
+    target = str(getattr(node, "target", ""))
+    mode, padded_dims = _PAD_MODE_TARGETS[target]
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    input_node, padding = args
+    if not isinstance(padding, (tuple, list)) or len(padding) != 2 * padded_dims:
+        raise ValueError(
+            f"{target}.padding must hold {2 * padded_dims} entries, got {padding!r}"
+        )
+    if not all(
+        isinstance(pad, int) and not isinstance(pad, bool) for pad in padding
+    ):
+        raise ValueError(f"{target}.padding must contain integers, got {padding!r}")
+
+    input_type = _node_type(input_node)
+    shape = input_type.shape
+    rank = len(shape)
+    if rank < padded_dims:
+        raise ValueError(
+            f"{target} needs at least rank {padded_dims}, got shape {shape}"
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, input_type.dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    current_shape = shape
+    for position in range(padded_dims):
+        axis = rank - 1 - position
+        before, after = padding[2 * position], padding[2 * position + 1]
+        size = current_shape[axis]
+        if before == 0 and after == 0:
+            continue
+        # Negative entries crop the padded extent the way ATen does: build the
+        # full pad first and slice the window afterwards, which keeps a mirror
+        # window anchored on the original extent.
+        pad_before, pad_after = max(before, 0), max(after, 0)
+        crop_before, crop_after = max(-before, 0), max(-after, 0)
+        if mode == "reflect" and (pad_before >= size or pad_after >= size):
+            raise ValueError(
+                f"{target} reflection padding {pad_before}/{pad_after} must stay "
+                f"below the {size} elements of axis {axis}"
+            )
+
+        pieces: list[str] = []
+        if pad_before:
+            single_shape = (
+                current_shape[:axis] + (1,) + current_shape[axis + 1 :]
+            )
+            if mode == "reflect":
+                window = (
+                    current_shape[:axis] + (pad_before,) + current_shape[axis + 1 :]
+                )
+                piece = emit(
+                    "slice",
+                    (current,),
+                    {"dim": axis, "start": 1, "end": pad_before + 1, "step": 1},
+                    window,
+                )
+                piece = emit("flip", (piece,), {"dims": (axis,)}, window)
+            else:
+                piece = emit(
+                    "slice",
+                    (current,),
+                    {"dim": axis, "start": 0, "end": 1, "step": 1},
+                    single_shape,
+                )
+                window = (
+                    current_shape[:axis] + (pad_before,) + current_shape[axis + 1 :]
+                )
+                piece = emit("expand", (piece,), {"shape": window}, window)
+            pieces.append(piece)
+        pieces.append(current)
+        if pad_after:
+            if mode == "reflect":
+                window = (
+                    current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
+                )
+                piece = emit(
+                    "slice",
+                    (current,),
+                    {
+                        "dim": axis,
+                        "start": size - pad_after - 1,
+                        "end": size - 1,
+                        "step": 1,
+                    },
+                    window,
+                )
+                piece = emit("flip", (piece,), {"dims": (axis,)}, window)
+            else:
+                single_shape = (
+                    current_shape[:axis] + (1,) + current_shape[axis + 1 :]
+                )
+                piece = emit(
+                    "slice",
+                    (current,),
+                    {"dim": axis, "start": size - 1, "end": size, "step": 1},
+                    single_shape,
+                )
+                window = (
+                    current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
+                )
+                piece = emit("expand", (piece,), {"shape": window}, window)
+            pieces.append(piece)
+
+        padded_shape = (
+            current_shape[:axis]
+            + (size + pad_before + pad_after,)
+            + current_shape[axis + 1 :]
+        )
+        current = (
+            pieces[0]
+            if len(pieces) == 1
+            else emit("cat", tuple(pieces), {"dim": axis}, padded_shape)
+        )
+        current_shape = padded_shape
+
+        if crop_before or crop_after:
+            padded_size = padded_shape[axis]
+            start, end = crop_before, padded_size - crop_after
+            if start >= end:
+                raise ValueError(
+                    f"{target} crop ({before}, {after}) empties axis {axis} of "
+                    f"size {padded_size}"
+                )
+            cropped_shape = (
+                current_shape[:axis]
+                + (end - start,)
+                + current_shape[axis + 1 :]
+            )
+            current = emit(
+                "slice",
+                (current,),
+                {"dim": axis, "start": start, "end": end, "step": 1},
+                cropped_shape,
+            )
+            current_shape = cropped_shape
+
+    expected = _node_type(node).shape
+    if current_shape != expected:
+        raise ValueError(
+            f"{target} output shape {expected} does not match the padded "
+            f"{current_shape}"
+        )
+    return tuple(operations), current
 
 
 def _repeat_operations(

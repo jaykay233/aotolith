@@ -384,7 +384,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
 | Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、sum/mean/prod/amax/amin/var/std 归约、`vector_norm` 与 `F.normalize`、cumsum、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
 | 排序与选择 | `argmax`、`argmin`、`sort`（values/indices）、`topk`（values/indices，最大或最小），按被读取的输出分别 lowering |
-| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、`repeat`/`tile`、cat/stack、constant padding、flip/roll、clone、cast 和静态常量 |
+| 布局与数据移动 | view/reshape、transpose/permute、slice、expand、`repeat`/`tile`、cat/stack、constant/reflect/replicate padding、flip/roll、clone、cast 和静态常量 |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32 和 I64 |
 | KV Cache | 静态 shape 的 prefill/decode 图契约和布局；分配与分页仍由外部运行时负责 |
 
@@ -398,6 +398,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - artifact ABI 只接受 `apple-metal` target，尚未实现跨厂商 target 和 host runtime ABI 兼容。
 - `scatter`、`scatter_add`、`scatter_reduce` 和 `index_add` 走 MLX 而不是生成 kernel。归约覆盖 `sum`/`prod`/`amax`/`amin`/`mean`，都支持 `include_self=False`；`mean` 会在累加数值的同时累加写入次数再相除，因此重复索引取平均而不是求和；`amax`/`amin` 在 `include_self=False` 时需要浮点输入，因为它们的单位元是 ±inf。重复索引按设备调度顺序累加，这正是 CUDA `scatter_add` 给出的保证，而 PyTorch 的 CPU 路径给不了。原地写法（`scatter_`、`scatter_add_`、`scatter_reduce_`、`index_add_`）在被改写的 tensor 于图内没有其他观察者时降级成同一组算子；编译后的调用返回更新后的 tensor，不会回写调用方仍然持有的那块 tensor。
 - `F.pad` 的默认 `constant` 模式降级成 `pad` layout op，由 MLX 执行。padding 对按 PyTorch 的定义从最内层维开始，填充值保持源 dtype。全零的 pad 会被当作恒等操作消除；负数条目（在 PyTorch 里是裁剪）在捕获期直接拒绝并提示改用 `slice`/`narrow`；其他 mode 在捕获期报错。
+- `F.pad(..., mode="reflect")` 和 `mode="replicate"` 展开成不生成 kernel 的视图链：每一维取内层窗口再 `flip`（reflect），或用 `expand` 复制边沿（replicate），最后由 `cat` 拼接回主轴两侧。负数条目按 ATen 的语义裁剪**展开后**的 extent，所以镜像窗口始终锚定在未裁剪的边界上；同一轴上既有 padding 又有裁剪也能表达，反射窗口宽度不小于轴长度时前端报错。
 - 整数 pointwise 不再要求操作数 dtype 相同：PyTorch 自己会提升的组合，前端插入 `cast` 节点而不是让整张图失败——I32 与 I64 混合提升到 I64，`div` 的整数操作数提升到输出的 float dtype，整数与浮点混合提升到那个 float dtype。`where` 的两个分支按同样规则提升，所以 `where(mask, int32, int64)` 会以 I64 select 执行。bool 与数值 dtype 混合仍会被拒绝。整数 `pow` 是精确的：kernel 用 square-and-multiply 循环，乘法按位宽回绕，所以 `2**70` 和 PyTorch 一样回绕成 `0`，`0**0` 是 `1`。负的标量指数在编译期直接拒绝；只出现在 tensor 里的负指数不做逐元素检查（PyTorch 会在运行时报错），kernel 对它返回 `0`。
 - `prod`、`amax`、`amin` 和 `log_softmax` 走 MLX 而不是生成 kernel。三个归约支持任意非空轴集合和 `keepdim`；`amax`/`amin` 与 PyTorch 逐位一致，`prod` 因为乘法顺序不同在浮点上可能相差几个 ulp，整数乘积按位宽回绕。`log_softmax` 是输入减去自身的 log-sum-exp，只接受浮点输入，重复轴在 lowering 期报错。
 - `native_layer_norm` 的三个输出都能用。归一化结果仍走专用 kernel；mean 和 rstd 只在图真的读取时才展开成一个 `mean` 加一段两次遍历的方差链（`sub`/`mul`/`mean`/`add eps`/`rsqrt`），因为 IR 的每个 op 只写一个值。它们与 PyTorch 内部的 Welford 统计相差几个 ulp（f32 测试实测在 `1e-5` 以内），只读 `rstd`、不读归一化输出的图也能编译。
