@@ -3595,11 +3595,15 @@ def _validate_layout_op(graph: Graph, op: Operation) -> None:
     rank = len(input_type.shape)
     if op.op == "reshape":
         shape = op.attrs.get("shape")
-        if not isinstance(shape, tuple) or not shape or not all(
-            isinstance(dim, int) and not isinstance(dim, bool)
-            for dim in shape
+        if not isinstance(shape, tuple) or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
         ):
-            raise ValueError("reshape.shape must be a non-empty tuple of integers")
+            raise ValueError("reshape.shape must be a tuple of integers")
+        if not shape and (output_type.shape != () or prod(input_type.shape) != 1):
+            raise ValueError(
+                "a rank-0 reshape needs exactly one input element, got "
+                f"{input_type.shape}"
+            )
         if any(dim == 0 or dim < -1 for dim in shape):
             raise ValueError(f"reshape.shape contains an invalid dimension: {shape}")
         if shape.count(-1) > 1:

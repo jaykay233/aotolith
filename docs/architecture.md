@@ -55,7 +55,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin`/`mean` |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
 | `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，仅在原值没有其他别名观察者时做 SSA legalization |
-| `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default` | 与对应的非原地形式完全同构，只在被改写的原值没有其他消费者时接受；编译结果返回新值，不回写调用方持有的 tensor |
+| `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default`、`aten.clamp_`/`clamp_min_`/`clamp_max_`（`default`/`Tensor`/`Scalar`） | 与对应的非原地形式完全同构，只在被改写的原值没有其他消费者时接受；编译结果返回新值，不回写调用方持有的 tensor |
 | `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
@@ -74,6 +74,9 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |
 | `aten.unsqueeze.default` | `unsqueeze` |
 | `aten.squeeze.dim` | `squeeze` |
+| `aten.squeeze.default` | 展开成一条 `reshape`（删掉所有长度 1 的轴），不生成 kernel |
+| `aten.count_nonzero.default`、`aten.count_nonzero.dim_IntList` | `ne` + `sum`，输出固定 I64 |
+| `aten.all.*`、`aten.any.*`（`default`/`dim`/`dims`） | `ne` + `sum`，再与归约元素数（all）或 0（any）比较，输出 BOOL |
 | `aten.clone.default`、`aten.alias.default` | `contiguous`、`alias` |
 | `aten._to_copy.default` | `cast` |
 | `aten._softmax.default`、`aten._safe_softmax.default` | `softmax`、`safe_softmax` |
@@ -211,6 +214,8 @@ reflect/replicate padding 在进入 IR 之前就已经展开成视图链，因�
 `logsumexp` 是组合 lowering，没有对应 IR op：`amax`（keepdim）求出平移量，`isinf` + `masked_fill` 把无穷大的最大值换成 0，再走 `sub -> exp -> sum -> log -> add`，最后按 `keepdim` 决定是否需要 `reshape`。把无穷最大值换成 0 是 ATen 自己的做法，所以 `+inf` 行保持 `+inf`、全 `-inf` 行保持 `-inf`，不会因为 `inf - inf` 变成 `nan`；只有 `amax`/`masked_fill` 是额外的 op，`sub`/`exp` 会融合进相邻的 pointwise 区域。空 `dim` 序列在捕获期报错，因为 ATen 对它没有定义。
 
 `nansum` 同样没有新 op，它按 ATen 的定义展开成 `isnan -> masked_fill(0) -> sum`，因此全 NaN 的切片求和为 0，整数输入直接跳过掩码（`isnan` 恒为假），`dtype` 参数先把操作数 `cast` 到目标 dtype 再归约，与 ATen 的累加宽度一致。`nanmean` 由 PyTorch 自己展开成 `nansum(x) / max(count, 1)`，其中 count 是对 `x != x` 取反后的 `sum`，所以整条链落在两个归约加一次 pointwise 除法上，全 NaN 的切片是 NaN（`0 / 1`），与 PyTorch 相同。这也暴露了 `aten.sum.dim_IntList` 的 `dim=None` 拼法：ATen 的分解用 `None` 表示全轴归约而不是省略参数，前端把两者归一化到同一组 `dims`。
+
+`count_nonzero`、`all` 和 `any` 也走「先布尔化再计数」的组合 lowering，因为 IR 里没有布尔归约 op：`count_nonzero` 是 `ne(0) -> sum`，输出固定 I64；`all`/`any` 在同一条计数归约之后比较归约元素数（并列）或 0（析取），输出 BOOL。NaN 按 PyTorch 的布尔转换算作真（`ne(nan, 0)` 为真），输入已经是 BOOL 时省掉 `ne`，所以 `count_nonzero(x > 0)` 只多出一条 `sum`。`torch.squeeze(x)` 省略轴的拼法是一条 `reshape`（删掉所有长度为 1 的轴），空 shape 的 `reshape` 只在输入恰好一个元素时被接受，与既有 `argmax()` 的 rank-0 输出一致。
 
 `cumprod` 与 `cumsum` 共用同一套参数规范化与校验，Runtime 分别映射到 `mx.cumsum` 和 `mx.cumprod`。`masked_fill.Tensor` 的填充值在 PyTorch 里必须是 0 维 tensor（更高维会被 ATen 直接拒绝），因此它等价于把 `where` 的操作数换个顺序，前端直接发 `where(mask, value, input)`，复用同一套广播与 dtype 提升规则。
 
@@ -573,7 +578,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `var`/`std` 走 MLX 的 `mx.var`，`dims`/`keepdim`/`correction` 保存在 attribute 中。三条 ATen 拼法（`var.correction`、`var.dim`、`var.default`，`std` 同理）在前端统一归一化，`unbiased` 会折算成 `correction`。整数 `correction` 直接作为 `ddof` 传给 `mx.var`；小数 `correction` 因为 MLX 的 `ddof` 只接受整数，改算有偏方差再乘 `n / (n - correction)`（`n` 是实际被归约的元素数），这正是 ATen 的定义。`correction >= 归约元素数` 时与 PyTorch 一样得到 inf，非有限的 `correction` 在捕获期报错。FP16/BF16 输入先提升到 FP32 再归约，最后 cast 回输入 dtype，与 PyTorch 的累加精度一致
 - `dot`、`mv`、`trace` 都是既有算子的组合，没有新 kernel：`dot` 是 `mul -> sum`（整轴归约），`mv` 把向量 reshape 成 `(n, 1)` 后走 `matmul` 再把结果 reshape 回 `(m,)`，`trace` 复用 `diagonal` 的 strided view——整块 flatten 后按 `columns + 1` 取步长，再对这条对角线做 `sum`，因此矩形输入取的是较短的那条对角线，和 `torch.trace` 一致
 - `repeat`/`tile` 没有独立 op：每根轴拆成 `(repeat, size)` 后广播，因此 lowering 是 `reshape -> expand -> reshape`，不产生 kernel，也不需要复制。repeats 比 rank 短或长都按 PyTorch 的规则左补 1；全部为 1 时整条链消失；`repeat=0` 会产生 IR 不建模的空维度，在捕获期报错
-- `vector_norm` 走 MLX 的 `mx.linalg.norm`。MLX 只接受单个 norm 轴，所以 Runtime 先把被归约的轴 permute 到末尾并合并成一条，调用后再按 `keepdim` reshape 回去，因此任意轴集合都能用一份实现覆盖；`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`。FP16/BF16 输入同样先提升到 FP32 再归约
+- `vector_norm` 走 MLX 的 `mx.linalg.norm`。MLX 只接受单个 norm 轴，所以 Runtime 先把被归约的轴 permute 到末尾并合并成一条，调用后再按 `keepdim` reshape 回去，因此任意轴集合都能用一份实现覆盖；`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`，`F.cosine_similarity` 则是两条 `vector_norm` 加一个 `dot / max(norm 乘积, eps)` 的融合 pointwise 区域（它的分母钳位在 ATen 分解里是 `clamp_min_`，走原地 clamp 的 legalization）。FP16/BF16 输入同样先提升到 FP32 再归约
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持

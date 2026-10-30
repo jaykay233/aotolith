@@ -382,9 +382,9 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 | 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
-| Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、logsumexp、sum/mean/prod/amax/amin/var/std 归约、`vector_norm` 与 `F.normalize`、cumsum/cumprod、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
+| Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、logsumexp、sum/mean/prod/amax/amin/nansum/nanmean/var/std/count_nonzero 归约、`all`/`any`、`vector_norm`、`F.normalize` 与 `F.cosine_similarity`、cumsum/cumprod、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |
 | 排序与选择 | `argmax`、`argmin`、带 `dim` 的 `max`/`min`（values/indices）、`sort`（values/indices）、`topk`（values/indices，最大或最小），按被读取的输出分别 lowering |
-| 布局与数据移动 | view/reshape、transpose/permute、slice、`split`/`chunk`/`unbind`、expand、`repeat`/`tile`、作为 strided view 的 `diagonal`、cat/stack、constant/reflect/replicate padding、flip/roll、clone、cast 和静态常量 |
+| 布局与数据移动 | view/reshape、transpose/permute、slice、`split`/`chunk`/`unbind`、`squeeze`（含省略轴的形式）、expand、`repeat`/`tile`、作为 strided view 的 `diagonal`、cat/stack、constant/reflect/replicate padding、flip/roll、clone、cast 和静态常量 |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32 和 I64 |
 | KV Cache | 静态 shape 的 prefill/decode 图契约和布局；分配与分页仍由外部运行时负责 |
 
@@ -410,7 +410,8 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - `logsumexp` 是组合 lowering 而不是新 op：`amax`（keepdim）先做稳定化平移，`masked_fill` 在相减前把无穷大的最大值换成 0，再由 `sum`/`log`/`add` 完成归约。这与 ATen 的实现一致，所以 `+inf` 行保持 `+inf`、全 `-inf` 行保持 `-inf`，不会变成 `nan`；这些算子会和相邻 pointwise 区域一起融合。
 - `cumprod` 和 `cumsum` 一样走 MLX，同样只带一个 `dim` attribute 并保持 dtype。`diagonal` 降级成 strided view：把两根轴 permute 到末尾、合并成一条，对角线就是这条平轴上的每 `columns + 1` 个元素，因此 `torch.diagonal` 和矩阵上的 `torch.diag` 不复制、不生成 kernel。若 offset 使结果为空，因为静态 IR 不建模零长度维度而报错。`masked_fill` 的 tensor 值（0 维）降级成 `where(mask, value, input)`，就是把 select 的两个操作数换位。
 - `elu` 保留 ATen 的 `alpha`/`scale`/`input_scale`，所以 `selu`（scale 1.0507、alpha 1.6733）和手写的 `elu(x, alpha, scale, input_scale)` 都能编译。只有负半支会被 `input_scale` 缩放，与 ATen 一致，测试里直接断言了这一点。
-- `repeat`/`tile` 展开成 `reshape -> expand -> reshape`，不生成 kernel、不复制：每根轴拆成 `(repeat, size)` 后广播，所以 repeats 比 rank 短或长都按 PyTorch 规则左补 1，全 1 的 repeat 整条消失，`repeat=0` 因为 IR 不建模空维度而在捕获期被拒绝。`vector_norm` 走 MLX：`mx.linalg.norm` 只接受单个轴，所以先把被归约的轴 permute 到末尾合并、调用后再按 `keepdim` reshape 回去，一份实现覆盖任意轴集合。`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`，半精度输入先提升到 float32 做归约。
+- `count_nonzero`、`all`、`any` 走「先布尔化再计数」的组合 lowering，因为 IR 没有布尔归约：`count_nonzero` 是 `ne(0) -> sum`，输出固定 I64；`all`/`any` 在同一条计数归约后与归约元素数（合取）或 0（析取）比较，输出 BOOL。NaN 按 PyTorch 的布尔转换算作真，输入已经是 BOOL 时省掉 `ne`，因此 `count_nonzero(x > 0)` 只多出一条 `sum`。省略轴的 `x.squeeze()` 是一条删掉所有长度 1 轴的 `reshape`；空目标 shape 只在输入恰好一个元素时接受，与 `argmax()` 全轴归约的 rank-0 规则一致。
+- `repeat`/`tile` 展开成 `reshape -> expand -> reshape`，不生成 kernel、不复制：每根轴拆成 `(repeat, size)` 后广播，所以 repeats 比 rank 短或长都按 PyTorch 规则左补 1，全 1 的 repeat 整条消失，`repeat=0` 因为 IR 不建模空维度而在捕获期被拒绝。`vector_norm` 走 MLX：`mx.linalg.norm` 只接受单个轴，所以先把被归约的轴 permute 到末尾合并、调用后再按 `keepdim` reshape 回去，一份实现覆盖任意轴集合。`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`，半精度输入先提升到 float32 做归约；`F.cosine_similarity` 是两条 `vector_norm` 加一个 `dot / max(范数乘积, eps)` 的融合 pointwise 区域，它分母上的钳位在 ATen 分解里是 `clamp_min_`，走原地 clamp 的 legalization。
 - `var` 和 `std` 走 MLX。三条 ATen 拼法（`correction`、`dim`、`default`）统一归一化成 `dims`/`keepdim`/`correction`，`unbiased` 折算进 `correction`。`correction` 可以是小数：MLX 的 `ddof` 只接受整数，所以 backend 先算有偏方差，再按 ATen 的定义乘上 `n / (n - correction)`（`n` 是实际被归约的元素数）；`correction` 大于等于归约元素数时与 PyTorch 一样得到 `inf`，非有限的 `correction` 在捕获期被拒绝。半精度输入会先提升到 float32 做归约再 cast 回输入 dtype，与 PyTorch 的累加宽度一致。
 - `nansum` 与 `nanmean` 同样是组合 lowering。`nansum` 采用 ATen 自己的定义 `masked_fill(isnan(x), 0) -> sum`，所以全 NaN 的切片求和为 0，整数输入直接跳过掩码；带 `dtype` 时先把操作数 `cast` 到目标 dtype，这正是 ATen 的累加宽度。`nanmean` 由 PyTorch 自己展开成 `nansum` 除以对 `x != x` 求出的 `max(count, 1)`，因此落在两个归约加一次融合除法上，全 NaN 的切片保持 NaN。也正因为这条分解，`sum.dim_IntList` 接受 `dim=None` 表示全轴归约：ATen 的分解用 `None` 而不是省略参数。
 - `argmax`、`argmin`、`sort`、`topk` 走 MLX 而不是生成 kernel，返回 tuple 的 op 会按实际被读取的输出分别 lowering，所以只读 `sort(...).values` 的图不会计算索引。带 `dim` 的 `torch.max`/`torch.min` 复用同一套机制：values 选择降级成与无 `dim` 形式相同的 `amax`/`amin`，indices 选择降级成 `argmax`/`argmin`，所以 `values, indices = x.max(dim=-1)` 是两次归约，只读 `.values` 就只算一次。索引输出固定 I64，`topk` 两个方向都支持：MLX 的升序窗口会被翻转成 `torch.topk` 的排序输出，`k` 等于轴长时退回排序，因为 MLX 的 select 路径不保证全量窗口的顺序。ties 的索引顺序沿用 MLX，`sort(stable=True)` 的 values 仍一致但索引顺序不一定与 PyTorch 相同；`topk(sorted=False)` 仍返回排序结果，是 PyTorch 承诺的子集。NaN 的位置两个方向都与 PyTorch 一致。
@@ -424,7 +425,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 
 - `heaviside` 融合进 pointwise kernel，比较顺序与 ATen 一致：先判 `x == 0` 取边界值，再判 `x > 0` 得 1，其余为 0。因此 `-0.0` 取边界值，NaN 落到 0 而不是边界值。浮点与整数操作数都支持，整数 kernel 使用整数字面量，输出保持操作数的 dtype；bool 操作数会被拒绝。
 - bool 上的 `mul`、`add` 就是逻辑与、逻辑或，在同一个 kernel 里生成 `&&`/`||`。ATen 自己就用这两个拼写合并谓词——`isclose` 是两个比较、一个缩放、一个偏移再配合 bool 的 `*` 与 `&`——所以 `torch.isclose` 现在会编译成单个 pointwise kernel，并保持 ATen 的 NaN、无穷和容差规则（`equal_nan=True` 只翻转 NaN 那一路比较）。`add`、`sub`、`div`、`mul` 的 `.Scalar` 拼写，以及被除数为标量的 `remainder`（`2.0 % x`，即 `Scalar_Tensor` schema，符号仍跟随除数）与对应的 tensor 拼写走同一套 lowering。
-- 原地拼写与原地 scatter 家族用同一套 legalization：`add_`、`sub_`、`mul_`、`div_`、`remainder_`、`bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_` 和 `logical_not_`，每种的 `.Tensor` 与 `.Scalar` 形式都支持。被改写的值在图里不能有其他消费者，编译后的调用返回更新后的值，绝不回写调用方仍然持有的 tensor。
+- 原地拼写与原地 scatter 家族用同一套 legalization：`add_`、`sub_`、`mul_`、`div_`、`remainder_`、`bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_`、`logical_not_`，以及 `clamp_`/`clamp_min_`/`clamp_max_`，每种的 `.Tensor` 与 `.Scalar` 形式都支持。被改写的值在图里不能有其他消费者，编译后的调用返回更新后的值，绝不回写调用方仍然持有的 tensor。
 
 ## 测试
 

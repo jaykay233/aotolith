@@ -4726,6 +4726,103 @@ def test_sum_accepts_a_none_dim_like_the_decompositions() -> None:
         assert mx.allclose(actual, expected)
 
 
+@pytest.mark.parametrize("dim", [-1, 1, 0, (0, 2), None])
+def test_count_nonzero_matches_pytorch(dim) -> None:
+    torch.manual_seed(87)
+    x = torch.randn(2, 3, 4)
+    x[0, 0, 0] = 0.0
+    x[1] = 0.0
+
+    def fn(value):
+        return torch.count_nonzero(value, dim=dim)
+
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = fn(x)
+    mx.eval(actual)
+    assert actual.dtype == mx.int64
+    assert actual.shape == tuple(expected.shape)
+    assert actual.tolist() == expected.tolist()
+
+
+def test_count_nonzero_reuses_an_existing_boolean_mask() -> None:
+    torch.manual_seed(88)
+    x = torch.randn(3, 5)
+    result = compile_callable(
+        lambda value: torch.count_nonzero(value > 0.0, dim=1), (x,)
+    )
+    # The comparison already produces the mask, so no extra ``ne`` is emitted.
+    assert [op.op for op in result.lowered_graph.ops] == ["gt", "sum"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = torch.count_nonzero(x > 0.0, dim=1)
+    mx.eval(actual)
+    assert actual.tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize(
+    ("reduction", "dim", "keepdim"),
+    [
+        ("all", None, False),
+        ("all", -1, False),
+        ("all", 1, True),
+        ("any", None, False),
+        ("any", 0, False),
+        ("any", (0, 2), False),
+    ],
+)
+def test_all_and_any_match_pytorch(reduction, dim, keepdim) -> None:
+    torch.manual_seed(89)
+    x = torch.randn(2, 3, 4)
+    x[0, 0, 0] = float("nan")
+    x[1, 2, :] = 0.0
+
+    def fn(value):
+        return getattr(torch, reduction)(value, dim=dim, keepdim=keepdim)
+
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = fn(x)
+    mx.eval(actual)
+    assert actual.dtype == mx.bool_
+    assert actual.shape == tuple(expected.shape)
+    assert actual.tolist() == expected.tolist()
+
+
+def test_all_and_any_accept_a_boolean_input() -> None:
+    torch.manual_seed(90)
+    mask = torch.randn(4, 5) > 0.0
+
+    for reduction in ("all", "any"):
+        result = compile_callable(
+            lambda value: getattr(torch, reduction)(value, dim=1), (mask,)
+        )
+        actual = result.plan(mx.array(mask.numpy()))[0]
+        expected = getattr(torch, reduction)(mask, dim=1)
+        mx.eval(actual)
+        assert actual.tolist() == expected.tolist()
+
+
+def test_squeeze_without_a_dim_drops_every_singleton_axis() -> None:
+    torch.manual_seed(91)
+    x = torch.randn(1, 3, 1, 4)
+
+    result = compile_callable(lambda value: value.squeeze(), (x,))
+    assert [op.op for op in result.lowered_graph.ops] == ["reshape"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert actual.shape == (3, 4)
+    assert mx.array_equal(actual, mx.array(x.squeeze().numpy()))
+
+
+def test_squeeze_without_a_dim_keeps_a_fully_singleton_input() -> None:
+    x = torch.tensor([[2.5]])
+    result = compile_callable(lambda value: value.squeeze(), (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    mx.eval(actual)
+    assert actual.shape == ()
+    assert float(actual) == 2.5
+
+
 def test_transformer_decoder_block_compiles_and_runs() -> None:
     def decoder_block(
         x,
@@ -6461,6 +6558,52 @@ def test_inplace_pointwise_spellings_are_legalized(name, dtype) -> None:
         assert actual.tolist() == expected.tolist()
     else:
         assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "argument"),
+    [
+        ("clamp", torch.tensor([4.5, -1.0, 0.0, 2.0]), (-0.5, 1.5)),
+        ("clamp_min", torch.tensor([4.5, -1.0, 0.0, 2.0]), (0.25,)),
+        ("clamp_max", torch.tensor([4.5, -1.0, 0.0, 2.0]), (1.0,)),
+        ("clamp_min", torch.tensor([1, 2, 3, 4], dtype=torch.int32), (3,)),
+        ("clamp_max", torch.tensor([1, 2, 3, 4], dtype=torch.int32), (2,)),
+    ],
+)
+def test_inplace_clamp_spellings_are_legalized(name, value, argument) -> None:
+    # ``F.cosine_similarity`` decomposes into ``clamp_min_.Tensor``, so the
+    # in-place clamp family has to legalize like the arithmetic spellings.
+    def fn(tensor):
+        mutated = tensor.clone()
+        return getattr(mutated, f"{name}_")(*argument)
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [name]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
+def test_cosine_similarity_compiles_into_fused_pointwise_ops() -> None:
+    torch.manual_seed(88)
+    left = torch.randn(3, 5, 4)
+    right = torch.randn(3, 5, 4)
+
+    def fn(first, second):
+        return torch.nn.functional.cosine_similarity(first, second, dim=-1)
+
+    result = compile_callable(fn, (left, right))
+    # The denominator's clamp, the dot product and the division all land in
+    # one pointwise region once the norms are computed.
+    assert "vector_norm" in [op.op for op in result.lowered_graph.ops]
+    actual = result.plan(_torch_to_mlx(left), _torch_to_mlx(right))[0]
+    expected = _torch_to_mlx(fn(left, right))
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_inplace_mul_rejects_an_aliasing_observer() -> None:

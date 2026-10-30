@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Callable, Sequence
-from math import isfinite
+from math import isfinite, prod
 from typing import Any
 
 from .ir import DType, Graph, Operation, TensorType, Value
@@ -146,6 +146,13 @@ _SUPPORTED_OPS = {
     "aten.clamp_min.Tensor": "clamp_min",
     "aten.clamp_max.default": "clamp_max",
     "aten.clamp_max.Tensor": "clamp_max",
+    "aten.clamp_.default": "clamp",
+    "aten.clamp_.Tensor": "clamp",
+    "aten.clamp_.Scalar": "clamp",
+    "aten.clamp_min_.default": "clamp_min",
+    "aten.clamp_min_.Tensor": "clamp_min",
+    "aten.clamp_max_.default": "clamp_max",
+    "aten.clamp_max_.Tensor": "clamp_max",
     "aten.hardtanh.default": "clamp",
     "aten.leaky_relu.default": "leaky_relu",
     "aten.elu.default": "elu",
@@ -409,6 +416,13 @@ _INPLACE_TARGETS = {
     "aten.bitwise_xor_.Scalar",
     "aten.bitwise_not_.default",
     "aten.logical_not_.default",
+    "aten.clamp_.default",
+    "aten.clamp_.Tensor",
+    "aten.clamp_.Scalar",
+    "aten.clamp_min_.default",
+    "aten.clamp_min_.Tensor",
+    "aten.clamp_max_.default",
+    "aten.clamp_max_.Tensor",
 }
 # Constant padding accepts negative entries the same way the mirror modes do:
 # they crop the padded extent, so the frontend slices before it pads.
@@ -533,6 +547,22 @@ def capture_fx(
                 )
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, _node_type(node))
+                continue
+            if target == "aten.squeeze.default":
+                # ``torch.squeeze(x)`` drops every singleton axis, which is a
+                # pure reshape and needs no per-axis sweep.
+                output_type = _node_type(node)
+                output_id = f"v{len(ops)}"
+                ops.append(
+                    Operation(
+                        "reshape",
+                        (_argument_ids(node.args[0], node_ids),),
+                        (output_id,),
+                        {"shape": output_type.shape},
+                    )
+                )
+                values[output_id] = Value(output_id, output_type)
+                node_ids[node] = output_id
                 continue
             if target == _SELECT_TARGET:
                 select_ops = _select_operations(node, node_ids, len(ops))
@@ -751,6 +781,32 @@ def capture_fx(
                     node, node_ids, len(ops)
                 )
                 for operation, value in nansum_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
+            if target in {"aten.count_nonzero.default", "aten.count_nonzero.dim_IntList"}:
+                count_ops, output_id = _count_nonzero_operations(
+                    node, node_ids, len(ops)
+                )
+                for operation, value in count_ops:
+                    ops.append(operation)
+                    values[value.id] = value
+                node_ids[node] = output_id
+                continue
+            if target in {
+                "aten.all.default",
+                "aten.all.dim",
+                "aten.all.dims",
+                "aten.any.default",
+                "aten.any.dim",
+                "aten.any.dims",
+            }:
+                conjunction = target.startswith("aten.all.")
+                boolean_ops, output_id = _all_any_operations(
+                    node, node_ids, len(ops), conjunction=conjunction
+                )
+                for operation, value in boolean_ops:
                     ops.append(operation)
                     values[value.id] = value
                 node_ids[node] = output_id
@@ -2484,6 +2540,194 @@ def _nansum_operations(
         target_dtype,
     )
     return tuple(operations), total_id
+
+
+def _boolean_reduction_arguments(
+    node: object,
+    op: str,
+) -> tuple[object, tuple[int, ...], bool, bool]:
+    """Normalize the ``all``/``any``/``count_nonzero`` dims and keepdim."""
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{op} expects an input tensor")
+
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    dims = args[1] if len(args) > 1 else kwargs.get("dim")
+    keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{op}.keepdim must be a boolean, got {keepdim!r}")
+
+    if dims is None:
+        normalized_dims = tuple(range(rank))
+    elif isinstance(dims, int) and not isinstance(dims, bool):
+        normalized_dims = (dims % rank,)
+    elif isinstance(dims, (tuple, list)) and dims and all(
+        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    ):
+        normalized_dims = tuple(dim % rank for dim in dims)
+    else:
+        raise ValueError(f"{op}.dim must contain integers, got {dims!r}")
+    if len(set(normalized_dims)) != len(normalized_dims):
+        raise ValueError(f"{op}.dim repeats an axis: {dims!r}")
+
+    reduced_shape = tuple(
+        1 if axis in normalized_dims else size
+        for axis, size in enumerate(input_type.shape)
+    )
+    return input_node, normalized_dims, keepdim, reduced_shape
+
+
+def _count_nonzero_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``aten.count_nonzero`` as ``sum(x != 0)`` in I64."""
+
+    input_node, dims, keepdim, reduced_shape = _boolean_reduction_arguments(
+        node, "count_nonzero"
+    )
+    input_type = _node_type(input_node)
+    output_type = _node_type(node)
+    expected_shape = _reduced_extent(reduced_shape, dims, keepdim)
+    if output_type.shape != expected_shape:
+        raise ValueError(
+            f"count_nonzero output shape {output_type.shape} does not match "
+            f"the reduced {expected_shape}"
+        )
+    if output_type.dtype != DType.I64:
+        raise ValueError(
+            f"count_nonzero output dtype {output_type.dtype} must be I64"
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+        value_dtype: DType,
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, value_dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    if input_type.dtype != DType.BOOL:
+        current = emit(
+            "ne",
+            (current,),
+            {"scalar": 0, "scalar_position": "rhs"},
+            input_type.shape,
+            DType.BOOL,
+        )
+    total_id = emit(
+        "sum",
+        (current,),
+        {"dims": dims, "keepdim": keepdim},
+        expected_shape,
+        DType.I64,
+    )
+    return tuple(operations), total_id
+
+
+def _all_any_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+    *,
+    conjunction: bool,
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``all``/``any`` as a counted bool reduction.
+
+    A conjunction is ``sum(x != 0) == reduced_elements`` and a disjunction is
+    ``sum(x != 0) != 0``; both match ATen, including a NaN input counting as
+    true and an all-NaN slice being NaN-free by construction.
+    """
+
+    op = "all" if conjunction else "any"
+    input_node, dims, keepdim, reduced_shape = _boolean_reduction_arguments(
+        node, op
+    )
+    input_type = _node_type(input_node)
+    output_type = _node_type(node)
+    expected_shape = _reduced_extent(reduced_shape, dims, keepdim)
+    if output_type.shape != expected_shape:
+        raise ValueError(
+            f"{op} output shape {output_type.shape} does not match the "
+            f"reduced {expected_shape}"
+        )
+    if output_type.dtype != DType.BOOL:
+        raise ValueError(f"{op} output dtype {output_type.dtype} must be BOOL")
+
+    operations: list[tuple[Operation, Value]] = []
+
+    def emit(
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        output_shape: tuple[int, ...],
+        value_dtype: DType,
+    ) -> str:
+        value_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op, inputs, (value_id,), attrs),
+                Value(value_id, TensorType(output_shape, value_dtype)),
+            )
+        )
+        return value_id
+
+    current = _argument_ids(input_node, node_ids)
+    if input_type.dtype != DType.BOOL:
+        current = emit(
+            "ne",
+            (current,),
+            {"scalar": 0, "scalar_position": "rhs"},
+            input_type.shape,
+            DType.BOOL,
+        )
+    counted_id = emit(
+        "sum",
+        (current,),
+        {"dims": dims, "keepdim": keepdim},
+        expected_shape,
+        DType.I64,
+    )
+    total = prod(input_type.shape[axis] for axis in dims)
+    scalar = total if conjunction else 0
+    result_id = emit(
+        "eq" if conjunction else "ne",
+        (counted_id,),
+        {"scalar": scalar, "scalar_position": "rhs"},
+        expected_shape,
+        DType.BOOL,
+    )
+    return tuple(operations), result_id
+
+
+def _reduced_extent(
+    reduced_shape: tuple[int, ...],
+    dims: tuple[int, ...],
+    keepdim: bool,
+) -> tuple[int, ...]:
+    """Return the output shape of a reduction that keeps singleton axes."""
+
+    if keepdim:
+        return reduced_shape
+    return tuple(
+        size for axis, size in enumerate(reduced_shape) if axis not in set(dims)
+    )
 
 
 def _constant_pad_crops(node: object) -> bool:
