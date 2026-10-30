@@ -89,6 +89,7 @@ _INTEGER_POINTWISE_OPS = {
     "minimum",
     "floor_divide",
     "remainder",
+    "heaviside",
     "clamp",
     "clamp_min",
     "clamp_max",
@@ -4121,6 +4122,20 @@ def _validate_pointwise_region(
             _validate_integer_pointwise_op(op, output_type, input_types)
             continue
 
+        if op.op in {"mul", "add"} and output_type.dtype == DType.BOOL:
+            # PyTorch spells boolean conjunction and disjunction as ``*`` and
+            # ``+``, which is how ATen's own composites such as ``isclose``
+            # combine two masks.
+            valid = len(input_types) == 2 or (
+                len(input_types) == 1
+                and isinstance(op.attrs.get("scalar"), bool)
+            )
+            if not valid:
+                raise ValueError(f"malformed boolean op: {op.op}")
+            if any(input_type.dtype != DType.BOOL for input_type in input_types):
+                raise ValueError(f"boolean {op.op} requires boolean tensor inputs")
+            continue
+
         if op.op in _NUMERIC_PREDICATE_POINTWISE_OPS:
             if output_type.dtype != DType.BOOL or len(input_types) != 1:
                 raise ValueError(f"malformed predicate op: {op.op}")
@@ -4250,7 +4265,7 @@ def _validate_pointwise_region(
             | _LOGICAL_POINTWISE_OPS
             | _BITWISE_POINTWISE_OPS
             | _NUMERIC_PREDICATE_POINTWISE_OPS
-            | {"where", "masked_fill"}
+            | {"where", "masked_fill", "mul", "add"}
             | _CONSTANT_POINTWISE_OPS
         ):
             raise ValueError("boolean pointwise region has an unsupported root op")
@@ -4283,6 +4298,7 @@ def _validate_integer_pointwise_op(
         "minimum",
         "floor_divide",
         "remainder",
+        "heaviside",
         "bitwise_and",
         "bitwise_or",
         "bitwise_xor",
@@ -4767,6 +4783,22 @@ def _emit_pointwise_expression(
     if op.op == "xlogy":
         left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_xlogy_f32({left}, {right})"
+    if output_dtype == DType.BOOL and op.op in {"mul", "add"}:
+        # ``&&`` and ``||`` short-circuit in MSL, which is harmless for two
+        # pure predicate operands and keeps the boolean region a plain kernel.
+        left, right = _binary_operands(op, arguments, input_types)
+        operator_symbol = "&&" if op.op == "mul" else "||"
+        return f"(({left}) {operator_symbol} ({right}))"
+    if op.op == "heaviside":
+        # ATen compares against zero first, so a NaN input takes the zero branch
+        # and becomes 0 rather than the boundary value.
+        value, boundary = _binary_operands(op, arguments, input_types)
+        if output_dtype in _INTEGRAL_DTYPES:
+            return f"(({value}) == 0 ? ({boundary}) : (({value}) > 0 ? 1 : 0))"
+        return (
+            f"(({value}) == 0.0f ? ({boundary}) "
+            f": (({value}) > 0.0f ? 1.0f : 0.0f))"
+        )
     if op.op == "logit":
         value = arguments[0]
         if "eps" in op.attrs:
@@ -5007,6 +5039,12 @@ def _emit_integer_pointwise_expression(
         left, right = _binary_operands(op, arguments, input_types)
         function = "floor_div" if op.op == "floor_divide" else "remainder"
         return f"tsc_{function}_{suffix}({left}, {right})"
+
+    if op.op == "heaviside":
+        # ATen compares against zero before the sign, so the boundary value only
+        # applies to an exact zero.
+        value, boundary = _binary_operands(op, arguments, input_types)
+        return f"(({value}) == 0 ? ({boundary}) : (({value}) > 0 ? 1 : 0))"
 
     if op.op in {"bitwise_and", "bitwise_or", "bitwise_xor"}:
         left, right = _binary_operands(op, arguments, input_types)
@@ -7051,6 +7089,21 @@ def _evaluate_pointwise_mlx(
             (left == 0.0) & ~mx.isnan(right),
             mx.zeros_like(left),
             left * mx.log(right),
+        )
+    if output_type.dtype == DType.BOOL and op.op in {"mul", "add"}:
+        left, right = _binary_mx_operands(op, arguments)
+        if op.op == "mul":
+            return mx.logical_and(left, right)
+        return mx.logical_or(left, right)
+    if op.op == "heaviside":
+        value, boundary = _binary_mx_operands(op, arguments)
+        dtype = (value if isinstance(value, mx.array) else boundary).dtype
+        zero = mx.array(0, dtype=dtype)
+        one = mx.array(1, dtype=dtype)
+        return mx.where(
+            mx.equal(value, zero),
+            boundary,
+            mx.where(mx.greater(value, zero), one, zero),
         )
     if op.op == "lerp":
         start, end = arguments[0], arguments[1]

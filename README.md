@@ -421,6 +421,10 @@ Operator coverage is intentionally narrower than PyTorch. Unsupported targets fa
 - The repository does not implement scheduler, continuous batching, preemption, paged KV cache, prefix cache, sampling policies, PD disaggregation, EP/MoE dispatch, EPLB, or serving APIs.
 - Training and autograd are out of scope.
 
+- `heaviside` fuses into the pointwise kernel and follows ATen's comparison order: `x == 0` picks the boundary value, then `x > 0` gives 1, everything else 0. That means `-0.0` takes the boundary and a NaN input becomes 0 rather than the boundary. Both floating-point and integer operands are supported, the integer kernel uses integer literals, and the output keeps the operand dtype; boolean operands are rejected.
+- Boolean `mul` and `add` are conjunction and disjunction, in one kernel as `&&`/`||`. ATen writes mask combinations that way - `isclose` is two comparisons, a scale and an offset combined with boolean `*` and `&` - so `torch.isclose` now compiles into a single pointwise kernel that keeps ATen's NaN, infinity and tolerance rules (`equal_nan=True` only flips the NaN comparison). The `.Scalar` spellings of `add`, `sub`, `div` and `mul`, and `remainder` with a scalar dividend (`2.0 % x`, which is the `Scalar_Tensor` schema and keeps the divisor's sign), lower exactly like their tensor spellings.
+- In-place pointwise spellings are legalized the same way the in-place scatter family is: `add_`, `sub_`, `mul_`, `div_`, `remainder_`, `bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_` and `logical_not_`, each in its `.Tensor` and `.Scalar` form. The rewritten value must have no other consumer in the graph, the compiled call returns the updated tensor, and the tensor the caller still holds is never written back.
+
 ## Testing
 
 ```bash

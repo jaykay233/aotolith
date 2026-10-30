@@ -85,6 +85,7 @@ POINTWISE_OPS = {
     "minimum",
     "logaddexp",
     "atan2",
+    "heaviside",
     "scalar_tensor",
     "zeros",
     "ones",

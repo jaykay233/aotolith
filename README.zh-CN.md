@@ -421,6 +421,10 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 - 仓库不实现 scheduler、continuous batching、抢占、paged KV cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch、EPLB 或 serving API。
 - 不支持训练和 autograd。
 
+- `heaviside` 融合进 pointwise kernel，比较顺序与 ATen 一致：先判 `x == 0` 取边界值，再判 `x > 0` 得 1，其余为 0。因此 `-0.0` 取边界值，NaN 落到 0 而不是边界值。浮点与整数操作数都支持，整数 kernel 使用整数字面量，输出保持操作数的 dtype；bool 操作数会被拒绝。
+- bool 上的 `mul`、`add` 就是逻辑与、逻辑或，在同一个 kernel 里生成 `&&`/`||`。ATen 自己就用这两个拼写合并谓词——`isclose` 是两个比较、一个缩放、一个偏移再配合 bool 的 `*` 与 `&`——所以 `torch.isclose` 现在会编译成单个 pointwise kernel，并保持 ATen 的 NaN、无穷和容差规则（`equal_nan=True` 只翻转 NaN 那一路比较）。`add`、`sub`、`div`、`mul` 的 `.Scalar` 拼写，以及被除数为标量的 `remainder`（`2.0 % x`，即 `Scalar_Tensor` schema，符号仍跟随除数）与对应的 tensor 拼写走同一套 lowering。
+- 原地拼写与原地 scatter 家族用同一套 legalization：`add_`、`sub_`、`mul_`、`div_`、`remainder_`、`bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_` 和 `logical_not_`，每种的 `.Tensor` 与 `.Scalar` 形式都支持。被改写的值在图里不能有其他消费者，编译后的调用返回更新后的值，绝不回写调用方仍然持有的 tensor。
+
 ## 测试
 
 ```bash

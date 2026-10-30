@@ -55,6 +55,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin`/`mean` |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
 | `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，仅在原值没有其他别名观察者时做 SSA legalization |
+| `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default` | 与对应的非原地形式完全同构，只在被改写的原值没有其他消费者时接受；编译结果返回新值，不回写调用方持有的 tensor |
 | `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
@@ -96,12 +97,12 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.mish.default` | `mish` |
 | `aten.log_sigmoid_forward.default` | `logsigmoid`，仅第 0 个输出 |
 | `aten.mul.Tensor`、`aten.mul.Scalar` | `mul` |
-| `aten.add.Tensor` | `add` |
-| `aten.sub.Tensor` | `sub` |
+| `aten.add.Tensor`、`aten.add.Scalar` | `add` |
+| `aten.sub.Tensor`、`aten.sub.Scalar` | `sub` |
 | `aten.rsub.Scalar` | `rsub` |
-| `aten.div.Tensor` | `div` |
+| `aten.div.Tensor`、`aten.div.Scalar` | `div` |
 | `aten.floor_divide.default`、`aten.floor_divide.Tensor`、`aten.floor_divide.Scalar` | `floor_divide` |
-| `aten.remainder.Tensor`、`aten.remainder.Scalar` | `remainder` |
+| `aten.remainder.Tensor`、`aten.remainder.Scalar`、`aten.remainder.Scalar_Tensor` | `remainder`；`Scalar_Tensor` 的被除数是标量，结果的符号仍跟随除数 |
 | `aten.fmod.Tensor`、`aten.fmod.Scalar` | `fmod` |
 | `aten.lerp.Tensor`、`aten.lerp.Scalar` | `lerp`，保留 tensor 或标量 weight |
 | `aten.addcmul.default` | `addcmul`，保留 `value`（默认 1） |
@@ -110,6 +111,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
 | `aten.logaddexp.default` | `logaddexp` |
 | `aten.atan2.default` | `atan2` |
+| `aten.heaviside.default` | `heaviside`，浮点与整数都支持 |
 | `aten.copysign.Tensor`、`aten.copysign.Scalar`、`aten.copysign.Scalar_Scalar` | `copysign` |
 | `aten.xlogy.Tensor`、`aten.xlogy.Scalar_Self`、`aten.xlogy.Scalar_Other` | `xlogy`，左侧为 0 且右侧非 NaN 时短路成 0 |
 | `aten.logit.default` | `logit`，保留可选 `eps` 钳制 |
@@ -333,6 +335,10 @@ input_offset = (elem % 3) * 1
 Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异，因此 `tsc_atan2` 显式处理 NaN、`x == ±0`、`y == ±0`、`x`/`y` 为无穷以及 `(-inf, -inf)` 等象限边界，其余有限值回退到系统 `atan2`。这些规则与 `torch.atan2` 的参数顺序一致。
 
 浮点 `floor_divide` 生成 `tsc_floor_div_f32`，就是 `floor(a / b)`，`inf`/`NaN` 按 IEEE 传播；浮点 `remainder` 生成 `tsc_remainder_f32`，先取 `metal::fmod` 再在余数非零且与除数异号时加一次除数，与 ATen 的浮点 kernel 同构，因此结果始终与除数同号。`fmod` 直接生成 `metal::fmod`，符号跟随被除数。`lerp` 生成 `tsc_lerp_f32`，照搬 ATen 的两个分支——`|weight| < 0.5` 时用 `start + weight * (end - start)`，否则用 `end - (end - start) * (1 - weight)`——两个分支的取舍是为了减少抵消误差，`lerp.Scalar` 的标量 weight 在编译期就成为字面量。`addcmul`/`addcdiv` 生成 `self + value * t1 * t2` 与 `self + value * t1 / t2`；`addcdiv` 保持 ATen 的求值顺序（先乘后除），因为 `value * t1 / t2` 与 `value * (t1 / t2)` 在浮点下并不相等。这三种算子只接受浮点 tensor，整数输入在 lowering 阶段报错，而 `floor_divide`/`remainder`/`fmod` 对整数与浮点都支持。
+
+`heaviside` 生成的表达式是 `x == 0 ? values : (x > 0 ? 1 : 0)`，与 ATen 的比较顺序一致：先判零，再判符号，所以 `-0.0` 取 `values`，而 NaN 两个比较都不成立、落到 0，而不是取 `values`。浮点与整数输入都支持，整数版本用整数常量，输出保持输入 dtype；bool 输入会被拒绝。
+
+bool 上的 `mul`/`add` 是逻辑与/逻辑或：ATen 自己的复合算子（例如 `isclose`，它是两个比较、一个缩放、一个偏移再用 bool 的 `*`/`&` 组合）就用这两个拼写合并谓词。kernel 里分别生成 `&&` 和 `||`，MLX 回退路径用 `mx.logical_and`/`mx.logical_or`，输出保持 BOOL。因此 `torch.isclose` 整条复合链会融合成一个 pointwise kernel，NaN 永不相等、相同的无穷相等、`equal_nan=True` 只翻转 NaN 那一路比较。
 
 整数常量和 `arange` 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。整数 `arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。浮点 `arange` 不能直接用 double 走 GPU：Metal 没有 double，所以编译期把 `start`、`step` 这两个 Python double 各拆成 float 头尾（`hi` 是平台 float32 舍入值，`lo` 是剩下那部分），kernel 内先算 `factor * step_hi`，用 `fma` 拿到乘积的精确残差，再用 two-sum 求出 `product + start_hi` 的舍入误差，最后把两个误差和常量尾部一起加回去。这样每个元素等价于一次双精度求和后舍入，`arange(0, 1, 0.1)` 给出 0.9 而不是 float32 乘积的 0.90000004。
 

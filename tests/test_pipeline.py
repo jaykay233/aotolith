@@ -6101,6 +6101,203 @@ def test_float_floor_divide_and_remainder_match_pytorch(dtype, divisor) -> None:
     assert mx.allclose(actual, expected, atol=1e-3, rtol=1e-3)
 
 
+def test_scalar_dividend_remainder_matches_pytorch() -> None:
+    # ``scalar % tensor`` is the Scalar_Tensor schema, so the frontend has to
+    # hand the scalar over as the dividend and keep the result on the divisor's
+    # sign. Both the float and the integer spelling have to work.
+    divisors = torch.tensor([-3.0, -2.0, 2.0, 3.0, 0.5, -0.5])
+
+    result = compile_callable(lambda value: torch.remainder(2.0, value), (divisors,))
+    assert [op.op for op in result.lowered_graph.ops] == ["remainder"]
+    actual = result.plan(_torch_to_mlx(divisors))[0]
+    expected = _torch_to_mlx(torch.remainder(2.0, divisors))
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist()
+    assert actual.tolist() == [-1.0, 0.0, 0.0, 2.0, 0.0, 0.0]
+
+    integers = torch.tensor([-3, -2, 2, 3], dtype=torch.int32)
+    int_result = compile_callable(
+        lambda value: torch.remainder(7, value), (integers,)
+    )
+    int_actual = int_result.plan(_torch_to_mlx(integers))[0]
+    int_expected = _torch_to_mlx(torch.remainder(7, integers))
+    mx.eval(int_actual, int_expected)
+    assert int_actual.dtype == mx.int32
+    assert int_actual.tolist() == int_expected.tolist()
+    assert int_actual.tolist() == [-2, -1, 1, 1]
+
+
+@pytest.mark.parametrize("name", ["add", "sub", "div", "mul"])
+def test_scalar_operand_schema_matches_the_tensor_spelling(name: str) -> None:
+    # ATen decompositions spell scalar arithmetic with the ``.Scalar`` schemas
+    # directly, so those have to lower exactly like the tensor spelling.
+    value = torch.tensor([-3.0, -1.0, 0.0, 2.0, 4.0])
+    scalar = 2.0
+    tensor_op = getattr(getattr(torch.ops.aten, name), "Scalar")
+
+    result = compile_callable(lambda tensor: tensor_op(tensor, scalar), (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [name]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(tensor_op(value, scalar))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "dtype"),
+    [
+        ("mul", torch.float32),
+        ("div", torch.float32),
+        ("sub", torch.float32),
+        ("remainder", torch.float32),
+        ("add", torch.int32),
+        ("bitwise_and", torch.int32),
+        ("bitwise_or", torch.int32),
+        ("bitwise_xor", torch.int32),
+        ("bitwise_not", torch.int32),
+        ("logical_not", torch.bool),
+    ],
+)
+def test_inplace_pointwise_spellings_are_legalized(name, dtype) -> None:
+    # In-place arithmetic appears in ATen decompositions and in hand-written
+    # models. The mutated tensor must have no other observer, which is the same
+    # rule the in-place scatter family already follows.
+    if dtype == torch.bool:
+        value = torch.tensor([True, False, True, True])
+    elif dtype == torch.int32:
+        value = torch.tensor([1, 2, 3, 4], dtype=dtype)
+    else:
+        value = torch.tensor([4.5, -1.0, 0.0, 2.0])
+
+    # The operand is a Python scalar so it binds as the ``.Scalar`` schema
+    # instead of a traced constant tensor.
+    if name in {"bitwise_not", "logical_not"}:
+        argument = None
+    elif dtype == torch.int32:
+        argument = 5
+    else:
+        argument = 2.0
+
+    def fn(tensor):
+        mutated = tensor.clone()
+        if argument is None:
+            return getattr(mutated, f"{name}_")()
+        return getattr(mutated, f"{name}_")(argument)
+
+    result = compile_callable(fn, (value,))
+    assert [op.op for op in result.lowered_graph.ops] == [name]
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    if dtype == torch.bool:
+        assert actual.tolist() == expected.tolist()
+    else:
+        assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_inplace_mul_rejects_an_aliasing_observer() -> None:
+    def fn(value):
+        observed = value + 1.0
+        value.mul_(2.0)
+        return observed + value
+
+    with pytest.raises(NotImplementedError, match="aliasing observer"):
+        compile_callable(fn, (torch.randn(3),))
+
+
+def test_boolean_mul_and_add_are_conjunction_and_disjunction() -> None:
+    # ATen writes mask conjunctions as ``*`` and disjunctions as ``+`` on bool
+    # tensors, which is how ``isclose`` combines its two comparisons.
+    value = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0, float("nan")])
+
+    conj = compile_callable(lambda x: (x > 0) * (x < 1), (value,))
+    assert [op.op for op in conj.lowered_graph.ops] == ["fused_elementwise"]
+    conj_actual = conj.plan(_torch_to_mlx(value))[0]
+    conj_expected = _torch_to_mlx((value > 0) * (value < 1))
+    mx.eval(conj_actual, conj_expected)
+    assert conj_actual.dtype == mx.bool_
+    assert conj_actual.tolist() == conj_expected.tolist()
+    assert conj_actual.tolist() == [False, False, False, True, False, False]
+
+    disj = compile_callable(lambda x: (x > 0) + (x < 1), (value,))
+    disj_actual = disj.plan(_torch_to_mlx(value))[0]
+    disj_expected = _torch_to_mlx((value > 0) + (value < 1))
+    mx.eval(disj_actual, disj_expected)
+    assert disj_actual.tolist() == disj_expected.tolist()
+
+
+def test_isclose_lowers_to_one_fused_kernel() -> None:
+    # ``isclose`` is an ATen composite: two comparisons, a scale and an offset,
+    # combined with boolean ``*``/``&``. It has to compile as one kernel and
+    # keep ATen's NaN and infinity rules.
+    left = torch.tensor([1.0, 1.0000001, -1.0, float("nan"), float("inf"), 0.0])
+    right = torch.tensor([1.0, 1.0, 1.0, 1.0, float("inf"), 1e-9])
+
+    result = compile_callable(torch.isclose, (left, right))
+    assert [op.op for op in result.lowered_graph.ops] == ["fused_elementwise"]
+
+    actual = result.plan(_torch_to_mlx(left), _torch_to_mlx(right))[0]
+    expected = _torch_to_mlx(torch.isclose(left, right))
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.bool_
+    assert actual.tolist() == expected.tolist()
+    # NaN is never close, matching infinities are, and a difference inside the
+    # default ``atol + rtol * |other|`` window counts as close.
+    assert actual.tolist() == [True, True, False, False, True, True]
+
+
+def test_isclose_with_equal_nan_flips_only_the_nan_comparison() -> None:
+    value = torch.tensor([float("nan"), 1.0])
+
+    result = compile_callable(
+        lambda tensor: torch.isclose(tensor, tensor, equal_nan=True), (value,)
+    )
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(
+        torch.isclose(value, value, equal_nan=True)
+    )
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist() == [True, True]
+
+
+def test_heaviside_matches_pytorch_on_both_branches() -> None:
+    value = torch.tensor([-2.0, -1.0, -0.0, 0.0, 1.0, 2.0, float("nan")])
+    boundary = torch.tensor([7.0, -7.0, 0.5, -0.5, 1.5, -1.5, 3.0])
+
+    result = compile_callable(torch.heaviside, (value, boundary))
+    assert [op.op for op in result.lowered_graph.ops] == ["heaviside"]
+    assert "== 0.0f ?" in result.plan.kernels[0].source
+
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(boundary))[0]
+    expected = _torch_to_mlx(torch.heaviside(value, boundary))
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist()
+    # ATen compares against zero before the sign, so NaN takes the zero branch
+    # and -0.0 counts as zero, where the boundary value wins.
+    assert actual.tolist() == [0.0, 0.0, 0.5, -0.5, 1.0, 1.0, 0.0]
+
+
+def test_heaviside_keeps_an_integer_dtype() -> None:
+    value = torch.tensor([-2, -1, 0, 1, 2], dtype=torch.int32)
+    boundary = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
+
+    result = compile_callable(torch.heaviside, (value, boundary))
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(boundary))[0]
+    expected = _torch_to_mlx(torch.heaviside(value, boundary))
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.int32
+    assert actual.tolist() == expected.tolist() == [0, 0, 7, 1, 1]
+
+
+def test_heaviside_rejects_boolean_operands() -> None:
+    with pytest.raises(ValueError, match="boolean tensor operands"):
+        compile_callable(torch.heaviside, (torch.ones(3, dtype=torch.bool), torch.zeros(3, dtype=torch.bool)))
+
+
 def test_float_remainder_keeps_the_divisor_sign() -> None:
     # ATen adjusts the truncated remainder towards the divisor, so the result
     # of a mixed-sign pair is non-negative for a positive divisor and vice
