@@ -4,6 +4,7 @@ The batch and cache shapes are fixed, while each request can have a different
 valid prompt length. The cache is a correctness-oriented ABI demonstration:
 decode shifts the full fixed-capacity cache and is not a paged cache.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -51,16 +52,12 @@ def project_qkv(
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     normalized = rms_norm(value, norm_weight)
-    query, key, attention_value = (normalized @ qkv_weight).split(
-        HIDDEN_SIZE, dim=-1
-    )
+    query, key, attention_value = (normalized @ qkv_weight).split(HIDDEN_SIZE, dim=-1)
     batch_size, sequence_length = value.shape[:2]
-    query = query.reshape(
-        batch_size, sequence_length, NUM_HEADS, HEAD_DIM
-    ).transpose(1, 2)
-    key = key.reshape(
-        batch_size, sequence_length, NUM_HEADS, HEAD_DIM
-    ).transpose(1, 2)
+    query = query.reshape(batch_size, sequence_length, NUM_HEADS, HEAD_DIM).transpose(
+        1, 2
+    )
+    key = key.reshape(batch_size, sequence_length, NUM_HEADS, HEAD_DIM).transpose(1, 2)
     attention_value = attention_value.reshape(
         batch_size, sequence_length, NUM_HEADS, HEAD_DIM
     ).transpose(1, 2)
@@ -273,9 +270,9 @@ def make_model_inputs() -> tuple[torch.Tensor, ...]:
 
 
 def make_rotary_tables() -> tuple[torch.Tensor, torch.Tensor]:
-    frequencies = torch.arange(
-        CACHE_CAPACITY, dtype=torch.float32
-    )[:, None] / torch.pow(
+    frequencies = torch.arange(CACHE_CAPACITY, dtype=torch.float32)[
+        :, None
+    ] / torch.pow(
         torch.tensor(10000.0),
         torch.arange(0, HEAD_DIM, 2, dtype=torch.float32)[None, :] / HEAD_DIM,
     )
@@ -295,9 +292,7 @@ def make_prefill_mask(
     if any(length <= 0 or length > sequence_length for length in valid_lengths):
         raise ValueError("valid lengths must fit the padded prompt length")
 
-    mask = torch.zeros(
-        batch_size, 1, sequence_length, CACHE_CAPACITY, dtype=torch.bool
-    )
+    mask = torch.zeros(batch_size, 1, sequence_length, CACHE_CAPACITY, dtype=torch.bool)
     cache_start = CACHE_CAPACITY - sequence_length
     for batch_index, valid_length in enumerate(valid_lengths):
         first_query = sequence_length - valid_length
@@ -315,9 +310,7 @@ def make_prefill_mask(
 def make_decode_mask(valid_lengths: int | Sequence[int]) -> torch.Tensor:
     if isinstance(valid_lengths, int):
         valid_lengths = (valid_lengths,)
-    mask = torch.zeros(
-        len(valid_lengths), 1, 1, CACHE_CAPACITY, dtype=torch.bool
-    )
+    mask = torch.zeros(len(valid_lengths), 1, 1, CACHE_CAPACITY, dtype=torch.bool)
     for batch_index, valid_length in enumerate(valid_lengths):
         mask[batch_index, 0, 0, -valid_length:] = True
     return mask
@@ -351,9 +344,7 @@ def main() -> None:
         prompt_positions,
         cosine,
         sine,
-        make_prefill_mask(
-            prompts.shape[0], prompts.shape[1], initial_valid_lengths
-        ),
+        make_prefill_mask(prompts.shape[0], prompts.shape[1], initial_valid_lengths),
         *weights,
     )
     prefill_result = aoto.compile_callable(
@@ -367,9 +358,7 @@ def main() -> None:
     mx.eval(*prefill_outputs)
 
     empty_caches = tuple(
-        torch.zeros(
-            prompts.shape[0], NUM_HEADS, CACHE_CAPACITY, HEAD_DIM
-        )
+        torch.zeros(prompts.shape[0], NUM_HEADS, CACHE_CAPACITY, HEAD_DIM)
         for _ in range(2 * NUM_LAYERS)
     )
     decode_inputs = (
@@ -396,15 +385,11 @@ def main() -> None:
         valid_lengths = tuple(length + step for length in initial_valid_lengths)
         decode_outputs = decode_result.plan(
             mx.array([[tokens[-1]] for tokens in generated], dtype=mx.int32),
-            mx.array(
-                [[length] for length in valid_lengths], dtype=mx.int64
-            ),
+            mx.array([[length] for length in valid_lengths], dtype=mx.int64),
             mx.array(cosine.numpy()),
             mx.array(sine.numpy()),
             mx.array(
-                make_decode_mask(
-                    tuple(length + 1 for length in valid_lengths)
-                ).numpy()
+                make_decode_mask(tuple(length + 1 for length in valid_lengths)).numpy()
             ),
             *caches,
             *(mx.array(weight.numpy()) for weight in weights),

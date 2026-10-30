@@ -61,7 +61,7 @@ def _prompt_ids(tokenizer: object, count: int) -> list[int]:
     if not ids:
         raise RuntimeError("tokenizer produced an empty prompt")
     if len(ids) < count:
-        ids = (ids * ((count + len(ids) - 1) // len(ids)))
+        ids = ids * ((count + len(ids) - 1) // len(ids))
     return ids[:count]
 
 
@@ -107,9 +107,7 @@ def _prefill_once(
     start = time.perf_counter()
     logits, compact_cache = runtime.prefill_ids(prompt)
     cache = runtime.pad_cache(compact_cache)
-    token = mx.argmax(
-        logits[:, -1, :], axis=-1, keepdims=True
-    ).astype(mx.int64)
+    token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
     mx.eval(token, cache)
     return time.perf_counter() - start
 
@@ -123,9 +121,7 @@ def _decode_once(
 ) -> tuple[float, mx.array]:
     logits, compact_cache = runtime.prefill_ids(prompt)
     cache = runtime.pad_cache(compact_cache)
-    token = mx.argmax(
-        logits[:, -1, :], axis=-1, keepdims=True
-    ).astype(mx.int64)
+    token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
     mx.eval(token, cache)
     generated = [token.reshape(-1)]
     valid_length = runtime.prompt_length
@@ -139,9 +135,7 @@ def _decode_once(
         logits, cache = runtime.decode_token(
             token, cache, valid_length, verify_token=False
         )
-        token = mx.argmax(
-            logits[:, -1, :], axis=-1, keepdims=True
-        ).astype(mx.int64)
+        token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
         if sync_each_step:
             mx.eval(token, cache)
         generated.append(token.reshape(-1))
@@ -262,9 +256,7 @@ def main() -> None:
 
     artifact_paths: list[str] = []
     if args.artifact_prefix is not None:
-        artifact_paths = [
-            str(path) for path in runtime.save(args.artifact_prefix)
-        ]
+        artifact_paths = [str(path) for path in runtime.save(args.artifact_prefix)]
 
     # Warm up both graph executions and the host greedy loop before recording.
     _prefill_once(runtime, prompt)
@@ -357,39 +349,27 @@ def main() -> None:
         "codegen_attention": args.codegen_attention,
         "autotune": args.autotune,
         "prefill": {
-            "latency_ms": _summary(
-                [value * 1000 for value in prefill_latencies]
-            ),
-            "tokens_per_s": _rate_summary(
-                prefill_latencies, args.prompt_tokens
-            ),
+            "latency_ms": _summary([value * 1000 for value in prefill_latencies]),
+            "tokens_per_s": _rate_summary(prefill_latencies, args.prompt_tokens),
         },
         "decode_sync_each_step": {
-            "latency_ms": _summary(
-                [value * 1000 for value in sync_decode_latencies]
-            ),
+            "latency_ms": _summary([value * 1000 for value in sync_decode_latencies]),
             "tokens_per_s": _rate_summary(
                 sync_decode_latencies, args.decode_tokens - 1
             ),
         },
         "decode_async": {
-            "latency_ms": _summary(
-                [value * 1000 for value in async_decode_latencies]
-            ),
+            "latency_ms": _summary([value * 1000 for value in async_decode_latencies]),
             "tokens_per_s": _rate_summary(
                 async_decode_latencies, args.decode_tokens - 1
             ),
         },
         "end_to_end_sync_each_step": {
-            "latency_ms": _summary(
-                [value * 1000 for value in sync_e2e]
-            ),
+            "latency_ms": _summary([value * 1000 for value in sync_e2e]),
             "tokens_per_s": _rate_summary(sync_e2e, args.decode_tokens),
         },
         "end_to_end_async": {
-            "latency_ms": _summary(
-                [value * 1000 for value in async_e2e]
-            ),
+            "latency_ms": _summary([value * 1000 for value in async_e2e]),
             "tokens_per_s": _rate_summary(async_e2e, args.decode_tokens),
         },
         "prefill_graph_ops": len(runtime.prefill.input_graph.ops),
@@ -407,15 +387,11 @@ def main() -> None:
         ).hexdigest(),
         "reference_tokens": reference_tokens,
         "reference_tokens_match": (
-            None
-            if reference_tokens is None
-            else generated == reference_tokens
+            None if reference_tokens is None else generated == reference_tokens
         ),
         "first_reference_mismatch": first_reference_mismatch,
         "artifact_paths": artifact_paths,
-        "artifact_bytes": [
-            Path(path).stat().st_size for path in artifact_paths
-        ],
+        "artifact_bytes": [Path(path).stat().st_size for path in artifact_paths],
     }
     if args.mlx_baseline:
         baseline = _mlx_lm_decode_rate(
@@ -426,8 +402,9 @@ def main() -> None:
             repeats=args.repeats,
         )
         if baseline is None:
-            print("mlx_lm is not installed; skipping the native baseline",
-                  file=sys.stderr)
+            print(
+                "mlx_lm is not installed; skipping the native baseline", file=sys.stderr
+            )
         else:
             result["mlx_lm_baseline"] = baseline
     text = json.dumps(result, indent=2)

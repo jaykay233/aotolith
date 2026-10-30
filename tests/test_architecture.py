@@ -31,21 +31,14 @@ LAYERS: dict[str, int] = {
     "shapes": 0,
     "ir": 0,
     "ir.types": 0,
-    "ir.op": 1,  # Operation, built from types
-    "ir.graph": 2,  # Graph, built from both
-    "ir.ops": 3,  # the contract table, over the whole IR
-    "ir.ops.rules": 3,
-    "ir.ops.shared": 3,
-    "ir.ops.view": 3,
-    "ir.ops.constants": 3,
-    "ir.ops.reduction": 3,
-    "ir.ops.elementwise": 3,
-    "ir.ops.indexing": 3,
-    "ir.ops.kernels": 3,
-    "ir.ops.table": 4,  # assembles every family
     "selection": 0,
     "_version": 0,
-    # Facts about the operator set, expressed in terms of the IR types.
+    # The two lowest codegen pieces: what an MLX dtype maps to, and what a Metal
+    # kernel header looks like. The target needs both to answer "can this
+    # machine compile this at all", so they sit below it.
+    "codegen.dtypes": 1,
+    "codegen.msl": 1,
+    "ir.op": 1,  # Operation, built from types
     "planning": 1,
     # Graph rewriting: knows operators and the IR, not the backend.
     "passes": 1,
@@ -55,13 +48,34 @@ LAYERS: dict[str, int] = {
     # Tracing only: it knows the IR and takes the decomposition keep set as an
     # argument, so it stays below the legalizer.
     "capture.tracer": 2,
-    # Legalization: FX -> core ops. Sits above capture because it consumes what
-    # tracing produced, and never the other way round.
-    "legalize": 3,
+    "ir.graph": 2,  # Graph, built from both
     "legalize.targets": 2,
+    # Device capability: what this machine can compile and how much it holds.
+    # Everything below the backend may ask, and nothing tells it what to do.
+    "target": 3,
+    "target.apple": 3,
+    # The contract table, over the whole IR.
+    "ir.ops": 3,
+    "ir.ops.rules": 3,
+    "ir.ops.shared": 3,
+    "ir.ops.view": 3,
+    "ir.ops.constants": 3,
+    "ir.ops.reduction": 3,
+    "ir.ops.elementwise": 3,
+    "ir.ops.indexing": 3,
+    "ir.ops.kernels": 3,
+    "legalize": 3,
     "legalize.fx": 3,
     "legalize.refs": 3,
     "legalize.state": 3,
+    # Metal source emission. The families only need the IR and the target's
+    # answers, so they line up here; `matmul` and `attention` reach for the norm
+    # prologue and the reduction tree, so they sit above those.
+    "ir.ops.table": 4,  # assembles every family
+    "codegen.expr": 4,
+    "codegen.reduction": 4,
+    "codegen.pointwise": 4,
+    "codegen.index": 4,
     "legalize.views": 4,
     "legalize.elementwise": 4,
     "legalize.indexing": 4,
@@ -69,19 +83,33 @@ LAYERS: dict[str, int] = {
     "legalize.padding": 4,
     "legalize.linalg": 4,
     "legalize.attention": 4,
+    "codegen.norm": 5,
+    "runtime.bounds": 5,
     # The composition point: trace, then legalize. It sits above both halves and
     # is imported by neither, which is what keeps the two one-way.
     "capture": 5,
-    # One target's implementation: codegen, runtime dispatch, plan execution.
-    "backends": 3,
-    "backends.apple_metal": 3,
+    "codegen.matmul": 6,
+    "codegen.attention": 7,
+    # Execution: the MLX fallback, then the plan that runs it. The plan holds
+    # compiled artifacts, so it sits above the whole of codegen.
+    "runtime.mlx_ops": 7,
+    "runtime.mlx_ops.pointwise": 8,
+    "runtime.mlx_ops.layout": 8,
+    "runtime.mlx_ops.scatter": 8,
+    "runtime.mlx_ops.matmul": 8,
+    "runtime.mlx_ops.attention": 8,
+    "runtime": 8,
+    "runtime.plan": 9,
+    # One target's implementation, composing the three above.
+    "backends": 10,
+    "backends.apple": 10,
     # Serialization of a finished plan.
-    "artifact": 4,
+    "artifact": 11,
     # Sequencing the whole pipeline.
-    "compiler": 6,
+    "compiler": 11,
     # Entry points.
-    "cli": 7,
-    "models.qwen2": 7,
+    "cli": 12,
+    "models.qwen2": 12,
 }
 
 MODULE_PATHS = {
@@ -120,8 +148,29 @@ MODULE_PATHS = {
     "legalize.padding": "legalize/padding.py",
     "legalize.linalg": "legalize/linalg.py",
     "legalize.attention": "legalize/attention.py",
+    "target": "target/__init__.py",
+    "target.apple": "target/apple.py",
+    "codegen": "codegen/__init__.py",
+    "codegen.dtypes": "codegen/dtypes.py",
+    "codegen.msl": "codegen/msl.py",
+    "codegen.expr": "codegen/expr.py",
+    "codegen.reduction": "codegen/reduction.py",
+    "codegen.pointwise": "codegen/pointwise.py",
+    "codegen.index": "codegen/index.py",
+    "codegen.norm": "codegen/norm.py",
+    "codegen.matmul": "codegen/matmul.py",
+    "codegen.attention": "codegen/attention.py",
+    "runtime": "runtime/__init__.py",
+    "runtime.bounds": "runtime/bounds.py",
+    "runtime.mlx_ops": "runtime/mlx_ops/__init__.py",
+    "runtime.mlx_ops.pointwise": "runtime/mlx_ops/pointwise.py",
+    "runtime.mlx_ops.layout": "runtime/mlx_ops/layout.py",
+    "runtime.mlx_ops.scatter": "runtime/mlx_ops/scatter.py",
+    "runtime.mlx_ops.matmul": "runtime/mlx_ops/matmul.py",
+    "runtime.mlx_ops.attention": "runtime/mlx_ops/attention.py",
+    "runtime.plan": "runtime/plan.py",
     "backends": "backends/__init__.py",
-    "backends.apple_metal": "backends/apple_metal.py",
+    "backends.apple": "backends/apple.py",
     "artifact": "artifact.py",
     "compiler": "compiler.py",
     "cli": "cli.py",
@@ -212,15 +261,18 @@ def test_the_operator_registry_does_not_import_the_pass_pipeline() -> None:
 def test_the_backend_does_not_import_the_pass_pipeline() -> None:
     # Same edge from the other side: the backend read LAYOUT_OPS out of
     # passes.py, which made codegen depend on what rewrites exist.
-    imported = _module_level_imports(MODULE_PATHS["backends.apple_metal"])
-    assert "passes" not in imported
+    for module in ("backends.apple", "codegen.matmul", "runtime.plan"):
+        imported = _module_level_imports(MODULE_PATHS[module])
+        assert "passes" not in imported
 
 
 def test_fusion_and_codegen_agree_on_what_is_pointwise() -> None:
     # Both sides import the one definition, so a new elementwise operator
     # cannot be fusable without also being emittable, or the reverse.
-    from aotolith import passes
-    from aotolith.backends import apple_metal
+    from aotolith import op_sets, passes
+    from aotolith.backends import apple
 
-    assert passes.POINTWISE_OPS is apple_metal.POINTWISE_OPS
-    assert passes.LAYOUT_OPS is apple_metal.LAYOUT_OPS
+    assert passes.POINTWISE_OPS is op_sets.POINTWISE_OPS
+    assert passes.LAYOUT_OPS is op_sets.LAYOUT_OPS
+    assert apple.POINTWISE_OPS is op_sets.POINTWISE_OPS
+    assert apple.LAYOUT_OPS is op_sets.LAYOUT_OPS

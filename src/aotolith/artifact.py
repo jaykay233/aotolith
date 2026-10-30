@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from ._version import __version__
-from .backends.apple_metal import AppleMetalBackend, CompiledPlan, KernelArtifact
+from .backends.apple import AppleMetalBackend
+from .codegen.msl import KernelArtifact
+from .runtime.plan import CompiledPlan
 from .ir import DType, Graph, Operation, TensorType, Value
 from .planning import BufferSlot, StoragePlan, ValueLifetime
 from .selection import KernelBenchmark, KernelSelection

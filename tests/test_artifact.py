@@ -16,7 +16,7 @@ from aotolith import (
     ArtifactCompatibilityError,
     compile_module,
 )
-from aotolith.backends.apple_metal import AppleMetalBackend
+from aotolith.backends.apple import AppleMetalBackend
 
 
 class TinyArtifactModule(torch.nn.Module):

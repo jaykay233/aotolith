@@ -111,10 +111,14 @@ def run_case(
         },
         inner,
     )
-    print(f"custom kernel:         {timings['custom'] * 1e3:8.1f} us "
-          f"({flops / timings['custom'] * 1e-9:.1f} TFLOPS)")
-    print(f"MLX matmul:            {timings['mlx'] * 1e3:8.1f} us "
-          f"({flops / timings['mlx'] * 1e-9:.1f} TFLOPS)")
+    print(
+        f"custom kernel:         {timings['custom'] * 1e3:8.1f} us "
+        f"({flops / timings['custom'] * 1e-9:.1f} TFLOPS)"
+    )
+    print(
+        f"MLX matmul:            {timings['mlx'] * 1e3:8.1f} us "
+        f"({flops / timings['mlx'] * 1e-9:.1f} TFLOPS)"
+    )
     ratio = timings["mlx"] / timings["custom"]
     verdict = f"{ratio:.2f}x faster" if ratio >= 1 else f"{1 / ratio:.2f}x slower"
     print(f"custom vs MLX:         {verdict}")

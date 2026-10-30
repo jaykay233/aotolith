@@ -15,7 +15,9 @@ from aotolith import (
     load_compiled_module,
     save_compiled,
 )
-from aotolith.backends import apple_metal as metal_backend
+import aotolith.codegen.msl as metal_msl
+import aotolith.runtime.mlx_ops.pointwise as metal_pointwise
+import aotolith.target.apple as metal_target
 from aotolith.ir import DType, Graph, Operation, TensorType, Value
 
 
@@ -111,13 +113,13 @@ def test_pointwise_fusion_emits_one_metal_region() -> None:
 def test_repeated_compilation_reuses_identical_metal_kernel() -> None:
     # The first compilation probes for tensor cores, and that probe is itself a
     # cached metal kernel, so memoize it before counting misses.
-    metal_backend._compiler_reports_tensor_ops()
-    metal_backend._metal_kernel.cache_clear()
+    metal_target._compiler_reports_tensor_ops()
+    metal_msl._metal_kernel.cache_clear()
     x = torch.randn(2, 8)
     first = compile_callable(lambda value: torch.relu(value), (x,))
     second = compile_callable(lambda value: torch.relu(value), (x,))
 
-    cache_info = metal_backend._metal_kernel.cache_info()
+    cache_info = metal_msl._metal_kernel.cache_info()
     assert cache_info.misses == 1
     assert cache_info.hits == 1
 
@@ -3841,7 +3843,7 @@ def test_native_decode_attention_launches_one_threadgroup_per_head(
     )
 
     launches: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    cached_kernel = metal_backend._metal_kernel
+    cached_kernel = metal_msl._metal_kernel
 
     def recording_kernel(name, input_names, output_names, source, header):
         kernel = cached_kernel(name, input_names, output_names, source, header)
@@ -3852,7 +3854,7 @@ def test_native_decode_attention_launches_one_threadgroup_per_head(
 
         return launch
 
-    monkeypatch.setattr(metal_backend, "_metal_kernel", recording_kernel)
+    monkeypatch.setattr(metal_msl, "_metal_kernel", recording_kernel)
     result = compile_graph(graph, codegen_attention=True)
     assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
     assert "threadgroup float scores[8]" in result.plan.kernels[0].source
@@ -7087,7 +7089,7 @@ def test_integer_one_sided_clamp_uses_neutral_limit(dtype, operation) -> None:
     pointwise_op = body[0] if body is not None else result.lowered_graph.ops[0]
     output_type = result.lowered_graph.value(pointwise_op.outputs[0]).type
     environment = {"arg0": _torch_to_mlx(value)}
-    actual = metal_backend._evaluate_pointwise_mlx(
+    actual = metal_pointwise._evaluate_pointwise_mlx(
         pointwise_op, environment, output_type
     )
     expected = _torch_to_mlx(operation_fn(value, bound))
@@ -7440,7 +7442,7 @@ def test_backend_falls_back_when_the_gpu_cannot_load_tensor_ops(
     otherwise every machine older than the tile tables has no working matmul.
     """
 
-    monkeypatch.setattr(metal_backend, "_mpp_supported", lambda: False)
+    monkeypatch.setattr(metal_target, "_mpp_supported", lambda: False)
 
     torch.manual_seed(35)
     matmul_inputs = (
@@ -7487,11 +7489,11 @@ def test_a_device_that_rejects_tensor_core_kernels_still_compiles(
     on a user's first matmul.
     """
 
-    monkeypatch.setattr(metal_backend, "_TENSOR_CORES_BLOCKED", False)
-    monkeypatch.setattr(metal_backend, "_TENSOR_CORE_BLOCK_ERROR", None)
-    assert metal_backend._mpp_supported(), "this test needs the hardware gate on"
+    monkeypatch.setattr(metal_target, "_TENSOR_CORES_BLOCKED", False)
+    monkeypatch.setattr(metal_target, "_TENSOR_CORE_BLOCK_ERROR", None)
+    assert metal_target._mpp_supported(), "this test needs the hardware gate on"
 
-    create_kernel = metal_backend._metal_kernel
+    create_kernel = metal_msl._metal_kernel
 
     def refuse_tensor_core_kernels(name, input_names, output_names, source, header):
         kernel = create_kernel(name, input_names, output_names, source, header)
@@ -7506,7 +7508,7 @@ def test_a_device_that_rejects_tensor_core_kernels_still_compiles(
 
         return reject
 
-    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_tensor_core_kernels)
+    monkeypatch.setattr(metal_msl, "_metal_kernel", refuse_tensor_core_kernels)
 
     torch.manual_seed(38)
     inputs = (
@@ -7518,7 +7520,7 @@ def test_a_device_that_rejects_tensor_core_kernels_still_compiles(
     ).plan
 
     assert "tensorcore" not in plan.kernels[0].name
-    assert metal_backend.tensor_core_fallback_reason() is not None
+    assert metal_target.tensor_core_fallback_reason() is not None
     assert "tensor cores rejected" in plan.selections[0].reason
 
     actual = plan(*(_torch_to_mlx(value) for value in inputs))[0]
@@ -7540,10 +7542,10 @@ def test_tensor_core_support_is_checked_per_dtype(
     """
 
     _require_tensor_cores()
-    monkeypatch.setattr(metal_backend, "_TENSOR_CORES_BLOCKED", False)
-    monkeypatch.setattr(metal_backend, "_TENSOR_CORE_BLOCK_ERROR", None)
+    monkeypatch.setattr(metal_target, "_TENSOR_CORES_BLOCKED", False)
+    monkeypatch.setattr(metal_target, "_TENSOR_CORE_BLOCK_ERROR", None)
 
-    create_kernel = metal_backend._metal_kernel
+    create_kernel = metal_msl._metal_kernel
 
     def refuse_bfloat16_tiles(name, input_names, output_names, source, header):
         kernel = create_kernel(name, input_names, output_names, source, header)
@@ -7558,7 +7560,7 @@ def test_tensor_core_support_is_checked_per_dtype(
 
         return reject
 
-    monkeypatch.setattr(metal_backend, "_metal_kernel", refuse_bfloat16_tiles)
+    monkeypatch.setattr(metal_msl, "_metal_kernel", refuse_bfloat16_tiles)
 
     torch.manual_seed(39)
     half = (torch.randn(64, 64, dtype=torch.float16),) * 2

@@ -42,9 +42,7 @@ def main() -> None:
     )
     print(
         "kernels:",
-        ", ".join(
-            sorted({kernel.kind for kernel in compiled.plan.kernels})
-        ),
+        ", ".join(sorted({kernel.kind for kernel in compiled.plan.kernels})),
     )
 
     del model

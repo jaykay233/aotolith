@@ -40,15 +40,11 @@ def decoder_layer(value: torch.Tensor, *parameters: torch.Tensor) -> torch.Tenso
         sine,
     ) = parameters
     normalized = rms_norm(value, attention_norm)
-    query, key, attention_value = (normalized @ qkv_weight).split(
-        HIDDEN_SIZE, dim=-1
+    query, key, attention_value = (normalized @ qkv_weight).split(HIDDEN_SIZE, dim=-1)
+    query = query.reshape(BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM).transpose(
+        1, 2
     )
-    query = query.reshape(
-        BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM
-    ).transpose(1, 2)
-    key = key.reshape(
-        BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM
-    ).transpose(1, 2)
+    key = key.reshape(BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM).transpose(1, 2)
     attention_value = attention_value.reshape(
         BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM
     ).transpose(1, 2)
@@ -100,9 +96,9 @@ def make_inputs() -> tuple[torch.Tensor, ...]:
         torch.randn(HIDDEN_SIZE, VOCABULARY_SIZE),
     ]
 
-    frequencies = torch.arange(
-        SEQUENCE_LENGTH, dtype=torch.float32
-    )[:, None] / torch.pow(
+    frequencies = torch.arange(SEQUENCE_LENGTH, dtype=torch.float32)[
+        :, None
+    ] / torch.pow(
         torch.tensor(10000.0),
         torch.arange(0, HEAD_DIM, 2, dtype=torch.float32)[None, :] / HEAD_DIM,
     )

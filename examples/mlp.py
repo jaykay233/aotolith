@@ -8,7 +8,9 @@ import torch
 import aotolith as aoto
 
 
-def mlp(x: torch.Tensor, gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor):
+def mlp(
+    x: torch.Tensor, gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor
+):
     gate = x @ gate_w
     up = x @ up_w
     return (torch.nn.functional.silu(gate) * up) @ down_w

@@ -33,9 +33,7 @@ def _hot_operand(source: str, name: str, position: int) -> str:
     streaming operand loads cost.
     """
 
-    pattern = (
-        f"const device T* {name} = in_{position} + "
-    )
+    pattern = f"const device T* {name} = in_{position} + "
     start = source.find(pattern)
     if start < 0:
         raise RuntimeError(f"the kernel no longer declares {name}")
@@ -61,20 +59,19 @@ def _compiled_variant(
 ) -> tuple[aoto.CompiledPlan, tuple[mx.array, ...]]:
     """Compile the pass, optionally rewriting the generated kernel source."""
 
-    from aotolith.backends import apple_metal
+    from aotolith.codegen import attention as attention_codegen
 
-    original = apple_metal._emit_mpp_attention_source
+    original = attention_codegen._emit_mpp_attention_source
     if name is not None:
+
         def patched(**kwargs):
             return _variant_source(original(**kwargs), name)
 
-        apple_metal._emit_mpp_attention_source = patched
+        attention_codegen._emit_mpp_attention_source = patched
     try:
-        native = aoto.compile_callable(
-            attention, torch_inputs, codegen_attention=True
-        )
+        native = aoto.compile_callable(attention, torch_inputs, codegen_attention=True)
     finally:
-        apple_metal._emit_mpp_attention_source = original
+        attention_codegen._emit_mpp_attention_source = original
     kernel = native.plan.kernels[0]
     if "tensorcore" not in kernel.name:
         raise RuntimeError("this device did not select the tensor-core attention")
@@ -114,7 +111,11 @@ def run_ablation(batch: int, heads: int, sequence: int, head_dim: int) -> None:
     full = timings["full kernel"]
     for name in [*names, "MLX SDPA"]:
         saved = full - timings[name]
-        share = "" if name in {"full kernel", "MLX SDPA"} else f"  saves {saved / full:5.1%}"
+        share = (
+            ""
+            if name in {"full kernel", "MLX SDPA"}
+            else f"  saves {saved / full:5.1%}"
+        )
         print(f"  {name:<20} {timings[name] * 1e3:9.1f} us{share}")
 
 
