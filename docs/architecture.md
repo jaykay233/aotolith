@@ -246,13 +246,30 @@ FP16/BF16 的 CPU SDPA 分解图常把 Q/K/V 转成 FP32 计算，再把结果�
 
 ## 2. SSA IR
 
-IR 定义在 `ir.py`：
+IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，`op.py` 放 `Operation`，`graph.py` 放 `Graph` 与 `validate()`，`__init__.py` 原样再导出这五个名字，所以调用方仍然写 `from ..ir import Graph, Operation`。
 
 - `Value` 有唯一 ID 和静态 `TensorType`
 - `Operation` 产生一个或多个输出，输入是已定义的 value ID。绝大多数算子只写一个值；`native_layer_norm` 这类在 ATen 里返回 tuple 的算子把同一个 kernel 已经算出的多个结果一次写成多个 SSA value，因此 tuple 语义不需要靠“再推导一遍兄弟输出”来表达
 - `Graph.validate()` 检查输入唯一性、use-before-def、重复定义、输出类型是否存在
 
 这是限制过的 SSA 形式。后续加入 layout、tile、schedule 时，可以继续扩展 operation attribute，而不需要改前端的 value 命名规则。
+
+## 2.5 Capture 与 Legalize
+
+前端拆成两半，因为它们的失败原因不一样：
+
+- `capture/`：只负责 tracing。`tracer.trace(fn, example_inputs, keep)` 用 `make_fx` 的 `tracing_mode="fake"` 把 callable 追成一张 FX 图，并把「不可追踪」的错误（某个张量从没成为 graph input）写在 `make_fx` 调用旁边。`keep` 是后端自己 lower 的 target 集合，作为参数传入而不是 import——这样 tracing 待在 legalizer 下面，依赖只朝一个方向。
+- `legalize/`：只负责 FX → 核心 op。`targets.py` 收拢所有 ATen target 字面量，`fx.py` 读取追踪结果（节点类型、被烘焙进图的常量、零长度常量、该拒绝的图），`refs.py` 解析 node → value id，`state.py` 是 `Lowering`（value 表、op 表、id 分配），其余按族分文件：`views`、`elementwise`、`indexing`、`reductions`、`padding`、`linalg`、`attention`。
+
+`capture/__init__.py` 里的 `capture_fx` 是组合点（trace 再 legalize），它坐在两半之上，两半都不 import 它。原先 `capture_fx` 是一个 500 行的循环，把 tracing、FX→IR 翻译、以及 30 个复合算子的手写 lowering 混在一个函数里；现在循环只剩 placeholder/get_attr/output 和一次派发。
+
+派发是三张按 target 索引的表，而不是一条 if 链：
+
+- 每个族导出 `HANDLERS: dict[target, tuple[handler, ...]]`。一个 target 可以有多个 handler，按顺序试；handler 返回 `False` 表示「不是我以为的形状」，于是下一个接管。`constant_pad_nd` 就靠这个：只有全负的 pad 才是 crop，其余交给通用路径。
+- 族 handler 全部拒绝之后才跑 `PRE_HANDLERS`，然后是通用逐元素路径。这个顺序是必须的：`rms_norm` 到达时已经被分解成乘法链，没有任何 target 名字可认，只能按形状匹配，所以它必须排在最后、并且在通用路径之前对所有节点尝试一次。
+- 就地算子（`scatter_`、`index_add_`）注册到它规范化后的那个 target 上，外面套一层「目的值没有别的读者」的检查。编译器建模的是 value 而不是 mutation，所以就地写只有在原值此后已死时才是合法化。
+
+死代码在同一次遍历里掉出去：没有被任何输出用到的 value 在组装程序时被丢弃，所以一个只读 `getitem(k=0)` 的分解图只发射可达的那部分。
 
 每个 IR op 的操作数个数、必备 attribute、输出个数、dtype 和 shape 规则集中声明在 `ir/ops/`，由 `check_operation()` 一次性校验：`OpContract` 用 `arity`、`attrs`、`rank`、`dtype`、`shape`、`outputs` 六个字段描述通用规则，字段表达不了的算子间约束（scatter 的 index/update 相容性、embedding 的浮点 weight 加整型 indices、layout op 的目标 shape）放在该算子自己的 `extra` 钩子里。后端在 lowering 之前统一跑一遍校验，然后只根据 op 名决定“能否生成 kernel”，不再让每个 `elif` 分支各自重写 rank/dtype/shape 前置检查。新增一个算子因此是一行声明加至多一个钩子，`tests/test_planning.py` 里有一条测试要求 `POINTWISE_OPS` 和 `LAYOUT_OPS` 的每个名字都已注册，避免新算子绕过校验。
 

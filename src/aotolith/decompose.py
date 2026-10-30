@@ -18,10 +18,10 @@ Two reasons to use it rather than hand-writing every lowering:
 
 Which operators keep their own lowering is the *caller's* decision, passed in
 as ``keep``. This module deliberately does not know the frontend's operator
-table: the table is a fact about capture, and reaching back for it would make
-capture and legalization import each other. The frontend already owns the list
-(``frontend.NATIVE_TARGETS``), so it passes it in and the dependency points one
-way.
+table: the table is a fact about legalization, and reaching back for it would
+make tracing and legalization import each other. The legalizer already owns the
+list (``legalize.targets.NATIVE_TARGETS``), so the caller passes it in and the
+dependency points one way.
 
 For the operators that are kept, a decomposition would be a regression rather
 than a shortcut: it replaces a dedicated Metal kernel (``attention``,

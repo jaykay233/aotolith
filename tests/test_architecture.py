@@ -52,17 +52,36 @@ LAYERS: dict[str, int] = {
     # The decomposition table: a filter over Torch's rules. It reaches back for
     # nothing, so capture can depend on it rather than the reverse.
     "decompose": 1,
-    # Capture and legalization: emits the core operator set.
-    "frontend": 2,
+    # Tracing only: it knows the IR and takes the decomposition keep set as an
+    # argument, so it stays below the legalizer.
+    "capture.tracer": 2,
+    # Legalization: FX -> core ops. Sits above capture because it consumes what
+    # tracing produced, and never the other way round.
+    "legalize": 3,
+    "legalize.targets": 2,
+    "legalize.fx": 3,
+    "legalize.refs": 3,
+    "legalize.state": 3,
+    "legalize.views": 4,
+    "legalize.elementwise": 4,
+    "legalize.indexing": 4,
+    "legalize.reductions": 4,
+    "legalize.padding": 4,
+    "legalize.linalg": 4,
+    "legalize.attention": 4,
+    # The composition point: trace, then legalize. It sits above both halves and
+    # is imported by neither, which is what keeps the two one-way.
+    "capture": 5,
     # One target's implementation: codegen, runtime dispatch, plan execution.
+    "backends": 3,
     "backends.apple_metal": 3,
     # Serialization of a finished plan.
     "artifact": 4,
     # Sequencing the whole pipeline.
-    "compiler": 5,
+    "compiler": 6,
     # Entry points.
-    "cli": 6,
-    "models.qwen2": 6,
+    "cli": 7,
+    "models.qwen2": 7,
 }
 
 MODULE_PATHS = {
@@ -87,7 +106,21 @@ MODULE_PATHS = {
     "planning": "planning.py",
     "passes": "passes.py",
     "decompose": "decompose.py",
-    "frontend": "frontend.py",
+    "capture": "capture/__init__.py",
+    "capture.tracer": "capture/tracer.py",
+    "legalize": "legalize/__init__.py",
+    "legalize.targets": "legalize/targets.py",
+    "legalize.fx": "legalize/fx.py",
+    "legalize.refs": "legalize/refs.py",
+    "legalize.state": "legalize/state.py",
+    "legalize.views": "legalize/views.py",
+    "legalize.elementwise": "legalize/elementwise.py",
+    "legalize.indexing": "legalize/indexing.py",
+    "legalize.reductions": "legalize/reductions.py",
+    "legalize.padding": "legalize/padding.py",
+    "legalize.linalg": "legalize/linalg.py",
+    "legalize.attention": "legalize/attention.py",
+    "backends": "backends/__init__.py",
     "backends.apple_metal": "backends/apple_metal.py",
     "artifact": "artifact.py",
     "compiler": "compiler.py",
@@ -115,7 +148,12 @@ def _module_level_imports(relative_path: str) -> set[str]:
                 base = base[: len(base) - (node.level - 1)]
                 target = ".".join(base + ([node.module] if node.module else []))
             if target == "aotolith" or target.startswith("aotolith."):
-                found.add(target[len("aotolith.") :])
+                prefix = target[len("aotolith.") :]
+                if node.module is None and node.level:
+                    # ``from . import views`` names submodules, not attributes.
+                    found.update(f"{prefix}.{alias.name}" for alias in node.names)
+                else:
+                    found.add(prefix)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.startswith("aotolith."):

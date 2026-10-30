@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from ..compiler import CompiledModulePlan, compile_module
-from ..frontend import capture_fx
+from ..capture import capture_fx
 
 # Probe points for the activation pre-flight check below. They span the range
 # where activations differ, including a negative input, where SiLU is not

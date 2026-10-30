@@ -460,7 +460,15 @@ PyTorch raises `IndexError` for out-of-range embedding and gather indices, while
 ## Repository Layout
 
 ```text
-src/aotolith/   Compiler frontend, IR, passes, planner, selection, and Metal backend
+src/aotolith/
+  capture/          FX tracing only (make_fx, fake mode, decomposition table)
+  legalize/         FX -> core ops: ATen target tables, per-family lowerings
+  ir/               typed SSA IR, plus the per-family operator contract table
+  passes.py         graph rewrites: layout folding, fusion, CSE
+  planning.py       operation legality and the execution plan
+  op_sets.py        how each operator executes (pointwise / layout / constant)
+  selection.py      native kernel vs MLX fallback
+  backends/         Metal codegen and the MLX runtime
 tests/                                IR, lowering, numerical parity, generation, and planner tests
 examples/                             Runnable model, kernel, and static KV-cache examples
 docs/architecture.md                  Detailed implementation notes and known boundaries

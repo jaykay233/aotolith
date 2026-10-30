@@ -8,7 +8,8 @@ import torch
 
 from aotolith import compile_callable
 from aotolith.decompose import aten_decompositions
-from aotolith.frontend import NATIVE_TARGETS, capture_fx
+from aotolith.capture import capture_fx
+from aotolith.legalize.targets import NATIVE_TARGETS
 
 
 def test_attention_and_layer_norm_are_never_decomposed() -> None:

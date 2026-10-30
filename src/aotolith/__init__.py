@@ -18,7 +18,7 @@ from .compiler import (
     compile_graph,
     compile_module,
 )
-from .frontend import capture_fx
+from .capture import capture_fx
 from .ir import DType, Graph, Operation, TensorType, Value
 from .planning import BufferSlot, StoragePlan, ValueLifetime, plan_storage
 from .selection import KernelBenchmark, KernelSelection

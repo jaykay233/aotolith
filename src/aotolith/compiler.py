@@ -10,7 +10,7 @@ from typing import Any
 import mlx.core as mx
 
 from .backends import AppleMetalBackend, CompiledPlan
-from .frontend import capture_fx
+from .capture import capture_fx
 from .ir import Graph
 from .passes import (
     canonicalize_batched_matmul,
