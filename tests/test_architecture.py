@@ -22,12 +22,17 @@ import pytest
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "aotolith"
 
 # Lower number = lower layer. A module may import only from a strictly smaller
-# number, so nothing at the bottom knows what is above it.
+# number, so nothing at the bottom knows what is above it. A package's
+# ``__init__`` may also re-export from its own submodules, which is the one
+# allowed same-layer edge.
 LAYERS: dict[str, int] = {
     # No intra-package imports at all: pure data and shared primitives.
     "op_sets": 0,
     "shapes": 0,
     "ir": 0,
+    "ir.types": 0,
+    "ir.op": 1,  # Operation, built from types
+    "ir.graph": 2,  # Graph, built from both
     "selection": 0,
     "_version": 0,
     # Facts about the operator set, expressed in terms of the IR types.
@@ -54,7 +59,10 @@ LAYERS: dict[str, int] = {
 MODULE_PATHS = {
     "op_sets": "op_sets.py",
     "shapes": "shapes.py",
-    "ir": "ir.py",
+    "ir": "ir/__init__.py",
+    "ir.types": "ir/types.py",
+    "ir.op": "ir/op.py",
+    "ir.graph": "ir/graph.py",
     "selection": "selection.py",
     "_version": "_version.py",
     "op_defs": "op_defs.py",
@@ -100,7 +108,17 @@ def _module_level_imports(relative_path: str) -> set[str]:
 @pytest.mark.parametrize("module", sorted(LAYERS))
 def test_a_module_only_imports_from_a_lower_layer(module: str) -> None:
     layer = LAYERS[module]
+    # A package's ``__init__`` re-exports its own submodules; that is the one
+    # same-package edge allowed, and it is what makes ``from ..ir import
+    # Graph`` work.
+    package = (
+        module
+        if MODULE_PATHS[module].endswith("__init__.py")
+        else module.rpartition(".")[0]
+    )
     for imported in _module_level_imports(MODULE_PATHS[module]):
+        if package and imported.startswith(package + "."):
+            continue
         # A submodule of a known package counts as that package.
         known = next(
             (
