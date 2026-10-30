@@ -133,6 +133,15 @@ _SUPPORTED_OPS = {
     "aten.log10.default": "log10",
     "aten.log1p.default": "log1p",
     "aten.erf.default": "erf",
+    # Special functions. ``lgamma`` and ``i0`` become pointwise Metal
+    # expressions; ``erfinv`` stays an MLX call because PyTorch refines it with
+    # Newton steps against an accurate ``erf``, which MSL does not provide.
+    "aten.lgamma.default": "lgamma",
+    "aten.i0.default": "i0",
+    "aten.erfinv.default": "erfinv",
+    # A bit test, so it is exact for both floats and integers: ``signbit`` is
+    # true for -0.0, which a comparison against zero would miss.
+    "aten.signbit.default": "signbit",
     "aten.sin.default": "sin",
     "aten.cos.default": "cos",
     "aten.floor.default": "floor",
@@ -265,6 +274,9 @@ _FLOAT_ONLY_POINTWISE_OPS = {
     "erfc",
     "frac",
     "sinc",
+    "lgamma",
+    "i0",
+    "erfinv",
     "hypot",
     "copysign",
     "xlogy",
@@ -596,9 +608,7 @@ def capture_fx(
                 # other use reaches ``_argument_ids`` and fails by name.
                 continue
             if promoted_constants is None:
-                raise NotImplementedError(
-                    _constant_tensor_message(traced, node)
-                )
+                raise NotImplementedError(_constant_tensor_message(traced, node))
             constant = _constant_value(traced, node)
             value_id = f"arg{len(input_ids)}"
             node_ids[node] = value_id
@@ -659,8 +669,8 @@ def capture_fx(
                 node_ids[node] = select_ops[-1][0].outputs[0]
                 continue
             if target == _INDEX_TARGET:
-                inputs, attrs, output_type, permute_dims = (
-                    _advanced_index_operation(node, node_ids)
+                inputs, attrs, output_type, permute_dims = _advanced_index_operation(
+                    node, node_ids
                 )
                 if permute_dims is not None:
                     source_type = values[inputs[0]].type
@@ -703,18 +713,14 @@ def capture_fx(
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target == "aten.embedding.default":
-                inputs, attrs, output_type = _embedding_operation(
-                    node, node_ids
-                )
+                inputs, attrs, output_type = _embedding_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(Operation("embedding", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target == "aten.index_select.default":
-                inputs, attrs, output_type = _index_select_operation(
-                    node, node_ids
-                )
+                inputs, attrs, output_type = _index_select_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(Operation("index_select", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
@@ -742,9 +748,7 @@ def capture_fx(
                 values[output_id] = Value(output_id, output_type)
                 continue
             if target == _INDEX_ADD_TARGET:
-                inputs, attrs, output_type = _index_add_operation(
-                    node, node_ids
-                )
+                inputs, attrs, output_type = _index_add_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(Operation("index_add", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
@@ -760,9 +764,7 @@ def capture_fx(
                     node_ids[folded_node] = output_id
                 continue
             if target in _DIRECT_ATTENTION_TARGETS:
-                inputs, attrs, output_node = _attention_operation(
-                    node, node_ids
-                )
+                inputs, attrs, output_node = _attention_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(Operation("attention", inputs, (output_id,), attrs))
                 values[output_id] = Value(output_id, _node_type(output_node))
@@ -772,8 +774,8 @@ def capture_fx(
                         node_ids[user] = output_id
                 continue
             if target == "aten.native_layer_norm.default":
-                inputs, attrs, output_type, stat_type, wanted = (
-                    _layer_norm_operation(node, node_ids)
+                inputs, attrs, output_type, stat_type, wanted = _layer_norm_operation(
+                    node, node_ids
                 )
                 # One kernel writes the normalized value and, when the graph
                 # reads them, the two statistics it already reduced. Reading
@@ -823,9 +825,7 @@ def capture_fx(
                         dead_nodes.add(user)
                 continue
             if target in _SORT_TARGETS:
-                sort_ops, produced = _sort_operations(
-                    node, node_ids, next_index()
-                )
+                sort_ops, produced = _sort_operations(node, node_ids, next_index())
                 for operation, value in sort_ops:
                     ops.append(operation)
                     values[value.id] = value
@@ -866,15 +866,16 @@ def capture_fx(
                 node_ids[node] = output_id
                 continue
             if target == _NANSUM_TARGET:
-                nansum_ops, output_id = _nansum_operations(
-                    node, node_ids, next_index()
-                )
+                nansum_ops, output_id = _nansum_operations(node, node_ids, next_index())
                 for operation, value in nansum_ops:
                     ops.append(operation)
                     values[value.id] = value
                 node_ids[node] = output_id
                 continue
-            if target in {"aten.count_nonzero.default", "aten.count_nonzero.dim_IntList"}:
+            if target in {
+                "aten.count_nonzero.default",
+                "aten.count_nonzero.dim_IntList",
+            }:
                 count_ops, output_id = _count_nonzero_operations(
                     node, node_ids, next_index()
                 )
@@ -919,18 +920,14 @@ def capture_fx(
                 node_ids[node] = output_id
                 continue
             if target == _REPEAT_TARGET:
-                repeat_ops, output_id = _repeat_operations(
-                    node, node_ids, next_index()
-                )
+                repeat_ops, output_id = _repeat_operations(node, node_ids, next_index())
                 for operation, value in repeat_ops:
                     ops.append(operation)
                     values[value.id] = value
                 node_ids[node] = output_id
                 continue
             if target == _VECTOR_NORM_TARGET:
-                inputs, attrs, output_type = _vector_norm_operation(
-                    node, node_ids
-                )
+                inputs, attrs, output_type = _vector_norm_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(Operation("vector_norm", inputs, (output_id,), attrs))
                 node_ids[node] = output_id
@@ -940,9 +937,7 @@ def capture_fx(
                 inputs, attrs, output_type = _variance_operation(node, node_ids)
                 output_id = f"v{next_index()}"
                 ops.append(
-                    Operation(
-                        _VARIANCE_TARGETS[target], inputs, (output_id,), attrs
-                    )
+                    Operation(_VARIANCE_TARGETS[target], inputs, (output_id,), attrs)
                 )
                 node_ids[node] = output_id
                 values[output_id] = Value(output_id, output_type)
@@ -960,9 +955,7 @@ def capture_fx(
                 op_name = "where"
                 call_args = (mask, fill, masked)
             if target == "aten.cat.default" and empty_nodes:
-                call_args = _fold_empty_cat_operands(
-                    node, empty_nodes, node_ids
-                )
+                call_args = _fold_empty_cat_operands(node, empty_nodes, node_ids)
                 if call_args is None:
                     # A concatenation with one surviving operand is that
                     # operand, so the operation disappears entirely.
@@ -1128,7 +1121,9 @@ def _tensor_type(tensor: object, context: str) -> TensorType:
     if dtype is None:
         raise ValueError(f"unsupported dtype: {tensor.dtype}")
     if any(dim <= 0 for dim in tensor.shape):
-        raise ValueError(f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}")
+        raise ValueError(
+            f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}"
+        )
     return TensorType(tuple(int(dim) for dim in tensor.shape), dtype)
 
 
@@ -1184,7 +1179,10 @@ def _sequence_view_operations(
                 f"{[output_type.shape for output_type in output_types]}"
             )
     else:
-        if sum(output_type.shape[axis] for output_type in output_types) != input_type.shape[axis]:
+        if (
+            sum(output_type.shape[axis] for output_type in output_types)
+            != input_type.shape[axis]
+        ):
             raise ValueError(
                 f"split output lengths do not preserve input axis {axis} of shape "
                 f"{input_type.shape}"
@@ -1208,9 +1206,7 @@ def _sequence_view_operations(
         if target == "aten.unbind.int":
             sliced_id = f"v{next_op_index}"
             next_op_index += 1
-            sliced_shape = (
-                input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
-            )
+            sliced_shape = input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
             operations.append(
                 (
                     Operation(
@@ -1230,9 +1226,7 @@ def _sequence_view_operations(
             start += 1
             output_id = f"v{next_op_index}"
             next_op_index += 1
-            operation = Operation(
-                "squeeze", (sliced_id,), (output_id,), {"dim": axis}
-            )
+            operation = Operation("squeeze", (sliced_id,), (output_id,), {"dim": axis})
         else:
             output_id = f"v{next_op_index}"
             next_op_index += 1
@@ -1294,9 +1288,7 @@ def _select_operations(
             f"{input_type.shape[axis]}"
         )
 
-    sliced_shape = (
-        input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
-    )
+    sliced_shape = input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
     sliced_id = f"v{first_op_index}"
     output_id = f"v{first_op_index + 1}"
     sliced_type = TensorType(sliced_shape, input_type.dtype)
@@ -1376,9 +1368,7 @@ def _stack_operations(
     axis = dim + output_rank if dim < 0 else dim
     if axis < 0 or axis >= output_rank:
         raise ValueError(f"stack.dim {dim} exceeds output rank {output_rank}")
-    expected_shape = (
-        first_type.shape[:axis] + (len(tensors),) + first_type.shape[axis:]
-    )
+    expected_shape = first_type.shape[:axis] + (len(tensors),) + first_type.shape[axis:]
     if output_type.shape != expected_shape or output_type.dtype != first_type.dtype:
         raise ValueError(
             f"stack output metadata {(output_type.shape, output_type.dtype)} does not "
@@ -1428,9 +1418,7 @@ def _embedding_operation(
         "sparse",
     )
     if len(args) < 2 or len(args) > len(parameter_names):
-        raise ValueError(
-            f"embedding expects two to five arguments, got {len(args)}"
-        )
+        raise ValueError(f"embedding expects two to five arguments, got {len(args)}")
     for position, name in enumerate(parameter_names[: len(args)]):
         if name in kwargs:
             raise ValueError(f"embedding received duplicate {name} argument")
@@ -1451,7 +1439,9 @@ def _embedding_operation(
     if padding_idx is not None and (
         not isinstance(padding_idx, int) or isinstance(padding_idx, bool)
     ):
-        raise ValueError(f"embedding.padding_idx must be an integer, got {padding_idx!r}")
+        raise ValueError(
+            f"embedding.padding_idx must be an integer, got {padding_idx!r}"
+        )
     if not isinstance(scale_grad_by_freq, bool):
         raise ValueError(
             "embedding.scale_grad_by_freq must be a boolean, "
@@ -1474,8 +1464,7 @@ def _embedding_operation(
         )
     if indices_type.dtype not in {DType.I32, DType.I64}:
         raise ValueError(
-            "embedding indices must be int32 or int64, "
-            f"got {indices_type.dtype.value}"
+            f"embedding indices must be int32 or int64, got {indices_type.dtype.value}"
         )
     if padding_idx is not None and not (
         -weight_type.shape[0] <= padding_idx < weight_type.shape[0]
@@ -1506,8 +1495,7 @@ def _index_select_operation(
     kwargs = dict(getattr(node, "kwargs", {}))
     if kwargs:
         raise ValueError(
-            "index_select received unsupported keyword arguments: "
-            f"{sorted(kwargs)}"
+            f"index_select received unsupported keyword arguments: {sorted(kwargs)}"
         )
     if len(args) != 3:
         raise ValueError(f"index_select expects three arguments, got {len(args)}")
@@ -1525,8 +1513,7 @@ def _index_select_operation(
     axis = dim + rank if dim < 0 else dim
     if len(indices_type.shape) != 1:
         raise ValueError(
-            "index_select indices must have rank 1, "
-            f"got {indices_type.shape}"
+            f"index_select indices must have rank 1, got {indices_type.shape}"
         )
     if indices_type.dtype not in {DType.I32, DType.I64}:
         raise ValueError(
@@ -1559,8 +1546,7 @@ def _advanced_index_operation(
     kwargs = dict(getattr(node, "kwargs", {}))
     if kwargs:
         raise ValueError(
-            "index received unsupported keyword arguments: "
-            f"{sorted(kwargs)}"
+            f"index received unsupported keyword arguments: {sorted(kwargs)}"
         )
     if len(args) != 2:
         raise ValueError(f"index expects two arguments, got {len(args)}")
@@ -1571,21 +1557,17 @@ def _advanced_index_operation(
     source_type = _node_type(source)
     if len(indices) > len(source_type.shape):
         raise ValueError(
-            f"index has {len(indices)} indices for rank-{len(source_type.shape)} "
-            "input"
+            f"index has {len(indices)} indices for rank-{len(source_type.shape)} input"
         )
 
     index_nodes = [index for index in indices if index is not None]
     if not index_nodes:
         raise ValueError("index requires at least one tensor index")
-    index_types = tuple(
-        _node_type(index) for index in index_nodes
-    )
+    index_types = tuple(_node_type(index) for index in index_nodes)
     for index_type in index_types:
         if index_type.dtype not in {DType.I32, DType.I64}:
             raise ValueError(
-                "index indices must be int32 or int64, "
-                f"got {index_type.dtype.value}"
+                f"index indices must be int32 or int64, got {index_type.dtype.value}"
             )
 
     indexed_axes = tuple(
@@ -1616,8 +1598,7 @@ def _advanced_index_operation(
         op_axes = indexed_axes
     else:
         remaining = tuple(
-            source_type.shape[axis]
-            for axis in permute_dims[len(indexed_axes) :]
+            source_type.shape[axis] for axis in permute_dims[len(indexed_axes) :]
         )
         expected_shape = broadcast_shape + remaining
         op_axes = tuple(range(len(indexed_axes)))
@@ -1645,9 +1626,7 @@ def _broadcast_shapes(
         for axis, dim in enumerate(shape):
             current = result[offset + axis]
             if current != dim and current != 1 and dim != 1:
-                raise ValueError(
-                    f"{context} shapes cannot broadcast: {shapes}"
-                )
+                raise ValueError(f"{context} shapes cannot broadcast: {shapes}")
             result[offset + axis] = max(current, dim)
     return tuple(result)
 
@@ -1679,7 +1658,7 @@ def _gather_operation(
     sparse_grad = kwargs.pop("sparse_grad", False)
     if kwargs:
         raise ValueError(
-            "gather received unsupported keyword arguments: " f"{sorted(kwargs)}"
+            f"gather received unsupported keyword arguments: {sorted(kwargs)}"
         )
     if not isinstance(sparse_grad, bool):
         raise ValueError(f"gather.sparse_grad must be a boolean, got {sparse_grad!r}")
@@ -1703,8 +1682,7 @@ def _gather_operation(
         )
     if indices_type.dtype not in {DType.I32, DType.I64}:
         raise ValueError(
-            "gather indices must be int32 or int64, "
-            f"got {indices_type.dtype.value}"
+            f"gather indices must be int32 or int64, got {indices_type.dtype.value}"
         )
     for index_axis, (index_dim, source_dim) in enumerate(
         zip(indices_type.shape, source_type.shape, strict=True)
@@ -1738,9 +1716,7 @@ def _scatter_operation(
     if target == _SCATTER_REDUCE_TARGET:
         # `scatter_reduce` carries its reduction as a positional argument.
         if len(args) != 5:
-            raise ValueError(
-                f"scatter_reduce expects five arguments, got {len(args)}"
-            )
+            raise ValueError(f"scatter_reduce expects five arguments, got {len(args)}")
         source, dim, indices, update, reduce_name = args
     else:
         if len(args) != 4:
@@ -1768,8 +1744,7 @@ def _scatter_operation(
         )
     if indices_type.dtype not in {DType.I32, DType.I64}:
         raise ValueError(
-            "scatter indices must be int32 or int64, "
-            f"got {indices_type.dtype.value}"
+            f"scatter indices must be int32 or int64, got {indices_type.dtype.value}"
         )
     for index_axis, (index_dim, source_dim) in enumerate(
         zip(indices_type.shape, source_type.shape, strict=True)
@@ -1783,9 +1758,7 @@ def _scatter_operation(
     attrs: dict[str, object] = {"dim": axis}
     if target == "aten.scatter.value":
         if not isinstance(update, (bool, int, float)):
-            raise ValueError(
-                f"scatter.value must be a scalar number, got {update!r}"
-            )
+            raise ValueError(f"scatter.value must be a scalar number, got {update!r}")
         attrs["value"] = update
         inputs = (_argument_ids(source, node_ids), _argument_ids(indices, node_ids))
     else:
@@ -1837,8 +1810,7 @@ def _scatter_reduce_attrs(
     if target == "aten.scatter_add.default":
         if kwargs:
             raise ValueError(
-                "scatter_add received unsupported keyword arguments: "
-                f"{sorted(kwargs)}"
+                f"scatter_add received unsupported keyword arguments: {sorted(kwargs)}"
             )
         return "add", True
     if target != _SCATTER_REDUCE_TARGET:
@@ -1846,8 +1818,7 @@ def _scatter_reduce_attrs(
     unknown = sorted(set(kwargs) - {"reduce", "include_self"})
     if unknown:
         raise ValueError(
-            "scatter_reduce received unsupported keyword arguments: "
-            f"{unknown}"
+            f"scatter_reduce received unsupported keyword arguments: {unknown}"
         )
     if reduce_name is None:
         reduce_name = kwargs.get("reduce", "sum")
@@ -1871,9 +1842,7 @@ def _index_add_operation(
     kwargs = dict(getattr(node, "kwargs", {}))
     unknown = sorted(set(kwargs) - {"alpha"})
     if unknown:
-        raise ValueError(
-            f"index_add received unsupported keyword arguments: {unknown}"
-        )
+        raise ValueError(f"index_add received unsupported keyword arguments: {unknown}")
     if len(args) != 4:
         raise ValueError(f"index_add expects four arguments, got {len(args)}")
 
@@ -1891,13 +1860,11 @@ def _index_add_operation(
     axis = dim + rank if dim < 0 else dim
     if len(indices_type.shape) != 1:
         raise NotImplementedError(
-            "index_add requires a 1-D index tensor, got "
-            f"{indices_type.shape}"
+            f"index_add requires a 1-D index tensor, got {indices_type.shape}"
         )
     if indices_type.dtype not in {DType.I32, DType.I64}:
         raise ValueError(
-            "index_add indices must be int32 or int64, "
-            f"got {indices_type.dtype.value}"
+            f"index_add indices must be int32 or int64, got {indices_type.dtype.value}"
         )
     if update_type.dtype != source_type.dtype:
         raise ValueError(
@@ -1960,22 +1927,20 @@ def _attention_operation(
         raise NotImplementedError(
             "scaled_dot_product_attention requires identical Q/K/V dtypes"
         )
-    if not (
-        len(query_type.shape)
-        == len(key_type.shape)
-        == len(value_type.shape)
-    ):
+    if not (len(query_type.shape) == len(key_type.shape) == len(value_type.shape)):
         raise NotImplementedError(
             "scaled_dot_product_attention requires matching Q/K/V ranks"
         )
 
-    attn_mask, dropout_p, is_causal, enable_gqa, scale = (
-        _attention_call_arguments(target, args, kwargs)
+    attn_mask, dropout_p, is_causal, enable_gqa, scale = _attention_call_arguments(
+        target, args, kwargs
     )
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, (int, float)):
         raise ValueError(f"dropout_p must be a scalar number, got {dropout_p!r}")
     if float(dropout_p) != 0.0:
-        raise NotImplementedError("scaled_dot_product_attention dropout is not supported")
+        raise NotImplementedError(
+            "scaled_dot_product_attention dropout is not supported"
+        )
     if not isinstance(is_causal, bool):
         raise ValueError(f"is_causal must be a boolean, got {is_causal!r}")
     if not isinstance(enable_gqa, bool):
@@ -2085,9 +2050,7 @@ def _attention_output_node(node: object, target: str) -> object:
 def _layer_norm_operation(
     node: object,
     node_ids: dict[object, str],
-) -> tuple[
-    tuple[str, ...], dict[str, object], TensorType, TensorType, frozenset[int]
-]:
+) -> tuple[tuple[str, ...], dict[str, object], TensorType, TensorType, frozenset[int]]:
     """Read one ``native_layer_norm`` call and the selections the graph reads.
 
     The op writes the normalized value, and - because the kernel reduces the
@@ -2125,7 +2088,9 @@ def _layer_norm_operation(
             raise ValueError(f"malformed layer_norm getitem: {user!r}")
         index = user.args[1]
         if index not in {0, 1, 2}:
-            raise ValueError(f"native_layer_norm output index must be 0, 1, or 2, got {index}")
+            raise ValueError(
+                f"native_layer_norm output index must be 0, 1, or 2, got {index}"
+            )
         if not user.users:
             continue
         wanted.add(index)
@@ -2153,9 +2118,9 @@ def _layer_norm_operation(
     output_type = TensorType(input_type.shape, input_type.dtype)
     # ATen reports the statistics with the normalized axes collapsed to one, so
     # they broadcast against the normalized value.
-    stat_shape = input_type.shape[: len(input_type.shape) - len(shape)] + (
-        1,
-    ) * len(shape)
+    stat_shape = input_type.shape[: len(input_type.shape) - len(shape)] + (1,) * len(
+        shape
+    )
     stat_type = TensorType(stat_shape, input_type.dtype)
     return (
         tuple(inputs),
@@ -2180,9 +2145,7 @@ def _mv_operations(
     vector_id = _argument_ids(args[1], node_ids)
     matrix_type = _node_type(args[0])
     if len(matrix_type.shape) != 2:
-        raise ValueError(
-            f"mv requires a rank-2 matrix, got shape {matrix_type.shape}"
-        )
+        raise ValueError(f"mv requires a rank-2 matrix, got shape {matrix_type.shape}")
     rows, columns = matrix_type.shape
     vector_type = _node_type(args[1])
     if vector_type.shape != (columns,):
@@ -2304,9 +2267,7 @@ def _diagonal_operations(
             "matrix, and the static IR has no zero-sized dimensions"
         )
     remaining = tuple(
-        size
-        for axis, size in enumerate(shape)
-        if axis not in {dim1, dim2}
+        size for axis, size in enumerate(shape) if axis not in {dim1, dim2}
     )
 
     operations: list[tuple[Operation, Value]] = []
@@ -2327,11 +2288,14 @@ def _diagonal_operations(
         return value_id
 
     current = _argument_ids(input_node, node_ids)
-    order = tuple(
-        axis for axis in range(rank) if axis not in {dim1, dim2}
-    ) + (dim1, dim2)
+    order = tuple(axis for axis in range(rank) if axis not in {dim1, dim2}) + (
+        dim1,
+        dim2,
+    )
     if order != tuple(range(rank)):
-        current = emit("permute", (current,), {"dims": order}, tuple(shape[axis] for axis in order))
+        current = emit(
+            "permute", (current,), {"dims": order}, tuple(shape[axis] for axis in order)
+        )
     flattened_shape = remaining + (rows * columns,)
     current = emit("reshape", (current,), {"shape": flattened_shape}, flattened_shape)
     step = columns + 1
@@ -2382,9 +2346,7 @@ def _diagonal_arguments(
             raise ValueError(f"diagonal.{name} must be an integer, got {value!r}")
     axis1, axis2 = dim1 % rank, dim2 % rank
     if axis1 == axis2:
-        raise ValueError(
-            f"diagonal.dim1 and dim2 must differ, both are {axis1}"
-        )
+        raise ValueError(f"diagonal.dim1 and dim2 must differ, both are {axis1}")
     return input_node, offset, axis1, axis2
 
 
@@ -2483,8 +2445,10 @@ def _logsumexp_arguments(
         raise ValueError(f"logsumexp.keepdim must be a boolean, got {keepdim!r}")
     if isinstance(dims, int) and not isinstance(dims, bool):
         normalized = (dims % rank,)
-    elif isinstance(dims, (tuple, list)) and dims and all(
-        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    elif (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
     ):
         normalized = tuple(dim % rank for dim in dims)
     elif isinstance(dims, (tuple, list)) and not dims:
@@ -2532,8 +2496,10 @@ def _nansum_operations(
         normalized_dims = tuple(range(rank))
     elif isinstance(dims, int) and not isinstance(dims, bool):
         normalized_dims = (dims % rank,)
-    elif isinstance(dims, (tuple, list)) and dims and all(
-        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    elif (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
     ):
         normalized_dims = tuple(dim % rank for dim in dims)
     else:
@@ -2648,8 +2614,10 @@ def _boolean_reduction_arguments(
         normalized_dims = tuple(range(rank))
     elif isinstance(dims, int) and not isinstance(dims, bool):
         normalized_dims = (dims % rank,)
-    elif isinstance(dims, (tuple, list)) and dims and all(
-        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    elif (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
     ):
         normalized_dims = tuple(dim % rank for dim in dims)
     else:
@@ -2683,9 +2651,7 @@ def _count_nonzero_operations(
             f"the reduced {expected_shape}"
         )
     if output_type.dtype != DType.I64:
-        raise ValueError(
-            f"count_nonzero output dtype {output_type.dtype} must be I64"
-        )
+        raise ValueError(f"count_nonzero output dtype {output_type.dtype} must be I64")
 
     operations: list[tuple[Operation, Value]] = []
 
@@ -2739,9 +2705,7 @@ def _all_any_operations(
     """
 
     op = "all" if conjunction else "any"
-    input_node, dims, keepdim, reduced_shape = _boolean_reduction_arguments(
-        node, op
-    )
+    input_node, dims, keepdim, reduced_shape = _boolean_reduction_arguments(node, op)
     input_type = _node_type(input_node)
     output_type = _node_type(node)
     expected_shape = _reduced_extent(reduced_shape, dims, keepdim)
@@ -2849,8 +2813,7 @@ def _constant_pad_crop_operations(
     padded_dims = len(pads) // 2
     if padded_dims > rank:
         raise ValueError(
-            f"constant_pad_nd holds {padded_dims} padding pairs for a rank-"
-            f"{rank} input"
+            f"constant_pad_nd holds {padded_dims} padding pairs for a rank-{rank} input"
         )
 
     operations: list[tuple[Operation, Value]] = []
@@ -2966,9 +2929,7 @@ def _padding_operations(
         raise ValueError(
             f"{target}.padding must hold {2 * padded_dims} entries, got {padding!r}"
         )
-    if not all(
-        isinstance(pad, int) and not isinstance(pad, bool) for pad in padding
-    ):
+    if not all(isinstance(pad, int) and not isinstance(pad, bool) for pad in padding):
         raise ValueError(f"{target}.padding must contain integers, got {padding!r}")
 
     input_type = _node_type(input_node)
@@ -3017,9 +2978,7 @@ def _padding_operations(
 
         pieces: list[str] = []
         if pad_before:
-            single_shape = (
-                current_shape[:axis] + (1,) + current_shape[axis + 1 :]
-            )
+            single_shape = current_shape[:axis] + (1,) + current_shape[axis + 1 :]
             if mode == "reflect":
                 window = (
                     current_shape[:axis] + (pad_before,) + current_shape[axis + 1 :]
@@ -3046,9 +3005,7 @@ def _padding_operations(
         pieces.append(current)
         if pad_after:
             if mode == "reflect":
-                window = (
-                    current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
-                )
+                window = current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
                 piece = emit(
                     "slice",
                     (current,),
@@ -3062,18 +3019,14 @@ def _padding_operations(
                 )
                 piece = emit("flip", (piece,), {"dims": (axis,)}, window)
             else:
-                single_shape = (
-                    current_shape[:axis] + (1,) + current_shape[axis + 1 :]
-                )
+                single_shape = current_shape[:axis] + (1,) + current_shape[axis + 1 :]
                 piece = emit(
                     "slice",
                     (current,),
                     {"dim": axis, "start": size - 1, "end": size, "step": 1},
                     single_shape,
                 )
-                window = (
-                    current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
-                )
+                window = current_shape[:axis] + (pad_after,) + current_shape[axis + 1 :]
                 piece = emit("expand", (piece,), {"shape": window}, window)
             pieces.append(piece)
 
@@ -3098,9 +3051,7 @@ def _padding_operations(
                     f"size {padded_size}"
                 )
             cropped_shape = (
-                current_shape[:axis]
-                + (end - start,)
-                + current_shape[axis + 1 :]
+                current_shape[:axis] + (end - start,) + current_shape[axis + 1 :]
             )
             current = emit(
                 "slice",
@@ -3137,7 +3088,9 @@ def _repeat_operations(
         raise ValueError(f"repeat expects two arguments, got {len(args)}")
     input_node, repeats = args
     if not isinstance(repeats, (tuple, list)) or not repeats:
-        raise ValueError(f"repeat.repeats must be a non-empty sequence, got {repeats!r}")
+        raise ValueError(
+            f"repeat.repeats must be a non-empty sequence, got {repeats!r}"
+        )
     if not all(
         isinstance(repeat, int) and not isinstance(repeat, bool) for repeat in repeats
     ):
@@ -3169,7 +3122,10 @@ def _repeat_operations(
     operations: list[tuple[Operation, Value]] = []
 
     def emit(
-        op: str, inputs: tuple[str, ...], attrs: dict[str, object], shape: tuple[int, ...]
+        op: str,
+        inputs: tuple[str, ...],
+        attrs: dict[str, object],
+        shape: tuple[int, ...],
     ) -> str:
         value_id = f"v{first_op_index + len(operations)}"
         operations.append(
@@ -3180,9 +3136,7 @@ def _repeat_operations(
         )
         return value_id
 
-    interleaved = tuple(
-        item for size in padded_shape for item in (1, size)
-    )
+    interleaved = tuple(item for size in padded_shape for item in (1, size))
     expanded = tuple(
         item
         for size, repeat in zip(padded_shape, padded_repeats)
@@ -3229,14 +3183,14 @@ def _vector_norm_operation(
         normalized_dims = tuple(range(rank))
     elif isinstance(dims, int) and not isinstance(dims, bool):
         normalized_dims = (dims % rank,)
-    elif isinstance(dims, (tuple, list)) and dims and all(
-        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    elif (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
     ):
         normalized_dims = tuple(dim % rank for dim in dims)
     else:
-        raise ValueError(
-            f"linalg_vector_norm.dim must contain integers, got {dims!r}"
-        )
+        raise ValueError(f"linalg_vector_norm.dim must contain integers, got {dims!r}")
     if len(set(normalized_dims)) != len(normalized_dims):
         raise ValueError(f"linalg_vector_norm.dim repeats an axis: {dims!r}")
 
@@ -3292,9 +3246,7 @@ def _variance_operation(
             f"{target}.correction must be a number, got {correction!r}"
         )
     if isinstance(correction, float) and not isfinite(correction):
-        raise ValueError(
-            f"{target}.correction must be finite, got {correction!r}"
-        )
+        raise ValueError(f"{target}.correction must be finite, got {correction!r}")
     if isinstance(correction, float) and correction.is_integer():
         correction = int(correction)
 
@@ -3302,8 +3254,10 @@ def _variance_operation(
         normalized_dims = tuple(range(rank))
     elif isinstance(dims, int) and not isinstance(dims, bool):
         normalized_dims = (dims % rank,)
-    elif isinstance(dims, (tuple, list)) and dims and all(
-        isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+    elif (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
     ):
         normalized_dims = tuple(dim % rank for dim in dims)
     else:
@@ -3371,9 +3325,7 @@ def _extremum_dim_operations(
             wanted[index] = user
 
     output_shape = (
-        input_type.shape[:axis]
-        + (1,)
-        + input_type.shape[axis + 1 :]
+        input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
         if keepdim
         else input_type.shape[:axis] + input_type.shape[axis + 1 :]
     )
@@ -3480,7 +3432,12 @@ def _sort_operations(
     ) -> None:
         output_id = f"v{first_op_index + len(operations)}"
         operations.append(
-            (Operation(name, (_argument_ids(input_node, node_ids),), (output_id,), attrs), Value(output_id, output_type))
+            (
+                Operation(
+                    name, (_argument_ids(input_node, node_ids),), (output_id,), attrs
+                ),
+                Value(output_id, output_type),
+            )
         )
         produced[index] = output_id
 
@@ -3582,19 +3539,24 @@ def _rms_norm_normalized_input(
     if len(args) != 2 or args[0] is not compute_input or args[1] is not scale:
         return None
     target = str(getattr(normalized, "target", ""))
-    expected = "aten.mul.Tensor" if scale_op == "aten.rsqrt.default" else "aten.div.Tensor"
+    expected = (
+        "aten.mul.Tensor" if scale_op == "aten.rsqrt.default" else "aten.div.Tensor"
+    )
     return compute_input if target == expected else None
 
 
 def _rms_norm_operation(
     node: object,
     node_ids: dict[object, str],
-) -> tuple[
-    tuple[str, ...],
-    dict[str, object],
-    TensorType,
-    tuple[object, ...],
-] | None:
+) -> (
+    tuple[
+        tuple[str, ...],
+        dict[str, object],
+        TensorType,
+        tuple[object, ...],
+    ]
+    | None
+):
     target = str(getattr(node, "target", ""))
     cast_input = None
     square_targets = {"aten.pow.Tensor_Scalar", "aten.mul.Tensor"}
@@ -3642,9 +3604,7 @@ def _rms_norm_operation(
     axes = mean_args[1]
     if not isinstance(axes, (tuple, list)) or not axes:
         return None
-    if not all(
-        isinstance(axis, int) and not isinstance(axis, bool) for axis in axes
-    ):
+    if not all(isinstance(axis, int) and not isinstance(axis, bool) for axis in axes):
         return None
 
     add_eps = _single_user(mean)
@@ -3672,9 +3632,11 @@ def _rms_norm_operation(
     scale_op = str(scale.target)
 
     normalized = _single_user(scale)
-    if normalized is None or _rms_norm_normalized_input(
-        normalized, compute_input, scale, scale_op
-    ) is None:
+    if (
+        normalized is None
+        or _rms_norm_normalized_input(normalized, compute_input, scale, scale_op)
+        is None
+    ):
         return None
     if cast_input is not None and set(cast_input.users) != {square_node, normalized}:
         return None
@@ -3697,10 +3659,7 @@ def _rms_norm_operation(
     weight = None
     output_node = normalized
     weighted_output = _single_user(normalized)
-    if (
-        weighted_output is not None
-        and str(weighted_output.target) == "aten.mul.Tensor"
-    ):
+    if weighted_output is not None and str(weighted_output.target) == "aten.mul.Tensor":
         weighted_args = weighted_output.args
         position = (
             0
@@ -3838,9 +3797,7 @@ def _operation_inputs(
             )
         dim = args[1] if len(args) > 1 else kwargs.get("dim")
         keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
-        if dim is not None and (
-            not isinstance(dim, int) or isinstance(dim, bool)
-        ):
+        if dim is not None and (not isinstance(dim, int) or isinstance(dim, bool)):
             raise ValueError(f"{op}.dim must be an integer or None, got {dim!r}")
         if not isinstance(keepdim, bool):
             raise ValueError(f"{op}.keepdim must be a boolean, got {keepdim!r}")
@@ -3878,9 +3835,7 @@ def _operation_inputs(
 
     if op == "arange":
         if len(args) not in {1, 2, 3}:
-            raise ValueError(
-                f"arange expects one to three arguments, got {len(args)}"
-            )
+            raise ValueError(f"arange expects one to three arguments, got {len(args)}")
         start = 0 if len(args) == 1 else args[0]
         end = args[0] if len(args) == 1 else args[1]
         step = 1 if len(args) < 3 else args[2]
@@ -3890,9 +3845,7 @@ def _operation_inputs(
                     f"arange.{name} must be a scalar number, got {value!r}"
                 )
             if not isfinite(value):
-                raise ValueError(
-                    f"arange.{name} must be finite, got {value!r}"
-                )
+                raise ValueError(f"arange.{name} must be finite, got {value!r}")
         if step == 0:
             raise ValueError("arange.step must be nonzero")
         return (), {"start": start, "end": end, "step": step}
@@ -3934,11 +3887,7 @@ def _operation_inputs(
                 f"{op} expects {expected_args} positional arguments, got {len(args)}"
             )
         _argument_ids(args[0], node_ids)
-        value = (
-            args[1]
-            if op == "full_like"
-            else (0.0 if op == "zeros_like" else 1.0)
-        )
+        value = args[1] if op == "full_like" else (0.0 if op == "zeros_like" else 1.0)
         if not isinstance(value, (bool, int, float)):
             raise ValueError(f"{op} fill value must be scalar, got {value!r}")
         return (), {"value": value}
@@ -3954,15 +3903,9 @@ def _operation_inputs(
             raise ValueError("softplus received duplicate threshold arguments")
         beta = args[1] if len(args) >= 2 else kwargs.get("beta", 1.0)
         threshold = args[2] if len(args) >= 3 else kwargs.get("threshold", 20.0)
-        if (
-            not isinstance(beta, (int, float))
-            or isinstance(beta, bool)
-            or beta <= 0
-        ):
+        if not isinstance(beta, (int, float)) or isinstance(beta, bool) or beta <= 0:
             raise ValueError(f"softplus.beta must be positive, got {beta!r}")
-        if not isinstance(threshold, (int, float)) or isinstance(
-            threshold, bool
-        ):
+        if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
             raise ValueError(
                 f"softplus.threshold must be a scalar number, got {threshold!r}"
             )
@@ -4004,16 +3947,12 @@ def _operation_inputs(
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"{op}.dim must be an integer, got {dim!r}")
         if len(args) == 3 and not isinstance(args[2], bool):
-            raise ValueError(
-                f"{op}.half_to_float must be a boolean, got {args[2]!r}"
-            )
+            raise ValueError(f"{op}.half_to_float must be a boolean, got {args[2]!r}")
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
     if op in {"cumsum", "cumprod"}:
         if len(args) not in {2, 3}:
-            raise ValueError(
-                f"{op} expects two or three arguments, got {len(args)}"
-            )
+            raise ValueError(f"{op} expects two or three arguments, got {len(args)}")
         input_id, dim = args[:2]
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"{op}.dim must be an integer, got {dim!r}")
@@ -4027,8 +3966,12 @@ def _operation_inputs(
         if len(args) != 2:
             raise ValueError(f"reshape expects two arguments, got {len(args)}")
         input_id, shape = args
-        if not isinstance(shape, (tuple, list)) or not shape or not all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        if (
+            not isinstance(shape, (tuple, list))
+            or not shape
+            or not all(
+                isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+            )
         ):
             raise ValueError(f"reshape.shape must contain integers, got {shape!r}")
         return (
@@ -4041,8 +3984,7 @@ def _operation_inputs(
             raise ValueError(f"transpose expects three arguments, got {len(args)}")
         input_id, dim0, dim1 = args
         if not all(
-            isinstance(dim, int) and not isinstance(dim, bool)
-            for dim in (dim0, dim1)
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in (dim0, dim1)
         ):
             raise ValueError(
                 f"transpose dimensions must be integers, got {(dim0, dim1)!r}"
@@ -4056,8 +3998,12 @@ def _operation_inputs(
         if len(args) != 2:
             raise ValueError(f"permute expects two arguments, got {len(args)}")
         input_id, dims = args
-        if not isinstance(dims, (tuple, list)) or not dims or not all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        if (
+            not isinstance(dims, (tuple, list))
+            or not dims
+            or not all(
+                isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+            )
         ):
             raise ValueError(f"permute.dims must contain integers, got {dims!r}")
         return (
@@ -4069,8 +4015,12 @@ def _operation_inputs(
         if len(args) != 2:
             raise ValueError(f"expand expects two arguments, got {len(args)}")
         input_id, shape = args
-        if not isinstance(shape, (tuple, list)) or not shape or not all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        if (
+            not isinstance(shape, (tuple, list))
+            or not shape
+            or not all(
+                isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+            )
         ):
             raise ValueError(f"expand.shape must contain integers, got {shape!r}")
         return (
@@ -4089,9 +4039,7 @@ def _operation_inputs(
             not isinstance(start, int) or isinstance(start, bool)
         ):
             raise ValueError(f"slice.start must be an integer or None, got {start!r}")
-        if end is not None and (
-            not isinstance(end, int) or isinstance(end, bool)
-        ):
+        if end is not None and (not isinstance(end, int) or isinstance(end, bool)):
             raise ValueError(f"slice.end must be an integer or None, got {end!r}")
         if not isinstance(step, int) or isinstance(step, bool) or step <= 0:
             raise ValueError(f"slice.step must be a positive integer, got {step!r}")
@@ -4116,8 +4064,12 @@ def _operation_inputs(
         if len(args) != 2:
             raise ValueError(f"flip expects two arguments, got {len(args)}")
         input_id, dims = args
-        if not isinstance(dims, (tuple, list)) or not dims or not all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        if (
+            not isinstance(dims, (tuple, list))
+            or not dims
+            or not all(
+                isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+            )
         ):
             raise ValueError(f"flip.dims must contain integers, got {dims!r}")
         return (
@@ -4132,9 +4084,13 @@ def _operation_inputs(
         dims = args[2] if len(args) == 3 else kwargs.get("dims")
         if isinstance(shifts, int) and not isinstance(shifts, bool):
             normalized_shifts = (shifts,)
-        elif isinstance(shifts, (tuple, list)) and shifts and all(
-            isinstance(shift, int) and not isinstance(shift, bool)
-            for shift in shifts
+        elif (
+            isinstance(shifts, (tuple, list))
+            and shifts
+            and all(
+                isinstance(shift, int) and not isinstance(shift, bool)
+                for shift in shifts
+            )
         ):
             normalized_shifts = tuple(shifts)
         else:
@@ -4147,8 +4103,10 @@ def _operation_inputs(
                     f"{len(normalized_shifts)}"
                 )
             normalized_dims = None
-        elif isinstance(dims, (tuple, list)) and dims and all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in dims
+        elif (
+            isinstance(dims, (tuple, list))
+            and dims
+            and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims)
         ):
             normalized_dims = tuple(dims)
             if len(normalized_dims) != len(normalized_shifts):
@@ -4232,9 +4190,7 @@ def _operation_inputs(
             if value is None:
                 continue
             if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise ValueError(
-                    f"nan_to_num.{name} must be a scalar, got {value!r}"
-                )
+                raise ValueError(f"nan_to_num.{name} must be a scalar, got {value!r}")
             attrs[name] = float(value)
         return ((_argument_ids(args[0], node_ids),), attrs)
 
@@ -4265,9 +4221,7 @@ def _operation_inputs(
             weight_id = _argument_ids(weight, node_ids)
         except ValueError:
             if not isinstance(weight, (int, float)) or isinstance(weight, bool):
-                raise ValueError(
-                    f"unsupported lerp weight: {weight!r}"
-                ) from None
+                raise ValueError(f"unsupported lerp weight: {weight!r}") from None
             return inputs, {"weight": float(weight)}
         return (*inputs, weight_id), {}
 
@@ -4275,12 +4229,9 @@ def _operation_inputs(
         # ATen's signature is (self, tensor1, tensor2, *, value=1).
         if len(args) not in {3, 4}:
             raise ValueError(
-                f"{op} expects three or four positional arguments, "
-                f"got {len(args)}"
+                f"{op} expects three or four positional arguments, got {len(args)}"
             )
-        inputs = tuple(
-            _argument_ids(argument, node_ids) for argument in args[:3]
-        )
+        inputs = tuple(_argument_ids(argument, node_ids) for argument in args[:3])
         attrs: dict[str, object] = {}
         if len(args) == 4:
             if "value" in kwargs:
@@ -4326,9 +4277,7 @@ def _operation_inputs(
             bound_id = _argument_ids(bound, node_ids)
         except ValueError:
             if not isinstance(bound, (int, float)) or isinstance(bound, bool):
-                raise ValueError(
-                    f"unsupported {op} {name}: {bound!r}"
-                ) from None
+                raise ValueError(f"unsupported {op} {name}: {bound!r}") from None
             attrs[name] = bound
         else:
             attrs[f"{name}_input"] = len(inputs)
@@ -4340,11 +4289,15 @@ def _operation_inputs(
         if len(args) not in allowed:
             raise ValueError(f"{op} expects {allowed} arguments, got {len(args)}")
         attrs: dict[str, object] = {}
-        names = ["negative_slope"] if op == "leaky_relu" else [
-            "alpha",
-            "scale",
-            "input_scale",
-        ]
+        names = (
+            ["negative_slope"]
+            if op == "leaky_relu"
+            else [
+                "alpha",
+                "scale",
+                "input_scale",
+            ]
+        )
         for name, argument in zip(names, args[1:]):
             if not isinstance(argument, (int, float)) or isinstance(argument, bool):
                 raise ValueError(f"{op}.{name} must be a number, got {argument!r}")
@@ -4399,10 +4352,7 @@ def _operation_inputs(
             ):
                 scalars.append((position, argument))
                 continue
-            if (
-                not isinstance(argument, (int, float))
-                or isinstance(argument, bool)
-            ):
+            if not isinstance(argument, (int, float)) or isinstance(argument, bool):
                 raise ValueError(
                     f"unsupported {op} argument at position {position}: {argument!r}"
                 ) from None
@@ -4418,9 +4368,7 @@ def _operation_inputs(
             tuple(tensor_inputs),
             {
                 "scalar": value,
-                "scalar_position": (
-                    "lhs" if position == 0 or op == "rsub" else "rhs"
-                ),
+                "scalar_position": ("lhs" if position == 0 or op == "rsub" else "rhs"),
             },
         )
     raise ValueError(f"{op} requires at least one tensor input")
@@ -4524,8 +4472,7 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         approximate = kwargs.get("approximate", "none")
         if approximate not in {"none", "tanh"}:
             raise ValueError(
-                "gelu.approximate must be 'none' or 'tanh', "
-                f"got {approximate!r}"
+                f"gelu.approximate must be 'none' or 'tanh', got {approximate!r}"
             )
         attrs["approximate"] = approximate
     return attrs

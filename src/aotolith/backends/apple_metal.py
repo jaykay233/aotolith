@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from math import ceil, isfinite, isinf, isnan, pi, prod
+from math import ceil, isfinite, isinf, isnan, log, pi, prod
 from statistics import median
 from typing import Any
 
@@ -37,6 +37,20 @@ _MLX_DTYPES = {
 }
 _MLX_DTYPE_TO_DTYPE = {mlx_dtype: dtype for dtype, mlx_dtype in _MLX_DTYPES.items()}
 
+# Lanczos g=7, N=9. Shared by the Metal helper (which spells them as float
+# literals) and the MLX evaluator so the two agree bit for bit.
+_LANCZOS_COEFFICIENTS = (
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-06,
+    1.5056327351493116e-07,
+)
+
 _ELEMENTS_PER_THREAD = 4
 _DTYPE_ITEMSIZE = {
     DType.F16: 2,
@@ -59,7 +73,10 @@ _BITWISE_POINTWISE_OPS = {
     "bitwise_xor",
     "bitwise_not",
 }
-_NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf"}
+# Predicates: pointwise ops that produce a boolean mask. ``isnan``/``isinf``
+# only take floats, but ``signbit`` is defined for integers too - it is a bit
+# test, not a comparison, so -0.0 reports true where ``x < 0`` would not.
+_NUMERIC_PREDICATE_POINTWISE_OPS = {"isnan", "isinf", "signbit"}
 _CONSTANT_POINTWISE_OPS = {
     "scalar_tensor",
     "zeros",
@@ -130,6 +147,8 @@ def _gemv_threads(columns: int, transpose_right: bool) -> int:
             return _MATMUL_GEMV_THREADS_NARROW
         return _MATMUL_GEMV_THREADS_WIDE
     return _MATMUL_GEMV_THREADS
+
+
 _METAL_KERNEL_CACHE_SIZE = 256
 _ATTENTION_MAX_SHARED_BYTES = 31 * 1024
 _ATTENTION_LONG_SEQUENCE_THRESHOLD = 768
@@ -259,6 +278,71 @@ inline float tsc_sinc(float value) {
         return 1.0f - square / 6.0f + square * square / 120.0f;
     }
     return metal::sin(scaled) / scaled;
+}
+
+inline float tsc_i0(float value) {
+    // Abramowitz-Stegun 9.8.1 and 9.8.2, split at 3.75. MSL has no Bessel
+    // function, and both branches are plain polynomials, so the peak relative
+    // error is 1.1e-6 - about ten float ulps over the whole range.
+    float x = metal::abs(value);
+    if (x < 3.75f) {
+        float ratio = x / 3.75f;
+        float square = ratio * ratio;
+        return 1.0f + square * (3.5156229f + square * (3.0899424f
+            + square * (1.2067492f + square * (0.2659732f
+            + square * (0.0360768f + square * 0.0045813f)))));
+    }
+    // The scaled form keeps the leading exp out of the polynomial and cannot
+    // overflow before ``exp`` itself does.
+    float ratio = 3.75f / x;
+    float polynomial = 0.39894228f + ratio * (0.01328592f + ratio * (0.00225319f
+        + ratio * (-0.00157565f + ratio * (0.00916281f + ratio * (-0.02057706f
+        + ratio * (0.02635537f + ratio * (-0.01647633f
+        + ratio * 0.00392377f)))))));
+    return metal::exp(x) / metal::sqrt(x) * polynomial;
+}
+
+inline float tsc_lgamma_series(float value) {
+    // Lanczos g=7, N=9 (the usual published coefficient set). Metal has no
+    // tgamma/lgamma, and MSL forbids recursion, so the reflection branch below
+    // calls this helper instead of calling tsc_lgamma again.
+    float z = value - 1.0f;
+    float shifted = z + 7.5f;
+    float series = 0.99999999999980993f
+        + 676.5203681218851f / (z + 1.0f)
+        + -1259.1392167224028f / (z + 2.0f)
+        + 771.32342877765313f / (z + 3.0f)
+        + -176.61502916214059f / (z + 4.0f)
+        + 12.507343278686905f / (z + 5.0f)
+        + -0.13857109526572012f / (z + 6.0f)
+        + 9.9843695780195716e-6f / (z + 7.0f)
+        + 1.5056327351493116e-7f / (z + 8.0f);
+    return 0.9189385332046727f + (z + 0.5f) * metal::log(shifted)
+        - shifted + metal::log(series);
+}
+
+inline float tsc_lgamma(float value) {
+    // ``lgamma`` is log|Gamma|, so negative arguments go through the
+    // reflection formula rather than a separate series.
+    const float pi = 3.14159265358979323846f;
+    if (metal::isnan(value)) {
+        return value;
+    }
+    if (metal::isinf(value)) {
+        // ATen reports +inf for both infinities: |Gamma| grows without bound
+        // towards either end of the real line.
+        return INFINITY;
+    }
+    if (value <= 0.0f && value == metal::rint(value)) {
+        // The poles at zero and the negative integers. sin is exactly zero
+        // there, so the reflection branch below would divide by log(0).
+        return INFINITY;
+    }
+    if (value < 0.5f) {
+        return metal::log(pi) - metal::log(metal::abs(metal::sin(pi * value)))
+            - tsc_lgamma_series(1.0f - value);
+    }
+    return tsc_lgamma_series(value);
 }
 
 inline float tsc_xlogy_f32(float value, float other) {
@@ -551,9 +635,7 @@ class KernelArtifact:
         """The only output of a single-output kernel."""
 
         if len(self.output_ids) != 1:
-            raise ValueError(
-                f"kernel {self.name} writes {len(self.output_ids)} values"
-            )
+            raise ValueError(f"kernel {self.name} writes {len(self.output_ids)} values")
         return self.output_ids[0]
 
     @property
@@ -567,8 +649,8 @@ class KernelArtifact:
         return self.tensor_types[0]
 
 
-_PENDING_INDEX_CHECKS: ContextVar[list[tuple[mx.array, int, bool]] | None] = (
-    ContextVar("aotolith_pending_index_checks", default=None)
+_PENDING_INDEX_CHECKS: ContextVar[list[tuple[mx.array, int, bool]] | None] = ContextVar(
+    "aotolith_pending_index_checks", default=None
 )
 
 # A bounds check needs the index values, so a device-resident index forces a
@@ -596,9 +678,7 @@ def _defer_index_check(
     return True
 
 
-def _flush_index_checks(
-    pending: list[tuple[mx.array, int, bool]]
-) -> None:
+def _flush_index_checks(pending: list[tuple[mx.array, int, bool]]) -> None:
     """Collapse every queued bounds check into a single reduction and sync."""
 
     if not pending:
@@ -615,9 +695,7 @@ def _flush_index_checks(
         # One plan can queue index tensors of different shapes, so reduce each
         # one before combining: the masks themselves do not broadcast.
         found = mx.any(bad)
-        violation = (
-            found if violation is None else mx.logical_or(violation, found)
-        )
+        violation = found if violation is None else mx.logical_or(violation, found)
     if violation is None:
         return
     if bool(violation.item()):
@@ -662,23 +740,17 @@ def _evaluate_mlx_op(
         if not isinstance(body, tuple) or not all(
             isinstance(item, Operation) for item in body
         ):
-            raise ValueError(
-                "fused_elementwise body must be a tuple of operations"
-            )
+            raise ValueError("fused_elementwise body must be a tuple of operations")
         body_env = dict(env)
         for item in body:
-            body_env[item.outputs[0]] = _evaluate_mlx_op(
-                graph, item, body_env
-            )
+            body_env[item.outputs[0]] = _evaluate_mlx_op(graph, item, body_env)
         return body_env[op.outputs[0]]
     if op.op == "attention":
         return _evaluate_attention_mlx(op, env)
     if op.op == "rope":
         value, cosine, sine = (env[value_id] for value_id in op.inputs)
         half = value.shape[-1] // 2
-        rotated = mx.concatenate(
-            (-value[..., half:], value[..., :half]), axis=-1
-        )
+        rotated = mx.concatenate((-value[..., half:], value[..., :half]), axis=-1)
         return value * cosine + rotated * sine
     if op.op == "embedding":
         weight, indices = (env[value_id] for value_id in op.inputs)
@@ -702,9 +774,7 @@ def _evaluate_mlx_op(
             slice(0, indices.shape[dim]) if dim != axis else slice(None)
             for dim in range(len(source.shape))
         ]
-        return mx.take_along_axis(
-            source[tuple(source_slices)], indices, axis=axis
-        )
+        return mx.take_along_axis(source[tuple(source_slices)], indices, axis=axis)
     if op.op == "scatter":
         source, indices = (env[value_id] for value_id in op.inputs[:2])
         axis = int(op.attrs["dim"])
@@ -731,9 +801,7 @@ def _evaluate_mlx_op(
             for dim in range(len(source.shape))
         ]
         slices = tuple(source_slices)
-        updated = mx.put_along_axis(
-            source[slices], indices, values, axis=axis
-        )
+        updated = mx.put_along_axis(source[slices], indices, values, axis=axis)
         output = mx.array(source)
         output[slices] = updated
         return output
@@ -869,9 +937,7 @@ def _evaluate_mlx_op(
     if op.op == "cat":
         rank = len(env[op.inputs[0]].shape)
         axis = int(op.attrs["dim"]) % rank
-        return mx.concatenate(
-            [env[value_id] for value_id in op.inputs], axis=axis
-        )
+        return mx.concatenate([env[value_id] for value_id in op.inputs], axis=axis)
     if op.op in _MLX_LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
     if op.op == "matmul":
@@ -888,9 +954,7 @@ def _evaluate_mlx_op(
             paired = env[op.inputs[paired_position]]
             if op.attrs.get("transpose_b", False):
                 paired = mx.swapaxes(paired, -1, -2)
-            return product * (
-                mx.matmul(left, paired) / (1.0 + mx.exp(-product))
-            )
+            return product * (mx.matmul(left, paired) / (1.0 + mx.exp(-product)))
         return _apply_mlx_matmul_epilogue(op, env, product)
     if op.op == "addmm":
         bias, left, right = (env[value_id] for value_id in op.inputs[:3])
@@ -904,9 +968,7 @@ def _evaluate_mlx_op(
         return _apply_mlx_matmul_epilogue(
             op, env, beta * bias + alpha * mx.matmul(left, right)
         )
-    return _evaluate_pointwise_mlx(
-        op, env, graph.value(op.outputs[0]).type
-    )
+    return _evaluate_pointwise_mlx(op, env, graph.value(op.outputs[0]).type)
 
 
 # MLX accumulates a scatter through ``array.at[...]``; the method name and the
@@ -937,8 +999,7 @@ def _scatter_coordinates(
         for dim in range(rank)
     )
     region_shape = tuple(
-        source_shape[dim] if dim == axis else indices.shape[dim]
-        for dim in range(rank)
+        source_shape[dim] if dim == axis else indices.shape[dim] for dim in range(rank)
     )
     grid: list[Any] = []
     for dim in range(rank):
@@ -1034,9 +1095,7 @@ def _mlx_scatter_reduce(
     return output
 
 
-def _apply_mlx_matmul_norm(
-    op: Operation, env: dict[str, Any], left: Any
-) -> Any:
+def _apply_mlx_matmul_norm(op: Operation, env: dict[str, Any], left: Any) -> Any:
     """Normalize a fused RMS-norm operand before the fallback matrix multiply."""
 
     position = _matmul_norm_position(op)
@@ -1049,9 +1108,7 @@ def _apply_mlx_matmul_norm(
     return (normalized * scale * weight.astype(mx.float32)).astype(left.dtype)
 
 
-def _apply_mlx_matmul_epilogue(
-    op: Operation, env: dict[str, Any], product: Any
-) -> Any:
+def _apply_mlx_matmul_epilogue(op: Operation, env: dict[str, Any], product: Any) -> Any:
     kind = op.attrs.get("epilogue")
     if kind is None:
         return product
@@ -1068,9 +1125,7 @@ def _device_profile() -> tuple[str | None, str | None]:
         return None, None
     return (
         None if "device_name" not in info else str(info["device_name"]),
-        None
-        if "architecture" not in info
-        else str(info["architecture"]),
+        None if "architecture" not in info else str(info["architecture"]),
     )
 
 
@@ -1103,9 +1158,7 @@ def _coerce_tune_input(value: Any, tensor_type: TensorType) -> mx.array:
     return array
 
 
-def _outputs_match(
-    actual: mx.array, expected: mx.array, dtype: DType
-) -> bool:
+def _outputs_match(actual: mx.array, expected: mx.array, dtype: DType) -> bool:
     if tuple(actual.shape) != tuple(expected.shape) or actual.dtype != expected.dtype:
         return False
     if dtype in {DType.BOOL, DType.I32, DType.I64}:
@@ -1136,15 +1189,11 @@ def _time_runtime(
     return tuple(samples)
 
 
-def _validate_plan_inputs(
-    graph: Graph, inputs: tuple[Any, ...]
-) -> list[mx.array]:
+def _validate_plan_inputs(graph: Graph, inputs: tuple[Any, ...]) -> list[mx.array]:
     """Validate the caller's arrays against the graph signature."""
 
     if len(inputs) != len(graph.inputs):
-        raise ValueError(
-            f"expected {len(graph.inputs)} inputs, received {len(inputs)}"
-        )
+        raise ValueError(f"expected {len(graph.inputs)} inputs, received {len(inputs)}")
     values: list[mx.array] = []
     for value_id, value in zip(graph.inputs, inputs, strict=True):
         array = value if isinstance(value, mx.array) else mx.array(value)
@@ -1210,8 +1259,7 @@ def _compile_plan_runner(plan: CompiledPlan) -> Callable[..., Any] | None:
         return None
 
     names: dict[str, str] = {
-        value_id: f"i{position}"
-        for position, value_id in enumerate(graph.inputs)
+        value_id: f"i{position}" for position, value_id in enumerate(graph.inputs)
     }
     namespace: dict[str, Any] = {}
     body: list[str] = []
@@ -1407,7 +1455,6 @@ class CompiledPlan:
 
         _flush_index_checks(pending_index_checks)
 
-
         stats = ExecutionStats(
             arena_size_bytes=self.storage_plan.arena_size_bytes,
             arena_slot_count=len(slot_by_id),
@@ -1491,8 +1538,6 @@ def _tensor_core_candidates_load(
     return True
 
 
-
-
 _TENSOR_CORE_NOTE = "tensor cores rejected by this device"
 
 
@@ -1509,6 +1554,7 @@ def _annotate_tensor_core_fallback(
         else selection
         for selection in selections
     )
+
 
 def _as_arrays(outputs: Any) -> tuple[Any, ...]:
     if isinstance(outputs, (list, tuple)):
@@ -1590,9 +1636,7 @@ class AppleMetalBackend:
                     # A single-query attention needs one threadgroup per head
                     # and no online rescaling, so it beats the generic runtime
                     # kernel without the prefill-oriented codegen switch.
-                    compiled = self._compile_decode_attention(
-                        graph, op, index
-                    )
+                    compiled = self._compile_decode_attention(graph, op, index)
             elif (
                 self.codegen_matmul or self.autotune or self._wants_native(op)
             ) and op.op in {"matmul", "addmm"}:
@@ -1601,13 +1645,8 @@ class AppleMetalBackend:
                 left_type = graph.value(op.inputs[left_position]).type
                 right_type = graph.value(op.inputs[right_position]).type
                 output_type = graph.value(op.outputs[0]).type
-                batch_shape = _matmul_batch_shape(
-                    left_type.shape, right_type.shape
-                )
-                if (
-                    batch_shape is not None
-                    and output_type.shape[:-2] == batch_shape
-                ):
+                batch_shape = _matmul_batch_shape(left_type.shape, right_type.shape)
+                if batch_shape is not None and output_type.shape[:-2] == batch_shape:
                     compiled = self._compile_matmul(graph, op, index)
 
             if compiled is not None:
@@ -1615,9 +1654,7 @@ class AppleMetalBackend:
                 # Candidates are keyed by the operation's first output, which
                 # is also what a selection records; a multi-output kernel still
                 # fills every output of that operation.
-                candidates[artifact.output_ids[0]] = _NativeCandidate(
-                    artifact, runtime
-                )
+                candidates[artifact.output_ids[0]] = _NativeCandidate(artifact, runtime)
         return candidates
 
     def compile(
@@ -1630,9 +1667,7 @@ class AppleMetalBackend:
             raise RuntimeError("Apple Metal is unavailable in this process")
 
         candidates = self._lower_candidates(graph)
-        if _mpp_supported() and not _tensor_core_candidates_load(
-            graph, candidates
-        ):
+        if _mpp_supported() and not _tensor_core_candidates_load(graph, candidates):
             # This device compiled the tensor-core kernels and refused to
             # load them, so re-lower once without them rather than leaving
             # a plan that raises on its first matmul.
@@ -1643,9 +1678,7 @@ class AppleMetalBackend:
                 graph, candidates, tune_inputs
             )
         else:
-            kernels, selections, callables = self._heuristic_select(
-                graph, candidates
-            )
+            kernels, selections, callables = self._heuristic_select(graph, candidates)
 
         return CompiledPlan(
             graph,
@@ -1662,9 +1695,7 @@ class AppleMetalBackend:
         self,
         graph: Graph,
         candidates: Mapping[str, _NativeCandidate],
-    ) -> tuple[
-        tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]
-    ]:
+    ) -> tuple[tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]]:
         kernels: list[KernelArtifact] = []
         selections: list[KernelSelection] = []
         callables: dict[str, Any] = {}
@@ -1727,9 +1758,7 @@ class AppleMetalBackend:
         graph: Graph,
         candidates: Mapping[str, _NativeCandidate],
         tune_inputs: Sequence[Any] | None,
-    ) -> tuple[
-        tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]
-    ]:
+    ) -> tuple[tuple[KernelArtifact, ...], tuple[KernelSelection, ...], dict[str, Any]]:
         if tune_inputs is None:
             env = {
                 value_id: _synthetic_tune_input(graph.value(value_id).type)
@@ -1743,9 +1772,7 @@ class AppleMetalBackend:
                 )
             env = {
                 value_id: _coerce_tune_input(value, graph.value(value_id).type)
-                for value_id, value in zip(
-                    graph.inputs, tune_inputs, strict=True
-                )
+                for value_id, value in zip(graph.inputs, tune_inputs, strict=True)
             }
 
         device_name, device_architecture = _device_profile()
@@ -1801,9 +1828,7 @@ class AppleMetalBackend:
                 mlx_benchmark = None
                 env[output_id] = native_result
             else:
-                mlx_benchmark = self._benchmark(
-                    "mlx", None, fallback_runtime
-                )
+                mlx_benchmark = self._benchmark("mlx", None, fallback_runtime)
                 try:
                     native_result = candidate.runtime(*input_arrays)
                     mx.eval(native_result)
@@ -2116,9 +2141,7 @@ class AppleMetalBackend:
         )
 
         input_names = (
-            ("in_0", "in_1", "in_2", "in_3")
-            if has_mask
-            else ("in_0", "in_1", "in_2")
+            ("in_0", "in_1", "in_2", "in_3") if has_mask else ("in_0", "in_1", "in_2")
         )
         name = (
             f"metal_attention_tensorcore_{query_tile}x{_MPP_ATTENTION_KEY_TILE}_"
@@ -2175,9 +2198,7 @@ class AppleMetalBackend:
             f"_{config.key_value_heads}_{config.key_length}"
             f"_{config.query_head_dim}_{config.value_head_dim}_{index}"
         )
-        input_names = tuple(
-            f"in_{position}" for position in range(len(op.inputs))
-        )
+        input_names = tuple(f"in_{position}" for position in range(len(op.inputs)))
         kernel = _metal_kernel(
             name,
             input_names,
@@ -2258,14 +2279,10 @@ class AppleMetalBackend:
         key_tile = 32
         low_precision_attention = output_type.dtype in {DType.F16, DType.BF16}
         use_simdgroup_qk = (
-            low_precision_attention
-            and query_head_dim % 8 == 0
-            and query_length >= 8
+            low_precision_attention and query_head_dim % 8 == 0 and query_length >= 8
         )
         use_simdgroup_pv = (
-            low_precision_attention
-            and value_head_dim % 8 == 0
-            and query_length >= 8
+            low_precision_attention and value_head_dim % 8 == 0 and query_length >= 8
         )
         query_tile = 1 if query_length == 1 else 8
         if use_simdgroup_qk and use_simdgroup_pv and query_length > 8:
@@ -2306,9 +2323,7 @@ class AppleMetalBackend:
         if use_simdgroup_qk and use_simdgroup_pv and key_tile == 64:
             tile_alignment = "alignas(32) "
             load_vector_width = (
-                16
-                if query_head_dim % 16 == 0 and value_head_dim % 16 == 0
-                else 8
+                16 if query_head_dim % 16 == 0 and value_head_dim % 16 == 0 else 8
             )
             query_load_source = f"""
         for (uint vector_index = tid;
@@ -2425,9 +2440,7 @@ class AppleMetalBackend:
             else:
                 score_expression += f" + float(in_3[{mask_offset}])"
         if op.attrs.get("causal"):
-            score_expression = (
-                f"key > query_pos ? -INFINITY : ({score_expression})"
-            )
+            score_expression = f"key > query_pos ? -INFINITY : ({score_expression})"
 
         if use_simdgroup_qk:
             simdgroup_type = {
@@ -2768,15 +2781,16 @@ class AppleMetalBackend:
             }}
         }}
         """
-        input_names = ("in_0", "in_1", "in_2", "in_3") if has_mask else (
-            "in_0",
-            "in_1",
-            "in_2",
+        input_names = (
+            ("in_0", "in_1", "in_2", "in_3")
+            if has_mask
+            else (
+                "in_0",
+                "in_1",
+                "in_2",
+            )
         )
-        name = (
-            f"metal_attention_flash_{query_tile}x{key_tile}_"
-            f"{threads}_{index}"
-        )
+        name = f"metal_attention_flash_{query_tile}x{key_tile}_{threads}_{index}"
         kernel = _metal_kernel(
             name,
             input_names,
@@ -2987,8 +3001,7 @@ class AppleMetalBackend:
             )
         if output_type.shape != expected_output_shape:
             raise ValueError(
-                f"{op.op} output shape {output_type.shape} "
-                f"!= {expected_output_shape}"
+                f"{op.op} output shape {output_type.shape} != {expected_output_shape}"
             )
 
         output_count = prod(expected_output_shape) or 1
@@ -3012,9 +3025,7 @@ class AppleMetalBackend:
                     f"(output_index / {inner_size}u) * {columns * inner_size}u "
                     f"+ output_index % {inner_size}u"
                 )
-            reduction_offset = (
-                "col" if inner_size == 1 else f"col * {inner_size}u"
-            )
+            reduction_offset = "col" if inner_size == 1 else f"col * {inner_size}u"
         else:
             compact_output_shape = tuple(
                 dim
@@ -3163,9 +3174,7 @@ class AppleMetalBackend:
             isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
             for dim in normalized_shape
         ):
-            raise ValueError(
-                f"{kind}.normalized_shape must contain positive integers"
-            )
+            raise ValueError(f"{kind}.normalized_shape must contain positive integers")
 
         has_weight = op.attrs.get("has_weight")
         if not isinstance(has_weight, bool):
@@ -3186,13 +3195,9 @@ class AppleMetalBackend:
         # ``layer_norm`` may also write the per-row statistics it already
         # reduces, which is what makes the tuple-returning ATen signature one
         # kernel instead of a main output plus a re-derived pair.
-        stat_types = tuple(
-            graph.value(value_id).type for value_id in op.outputs[1:]
-        )
+        stat_types = tuple(graph.value(value_id).type for value_id in op.outputs[1:])
         if stat_types and kind != "layer_norm":
-            raise ValueError(
-                f"{kind} only writes one output, got {len(op.outputs)}"
-            )
+            raise ValueError(f"{kind} only writes one output, got {len(op.outputs)}")
         if len(op.outputs) not in {1, 3}:
             raise ValueError(
                 f"{kind} writes one or three values, got {len(op.outputs)}"
@@ -3204,9 +3209,9 @@ class AppleMetalBackend:
         for position, stat_type in enumerate(stat_types):
             # ATen reports the statistics with the normalized axes collapsed to
             # one, so the expected shape keeps them as singleton dimensions.
-            expected_stat = input_type.shape[:-len(normalized_shape)] + (
-                1,
-            ) * len(normalized_shape)
+            expected_stat = input_type.shape[: -len(normalized_shape)] + (1,) * len(
+                normalized_shape
+            )
             if stat_type.shape != expected_stat:
                 raise ValueError(
                     f"{kind} statistic {position + 1} shape {stat_type.shape} "
@@ -3250,7 +3255,6 @@ class AppleMetalBackend:
                     f"{kind} parameter shape {parameter_type.shape} "
                     f"!= {normalized_shape}"
                 )
-
 
         columns = prod(normalized_shape)
         rows = prod(input_type.shape[:-normalized_rank]) or 1
@@ -3341,7 +3345,7 @@ class AppleMetalBackend:
         uint offset = row * {columns}u;
         threadgroup float scratch[{threads}];
 
-{textwrap.indent(reduction_source, '        ')}
+{textwrap.indent(reduction_source, "        ")}
         float inv_std = metal::rsqrt({reduction_result} + {eps!r}f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 {stat_write_source}
@@ -3472,7 +3476,9 @@ class AppleMetalBackend:
                     f"to {output_type.shape}"
                 )
         if len(dtypes) != 1:
-            raise NotImplementedError("Metal matmul requires identical input/output dtypes")
+            raise NotImplementedError(
+                "Metal matmul requires identical input/output dtypes"
+            )
 
         row_blocks = ceil(rows / _MATMUL_BLOCK_ROWS)
         column_blocks = ceil(columns / _MATMUL_BLOCK_COLUMNS)
@@ -3506,13 +3512,11 @@ class AppleMetalBackend:
             threads = _gemv_threads(columns, transpose_right)
             batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
             layout = "transposed" if transpose_right else "row_major"
-            name = (
-                f"metal_{op.op}_gemv_{layout}_{threads}"
-                f"{batch_suffix}_{index}"
-            )
-        elif _supports_mpp_matmul(
-            rows, columns, reduction, output_type.dtype
-        ) and _mpp_supported():
+            name = f"metal_{op.op}_gemv_{layout}_{threads}{batch_suffix}_{index}"
+        elif (
+            _supports_mpp_matmul(rows, columns, reduction, output_type.dtype)
+            and _mpp_supported()
+        ):
             mpp_config = _select_mpp_gemm_config(
                 rows, columns, reduction, transpose_right
             )
@@ -3545,9 +3549,8 @@ class AppleMetalBackend:
                 batch_count,
             )
             batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
-            orientation = (
-                ("t" if transpose_left else "n")
-                + ("t" if transpose_right else "n")
+            orientation = ("t" if transpose_left else "n") + (
+                "t" if transpose_right else "n"
             )
             name = (
                 f"metal_{op.op}_tensorcore_{orientation}_"
@@ -3592,9 +3595,8 @@ class AppleMetalBackend:
                 left_batch_offset,
                 right_batch_offset,
             )
-            threads = (
-                (_MATMUL_BLOCK_ROWS // micro_rows)
-                * (_MATMUL_BLOCK_COLUMNS // micro_columns)
+            threads = (_MATMUL_BLOCK_ROWS // micro_rows) * (
+                _MATMUL_BLOCK_COLUMNS // micro_columns
             )
             batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
             name = (
@@ -3618,9 +3620,7 @@ class AppleMetalBackend:
             transpose_left,
             transpose_right,
         ):
-            columns_per_group = (
-                threads // 32 if transpose_right else threads
-            )
+            columns_per_group = threads // 32 if transpose_right else threads
             grid = (
                 ceil(columns / columns_per_group) * threads,
                 batch_count,
@@ -3928,8 +3928,7 @@ def _validate_pointwise_region(
                 expected_inputs = len(input_types) == 1
             else:
                 expected_inputs = len(input_types) == 2 or (
-                    len(input_types) == 1
-                    and isinstance(op.attrs.get("scalar"), bool)
+                    len(input_types) == 1 and isinstance(op.attrs.get("scalar"), bool)
                 )
             if not expected_inputs:
                 raise ValueError(f"malformed logical op: {op.op}")
@@ -3949,9 +3948,7 @@ def _validate_pointwise_region(
                 if not expected_inputs:
                     raise ValueError(f"malformed bitwise op: {op.op}")
                 if any(input_type.dtype != DType.BOOL for input_type in input_types):
-                    raise ValueError(
-                        f"boolean {op.op} requires boolean tensor inputs"
-                    )
+                    raise ValueError(f"boolean {op.op} requires boolean tensor inputs")
                 continue
             _validate_integer_pointwise_op(op, output_type, input_types)
             continue
@@ -3961,8 +3958,7 @@ def _validate_pointwise_region(
             # ``+``, which is how ATen's own composites such as ``isclose``
             # combine two masks.
             valid = len(input_types) == 2 or (
-                len(input_types) == 1
-                and isinstance(op.attrs.get("scalar"), bool)
+                len(input_types) == 1 and isinstance(op.attrs.get("scalar"), bool)
             )
             if not valid:
                 raise ValueError(f"malformed boolean op: {op.op}")
@@ -3975,7 +3971,7 @@ def _validate_pointwise_region(
                 raise ValueError(f"malformed predicate op: {op.op}")
             if input_types[0].dtype == DType.BOOL:
                 raise ValueError(f"{op.op} requires a numeric tensor input")
-            if input_types[0].dtype in _INTEGRAL_DTYPES:
+            if input_types[0].dtype in _INTEGRAL_DTYPES and op.op != "signbit":
                 raise ValueError(f"{op.op} does not accept integer tensor inputs")
             continue
 
@@ -4027,12 +4023,9 @@ def _validate_pointwise_region(
             if not valid:
                 raise ValueError(f"malformed binary pointwise op: {op.op}")
             if any(
-                input_type.dtype not in _FLOATING_DTYPES
-                for input_type in input_types
+                input_type.dtype not in _FLOATING_DTYPES for input_type in input_types
             ):
-                raise ValueError(
-                    f"{op.op} requires floating-point tensor operands"
-                )
+                raise ValueError(f"{op.op} requires floating-point tensor operands")
             continue
 
         if op.op == "nan_to_num":
@@ -4057,24 +4050,18 @@ def _validate_pointwise_region(
             if not floating_inputs:
                 raise ValueError("lerp requires one weight tensor or scalar")
             if any(
-                input_type.dtype not in _FLOATING_DTYPES
-                for input_type in input_types
+                input_type.dtype not in _FLOATING_DTYPES for input_type in input_types
             ):
                 raise ValueError("lerp requires floating-point tensor operands")
             continue
 
         if op.op in {"addcmul", "addcdiv"}:
             if len(input_types) != 3:
-                raise ValueError(
-                    f"{op.op} requires self, tensor1 and tensor2 tensors"
-                )
+                raise ValueError(f"{op.op} requires self, tensor1 and tensor2 tensors")
             if any(
-                input_type.dtype not in _FLOATING_DTYPES
-                for input_type in input_types
+                input_type.dtype not in _FLOATING_DTYPES for input_type in input_types
             ):
-                raise ValueError(
-                    f"{op.op} requires floating-point tensor operands"
-                )
+                raise ValueError(f"{op.op} requires floating-point tensor operands")
             value = op.attrs.get("value", 1.0)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise ValueError(f"{op.op}.value must be a scalar, got {value!r}")
@@ -4138,9 +4125,7 @@ def _validate_integer_pointwise_op(
         "bitwise_xor",
     }:
         if len(input_types) == 2:
-            if any(
-                input_type.dtype != output_type.dtype for input_type in input_types
-            ):
+            if any(input_type.dtype != output_type.dtype for input_type in input_types):
                 raise ValueError(f"integer {op.op} requires matching input dtypes")
         elif len(input_types) == 1:
             scalar = op.attrs.get("scalar")
@@ -4229,9 +4214,7 @@ def _split_double_to_floats(value: float) -> tuple[float, float]:
     return head, value - head
 
 
-def _emit_zero_input_expression(
-    expression: str, output_shape: tuple[int, ...]
-) -> str:
+def _emit_zero_input_expression(expression: str, output_shape: tuple[int, ...]) -> str:
     element_count = prod(output_shape)
     lines = [
         "uint base = thread_position_in_grid.x * 4u;",
@@ -4258,8 +4241,6 @@ def _msl_integer_literal(value: int, dtype: DType) -> str:
     raise ValueError(f"{dtype.value} is not an integer dtype")
 
 
-
-
 def _emit_pointwise_source(
     graph: Graph,
     input_ids: tuple[str, ...],
@@ -4284,9 +4265,7 @@ def _emit_pointwise_source(
         input_type = graph.value(value_id).type
         ctype = _pointwise_ctype(input_type.dtype)
         if input_type.shape:
-            offset = _offset_expression(
-                input_type.shape, output_shape, "elem"
-            )
+            offset = _offset_expression(input_type.shape, output_shape, "elem")
             lines.append(f"    {ctype} {variable} = in_{position}[{offset}];")
         else:
             lines.append(f"    {ctype} {variable} = ({ctype})in_{position};")
@@ -4448,6 +4427,13 @@ def _emit_pointwise_expression(
         return f"metal::isnan({arguments[0]})"
     if op.op == "isinf":
         return f"metal::isinf({arguments[0]})"
+    if op.op == "signbit":
+        # A bit test rather than a comparison, so -0.0 reports true like
+        # PyTorch. MSL has no integer overload for ``signbit``, and a signed
+        # integer has no negative zero, so ``< 0`` is exact for those.
+        if input_types[0].dtype in _INTEGRAL_DTYPES:
+            return f"({arguments[0]} < 0)"
+        return f"metal::signbit({arguments[0]})"
     if op.op == "where":
         return f"({arguments[0]} ? {arguments[1]} : {arguments[2]})"
     if op.op == "masked_fill":
@@ -4476,10 +4462,7 @@ def _emit_pointwise_expression(
                 f"0.7978845608028654f * ({value} + "
                 f"0.044715f * {value} * {value} * {value})))"
             )
-        return (
-            f"0.5f * {value} * (1.0f + tsc_erf("
-            f"{value} * 0.7071067811865476f))"
-        )
+        return f"0.5f * {value} * (1.0f + tsc_erf({value} * 0.7071067811865476f))"
     if op.op == "softplus":
         beta = _msl_float_literal(float(op.attrs["beta"]))
         threshold = _msl_float_literal(float(op.attrs["threshold"]))
@@ -4499,10 +4482,7 @@ def _emit_pointwise_expression(
         left, right = _binary_operands(op, arguments, input_types)
         comparison = "<" if op.op == "maximum" else ">"
         selected = f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
-        return (
-            f"((metal::isnan({left}) || metal::isnan({right})) "
-            f"? NAN : {selected})"
-        )
+        return f"((metal::isnan({left}) || metal::isnan({right})) ? NAN : {selected})"
     if op.op == "logaddexp":
         left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_logaddexp({left}, {right})"
@@ -4540,10 +4520,7 @@ def _emit_pointwise_expression(
         value, boundary = _binary_operands(op, arguments, input_types)
         if output_dtype in _INTEGRAL_DTYPES:
             return f"(({value}) == 0 ? ({boundary}) : (({value}) > 0 ? 1 : 0))"
-        return (
-            f"(({value}) == 0.0f ? ({boundary}) "
-            f": (({value}) > 0.0f ? 1.0f : 0.0f))"
-        )
+        return f"(({value}) == 0.0f ? ({boundary}) : (({value}) > 0.0f ? 1.0f : 0.0f))"
     if op.op == "logit":
         value = arguments[0]
         if "eps" in op.attrs:
@@ -4569,9 +4546,7 @@ def _emit_pointwise_expression(
         limit = _FINITE_LIMITS[input_types[0].dtype]
         nan_value = _msl_float_literal(float(op.attrs.get("nan", 0.0)))
         posinf_value = _msl_float_literal(float(op.attrs.get("posinf", limit)))
-        neginf_value = _msl_float_literal(
-            float(op.attrs.get("neginf", -limit))
-        )
+        neginf_value = _msl_float_literal(float(op.attrs.get("neginf", -limit)))
         return (
             f"(metal::isnan({value}) ? {nan_value} : "
             f"(metal::isinf({value}) ? "
@@ -4591,8 +4566,7 @@ def _emit_pointwise_expression(
         value = _msl_float_literal(float(op.attrs.get("value", 1.0)))
         operator = "*" if op.op == "addcmul" else "/"
         return (
-            f"{arguments[0]} + {value} * ({arguments[1]}) "
-            f"{operator} ({arguments[2]})"
+            f"{arguments[0]} + {value} * ({arguments[1]}) {operator} ({arguments[2]})"
         )
     if op.op in {"add", "sub", "rsub"}:
         left, right = _binary_operands(op, arguments, input_types)
@@ -4639,16 +4613,12 @@ def _emit_pointwise_expression(
     if op.op == "hardswish":
         value = arguments[0]
         body = (
-            f"({value}) * metal::min(metal::max(({value}) + 3.0f, 0.0f), 6.0f) "
-            "/ 6.0f"
+            f"({value}) * metal::min(metal::max(({value}) + 3.0f, 0.0f), 6.0f) / 6.0f"
         )
         return f"(metal::isnan({value}) ? NAN : {body})"
     if op.op == "hardsigmoid":
         value = arguments[0]
-        body = (
-            "metal::min(metal::max("
-            f"({value}) + 3.0f, 0.0f), 6.0f) / 6.0f"
-        )
+        body = f"metal::min(metal::max(({value}) + 3.0f, 0.0f), 6.0f) / 6.0f"
         return f"(metal::isnan({value}) ? NAN : {body})"
     if op.op == "threshold":
         value = arguments[0]
@@ -4674,6 +4644,10 @@ def _emit_pointwise_expression(
         return f"log1p({arguments[0]})"
     if op.op == "erf":
         return f"tsc_erf({arguments[0]})"
+    if op.op == "lgamma":
+        return f"tsc_lgamma({arguments[0]})"
+    if op.op == "i0":
+        return f"tsc_i0({arguments[0]})"
     if op.op == "sin":
         return f"metal::sin({arguments[0]})"
     if op.op == "cos":
@@ -4877,9 +4851,7 @@ def _supports_gemv_matmul(
     """Return whether the one-row matmul can use the bandwidth-oriented GEMV."""
 
     return (
-        rows == 1
-        and dtype in {DType.F16, DType.BF16, DType.F32}
-        and not transpose_left
+        rows == 1 and dtype in {DType.F16, DType.BF16, DType.F32} and not transpose_left
     )
 
 
@@ -5082,9 +5054,7 @@ def _emit_gemv_matmul_source(
         )
         value = f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * {value}"
     value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
-    lines.append(
-        f"{indent}out[{output_linear}] = (T)({value});"
-    )
+    lines.append(f"{indent}out[{output_linear}] = (T)({value});")
     if not exact_columns:
         lines.append("}")
     return "\n".join(f"        {line}" for line in lines)
@@ -5210,8 +5180,12 @@ def _emit_transposed_gemv_matmul_source(
                     f"[{left_batch_prefix}base + {offset}u]);"
                 )
         else:
-            lines.append(f"{indent}    vec<T, 4> norm_source_value = norm_source[index];")
-            lines.append(f"{indent}    vec<T, 4> norm_weight_value = norm_weight_values[index];")
+            lines.append(
+                f"{indent}    vec<T, 4> norm_source_value = norm_source[index];"
+            )
+            lines.append(
+                f"{indent}    vec<T, 4> norm_weight_value = norm_weight_values[index];"
+            )
             for offset in range(4):
                 lines.append(
                     f"{indent}    float x{offset} = float((T)(norm_scale * "
@@ -5231,6 +5205,7 @@ def _emit_transposed_gemv_matmul_source(
                 )
         lines.append(f"{indent}}}")
     else:
+
         def left_term(index: str) -> str:
             if norm_slot is None:
                 return f"float(in_{left_position}[{left_batch_prefix}{index}])"
@@ -5380,9 +5355,7 @@ def _emit_simdgroup_matmul_source(
     exact_reduction = reduction % block_reduction == 0
     left_batch_prefix = f"{left_batch_offset} + " if left_batch_offset else ""
     right_batch_prefix = f"{right_batch_offset} + " if right_batch_offset else ""
-    output_batch_offset = (
-        f"batch * {rows * columns}u + " if batch_count > 1 else ""
-    )
+    output_batch_offset = f"batch * {rows * columns}u + " if batch_count > 1 else ""
     load_vector_width = 8
     vector_loads = (
         exact_reduction
@@ -5472,13 +5445,9 @@ def _emit_simdgroup_matmul_source(
             ]
         )
         if transpose_left:
-            left_index = (
-                f"(k_base + local_k) * {rows}u + row_base + local_row"
-            )
+            left_index = f"(k_base + local_k) * {rows}u + row_base + local_row"
         else:
-            left_index = (
-                f"(row_base + local_row) * {reduction}u + k_base + local_k"
-            )
+            left_index = f"(row_base + local_row) * {reduction}u + k_base + local_k"
         if left_batch_offset:
             left_index = f"{left_batch_offset} + {left_index}"
         load_a = f"in_{left_position}[{left_index}]"
@@ -5496,13 +5465,9 @@ def _emit_simdgroup_matmul_source(
             ]
         )
         if transpose_right:
-            right_index = (
-                f"(col_base + local_column) * {reduction}u + k_base + local_k"
-            )
+            right_index = f"(col_base + local_column) * {reduction}u + k_base + local_k"
         else:
-            right_index = (
-                f"(k_base + local_k) * {columns}u + col_base + local_column"
-            )
+            right_index = f"(k_base + local_k) * {columns}u + col_base + local_column"
         if right_batch_offset:
             right_index = f"{right_batch_offset} + {right_index}"
         load_b = f"in_{right_position}[{right_index}]"
@@ -5571,10 +5536,7 @@ def _emit_simdgroup_matmul_source(
     if bias_id is not None:
         assert bias_type is not None
         bias_offset = _offset_expression(bias_type.shape, output_shape, "linear")
-        value = (
-            f"{beta!r} * float(in_0[{bias_offset}]) "
-            f"+ {alpha!r} * {value}"
-        )
+        value = f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * {value}"
     value = _matmul_epilogue_value(value, op, graph, output_shape, "linear")
     lines.extend(
         [
@@ -5636,8 +5598,7 @@ def _select_mpp_gemm_config(
             else wide
         )
     elif rows * columns >= _MPP_GEMM_WIDE_ELEMENTS or (
-        rows <= _MPP_GEMM_SKINNY_MAX_ROWS
-        and columns >= _MPP_GEMM_MIN_WIDE_COLUMNS
+        rows <= _MPP_GEMM_SKINNY_MAX_ROWS and columns >= _MPP_GEMM_MIN_WIDE_COLUMNS
     ):
         preferred = wide
     elif transposed_right or rows < _MPP_GEMM_TILE_ROW_MAJOR[0]:
@@ -5646,9 +5607,7 @@ def _select_mpp_gemm_config(
         preferred = _MPP_GEMM_TILE_ROW_MAJOR
     row_bound = max(16, ceil(rows / 16) * 16)
     column_bound = max(32, ceil(columns / 32) * 32)
-    for config in _MPP_GEMM_TILE_LADDER[
-        _MPP_GEMM_TILE_LADDER.index(preferred) :
-    ]:
+    for config in _MPP_GEMM_TILE_LADDER[_MPP_GEMM_TILE_LADDER.index(preferred) :]:
         if config[0] <= row_bound and config[1] <= column_bound:
             return config
     return _MPP_GEMM_TILE_TINY
@@ -5722,14 +5681,9 @@ def _emit_mpp_matmul_source(
         f"uint col_base = threadgroup_position_in_grid.x * {block_columns}u"
         f" + (sg % {warp_columns}u) * {warp_block_columns}u;"
     )
-    append(
-        "constexpr auto tsc_gemm_descriptor = "
-        "mpp::tensor_ops::matmul2d_descriptor("
-    )
+    append("constexpr auto tsc_gemm_descriptor = mpp::tensor_ops::matmul2d_descriptor(")
     append("    16, 32, 16, false, true, true,")
-    append(
-        "    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);"
-    )
+    append("    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);")
     append(
         "mpp::tensor_ops::matmul2d<tsc_gemm_descriptor, "
         "metal::execution_simdgroup> tsc_gemm;"
@@ -5781,9 +5735,7 @@ def _emit_mpp_matmul_source(
             return f"{origin + offset}u + fn"
         return f"{origin} + {offset}u + fn"
 
-    def emit_declarations(
-        fragments: int, prefix: str, indent: str
-    ) -> list[str]:
+    def emit_declarations(fragments: int, prefix: str, indent: str) -> list[str]:
         emitted: list[str] = []
         for row_fragment in range(row_fragments):
             for fragment in range(fragments):
@@ -5860,9 +5812,7 @@ def _emit_mpp_matmul_source(
 
     if full_steps > 0:
         lines.extend(emit_declarations(step_fragments, "loop_", ""))
-        append(
-            f"for (uint k0 = 0u; k0 < {full_steps * step}u; k0 += {step}u) {{"
-        )
+        append(f"for (uint k0 = 0u; k0 < {full_steps * step}u; k0 += {step}u) {{")
         lines.extend(emit_body("k0", step_fragments, "loop_", "    "))
         append("}")
     if tail_fragments > 0:
@@ -5904,9 +5854,7 @@ def _emit_mpp_matmul_source(
                                 f"col_base + {column_fragment * 16 + element}u"
                                 f" + fn < {columns}u"
                             )
-                        guard = (
-                            f"if ({' && '.join(conditions)}) " if conditions else ""
-                        )
+                        guard = f"if ({' && '.join(conditions)}) " if conditions else ""
                         append(
                             f"{guard}out[{output_batch_prefix}{linear}] = (T)({value});"
                         )
@@ -6039,9 +5987,7 @@ def _emit_mpp_attention_source(
 
     if rank == 4:
         query_batch_head = f"(batch * {query_heads}u + head)"
-        key_value_batch_head = (
-            f"(batch * {key_value_heads}u + head / {group_size}u)"
-        )
+        key_value_batch_head = f"(batch * {key_value_heads}u + head / {group_size}u)"
         output_batch_head = query_batch_head
     else:
         query_batch_head = "batch"
@@ -6057,17 +6003,11 @@ def _emit_mpp_attention_source(
     append("uint fm = (qid & 4u) | ((lane >> 1u) & 3u);")
     append("uint fn = ((qid & 2u) | (lane & 1u)) * 4u;")
     append("uint query_index = threadgroup_position_in_grid.x;")
-    append(
-        f"uint batch = query_index / {query_heads * query_blocks}u;"
-    )
-    append(
-        f"uint batch_index = query_index % {query_heads * query_blocks}u;"
-    )
+    append(f"uint batch = query_index / {query_heads * query_blocks}u;")
+    append(f"uint batch_index = query_index % {query_heads * query_blocks}u;")
     append(f"uint head = batch_index / {query_blocks}u;")
     append(f"uint query_block = batch_index % {query_blocks}u;")
-    append(
-        f"threadgroup T tile_q[{query_tile * query_head_dim}];"
-    )
+    append(f"threadgroup T tile_q[{query_tile * query_head_dim}];")
     append(
         f"for (uint index = tid; index < {query_tile * query_head_dim}u;"
         f" index += {threads}u) {{"
@@ -6093,9 +6033,7 @@ def _emit_mpp_attention_source(
             "mpp::tensor_ops::matmul2d_descriptor("
         )
         append("    16, 32, 16, false, true, true,")
-        append(
-            "    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);"
-        )
+        append("    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);")
         append(
             f"mpp::tensor_ops::matmul2d<tsc_{tag}_descriptor,"
             " metal::execution_simdgroup> tsc_"
@@ -6136,7 +6074,9 @@ def _emit_mpp_attention_source(
     else:
         append(f"uint key_limit = {key_length}u;")
 
-    append(f"for (uint key_base = 0u; key_base < key_limit; key_base += {key_tile}u) {{")
+    append(
+        f"for (uint key_base = 0u; key_base < key_limit; key_base += {key_tile}u) {{"
+    )
     append(
         f"    const device T* key_head = in_1 + {key_value_batch_head}"
         f" * {key_length * query_head_dim}u;"
@@ -6155,9 +6095,7 @@ def _emit_mpp_attention_source(
     )
     append("    for (uint e = 0u; e < 16u; ++e) { tsc_scores[e] = 0.0f; }")
     for half in range(2):
-        append(
-            f"    uint query_row_{half} = sg * 16u + {half * 8}u + fm;"
-        )
+        append(f"    uint query_row_{half} = sg * 16u + {half * 8}u + fm;")
         append(
             f"    uint query_pos_{half} = query_block * {query_tile}u"
             f" + query_row_{half};"
@@ -6168,9 +6106,7 @@ def _emit_mpp_attention_source(
     for row in range(4):
         expression = f"key_base + {row * 8}u + fm"
         if clamp_key_rows:
-            expression = (
-                f"metal::min(key_base + {row * 8}u + fm, {key_length - 1}u)"
-            )
+            expression = f"metal::min(key_base + {row * 8}u + fm, {key_length - 1}u)"
         append(f"    uint key_row_{row} = {expression};")
     append("    vec<T, 4> tsc_vector;")
     for fragment in range(dimension_fragments):
@@ -6183,9 +6119,7 @@ def _emit_mpp_attention_source(
                 f" * {query_head_dim}u + {fragment * 16}u + fn);"
             )
             for element in range(4):
-                append(
-                    f"        tsc_q[{half * 4 + element}] = tsc_vector[{element}];"
-                )
+                append(f"        tsc_q[{half * 4 + element}] = tsc_vector[{element}];")
         for nf in range(2):
             for half in range(2):
                 row = nf * 2 + half
@@ -6219,9 +6153,7 @@ def _emit_mpp_attention_source(
         nf = element >> 3
         half = (element >> 2) & 1
         offset = element & 3
-        append(
-            f"    scores[{element}] = tsc_scores[{element}] * {float(scale)!r};"
-        )
+        append(f"    scores[{element}] = tsc_scores[{element}] * {float(scale)!r};")
         if has_mask and mask_shape is not None:
             mask_offset = mask_offset_expression.replace(
                 "query_pos", f"mask_row_{half}"
@@ -6343,9 +6275,7 @@ def _emit_mpp_attention_source(
                             f" * {value_head_dim}u"
                             f" + {pair * 32 + nf * 16 + half * 8}u + fm];"
                         )
-            append(
-                f"            tsc_pv.run(tsc_p, tsc_v, tsc_acc_{pair});"
-            )
+            append(f"            tsc_pv.run(tsc_p, tsc_v, tsc_acc_{pair});")
             append("        }")
         append("    }")
 
@@ -6477,9 +6407,7 @@ def _emit_tiled_matmul_source(
     lines.append(f"        uint local_k = index / {block_columns}u;")
     lines.append(f"        uint local_column = index % {block_columns}u;")
     if transpose_right:
-        right_index = (
-            f"(col_base + local_column) * {reduction}u + k_base + local_k"
-        )
+        right_index = f"(col_base + local_column) * {reduction}u + k_base + local_k"
     else:
         right_index = f"(k_base + local_k) * {columns}u + col_base + local_column"
     if right_batch_offset:
@@ -6496,7 +6424,9 @@ def _emit_tiled_matmul_source(
     lines.append("    }")
     lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-    lines.append(f"    for (uint local_k = 0u; local_k < {block_reduction}u; ++local_k) {{")
+    lines.append(
+        f"    for (uint local_k = 0u; local_k < {block_reduction}u; ++local_k) {{"
+    )
     for row in range(micro_rows):
         lines.append(
             f"        float av_{row} = tile_a[(micro_row * {micro_rows}u + {row}u) "
@@ -6536,9 +6466,7 @@ def _emit_tiled_matmul_source(
             if not exact_tiles:
                 lines.append(f"if (row_ok_{row} && col_ok_{column}) {{")
             indent = "    " if not exact_tiles else ""
-            batch_offset = (
-                f"batch * {rows * columns}u + " if batch_count > 1 else ""
-            )
+            batch_offset = f"batch * {rows * columns}u + " if batch_count > 1 else ""
             lines.append(
                 f"{indent}uint {linear} = "
                 f"{batch_offset}"
@@ -6550,8 +6478,7 @@ def _emit_tiled_matmul_source(
                 assert bias_type is not None
                 bias_offset = _offset_expression(bias_type.shape, output_shape, linear)
                 value = (
-                    f"{beta!r} * float(in_0[{bias_offset}]) "
-                    f"+ {alpha!r} * {accumulator}"
+                    f"{beta!r} * float(in_0[{bias_offset}]) + {alpha!r} * {accumulator}"
                 )
             else:
                 value = accumulator
@@ -6563,9 +6490,7 @@ def _emit_tiled_matmul_source(
     return "\n".join(f"        {line}" for line in lines)
 
 
-def _evaluate_layout_mlx(
-    graph: Graph, op: Operation, value: mx.array
-) -> mx.array:
+def _evaluate_layout_mlx(graph: Graph, op: Operation, value: mx.array) -> mx.array:
     if op.op == "reshape":
         return mx.reshape(value, graph.value(op.outputs[0]).type.shape)
 
@@ -6579,9 +6504,7 @@ def _evaluate_layout_mlx(
         ):
             raise ValueError(f"pad.pads must be paired integers, got {pads!r}")
         if len(pads) > 2 * rank:
-            raise ValueError(
-                f"pad has {len(pads)} values for a rank-{rank} input"
-            )
+            raise ValueError(f"pad has {len(pads)} values for a rank-{rank} input")
         if any(item < 0 for item in pads):
             raise ValueError(f"pad.pads must be non-negative, got {pads!r}")
         width = [(0, 0)] * rank
@@ -6591,9 +6514,7 @@ def _evaluate_layout_mlx(
         source_type = graph.value(op.inputs[0]).type
         expected = tuple(
             size + before + after
-            for size, (before, after) in zip(
-                value.shape, width, strict=True
-            )
+            for size, (before, after) in zip(value.shape, width, strict=True)
         )
         output_type = graph.value(op.outputs[0]).type
         if expected != output_type.shape:
@@ -6627,9 +6548,7 @@ def _evaluate_layout_mlx(
     if op.op == "slice":
         index: list[slice] = [slice(None)] * rank
         axis = int(op.attrs["dim"]) % rank
-        start = (
-            int(op.attrs["start"]) if op.attrs.get("start") is not None else None
-        )
+        start = int(op.attrs["start"]) if op.attrs.get("start") is not None else None
         end = int(op.attrs["end"]) if op.attrs.get("end") is not None else None
         step = int(op.attrs["step"])
         start, end, step = slice(start, end, step).indices(value.shape[axis])
@@ -6671,6 +6590,88 @@ def _evaluate_layout_mlx(
         return value
 
     raise NotImplementedError(f"no Apple runtime lowering for {op.op}")
+
+
+def _mlx_lgamma(value: mx.array) -> mx.array:
+    """log|Gamma(x)|, mirroring the Metal helper ``tsc_lgamma``."""
+
+    compute = (
+        value if value.dtype in (mx.float32, mx.float64) else value.astype(mx.float32)
+    )
+
+    def series(arguments_value: mx.array) -> mx.array:
+        z = arguments_value - 1.0
+        total = _LANCZOS_COEFFICIENTS[0]
+        for index, coefficient in enumerate(_LANCZOS_COEFFICIENTS[1:], start=1):
+            total = total + coefficient / (z + float(index))
+        return (
+            0.9189385332046727 + (z + 0.5) * mx.log(z + 7.5) - (z + 7.5) + mx.log(total)
+        )
+
+    reflected = log(pi) - mx.log(mx.abs(mx.sin(pi * compute))) - series(1.0 - compute)
+    # ATen reports +inf at the poles and for both infinities, and NaN only for
+    # a NaN argument.
+    at_pole = (compute <= 0.0) & (compute == mx.round(compute))
+    body = mx.where(
+        at_pole, float("inf"), mx.where(compute < 0.5, reflected, series(compute))
+    )
+    return mx.where(mx.isinf(compute), float("inf"), body)
+
+
+def _mlx_i0(value: mx.array) -> mx.array:
+    """Modified Bessel I0, mirroring the Metal helper ``tsc_i0``."""
+
+    compute = (
+        value if value.dtype in (mx.float32, mx.float64) else value.astype(mx.float32)
+    )
+    magnitude = mx.abs(compute)
+    ratio = magnitude / 3.75
+    square = ratio * ratio
+    small = 1.0 + square * (
+        3.5156229
+        + square
+        * (
+            3.0899424
+            + square
+            * (
+                1.2067492
+                + square * (0.2659732 + square * (0.0360768 + square * 0.0045813))
+            )
+        )
+    )
+    scaled = 3.75 / magnitude
+    polynomial = 0.39894228 + scaled * (
+        0.01328592
+        + scaled
+        * (
+            0.00225319
+            + scaled
+            * (
+                -0.00157565
+                + scaled
+                * (
+                    0.00916281
+                    + scaled
+                    * (
+                        -0.02057706
+                        + scaled
+                        * (0.02635537 + scaled * (-0.01647633 + scaled * 0.00392377))
+                    )
+                )
+            )
+        )
+    )
+    large = mx.exp(magnitude) / mx.sqrt(magnitude) * polynomial
+    return mx.where(magnitude < 3.75, small, large)
+
+
+def _mlx_signbit(value: mx.array) -> mx.array:
+    """The sign bit of each element, true for -0.0 as well as for negatives."""
+
+    if value.dtype in (mx.int32, mx.int64, mx.uint32, mx.uint64):
+        return value < 0
+    negative_zero = (value == 0.0) & (mx.sign(1.0 / value) < 0.0)
+    return (value < 0.0) | negative_zero
 
 
 def _evaluate_pointwise_mlx(
@@ -6748,9 +6749,7 @@ def _evaluate_pointwise_mlx(
     if op.op == "gelu":
         value = arguments[0]
         if op.attrs.get("approximate") == "tanh":
-            inner = 0.7978845608028654 * (
-                value + 0.044715 * value * value * value
-            )
+            inner = 0.7978845608028654 * (value + 0.044715 * value * value * value)
             return 0.5 * value * (1.0 + mx.tanh(inner))
         return 0.5 * value * (1.0 + mx.erf(value * 0.7071067811865476))
     if op.op == "softplus":
@@ -6853,9 +6852,7 @@ def _evaluate_pointwise_mlx(
     if op.op == "lerp":
         start, end = arguments[0], arguments[1]
         weight = (
-            arguments[2]
-            if len(arguments) == 3
-            else float(op.attrs.get("weight", 1.0))
+            arguments[2] if len(arguments) == 3 else float(op.attrs.get("weight", 1.0))
         )
         return mx.where(
             mx.abs(weight) < 0.5,
@@ -6866,9 +6863,7 @@ def _evaluate_pointwise_mlx(
         accumulator, left, right = arguments
         value = float(op.attrs.get("value", 1.0))
         scaled = value * left
-        return accumulator + (
-            scaled * right if op.op == "addcmul" else scaled / right
-        )
+        return accumulator + (scaled * right if op.op == "addcmul" else scaled / right)
     if op.op == "logit":
         value = arguments[0]
         if "eps" in op.attrs:
@@ -6956,6 +6951,20 @@ def _evaluate_pointwise_mlx(
         return mx.log1p(arguments[0])
     if op.op == "erf":
         return mx.erf(arguments[0])
+    if op.op == "erfinv":
+        value = arguments[0]
+        if value.dtype not in (mx.float32, mx.float64):
+            value = value.astype(mx.float32)
+        # MLX's own implementation, which is what keeps this within an ulp of
+        # ATen: refining Pavlis' rational approximation needs an accurate
+        # ``erf`` that the Metal standard library does not provide.
+        return mx.erfinv(value).astype(_MLX_DTYPES[output_type.dtype])
+    if op.op == "lgamma":
+        return _mlx_lgamma(arguments[0]).astype(_MLX_DTYPES[output_type.dtype])
+    if op.op == "i0":
+        return _mlx_i0(arguments[0]).astype(_MLX_DTYPES[output_type.dtype])
+    if op.op == "signbit":
+        return _mlx_signbit(arguments[0])
     if op.op == "sin":
         return mx.sin(arguments[0])
     if op.op == "cos":
@@ -6988,14 +6997,10 @@ def _evaluate_pointwise_mlx(
         integer_min = -(1 << (31 if value.dtype == mx.int32 else 63))
         integer_max = (1 << (31 if value.dtype == mx.int32 else 63)) - 1
         lower: mx.array | float = (
-            mx.array(integer_min, dtype=value.dtype)
-            if integral
-            else -float("inf")
+            mx.array(integer_min, dtype=value.dtype) if integral else -float("inf")
         )
         upper: mx.array | float = (
-            mx.array(integer_max, dtype=value.dtype)
-            if integral
-            else float("inf")
+            mx.array(integer_max, dtype=value.dtype) if integral else float("inf")
         )
         if "min_input" in op.attrs:
             lower = arguments[int(op.attrs["min_input"])]
@@ -7069,12 +7074,9 @@ def _attention_shared_memory_bytes(
     if key_tile == 64:
         score_workspace_bytes = query_tile * key_tile * 4
         probability_and_pv_bytes = (
-            query_tile * key_tile * element_bytes
-            + query_tile * pv_value_tile * 4
+            query_tile * key_tile * element_bytes + query_tile * pv_value_tile * 4
         )
-        score_and_pv_bytes = max(
-            score_workspace_bytes, probability_and_pv_bytes
-        )
+        score_and_pv_bytes = max(score_workspace_bytes, probability_and_pv_bytes)
         probability_bytes = 0
         pv_bytes = 0
     else:
@@ -7178,9 +7180,7 @@ def _decode_attention_config(
         if len(mask_shape) > 4:
             return None
     threads = _DECODE_ATTENTION_THREADS
-    shared_bytes = (
-        4 * key_length + 4 * threads + 4 * query_head_dim
-    )
+    shared_bytes = 4 * key_length + 4 * threads + 4 * query_head_dim
     if shared_bytes > _ATTENTION_MAX_SHARED_BYTES:
         return None
     return _DecodeAttentionConfig(
@@ -7235,19 +7235,15 @@ def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
         f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
         f"{indent}const device T* row = key_base + key * {query_dim}u;",
         f"{indent}float dot = 0.0f;",
-        f"{indent}for (uint dimension = 0u; dimension < {query_dim}u; "
-        "++dimension) {",
-        f"{indent * 2}dot = fma(query_shared[dimension], "
-        "float(row[dimension]), dot);",
+        f"{indent}for (uint dimension = 0u; dimension < {query_dim}u; ++dimension) {{",
+        f"{indent * 2}dot = fma(query_shared[dimension], float(row[dimension]), dot);",
         f"{indent}}}",
         f"{indent}float score = dot * float({config.scale!r});",
     ]
     if config.mask_shape is not None:
         mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
         if config.mask_is_boolean:
-            lines.append(
-                f"{indent}score = in_3[{mask_offset}] ? score : -INFINITY;"
-            )
+            lines.append(f"{indent}score = in_3[{mask_offset}] ? score : -INFINITY;")
         else:
             lines.append(f"{indent}score += float(in_3[{mask_offset}]);")
     lines.extend(
@@ -7289,8 +7285,7 @@ def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
             "}",
             "float inv_total = scratch[0] > 0.0f ? 1.0f / scratch[0] : 0.0f;",
             f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
-            f"{indent}scores[key] = metal::exp(scores[key] - row_max) "
-            "* inv_total;",
+            f"{indent}scores[key] = metal::exp(scores[key] - row_max) * inv_total;",
             "}",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
         ]
@@ -7388,9 +7383,7 @@ def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array
     )
     output = mx.squeeze(output, axis=1)
     if op.attrs.get("safe_softmax") and explicit_mask is not None:
-        output = _zero_fully_masked_rows(
-            mx.squeeze(explicit_mask, axis=1), output
-        )
+        output = _zero_fully_masked_rows(mx.squeeze(explicit_mask, axis=1), output)
     return output
 
 
