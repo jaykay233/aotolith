@@ -687,6 +687,19 @@ _ADDBMM_TARGET = "aten.addbmm.default"
 _ADDMV_TARGET = "aten.addmv.default"
 
 
+_TRILINEAR_TARGET = "aten._trilinear.default"
+"""``nn.Bilinear`` and ``F.bilinear``, which Torch writes as one trilinear
+product plus a bias add.
+
+``_trilinear(i1, i2, i3, expand1, expand2, expand3, sumdim)`` broadcasts the
+three operands into one rank by inserting singleton axes at ``expand`` and sums
+the product over ``sumdim``. Bilinear is the only caller this IR has to answer,
+and it always arrives in the same layout - ``(batch, out, in1, in2)`` summed
+over the last two axes - so the shape check below is what separates it from a
+general einsum with three operands, which is refused by name.
+"""
+
+
 _LDEXP_TARGET = "aten.ldexp.Tensor"
 
 
@@ -930,6 +943,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _DIST_TARGET,
         _ADDBMM_TARGET,
         _ADDMV_TARGET,
+        _TRILINEAR_TARGET,
         _LDEXP_TARGET,
         *_EMPTY_TARGETS,
     }

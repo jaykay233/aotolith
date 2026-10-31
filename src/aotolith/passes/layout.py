@@ -121,6 +121,11 @@ def _fold_matmul_operand_layouts(
             producer = graph.ops[producer_index]
             if producer.outputs != (operand_id,):
                 break
+            if not producer.inputs:
+                # A constant producer (``zeros``, ``ones``, ``scalar_tensor``)
+                # has no layout to fold; reading an input would fail. RNNCell
+                # and every other cell built from a zero hidden state hit this.
+                break
             operand_type = graph.value(operand_id).type
             source_type = graph.value(producer.inputs[0]).type
             if operand_type.dtype != source_type.dtype:

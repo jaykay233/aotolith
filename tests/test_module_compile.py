@@ -563,6 +563,69 @@ def test_compile_module_supports_multiple_tensor_outputs() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "batch_shape",
+    [pytest.param((), id="unbatched"), pytest.param((3,), id="one_batch_axis")],
+)
+def test_bilinear_is_a_batched_product_over_both_inputs(batch_shape) -> None:
+    # ``F.bilinear`` traces into ``_trilinear`` with the bilinear expand lists,
+    # which is one operator with no lowering of its own. Multiplication alone
+    # would materialize ``batch * out * in1 * in2`` values, so the ``in1`` axis
+    # has to be contracted by a product against the weight instead.
+    torch.manual_seed(17)
+    module = torch.nn.Bilinear(4, 5, 3).eval()
+    first = torch.randn(*batch_shape, 4)
+    second = torch.randn(*batch_shape, 5)
+    expected = module(first, second)
+
+    compiled = compile_module(module, (first, second))
+    (actual,) = compiled(_to_mlx(first), _to_mlx(second))
+    mx.eval(actual)
+
+    assert tuple(int(dim) for dim in actual.shape) == tuple(expected.shape)
+    assert mx.allclose(
+        actual, mx.array(expected.detach().numpy()), atol=1e-5, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: torch.nn.RNNCell(4, 5), id="RNNCell"),
+        pytest.param(lambda: torch.nn.GRUCell(4, 5), id="GRUCell"),
+        pytest.param(lambda: torch.nn.LSTMCell(4, 5), id="LSTMCell"),
+    ],
+)
+def test_a_recurrent_cell_starts_from_a_zero_hidden_state(build) -> None:
+    # ``nn.RNNCell`` traces its zero hidden state as a ``zeros`` node and feeds
+    # it straight into the first matmul, so the layout pass met a matmul
+    # operand with no input to read and raised ``IndexError`` before any kernel
+    # ran. Every cell takes that same path.
+    torch.manual_seed(11)
+    module = build().eval()
+    value = torch.randn(2, 4)
+    expected = module(value)
+    if not isinstance(expected, tuple):
+        # ``LSTMCell`` returns ``(h, c)``; the other two return the state alone.
+        expected = (expected,)
+
+    compiled = compile_module(module, (value,))
+    outputs = compiled(_to_mlx(value))
+    mx.eval(*outputs)
+
+    assert len(outputs) == len(expected)
+    for actual, reference in zip(outputs, expected, strict=True):
+        # The plan multiplies through MLX, whose GPU matmul on this class of
+        # device is looser than a float32 product: a single cell already shows
+        # that, so the comparison uses the tolerance the recurrent tests use.
+        assert mx.allclose(
+            actual,
+            mx.array(reference.detach().numpy()),
+            atol=2e-3,
+            rtol=2e-3,
+        )
+
+
 def test_compile_module_flattens_a_nested_output_in_reading_order() -> None:
     # ``nn.LSTM`` returns ``(output, (h_n, c_n))``. The plan has no structure of
     # its own, so the leaves come back flat in the order they are read; without

@@ -29,6 +29,7 @@ from .targets import (
     _LINALG_CHECK_TARGET,
     _MV_TARGET,
     _TRACE_TARGET,
+    _TRILINEAR_TARGET,
 )
 
 
@@ -711,6 +712,113 @@ def _lower_addmv(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_trilinear(lowering: Lowering, node: Any, target: str) -> bool:
+    """``_trilinear`` as the batched product ``nn.Bilinear`` is built from.
+
+    Torch traces ``F.bilinear(x, y, weight, bias)`` into
+    ``_trilinear(x, weight, y, expand1=[1, 3], expand2=[0], expand3=[1, 2],
+    sumdim=[2, 3])`` followed by the bias add, which is a separate node. In the
+    ``(batch, out, in1, in2)`` layout the expand lists give each operand the
+    axes it owns: ``x`` holds batch and ``in1``, the weight holds all three of
+    ``out``/``in1``/``in2``, and ``y`` holds batch and ``in2``.
+
+    Multiplying the three operands together would materialize ``batch * out *
+    in1 * in2`` values - 2**42 for a pair of 1024-wide inputs - so the ``in1``
+    axis is contracted by a matmul against the weight first, and only the
+    ``in2`` axis is left to the pointwise multiply that the sum then reduces.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 7:
+        raise ValueError(f"{target} expects seven arguments, got {len(args)}")
+    expand1, expand2, expand3, sumdim = args[3], args[4], args[5], args[6]
+    if (expand1, expand2, expand3, sumdim) != ([1, 3], [0], [1, 2], [2, 3]):
+        raise NotImplementedError(
+            f"{target} with expand {expand1}, {expand2}, {expand3} and sumdim "
+            f"{sumdim} is outside what this IR lowers; only the bilinear layout "
+            "((batch, out, in1, in2) summed over the last two axes) is supported"
+        )
+
+    first_id = _argument_ids(args[0], lowering.node_ids)
+    weight_id = _argument_ids(args[1], lowering.node_ids)
+    second_id = _argument_ids(args[2], lowering.node_ids)
+    first = lowering.values[first_id].type
+    weight = lowering.values[weight_id].type
+    second = lowering.values[second_id].type
+    if len(weight.shape) != 3:
+        raise ValueError(f"{target} weight must be rank 3, got {weight.shape}")
+    outputs, inner, contracted = weight.shape
+    if first.shape[-1] != inner:
+        raise ValueError(
+            f"{target} first operand {first.shape} does not match the weight's "
+            f"contraction size {inner}"
+        )
+    if second.shape[-1] != contracted:
+        raise ValueError(
+            f"{target} second operand {second.shape} does not match the weight's "
+            f"contraction size {contracted}"
+        )
+    if first.shape[:-1] != second.shape[:-1]:
+        raise ValueError(
+            f"{target} operands {first.shape} and {second.shape} do not share "
+            "a batch prefix"
+        )
+
+    dtype = first.dtype
+    output_type = _node_type(node)
+    batch = 1
+    for dim in first.shape[:-1]:
+        batch *= dim
+
+    # The contraction runs as a batched product: the first operand is a batch of
+    # row vectors and the weight a batch of ``(in1, in2)`` matrices, both rank 4
+    # so the ``out`` axis of the weight and the batch axis of the input
+    # broadcast against each other instead of meeting head-on.
+    first_id = lowering.emit(
+        "reshape",
+        (first_id,),
+        {"shape": (batch, 1, 1, inner)},
+        TensorType((batch, 1, 1, inner), dtype),
+    )
+    weight_id = lowering.emit(
+        "reshape",
+        (weight_id,),
+        {"shape": (1, outputs, inner, contracted)},
+        TensorType((1, outputs, inner, contracted), dtype),
+    )
+    second_id = lowering.emit(
+        "reshape",
+        (second_id,),
+        {"shape": (batch, 1, 1, contracted)},
+        TensorType((batch, 1, 1, contracted), dtype),
+    )
+    product_id = lowering.emit(
+        "matmul",
+        (first_id, weight_id),
+        {},
+        TensorType((batch, outputs, 1, contracted), dtype),
+    )
+    weighted_id = lowering.emit(
+        "mul",
+        (product_id, second_id),
+        {},
+        TensorType((batch, outputs, 1, contracted), dtype),
+    )
+    total_id = lowering.emit(
+        "sum",
+        (weighted_id,),
+        {"dims": (3,), "keepdim": False},
+        TensorType((batch, outputs, 1), dtype),
+    )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "reshape", (total_id,), {"shape": output_type.shape}, output_type
+        ),
+    )
+    return True
+
+
 def _scaled_bias(
     lowering: Lowering, input_id: str, beta: float, output_type: TensorType
 ) -> str:
@@ -753,6 +861,7 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _LINALG_CHECK_TARGET: (_lower_linalg_check,),
     _ADDBMM_TARGET: (_lower_addbmm,),
     _ADDMV_TARGET: (_lower_addmv,),
+    _TRILINEAR_TARGET: (_lower_trilinear,),
 }
 
 for _linalg_target in _LINALG_RESULTS:
