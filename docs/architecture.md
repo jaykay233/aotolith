@@ -53,7 +53,7 @@ artifact.py / compiler.py                               图 → 产物、整条�
 
 模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；它们在运行期和 artifact 里共享同一份 buffer 和 payload，见第 15 节。
 
-HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。模块返回嵌套结构时（`nn.LSTM` 的 `(output, (h_n, c_n))`）不需要包装：tensor 叶子按阅读顺序进入图输出，plan 按同样顺序返回扁平 tuple。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。提升是递归的：list、tuple、mapping 里嵌套的 tensor 也会逐个成为图输入（`position_embeddings=(cos, sin)` 对应一个关键字、两个图输入，`past_key_values=[(k, v), ...]` 同理），调用方按 tracing 时的嵌套结构传回同一个值。同一个值里非 tensor 的叶子仍是 tracing 期常量，调用时传入不同的值会报错，而不是被静默忽略。其余关键字参数整体仍是 tracing 期常量。
+HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。模块返回嵌套结构时（`nn.LSTM` 的 `(output, (h_n, c_n))`）不需要包装：tensor 叶子按阅读顺序进入图输出，plan 按同样顺序返回扁平 tuple；`None` 叶子不携带数据，直接跳过（`nn.MultiheadAttention(need_weights=False)` 返回 `(output, None)`，plan 只返回 output）。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。提升是递归的：list、tuple、mapping 里嵌套的 tensor 也会逐个成为图输入（`position_embeddings=(cos, sin)` 对应一个关键字、两个图输入，`past_key_values=[(k, v), ...]` 同理），调用方按 tracing 时的嵌套结构传回同一个值。同一个值里非 tensor 的叶子仍是 tracing 期常量，调用时传入不同的值会报错，而不是被静默忽略。其余关键字参数整体仍是 tracing 期常量。
 
 两层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 
@@ -244,7 +244,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 
 模块上未注册成 buffer 的普通 tensor 属性（`self.scale = torch.tensor([...])`）在捕获期间临时注册为 buffer：fake tracing 无法接受真实 tensor，而 `functional_call` 只会替换参数和 buffer，所以属性先进入 `_buffers`、从 `__dict__` 里让出（否则普通属性会遮蔽 buffer 查找），捕获结束后再原样还原。这些 tensor 因此以属性自身的名字成为 plan 状态，例如 `("block.weight", "scale", "block.mask")`：参数在前，buffer 按模块遍历顺序在后。
 
-`embedding` 保留为一个 IR op，输入顺序与 ATen 一致，为 `weight, indices`。前端要求 weight 是 rank-2 的 FP16/BF16/FP32 tensor，indices 是 `int32/int64`，输出 shape 为 `indices.shape + (embedding_dim,)`。`padding_idx` 只影响反向梯度，推理时允许并校验范围；`scale_grad_by_freq` 和 `sparse` 同样只影响反向传播。`max_norm` 会生成 `embedding_renorm_` 节点，当前不进入这个 lowering。Runtime 用 `mx.take(weight, indices, axis=0)` 执行 gather，不生成 Metal kernel。
+`embedding` 保留为一个 IR op，输入顺序与 ATen 一致，为 `weight, indices`。前端要求 weight 是 rank-2 的 FP16/BF16/FP32 tensor，indices 是 `int32/int64`，输出 shape 为 `indices.shape + (embedding_dim,)`。`padding_idx` 只影响反向梯度，推理时允许并校验范围；`scale_grad_by_freq` 和 `sparse` 同样只影响反向传播。`max_norm` 会在 trace 里生成一条 `aten.embedding_renorm_`，它就地改写了被索引选中的那几行权重，而 plan 既不改写输入也不改写绑定的权重，于是 gather 会读编译时的旧表——返回值看起来合理，却忽略了范数。legalize 因此在 lowering 之前点名拒绝它，并给出做法：在 traced function 之外先把权重归一化，再用 `max_norm=None` 编译。这条能被看到，是因为"没人读的节点直接跳过"的规则只对纯算子成立：`embedding_renorm_` 的结果确实没人读，但 ATen schema 说它是 mutable 的，所以它仍然进 legalization，由别名检查或这条点名错误拦住Runtime 用 `mx.take(weight, indices, axis=0)` 执行 gather，不生成 Metal kernel。
 
 `index_select` 同样保留为独立 IR op，输入为 `source, indices`，归一化后的轴写入 `dim` attribute。前端要求 source rank 至少为 1，indices rank 为 1 且 dtype 为 `int32/int64`，输出只把 source 的 `dim` 轴替换为 indices 长度，并保持 source dtype。Runtime 映射到 `mx.take(source, indices, axis=dim)`；由于 MLX 会回绕负索引并把越界索引填成零，而 PyTorch 会报错，Runtime 在 gather 前显式检查 `[0, source.shape[dim])`。
 

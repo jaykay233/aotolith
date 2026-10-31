@@ -32,6 +32,7 @@ from .fx import (
     _constant_value,
     _node_type,
     _reject_data_dependent_shapes,
+    _reject_embedding_renorm,
     _reject_random_draw,
     _reject_unsupported_dropout,
     _tensor_type,
@@ -59,6 +60,24 @@ Their results are usually unread - the program reads the buffer they filled -
 so the dead-node rule below cannot use "nothing reads this" as a reason to drop
 them.
 """
+
+
+def _mutates_storage(node: Any) -> bool:
+    """Whether a ``call_function`` writes into one of its operands.
+
+    ``_WRITE_TARGETS`` names the mutable targets the families lower, but the
+    traced graph can also carry one no family claims: ``F.embedding`` with
+    ``max_norm`` emits ``aten.embedding_renorm_``, whose result is discarded,
+    and the dead-node rule below used to skip it - the gather then read the
+    untouched weight table and returned numbers that looked plausible. The ATen
+    schema says which operators are mutable, so the rule asks it rather than
+    keeping a list that can fall behind.
+    """
+
+    if str(getattr(node, "target", "")) in _WRITE_TARGETS:
+        return True
+    schema = getattr(getattr(node, "target", None), "_schema", None)
+    return bool(getattr(schema, "is_mutable", False))
 
 
 def _empty_value_nodes(traced: Any) -> set[Any]:
@@ -121,6 +140,7 @@ def legalize(
     _reject_unsupported_dropout(traced.graph)
     _reject_random_draw(traced.graph)
     _reject_data_dependent_shapes(traced.graph)
+    _reject_embedding_renorm(traced.graph)
     lowering = Lowering(traced, promoted_constants)
     node_ids = lowering.node_ids
     values = lowering.values
@@ -155,7 +175,7 @@ def legalize(
             if node in node_ids:
                 continue
             target = str(node.target)
-            if not node.users and target not in _WRITE_TARGETS:
+            if not node.users and not _mutates_storage(node):
                 # Nothing reads this node, so the result pruning would drop it
                 # anyway; skipping it here also lets a dead allocation the
                 # tracer left behind (``aten.empty`` for a saved-tensor buffer)

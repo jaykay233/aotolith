@@ -563,6 +563,50 @@ def test_compile_module_supports_multiple_tensor_outputs() -> None:
         )
 
 
+def test_a_none_leaf_in_the_output_is_dropped() -> None:
+    # ``nn.MultiheadAttention(need_weights=False)`` returns ``(output, None)``,
+    # which is the spelling every transformer block uses. ``None`` carries no
+    # data, so the plan returns the tensors it has rather than refusing the
+    # module for a leaf that has nothing to compile.
+    torch.manual_seed(23)
+    module = torch.nn.MultiheadAttention(8, 2, batch_first=True).eval()
+    query = torch.randn(2, 4, 8)
+    key = torch.randn(2, 5, 8)
+
+    with torch.no_grad():
+        expected = module(query, key, key, need_weights=False)[0]
+    compiled = compile_module(module, (query, key, key), example_kwargs={"need_weights": False})
+    actual = compiled(
+        mx.array(query.numpy()), mx.array(key.numpy()), mx.array(key.numpy())
+    )
+
+    assert len(actual) == 1
+    mx.eval(actual[0])
+    assert mx.allclose(actual[0], mx.array(expected.numpy()), atol=1e-3, rtol=1e-4)
+
+
+def test_an_embedding_with_max_norm_is_refused_before_its_table_is_read() -> None:
+    # ``max_norm`` renormalizes the rows an index selects, in place, and the
+    # planned gather reads a table bound at compile time - so the write used to
+    # be dropped and the plan returned plausible numbers that ignored the norm.
+    # The refusal has to name the write and say to bake it into the table.
+    torch.manual_seed(29)
+    weight = torch.randn(10, 4)
+    indices = torch.randint(0, 10, (2, 3))
+
+    with pytest.raises(NotImplementedError) as caught:
+        compile_callable(
+            lambda w, i: torch.nn.functional.embedding(i, w, max_norm=1.0),
+            (weight, indices),
+        )
+    assert "max_norm" in str(caught.value)
+    assert "bake" in str(caught.value).lower()
+
+    module = torch.nn.Embedding(10, 4, max_norm=1.0).eval()
+    with pytest.raises(NotImplementedError, match="max_norm"):
+        compile_module(module, (indices,))
+
+
 @pytest.mark.parametrize(
     "batch_shape",
     [pytest.param((), id="unbatched"), pytest.param((3,), id="one_batch_axis")],

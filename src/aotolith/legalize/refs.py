@@ -34,7 +34,9 @@ def _output_ids(output: object, node_ids: dict[object, str]) -> tuple[str, ...]:
     A module that returns ``(output, (h, c))`` - ``nn.LSTM`` - traces to a
     nested tuple of FX nodes. The plan returns a flat tuple of arrays in the
     order those leaves appear, so a nested structure is walked in reading
-    order rather than refused.
+    order rather than refused. ``None`` carries no data and is skipped:
+    ``nn.MultiheadAttention(need_weights=False)`` returns ``(output, None)``,
+    and the plan returns the output alone.
     """
 
     ids: list[str] = []
@@ -43,6 +45,8 @@ def _output_ids(output: object, node_ids: dict[object, str]) -> tuple[str, ...]:
         if isinstance(argument, (tuple, list)):
             for item in argument:
                 walk(item)
+            return
+        if argument is None:
             return
         ids.append(_argument_ids(argument, node_ids))
 

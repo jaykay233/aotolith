@@ -160,6 +160,30 @@ def _reject_random_draw(graph: object) -> None:
         )
 
 
+def _reject_embedding_renorm(graph: object) -> None:
+    """Refuse ``F.embedding`` with ``max_norm``, which writes its table.
+
+    ``max_norm`` renormalizes the rows an index selects, in place, before the
+    gather reads them. A plan neither mutates its inputs nor its bound weights,
+    so the gather would read the table as it was compiled - plausible numbers
+    that quietly ignore the norm. Baking the norm into the table beforehand is
+    the same arithmetic without the write, so the message asks for that.
+    """
+
+    for node in getattr(graph, "nodes", ()):
+        target = str(getattr(node, "target", ""))
+        if not target.startswith("aten.embedding_renorm_"):
+            continue
+        raise NotImplementedError(
+            f"F.embedding with max_norm renormalizes its weight table in place "
+            f"({target}), and a plan never mutates an input or a bound weight: "
+            "the gather would read the unrenormalized table. Bake the norm into "
+            "the table before compiling - renormalize the weight once outside "
+            "the traced function, then pass max_norm=None - so the weights "
+            "already hold the rows this plan should gather"
+        )
+
+
 # Operator whose metadata produced a symbolic length, and the name a user knows
 # it by. ``unique`` reports itself through the tuple-returning ``_unique2`` and a
 # ``getitem``, so the trace records a builtin rather than the operator the model
