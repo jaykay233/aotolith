@@ -2963,6 +2963,36 @@ def test_direct_scaled_dot_product_attention_causal() -> None:
     assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
+@pytest.mark.parametrize(("query_length", "key_length"), [(3, 5), (5, 3)])
+def test_direct_scaled_dot_product_attention_causal_with_uneven_lengths(
+    query_length: int, key_length: int
+) -> None:
+    """Torch aligns a causal mask at the top left, which is not MLX's mask.
+
+    MLX's own causal mask is aligned at the bottom right, so a query shorter or
+    longer than its keys has to be masked explicitly to agree with Torch.
+    """
+
+    def fn(query, key, value):
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=True
+        )
+
+    torch.manual_seed(31)
+    inputs = (
+        torch.randn(2, 2, query_length, 8),
+        torch.randn(2, 2, key_length, 8),
+        torch.randn(2, 2, key_length, 8),
+    )
+    result = compile_callable(fn, inputs)
+    assert [op.op for op in result.input_graph.ops] == ["attention"]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
 def test_direct_scaled_dot_product_attention_explicit_scale() -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(

@@ -33,12 +33,30 @@ def _mlx_variance(
     return mx.var(value, axis=dims, keepdims=keepdim) * scale
 
 
+def _causal_mask(query: mx.array, key: mx.array) -> mx.array:
+    """Torch's causal mask, aligned at the top left.
+
+    MLX's own ``"causal"`` mask aligns the two sequences at the bottom right,
+    which only agrees with Torch when the query and key lengths are equal. A
+    shorter query attends to the first ``query_length`` keys under Torch's rule,
+    so the mask is built explicitly as soon as the lengths differ.
+    """
+
+    rows = mx.arange(query.shape[-2])[:, None]
+    columns = mx.arange(key.shape[-2])[None, :]
+    additive = mx.array(0, dtype=query.dtype)
+    blocked = mx.array(-float("inf"), dtype=query.dtype)
+    return mx.where(rows >= columns, additive, blocked)
+
+
 def _evaluate_attention_mlx(op: Operation, env: dict[str, mx.array]) -> mx.array:
     query, key, value = (env[value_id] for value_id in op.inputs[:3])
     explicit_mask = env[op.inputs[3]] if len(op.inputs) == 4 else None
     mask = explicit_mask
     if op.attrs.get("causal"):
-        mask = "causal"
+        mask = (
+            "causal" if query.shape[-2] == key.shape[-2] else _causal_mask(query, key)
+        )
     scale = float(op.attrs["scale"])
 
     if query.ndim == 4:
