@@ -4321,6 +4321,24 @@ def test_a_comparison_over_the_values_is_refused_with_advice() -> None:
             compile_callable(fn, (value, value))
 
 
+def test_ctc_loss_is_refused_by_name_before_a_graph_exists() -> None:
+    # ``ctc_loss`` sums over an alignment picked from the label lengths, so its
+    # result length is a function of the values. Unlike ``nonzero`` there is no
+    # symbolic length to hand back: the fake kernel raises with nothing but the
+    # target name, so the refusal has to supply the operator's name and the way
+    # out rather than surfacing that bare string.
+    log_probs = torch.randn(3, 4, 5).log_softmax(2)
+    targets = torch.randint(0, 4, (2, 3))
+    with pytest.raises(ValueError) as caught:
+        compile_callable(
+            lambda a, b, c, d: torch.nn.functional.ctc_loss(a, b, c, d),
+            (log_probs, targets, torch.tensor([3, 2]), torch.tensor([2, 1])),
+        )
+    message = str(caught.value)
+    assert "ctc_loss (aten._ctc_loss.Tensor) returns a length" in message
+    assert "outside the compiled region" in message
+
+
 def test_a_float64_decomposition_says_where_the_float64_came_from() -> None:
     # ``quantile`` builds its result out of float64 constants, so the dtype
     # refusal fires even though every input is float32. Saying that in the

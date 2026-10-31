@@ -80,6 +80,49 @@ def _data_output_message(error: BaseException) -> str:
     )
 
 
+def _dynamic_output_shape_error() -> type[BaseException]:
+    """The exception fake tracing raises for a result it cannot even size.
+
+    ``nonzero`` and ``unique`` invent a symbolic length and are refused once
+    the graph exists, but ``ctc_loss`` has no shape to invent: its fake kernel
+    raises outright, before any node carries a name. Imported lazily for the
+    same reason as the guard.
+    """
+
+    try:
+        from torch._subclasses.fake_tensor import DynamicOutputShapeException
+    except ImportError:
+        return type("_NoDynamicOutputShape", (Exception,), {})
+    return DynamicOutputShapeException
+
+
+# Operators that raise the bare target name, and the name a user knows them by.
+_DYNAMIC_OUTPUT_NAMES = {
+    "aten._ctc_loss.Tensor": "ctc_loss",
+    "aten._ctc_loss.default": "ctc_loss",
+}
+
+
+def _dynamic_output_shape_message(error: BaseException) -> str:
+    """Explain an operator whose result length is a function of the values.
+
+    The exception carries nothing but the ATen target, so the refusal has to
+    supply the name and the way out - the same advice as the symbolic-length
+    refusal in legalization, written here because this operator never reaches
+    a graph.
+    """
+
+    target = str(error)
+    named = _DYNAMIC_OUTPUT_NAMES.get(target)
+    subject = f"{named} ({target})" if named else target
+    return (
+        f"{subject} returns a length computed from its values, and a plan can "
+        "only hold static shapes: fake tracing cannot size the result, so "
+        "there is no graph to lower. Pass the extent in from the input shape "
+        "instead, or run this operator outside the compiled region"
+    )
+
+
 def trace(
     fn: Callable[..., Any],
     example_inputs: Sequence[Any],
@@ -111,6 +154,8 @@ def trace(
         raise ValueError(_data_dependent_message(exc)) from exc
     except _data_dependent_output_error() as exc:
         raise ValueError(_data_output_message(exc)) from exc
+    except _dynamic_output_shape_error() as exc:
+        raise ValueError(_dynamic_output_shape_message(exc)) from exc
     except AssertionError as exc:
         if "Please convert all Tensors to FakeTensors" not in str(exc):
             raise
