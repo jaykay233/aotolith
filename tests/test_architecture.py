@@ -99,6 +99,7 @@ LAYERS: dict[str, int] = {
     "legalize.padding": 4,
     "legalize.linalg": 4,
     "legalize.attention": 4,
+    "legalize.kernels": 4,
     "codegen.norm": 5,
     "runtime.bounds": 5,
     # The composition point: trace, then legalize. It sits above both halves and
@@ -114,6 +115,7 @@ LAYERS: dict[str, int] = {
     "runtime.mlx_ops.scatter": 8,
     "runtime.mlx_ops.matmul": 8,
     "runtime.mlx_ops.attention": 8,
+    "runtime.mlx_ops.kernels": 8,
     "runtime": 8,
     "runtime.plan": 9,
     # One target's implementation, composing the three above.
@@ -177,6 +179,7 @@ MODULE_PATHS = {
     "legalize.padding": "legalize/padding.py",
     "legalize.linalg": "legalize/linalg.py",
     "legalize.attention": "legalize/attention.py",
+    "legalize.kernels": "legalize/kernels.py",
     "target": "target/__init__.py",
     "target.apple": "target/apple.py",
     "codegen": "codegen/__init__.py",
@@ -197,6 +200,7 @@ MODULE_PATHS = {
     "runtime.mlx_ops.scatter": "runtime/mlx_ops/scatter.py",
     "runtime.mlx_ops.matmul": "runtime/mlx_ops/matmul.py",
     "runtime.mlx_ops.attention": "runtime/mlx_ops/attention.py",
+    "runtime.mlx_ops.kernels": "runtime/mlx_ops/kernels.py",
     "runtime.plan": "runtime/plan.py",
     "backends": "backends/__init__.py",
     "backends.apple": "backends/apple.py",

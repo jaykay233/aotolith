@@ -27,6 +27,7 @@ from ..bounds import (
     _mlx_take_checked,
 )
 from .attention import _evaluate_attention_mlx, _mlx_variance
+from .kernels import _mlx_convolution
 from .layout import _MLX_LAYOUT_OPS, _evaluate_layout_mlx
 from .matmul import _apply_mlx_matmul_epilogue, _apply_mlx_matmul_norm
 from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
@@ -464,6 +465,8 @@ def _evaluate_mlx_op(
         rank = len(env[op.inputs[0]].shape)
         axis = int(op.attrs["dim"]) % rank
         return mx.concatenate([env[value_id] for value_id in op.inputs], axis=axis)
+    if op.op == "conv":
+        return _mlx_convolution(graph, op, env)
     if op.op in _MLX_LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
     if op.op == "matmul":

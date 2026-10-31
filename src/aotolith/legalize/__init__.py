@@ -35,7 +35,16 @@ from .fx import (
     _tensor_type,
 )
 from ..ir import Graph, Value
-from . import attention, elementwise, indexing, linalg, padding, reductions, views
+from . import (
+    attention,
+    elementwise,
+    indexing,
+    kernels,
+    linalg,
+    padding,
+    reductions,
+    views,
+)
 from .targets import _EMPTY_COPY_TARGETS
 from .state import Lowering
 
@@ -58,7 +67,16 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {}
 # node would be shadowed.
 PRE_HANDLERS: tuple[Handler, ...] = ()
 
-for _family in (views, indexing, attention, reductions, padding, linalg, elementwise):
+for _family in (
+    views,
+    indexing,
+    attention,
+    reductions,
+    padding,
+    linalg,
+    kernels,
+    elementwise,
+):
     for _target, _handlers in _family.HANDLERS.items():
         HANDLERS.setdefault(_target, ())
         HANDLERS[_target] += _handlers

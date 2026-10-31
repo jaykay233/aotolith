@@ -669,6 +669,9 @@ _BERNOULLI_TARGET = "aten.bernoulli_.float"
 _LAYER_NORM_TARGET = "aten.native_layer_norm.default"
 
 
+_CONV_TARGET = "aten.convolution.default"
+
+
 _SQUEEZE_ALL_TARGET = "aten.squeeze.default"
 
 
@@ -718,6 +721,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _LOGSUMEXP_TARGET,
         _BERNOULLI_TARGET,
         _LAYER_NORM_TARGET,
+        _CONV_TARGET,
         _SQUEEZE_ALL_TARGET,
     }
 )
