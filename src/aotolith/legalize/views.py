@@ -22,6 +22,7 @@ from .targets import (
     _SELECT_TARGET,
     _SEQUENCE_VIEW_TARGETS,
     _SQUEEZE_ALL_TARGET,
+    _UNFOLD_TARGET,
     _STACK_TARGET,
 )
 
@@ -463,6 +464,43 @@ def _lower_advanced_index(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_unfold(lowering: Lowering, node: Any, target: str) -> bool:
+    """``Tensor.unfold``: one strided read, so the window is never copied."""
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) < 4:
+        raise ValueError(f"{target} expects four arguments, got {len(args)}")
+    input_id = _argument_ids(args[0], lowering.node_ids)
+    input_type = lowering.values[input_id].type
+    axis = args[1] if not kwargs else kwargs.get("dimension", args[1])
+    size = args[2] if not kwargs else kwargs.get("size", args[2])
+    step = args[3] if not kwargs else kwargs.get("step", args[3])
+    if not isinstance(axis, int) or isinstance(axis, bool):
+        raise ValueError(f"{target}.dimension must be an integer, got {axis!r}")
+    normalized = axis % len(input_type.shape)
+    # The window count sits where the unfolded axis was and the window is
+    # appended last, which is the shape ATen's view reports.
+    windows = (input_type.shape[normalized] - size) // step + 1
+    shape = (
+        *input_type.shape[:normalized],
+        windows,
+        *input_type.shape[normalized + 1 :],
+        size,
+    )
+    attrs = {"dim": axis, "size": size, "step": step}
+    lowering.bind(
+        node,
+        lowering.emit(
+            "unfold",
+            (input_id,),
+            attrs,
+            TensorType(shape, input_type.dtype),
+        ),
+    )
+    return True
+
+
 def _lower_sequence_view(lowering: Lowering, node: Any, target: str) -> bool:
     lowering.emit_all(
         _sequence_view_operations(node, lowering.node_ids, lowering.next_index())
@@ -483,6 +521,7 @@ def _lower_stack(lowering: Lowering, node: Any, target: str) -> bool:
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _MATRIX_TRANSPOSE_TARGET: (_lower_matrix_transpose,),
     _SQUEEZE_ALL_TARGET: (_lower_squeeze_all,),
+    _UNFOLD_TARGET: (_lower_unfold,),
     _SELECT_TARGET: (_lower_select,),
     _INDEX_TARGET: (_lower_advanced_index,),
     _STACK_TARGET: (_lower_stack,),

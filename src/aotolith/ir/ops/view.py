@@ -151,6 +151,24 @@ def _squeeze_shape(op: Operation, shape: tuple[int, ...]) -> tuple[int, ...]:
     return shape[:axis] + shape[axis + 1 :]
 
 
+def _unfold_shape(op: Operation, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """``Tensor.unfold``: a window count at ``dim``, and the window appended last."""
+
+    axis = normalize_axis(op.attrs["dim"], len(shape), "unfold.dim")
+    size = op.attrs["size"]
+    step = op.attrs["step"]
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise ValueError(f"unfold.size must be a positive integer, got {size!r}")
+    if not isinstance(step, int) or isinstance(step, bool) or step <= 0:
+        raise ValueError(f"unfold.step must be a positive integer, got {step!r}")
+    if size > shape[axis]:
+        raise ValueError(f"unfold.size {size} exceeds the axis length {shape[axis]}")
+    windows = (shape[axis] - size) // step + 1
+    # The window count takes the unfolded axis's place and the window itself is
+    # appended last, so the axes after it keep their own dimensions.
+    return (*shape[:axis], windows, *shape[axis + 1 :], size)
+
+
 LAYOUT_RULES: dict[str, LayoutRule] = {
     "reshape": _reshape_shape,
     "transpose": _transpose_shape,
@@ -163,6 +181,7 @@ LAYOUT_RULES: dict[str, LayoutRule] = {
     "squeeze": _squeeze_shape,
     "contiguous": _identity_shape,
     "alias": _identity_shape,
+    "unfold": _unfold_shape,
 }
 
 
@@ -236,6 +255,16 @@ CONTRACTS: dict[str, OpContract] = {
         arity=(1, 1),
         shape=ShapeRule.FREE,
         attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_layout,
+    ),
+    "unfold": OpContract(
+        arity=(1, 1),
+        shape=ShapeRule.FREE,
+        attrs=(
+            AttrSpec("dim", AttrKind.INT),
+            AttrSpec("size", AttrKind.INT),
+            AttrSpec("step", AttrKind.INT),
+        ),
         extra=_check_layout,
     ),
     "contiguous": OpContract(arity=(1, 1), shape=ShapeRule.FREE, extra=_check_layout),

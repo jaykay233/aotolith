@@ -88,6 +88,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
 | `aten.diagonal.default`、`aten.diagonal_copy.default` | 展开成 `permute -> reshape -> slice` 的 strided view，不生成 kernel |
+| `aten.unfold.default` | `unfold`，一次 strided view：窗口数落在被展开的轴上、窗口自身追加到最后；ATen 返回 view，IR value 是 dense，所以读出来时物化一次 |
 | `aten.masked_fill.Tensor` | 降级成 `where`，操作数顺序为 `mask, value, input` |
 | `aten.logsumexp.default` | 组合 lowering：`amax` 平移 + `masked_fill` 抹掉无穷最大值 + `exp`/`sum`/`log`/`add` |
 | `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等；负数条目按 ATen 语义裁剪展开后的 extent，前端先发 `slice` 再把负宽度钳成 0 的 `pad` |

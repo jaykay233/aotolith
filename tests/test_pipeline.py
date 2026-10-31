@@ -2533,6 +2533,62 @@ def test_diagonal_reads_the_expected_elements() -> None:
     assert shifted.plan(source)[0].tolist() == [2.0, 6.0]
 
 
+@pytest.mark.parametrize(
+    ("shape", "dim", "size", "step"),
+    [
+        ((7,), 0, 2, 1),
+        ((2, 3, 7), 0, 2, 2),
+        ((2, 3, 7), -1, 3, 1),
+        ((1, 2, 5, 5), 2, 3, 1),
+        ((2, 3, 4, 5), 1, 2, 3),
+        ((2, 3, 6, 6), 3, 2, 2),
+    ],
+)
+def test_unfold_matches_pytorch(shape, dim, size, step) -> None:
+    def fn(value):
+        return value.unfold(dim, size, step)
+
+    torch.manual_seed(43)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    # A window is one strided read, so the plan copies nothing until the view
+    # is made contiguous and launches no kernel.
+    assert result.plan.kernels == ()
+    assert [op.op for op in result.lowered_graph.ops] == ["unfold"]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == tuple(expected.shape)
+    assert mx.array_equal(actual, expected)
+
+
+def test_unfold_puts_the_window_last_and_the_count_in_place() -> None:
+    # ATen keeps the axes after the unfolded one where they were and appends the
+    # window, so (2, 5) unfolded by two with a step of one is (2, 4, 2).
+    graph = compile_callable(
+        lambda value: value.unfold(1, 2, 1), (torch.zeros(2, 5),)
+    ).input_graph
+    (unfold,) = graph.ops
+    assert unfold.op == "unfold"
+    assert unfold.attrs == {"dim": 1, "size": 2, "step": 1}
+    assert graph.value(unfold.outputs[0]).type.shape == (2, 4, 2)
+
+
+def test_unfold_reads_the_expected_elements() -> None:
+    source = mx.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    stepped = compile_callable(
+        lambda value: value.unfold(1, 2, 2), (torch.zeros(2, 3),)
+    )
+    assert stepped.plan(source)[0].tolist() == [[[1.0, 2.0]], [[4.0, 5.0]]]
+
+
+def test_unfold_rejects_a_window_wider_than_the_axis() -> None:
+    # Torch rejects it while tracing, so the error surfaces before lowering.
+    with pytest.raises(RuntimeError, match="maximum size for tensor"):
+        compile_callable(lambda value: value.unfold(0, 4, 1), (torch.zeros(3),))
+
+
 def test_diagonal_rejects_an_offset_with_no_elements() -> None:
     with pytest.raises(NotImplementedError, match="no elements"):
         compile_callable(lambda value: torch.diagonal(value, 4), (torch.randn(3, 3),))

@@ -721,6 +721,9 @@ _RESIZE_TARGETS = frozenset(
 _SQUEEZE_ALL_TARGET = "aten.squeeze.default"
 
 
+_UNFOLD_TARGET = "aten.unfold.default"
+
+
 _COUNT_NONZERO_TARGETS = frozenset(
     {"aten.count_nonzero.default", "aten.count_nonzero.dim_IntList"}
 )
@@ -775,5 +778,6 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _LAYER_NORM_TARGET,
         _CONV_TARGET,
         _SQUEEZE_ALL_TARGET,
+        _UNFOLD_TARGET,
     }
 )

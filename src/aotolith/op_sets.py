@@ -175,6 +175,7 @@ LAYOUT_OPS = frozenset(
         "roll",
         "unsqueeze",
         "squeeze",
+        "unfold",
         "contiguous",
         "alias",
     }

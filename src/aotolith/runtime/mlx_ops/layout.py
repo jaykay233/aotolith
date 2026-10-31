@@ -109,6 +109,30 @@ def _evaluate_layout_mlx(graph: Graph, op: Operation, value: mx.array) -> mx.arr
             return value
         return mx.squeeze(value, axis=axis)
 
+    if op.op == "unfold":
+        # A window is a strided read, so nothing is copied until the view is
+        # made contiguous: ATen returns a view here, while an IR value is dense.
+        source = mx.contiguous(value)
+        axis = int(op.attrs["dim"]) % rank
+        size = int(op.attrs["size"])
+        step = int(op.attrs["step"])
+        windows = (source.shape[axis] - size) // step + 1
+        strides = [1] * rank
+        for index in range(rank - 2, -1, -1):
+            strides[index] = strides[index + 1] * source.shape[index + 1]
+        return mx.contiguous(
+            mx.as_strided(
+                source,
+                (*source.shape[:axis], windows, *source.shape[axis + 1 :], size),
+                (
+                    *strides[:axis],
+                    step * strides[axis],
+                    *strides[axis + 1 :],
+                    strides[axis],
+                ),
+            )
+        )
+
     if op.op == "contiguous":
         return mx.contiguous(value)
 
