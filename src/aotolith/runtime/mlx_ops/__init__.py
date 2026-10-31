@@ -180,6 +180,26 @@ def _mlx_histc(op: Operation, env: dict[str, mx.array], graph: Graph) -> mx.arra
     return counts.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
 
 
+def _evaluate_kv_cache_append(
+    graph: Graph, op: Operation, env: dict[str, mx.array]
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Roll one layer's window by one slot and write the new pair into it."""
+
+    cache, key, source = (env[value_id] for value_id in op.inputs)
+    layer = int(op.attrs["layer"])
+    heads, head_dim = cache.shape[3], cache.shape[5]
+    start = int(op.attrs["value_start"])
+    value = source[:, -1, start : start + heads * head_dim].reshape(
+        source.shape[0], heads, 1, head_dim
+    )
+    pair = cache[layer]
+    row = mx.concatenate(
+        (mx.expand_dims(key, 0), mx.expand_dims(value, 0)), axis=0
+    )
+    new_pair = mx.concatenate((pair[:, :, :, 1:, :], row), axis=3)
+    return new_pair, new_pair[0], new_pair[1]
+
+
 def _evaluate_mlx_op(
     graph: Graph, op: Operation, env: dict[str, mx.array]
 ) -> mx.array | tuple[mx.array, ...]:
@@ -201,6 +221,8 @@ def _evaluate_mlx_op(
         return body_env[op.outputs[0]]
     if op.op == "attention":
         return _evaluate_attention_mlx(op, env)
+    if op.op == "kv_cache_append":
+        return _evaluate_kv_cache_append(graph, op, env)
     if op.op == "rope":
         value, cosine, sine = (env[value_id] for value_id in op.inputs)
         half = value.shape[-1] // 2

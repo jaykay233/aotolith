@@ -36,6 +36,7 @@ from ..planning import plan_storage
 from ..codegen.attention import AttentionLowering
 from ..codegen.dtypes import _MLX_DTYPES
 from ..codegen.index import IndexLowering
+from ..codegen.kv_cache import KVCacheLowering
 from ..codegen.matmul import (
     MatmulLowering,
     _matmul_batch_shape,
@@ -166,7 +167,31 @@ def _coerce_tune_input(value: Any, tensor_type: TensorType) -> mx.array:
     return array
 
 
-def _outputs_match(actual: mx.array, expected: mx.array, dtype: DType) -> bool:
+def _store_outputs(env: dict[str, Any], op: Operation, result: Any) -> None:
+    """Publish every result of ``op`` so the next operation can read it."""
+
+    if len(op.outputs) == 1:
+        env[op.outputs[0]] = result
+        return
+    for value_id, array in zip(op.outputs, result, strict=True):
+        env[value_id] = array
+
+
+def _outputs_match(actual: Any, expected: Any, dtype: DType) -> bool:
+    # An operator with several results is compared result by result: a kernel
+    # that writes the pair and hands back two views of it has to agree with the
+    # fallback on all three, not just on the one it wrote.
+    if isinstance(actual, (tuple, list)) or isinstance(expected, (tuple, list)):
+        if not isinstance(actual, (tuple, list)) or not isinstance(
+            expected, (tuple, list)
+        ):
+            return False
+        if len(actual) != len(expected):
+            return False
+        return all(
+            _outputs_match(one, other, dtype)
+            for one, other in zip(actual, expected, strict=True)
+        )
     if tuple(actual.shape) != tuple(expected.shape) or actual.dtype != expected.dtype:
         return False
     if dtype in {DType.BOOL, DType.I32, DType.I64}:
@@ -205,6 +230,7 @@ class AppleMetalBackend(
     AttentionLowering,
     NormLowering,
     IndexLowering,
+    KVCacheLowering,
 ):
     def __init__(
         self,
@@ -272,6 +298,8 @@ class AppleMetalBackend(
                 # the head dimension and its half must be multiples of four.
                 if graph.value(op.outputs[0]).type.shape[-1] % 8 == 0:
                     compiled = self._compile_rope(graph, op, index)
+            elif op.op == "kv_cache_append":
+                compiled = self._compile_kv_cache_append(graph, op, index)
             elif op.op == "attention":
                 if self.codegen_attention or self.autotune or self._wants_native(op):
                     compiled = self._compile_attention(graph, op, index)
@@ -464,7 +492,7 @@ class AppleMetalBackend(
                         device_architecture=device_architecture,
                     )
                 )
-                env[output_id] = fallback_result
+                _store_outputs(env, op, fallback_result)
                 continue
 
             if fallback_result is None:
@@ -476,7 +504,7 @@ class AppleMetalBackend(
                     lambda: candidate.runtime(*input_arrays),
                 )
                 mlx_benchmark = None
-                env[output_id] = native_result
+                _store_outputs(env, op, native_result)
             else:
                 mlx_benchmark = self._benchmark("mlx", None, fallback_runtime)
                 try:
@@ -512,7 +540,7 @@ class AppleMetalBackend(
                         min_seconds=None,
                         error=f"{type(exc).__name__}: {exc}",
                     )
-                env[output_id] = fallback_result
+                _store_outputs(env, op, fallback_result)
 
             native_seconds = native_benchmark.median_seconds
             mlx_seconds = (
@@ -537,7 +565,7 @@ class AppleMetalBackend(
                 reason = self._measured_reason(
                     "MLX fallback", mlx_seconds, native_seconds
                 )
-                env[output_id] = fallback_result
+                _store_outputs(env, op, fallback_result)
 
             benchmarks = (native_benchmark,)
             if mlx_benchmark is not None:

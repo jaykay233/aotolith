@@ -308,6 +308,97 @@ def _check_rope(graph: Graph, op: Operation) -> None:
             )
 
 
+def _check_kv_cache_append(graph: Graph, op: Operation) -> None:
+    """The window, the new key and the projection row have to agree.
+
+    ``cache`` is a whole layer-stacked cache ``[layers, 2, batch, heads, slots,
+    head_dim]`` so the write happens in one place, keyed by the ``layer``
+    attribute. ``key`` is this step's rotated row, ``[batch, heads, 1,
+    head_dim]``. ``source`` is the projection row the value is read out of:
+    the value half of the same step needs no rope, so the operator reads it
+    where the projection wrote it instead of asking the graph for three views
+    that only exist to undo the layout.
+
+    The three outputs are the new pair and its two halves, which is what the
+    rewrite replaces the frontend's slice-and-stack spelling with.
+    """
+
+    cache_type, key_type, source_type = (
+        graph.value(value_id).type for value_id in op.inputs
+    )
+    new_pair, key_window, value_window = (
+        graph.value(value_id).type for value_id in op.outputs
+    )
+    if len(cache_type.shape) != 6:
+        raise ValueError(
+            f"kv_cache_append cache must be [layers, 2, batch, heads, slots, dim], "
+            f"got {cache_type.shape}"
+        )
+    layers, pair, batch, heads, slots, head_dim = cache_type.shape
+    if pair != 2:
+        raise ValueError(
+            f"kv_cache_append cache must stack key and value on axis 1, "
+            f"got {cache_type.shape}"
+        )
+    layer = op.attrs.get("layer")
+    if not isinstance(layer, int) or isinstance(layer, bool):
+        raise ValueError(f"kv_cache_append needs an integer layer, got {layer!r}")
+    if not 0 <= layer < layers:
+        raise ValueError(
+            f"kv_cache_append layer {layer} is outside a cache of {layers} layers"
+        )
+    for name, operand_type in (("key", key_type), ("source", source_type)):
+        if operand_type.dtype != cache_type.dtype:
+            raise ValueError(
+                f"kv_cache_append {name} dtype {operand_type.dtype} does not match "
+                f"the cache dtype {cache_type.dtype}"
+            )
+    if key_type.shape != (batch, heads, 1, head_dim):
+        raise ValueError(
+            f"kv_cache_append key must be {(batch, heads, 1, head_dim)}, "
+            f"got {key_type.shape}"
+        )
+    if len(source_type.shape) != 3:
+        raise ValueError(
+            f"kv_cache_append source must be a projection row [batch, steps, width], "
+            f"got {source_type.shape}"
+        )
+    if source_type.shape[0] != batch or source_type.shape[1] < 1:
+        raise ValueError(
+            f"kv_cache_append source {source_type.shape} does not start with "
+            f"{(batch, 1)}"
+        )
+    value_start = op.attrs.get("value_start")
+    if not isinstance(value_start, int) or isinstance(value_start, bool):
+        raise ValueError(
+            f"kv_cache_append needs an integer value_start, got {value_start!r}"
+        )
+    value_width = heads * head_dim
+    if value_start < 0 or value_start + value_width > source_type.shape[2]:
+        raise ValueError(
+            f"kv_cache_append value_start {value_start} with {value_width} values "
+            f"does not fit a source row of {source_type.shape[2]}"
+        )
+    if slots < 2:
+        raise ValueError(f"kv_cache_append needs room to roll, got {slots} slots")
+    if new_pair.shape != (pair, batch, heads, slots, head_dim):
+        raise ValueError(
+            f"kv_cache_append new pair must be "
+            f"{(pair, batch, heads, slots, head_dim)}, got {new_pair.shape}"
+        )
+    for name, window_type in (("key", key_window), ("value", value_window)):
+        if window_type.shape != (batch, heads, slots, head_dim):
+            raise ValueError(
+                f"kv_cache_append {name} window must be "
+                f"{(batch, heads, slots, head_dim)}, got {window_type.shape}"
+            )
+        if window_type.dtype != cache_type.dtype:
+            raise ValueError(
+                f"kv_cache_append {name} window dtype {window_type.dtype} does not "
+                f"match the cache dtype {cache_type.dtype}"
+            )
+
+
 def _check_attention(graph: Graph, op: Operation) -> None:
     query_type, key_type, value_type = (
         graph.value(value_id).type for value_id in op.inputs[:3]
@@ -481,6 +572,24 @@ CONTRACTS: dict[str, OpContract] = {
         attrs=(),
         native=True,
         extra=_check_rope,
+    ),
+    # One step of a rolling KV cache: slide the window down one slot, write this
+    # step's key and value into the freed slot, and hand back both the window for
+    # attention and the two halves of the new pair. It exists as one operator
+    # because the frontend spells it as nine - a slice of the window, two
+    # unsqueezes, a stack, the concatenate, and four slices to split the pair
+    # back apart - and each of those was a launch in a decode step.
+    "kv_cache_append": OpContract(
+        arity=(3, 3),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        outputs=(3, 3),
+        attrs=(
+            AttrSpec("layer", AttrKind.INT),
+            AttrSpec("value_start", AttrKind.INT),
+        ),
+        native=True,
+        extra=_check_kv_cache_append,
     ),
     "attention": OpContract(
         arity=(3, 4),

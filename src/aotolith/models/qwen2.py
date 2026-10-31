@@ -434,7 +434,11 @@ class Qwen2DecodeModule(_Qwen2StaticBase):
             # Writing straight to ``positions`` with a scatter reads better, but
             # MLX lowers it to an index-compare pass over the whole window while
             # a concatenate is a straight copy of the same bytes; measured on
-            # decode it cost 0.18 ms per step, so the roll stays.
+            # decode it cost 0.18 ms per step, so the roll stays. This spelling
+            # is only what the tracer records: ``fuse_kv_cache_update`` folds the
+            # slice, stack, concatenate and both unpackings into one
+            # ``kv_cache_append``, whose kernel is that single copy with the
+            # index arithmetic inside it.
             next_key_value = torch.cat(
                 (
                     cache[layer_index, :, :, :, 1:, :],

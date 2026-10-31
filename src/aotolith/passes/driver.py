@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from ..ir import Graph
+from .cache import fuse_kv_cache_update
 from .canonicalize import canonicalize_batched_matmul
 from .cse import eliminate_common_subexpressions
 from .fusion import (
@@ -30,6 +31,10 @@ from .quantize import fold_quantized_weights
 #: Names and functions, in order, with the reason each one sits where it does.
 #: The names are kept so a test can assert the order without calling anything.
 PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
+    # The KV-cache roll is matched against the frontend's own spelling - a
+    # slice, a squeeze, two unsqueezes and a concatenate - so it has to run
+    # before any pass that would tidy those views away.
+    ("fuse_kv_cache_update", fuse_kv_cache_update),
     # Dead layout work first: every later matcher reads shapes through whatever
     # the frontend left behind, and would otherwise have to see through it.
     ("simplify_layouts", simplify_layouts),

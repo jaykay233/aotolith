@@ -179,6 +179,48 @@ def _qwen2_prefill() -> tuple[Any, tuple[Any, ...]]:
     )
 
 
+def _qwen2_decode() -> tuple[Any, tuple[Any, ...]]:
+    """One Qwen2 decode step: the whole adapter, including the KV-cache roll.
+
+    The roll is the part worth gating here. Spelled out it is a slice of the
+    layer's pair, a stack of the two new rows, a concatenate, and a slice plus a
+    squeeze per half; ``fuse_kv_cache_update`` folds all of that into one
+    ``kv_cache_append`` per layer. When that match stops firing, ``input_ops``
+    and ``lowered_ops`` jump and the gate fails on the count, with no timing
+    noise involved.
+    """
+
+    import torch
+    import transformers
+
+    from .models.qwen2 import Qwen2DecodeModule
+
+    capacity = 128
+    config = transformers.Qwen2Config(
+        vocab_size=256,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=256,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(5)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    module = Qwen2DecodeModule(model, cache_capacity=capacity).eval()
+    cache = torch.zeros(
+        (2, 2, 1, 2, capacity, module.head_dim), dtype=torch.float32
+    )
+    return module, (
+        torch.zeros((1, 1), dtype=torch.int64),
+        torch.tensor([[7]], dtype=torch.int64),
+        torch.ones((1, 1, 1, capacity), dtype=torch.bool),
+        cache,
+    )
+
+
 def _packed_gemv() -> tuple[Any, tuple[Any, ...]]:
     """A decode-shaped matmul against an int4 weight, on the streaming kernel.
 
@@ -217,6 +259,7 @@ WORKLOADS: tuple[Workload, ...] = (
     Workload("attention_causal_128", _causal_attention, codegen_attention=True),
     Workload("packed_gemv_2048", _packed_gemv),
     Workload("qwen2_prefill_128", _qwen2_prefill, optional=True),
+    Workload("qwen2_decode_128", _qwen2_decode, optional=True),
 )
 
 

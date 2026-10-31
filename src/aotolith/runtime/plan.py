@@ -266,8 +266,6 @@ def _compile_plan_runner(plan: CompiledPlan) -> Callable[..., Any] | None:
 
     graph = plan.graph
     ops = graph.ops
-    if any(len(op.outputs) != 1 for op in ops):
-        return None
 
     names: dict[str, str] = {
         value_id: f"i{position}" for position, value_id in enumerate(graph.inputs)
@@ -286,9 +284,20 @@ def _compile_plan_runner(plan: CompiledPlan) -> Callable[..., Any] | None:
             return None
         thunk_name = f"t{index}"
         namespace[thunk_name] = thunk
-        target = f"v{index}"
-        names[op.outputs[0]] = target
-        body.append(f"    {target} = {thunk_name}({', '.join(arguments)})")
+        if len(op.outputs) == 1:
+            target = f"v{index}"
+            names[op.outputs[0]] = target
+            body.append(f"    {target} = {thunk_name}({', '.join(arguments)})")
+            continue
+        # A multi-output operator is one call that returns a tuple, so the
+        # targets are bound by unpacking rather than by a second evaluation.
+        # Keeping it unrolled matters: a plan with one such operator used to
+        # fall back to the interpreter for the whole graph.
+        targets = [f"v{index}_{position}" for position in range(len(op.outputs))]
+        for value_id, target in zip(op.outputs, targets, strict=True):
+            names[value_id] = target
+        joined = ", ".join(targets)
+        body.append(f"    {joined} = {thunk_name}({', '.join(arguments)})")
 
     returned: list[str] = []
     for value_id in graph.outputs:

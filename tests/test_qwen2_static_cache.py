@@ -242,6 +242,50 @@ def test_decode_step_writes_only_the_newest_slot() -> None:
     )
 
 
+def test_decode_graph_keeps_one_cache_operator_per_layer() -> None:
+    """A 24-layer decode step must lower to fewer than 700 operators.
+
+    The roll used to be spelled out: slice the oldest slot off the layer's pair,
+    stack the new key and value, concatenate, slice the pair apart and squeeze
+    both halves. That was eleven operators per layer, and it is the bulk of what
+    a decode step launched. The rewrite folds each chain into one
+    ``kv_cache_append``, so the count has to scale with the layer count alone
+    and stay under the budget the throughput work was aiming at.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=24,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(41)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    runtime = compile_qwen2_static_cache(
+        model,
+        prompt_length=4,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+
+    graph = runtime.decode.lowered_graph
+    appends = [op for op in graph.ops if op.op == "kv_cache_append"]
+    assert [op.attrs["layer"] for op in appends] == list(range(24))
+    assert len(graph.ops) < 700
+    # Nothing of the roll survives as general operators: the concatenate that
+    # rebuilt the pair, and the slices that unpacked it, are all gone.
+    assert not any(
+        op.op == "cat" and int(op.attrs["dim"]) % 4 == 3 for op in graph.ops
+    )
+
+
 def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() -> None:
     """Autotune must skip the MLX comparison, not fail, when there is none.
 

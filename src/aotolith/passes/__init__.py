@@ -13,6 +13,7 @@ matchers and the backend read it from there.
 from __future__ import annotations
 
 from ..op_sets import LAYOUT_OPS, POINTWISE_OPS
+from .cache import fuse_kv_cache_update
 from .canonicalize import canonicalize_batched_matmul
 from .cse import eliminate_common_subexpressions
 from .driver import PIPELINE, rewrite
@@ -40,6 +41,7 @@ __all__ = [
     "fuse_activation_epilogue",
     "fuse_attention",
     "fuse_gate_up_projection",
+    "fuse_kv_cache_update",
     "fuse_norm_scale",
     "fuse_pointwise",
     "fuse_residual_epilogue",

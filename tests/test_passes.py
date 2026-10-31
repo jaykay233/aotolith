@@ -18,6 +18,9 @@ from aotolith.ir import Graph
 
 def test_the_pipeline_runs_every_pass_once_in_the_documented_order() -> None:
     expected = [
+        # The KV-cache roll is matched against the frontend's own spelling, so
+        # it runs before any pass that would tidy those views away.
+        "fuse_kv_cache_update",
         "simplify_layouts",
         "canonicalize_batched_matmul",
         "fuse_attention",

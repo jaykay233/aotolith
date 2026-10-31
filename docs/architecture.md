@@ -372,6 +372,8 @@ Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention
 
 同一个 pass 还收紧了一处匹配条件。`_match_rms_norm_consumers` 会把归一化折进读它的投影的 prologue，让 GEMV 在加载输入行时顺便缩放。对打包权重这是免费的——prologue 本来就是生成的 Metal；但稠密投影退回 MLX，它会为每个读者重新推导一遍归一化，比算一次更慢。现在只有投影带 `weight_group_size` 时才吸收，稠密图保持一个独立的 `rms_norm`。
 
+`fuse_kv_cache_update` 折掉的是 decode 的 KV-cache 滚动链。前端把它写成每层一组：从分层 cache 里切出该层、切掉最旧一个 slot 得到窗口、把这一步的 key 和从投影行读出的 value 用 `unsqueeze -> cat` 拼成 pair、`cat` 到窗口上、再 `slice -> squeeze` 拆成两半喂给 attention；value 那一路还要额外付出 `slice -> reshape -> transpose` 三个只改布局的 view。每层 13 个 op、24 层一共 312 个，是 decode step 里最大的一块通用算子。pass 以那个 key 轴上的 `cat` 为锚点正向检查：窗口必须是 *同一个* pair 的前缀切片且端到端正好差一个 slot，pair 必须由层切片（可以藏在 `squeeze/reshape` 后面）从 6 维分层 cache 里取出，两半必须由 `slice(half, half+1)` 加一次 `squeeze` 解出、形状与算子输出一致，value 必须来自 projection 行的 `value_start` 处，且链上要删掉的每个 value 都不能被链外的 consumer 读到。命中的整条链换成一个 `kv_cache_append`：输入是整份 cache、这一步的 key 和打包的投影行，输出是新的 pair 和两个窗口。因为匹配依赖前端原始的 view 写法，它必须排在 `simplify_layouts` 之前。`tests/test_passes_cache.py` 覆盖四种不命中情形、改写前后的逐位一致、kernel 与 MLX fallback 的一致，以及多输出算子不会把 plan 退回解释执行；`tests/test_qwen2_static_cache.py` 断言 24 层 decode 的 lowering 少于 700 个 op。
+
 ## 4. Pointwise 融合
 
 `fuse_pointwise` 找出图的融合区域：
@@ -703,9 +705,11 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 `examples/tiny_transformer_generate.py` 把 prefill 和 decode 编译成两个静态计划，并由 Python host loop 串起 greedy 生成。这个例子用于验证 KV Cache 的图 ABI；生成循环仍由示例代码提供。batch 和 cache shape 固定，但每个 batch row 可以通过 mask 和 position 使用不同的有效长度。cache 布局是 `[batch, kv_heads, capacity, head_dim]`，每层分别返回 K 和 V。
 
 - prefill 图接收左侧 padding 的 prompt token、RoPE position、逐请求 bool mask，以及模型权重；它把 padded prompt 的 K/V 右对齐写入固定容量 cache。对应的 mask 为 `[B, 1, prompt_len, capacity]`，padding query 被整行 mask，每个有效 query 只能看到本请求有效区域中的 causal prefix。
-- decode 图接收每行一个 token、各自当前位置、`[B, 1, 1, capacity]` mask、每层旧 cache 和权重；它沿 sequence 维把 cache 左移一格，在末尾拼接当前 token 的 K/V，再返回 logits 和全部更新后的 cache。
+- decode 图接收每行一个 token、各自当前位置、`[B, 1, 1, capacity]` mask、每层旧 cache 和权重；它把 cache 的滚动与写入收成每层一个 `kv_cache_append`，再返回 logits 和全部更新后的 cache。
 - RoPE position 通过 `F.embedding` 从静态 cos/sin 表选行。这个操作已经能被现有 embedding lowering 执行，不需要新增 cache 专用算子。
 - 测试覆盖 `B=1` 和左侧 padding 的 `B=2`，第二个请求的有效 prompt 更短。连续三步 decode 会逐请求对照完整序列 forward 的 logits 和贪心 token，验证 padding、mask、position 和 cache 更新没有改变模型语义。
+
+`kv_cache_append` 的 lowering 在 `codegen/kv_cache.py`。对每个 `(half, batch, head)`，一个 head 的 slots 是连续的一段，所以「丢最旧一格、追加一格」就是这段往后挪一行再读：除末格是向量拷贝，末格从 key 张量或投影行里按 `value_start` 取，value 因此不需要先 materialize 成 `[B, H, 1, D]`。每线程搬四个元素（bf16 窗口八个字节），唯一的分支只判最后一行；`head_dim`、`value_start` 或投影行宽不是四的倍数时退回 MLX。两个窗口不是第二次拷贝，而是刚写好的 pair 上的 view。算子是三元组输出，`runtime/plan.py` 的展开式 runner 因此学会了 `v_0, v_1, v_2 = thunk(...)` 的绑定，多输出 kernel 不会被踢回解释执行。代价是它仍然整窗拷贝一遍（每层不到 100 KB），所以字节数没变，收益全在消失掉的 launch 上；真正免掉这次拷贝要按 slot 计数器寻址、让 attention 直接读环形窗口，那属于 attention kernel 的布局决定，尚未做。
 
 这个实现优先保证布局容易验证。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
 
@@ -721,7 +725,7 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 ## 13.5 性能回归门禁
 
-`aotolith/bench.py` 与 `aoto bench` 提供编译器自身的回归门禁。五个固定负载分别覆盖投影、gated MLP（`silu_mul_paired` epilogue 融合）、RMSNorm、causal attention 和 Qwen2 prefill 适配层；输入用固定 seed 的 torch 张量生成，不需要下载权重。
+`aotolith/bench.py` 与 `aoto bench` 提供编译器自身的回归门禁。固定负载覆盖投影、gated MLP（`silu_mul_paired` epilogue 融合）、RMSNorm、causal attention、量化 GEMV 流式 kernel、Qwen2 prefill 适配层和 Qwen2 decode 适配层；输入用固定 seed 的 torch 张量生成，不需要下载权重。decode 那一项就是 `kv_cache_append` 的闸门：一旦 `fuse_kv_cache_update` 不再命中，`input_ops` 和 `lowered_ops` 会立刻跳起来，不需要任何计时。
 
 门禁按可比性分成两半：
 

@@ -284,7 +284,7 @@ That sums to 3.96 ms of device time and 991 MB, against 4.30 ms measured for the
 
 Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel. The replay also flatters the tiny buckets for the opposite reason: the 24 instances of a bucket run back to back there, while in the real step each layer waits for the previous one, so per-launch figures for RoPE and attention are upper bounds and the table's sum only approximates the step.
 
-Two experiments in this area were measured and dropped. Writing the new key/value straight into slot `positions` and selecting the live slots with the mask reads better than rolling the window, but MLX lowers a scatter to an index-compare pass over the whole window where the concatenate is a straight copy of the same bytes: 0.18 ms slower per step, so the roll stays. And the rotary position for a decode token is `valid_length - 1`, not `valid_length`; `Qwen2StaticCacheRuntime.decode_token` documented the second and briefly used it, which cost 0.7 in max logit deviation against the reference and broke the exact-token match. It now matches all 64 tokens.
+Two experiments in this area were measured and dropped. Writing the new key/value straight into slot `positions` and selecting the live slots with the mask reads better than rolling the window, but MLX lowers a scatter to an index-compare pass over the whole window where the concatenate is a straight copy of the same bytes: 0.18 ms slower per step, so the roll stays. What did change later is that the roll stopped being eleven operators per layer — [it is one `kv_cache_append` now](#the-kv-cache-roll-is-one-operator), with the index arithmetic inside the kernel. And the rotary position for a decode token is `valid_length - 1`, not `valid_length`; `Qwen2StaticCacheRuntime.decode_token` documented the second and briefly used it, which cost 0.7 in max logit deviation against the reference and broke the exact-token match. It now matches all 64 tokens.
 
 ### Why the small buckets cannot be fixed
 
@@ -355,6 +355,25 @@ The before/after pairs are what the ratios rest on, and they are 1.08x and 1.17x
 The same pass exposed a second problem worth documenting because the fix is scoped rather than general. `_match_rms_norm_consumers` folds a normalization into the *prologue* of the projection that reads it, so the GEMV scales its input rows as it loads them. That is free for a packed projection, whose prologue is generated Metal. It is not free for a dense one, which falls back to MLX and would re-derive the normalization once per reader — slower than computing it once. The matcher now absorbs a normalization only when the projection carries a packed weight, and leaves dense graphs alone.
 
 
+### The KV-Cache Roll Is One Operator
+
+A decode step writes one key and one value per layer into a fixed-capacity window, and the spellings torch has for that are all longer than the fact. The adapter slices the oldest slot off the layer's pair, stacks this step's two new rows, concatenates them onto the window, then slices the pair apart again and squeezes both halves because attention wants them separate. That is eleven operators per layer, plus the three views — slice, reshape, transpose — that read the value back out of the projection row it was just computed in. Across 24 layers it was 312 of the step's 995 operators, a third of the graph, for a statement that fits in one line: slide the window down a slot, write the new key and value into the freed slot, hand back the window and its two halves.
+
+`kv_cache_append` is that line. It takes the whole layer-stacked cache, this step's key, and the packed projection row, and returns the new pair plus both windows. Its contract in `ir/ops/kernels.py` is where the meaning is written down: the cache is `[layers, 2, batch, heads, slots, dim]` with the pair on axis 1, `layer` says which slice of it this step owns, and `value_start` says where in the projection row the value half begins — the operator reads it there, so no shaped copy of it ever has to exist. `fuse_kv_cache_update` in `passes/cache.py` is the rewrite, and it is deliberately narrow: the concatenate has to build a pair exactly one slot longer than a window that is a front-slice of the *same* pair, the two halves have to be unpacked by a slice and a squeeze with exactly the shapes the operator produces, and nothing the rewrite deletes may be read by an operator outside the chain. A window that drops two slots, a value that is not the projection's, a pair with a third consumer — each keeps its general form. It runs first in the pipeline, because later passes would happily tidy the very views it has to see.
+
+The backend emits one kernel per layer. Per `(half, batch, head)` the slots are one contiguous run, so dropping the oldest and appending one is that run read one row further along: every slot but the last is a vector copy from the source, and the last slot is picked from the key tensor or from the projection row. Four elements per thread is eight bytes for a bf16 window, and the only branch is the one on the final row. It is still a copy of the whole window — under a hundred kilobytes per layer — so the bytes moved are unchanged and the win is entirely the launches that disappeared. The MLX fallback in `runtime/mlx_ops` computes the same three outputs for autotuning and for shapes the kernel declines, and the unrolled plan runner learned to bind multi-output operators so neither path is interpreted.
+
+Measured the same way as the section above — the pass off, on, off, on, in one session — on the 0.5B bf16 model:
+
+| | before | after |
+| --- | ---: | ---: |
+| graph ops per decode step | 995 | 683 |
+| decode, synchronized each step | 147.9 tok/s (6.76 ms) | 154.6 tok/s (6.47 ms) |
+| decode, asynchronous | 178.8 tok/s (5.59 ms) | 188.5 tok/s (5.30 ms) |
+| greedy tokens matching the reference | 64 / 64 | 64 / 64 |
+
+A third of the graph bought 1.045x and 1.054x, not a third of the throughput, and that is the honest reading: these were the cheapest operators in the step, each moving a window smaller than the smallest projection row. What it does settle is that the cost really is per launch — an operator that only copies 90 kB costs about as much as one that moves 2 MB, and removing 312 of them is worth what the launch floor predicts. The obvious next move is the one this rewrite sets up but does not take: with the write indexed by a slot counter instead of by position, the window would not have to shift at all, and the kernel would be a single row store. That changes what attention reads, so it belongs with the attention kernel rather than here.
+
 ### Command Line And Artifacts
 
 The installed `aoto` command compiles a callable, module, or HuggingFace model. It can also inspect or execute the result without importing the original model.
@@ -393,7 +412,7 @@ Use repeated `--input '<json>'` arguments instead of `--input-file` when conveni
 
 A tensor keyword argument becomes a graph input, written here as `NAME=<json spec>`: `aoto compile ... --forward-kwarg position_ids='{"shape":[1,4],"dtype":"int64","data":[[0,1,2,3]]}'` and `aoto run ... --kwarg position_ids=...`. `aoto inspect` lists them under `entrypoint.kwargs`.
 
-`aoto bench` is the regression gate for the compiler itself. It measures a fixed set of shapes — a projection, a gated MLP, an RMSNorm, causal attention, and the Qwen2 prefill adapter — and can compare the result against a recorded baseline:
+`aoto bench` is the regression gate for the compiler itself. It measures a fixed set of shapes — a projection, a gated MLP, an RMSNorm, causal attention, an int4 GEMV, and the Qwen2 prefill and decode adapters — and can compare the result against a recorded baseline:
 
 ```bash
 aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-report.json

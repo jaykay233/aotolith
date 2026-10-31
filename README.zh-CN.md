@@ -282,7 +282,7 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 有三种做法会把这个表测成“什么都没测”，而且看起来都很正常。一是每轮丢掉输出的数组，惰性图在到达设备之前就被释放，墙钟时间只覆盖 host 提交，带宽那一列会算出 1 TB/s 以上。二是传全零权重，驱动可以跳过读取，小分桶因此被抬高。一个分桶必须让每一轮的输出都活着，并且喂真实数值，它的数字才有意义；任何超过 `mx.sum` 读同样字节能达到的读数，测的是 harness 而不是 kernel。三是回放本身会往反方向偏：表里同一个分桶的 24 个实例是连着跑的，而真实 step 里每一层都要等上一层，所以 RoPE 和 attention 的单次数字是上界，整表的和只是近似整个 step。
 
-这个方向上有两个实验被测过并放弃。把新的 key/value 直接写到 slot `positions`、用 mask 挑出有效 slot，读起来比滚动窗口更顺，但 MLX 会把 scatter 降级成对整窗口做一遍下标比较，而 concatenate 只是同样字节数的一次拷贝：每个 step 慢 0.18 ms，所以保留滚动。另外，decode token 的旋转位置是 `valid_length - 1` 而不是 `valid_length`；`Qwen2StaticCacheRuntime.decode_token` 曾把后者写进文档并短暂使用，代价是相对参考实现 0.7 的 logit 最大偏差，token 也无法完全对齐。现在 64 个 token 全部一致。
+这个方向上有两个实验被测过并放弃。把新的 key/value 直接写到 slot `positions`、用 mask 挑出有效 slot，读起来比滚动窗口更顺，但 MLX 会把 scatter 降级成对整窗口做一遍下标比较，而 concatenate 只是同样字节数的一次拷贝：每个 step 慢 0.18 ms，所以保留滚动。后来变的是滚动的写法——它不再是每层十一个 op，而是[每层一个 `kv_cache_append`](#把-kv-cache-滚动链收成一个算子)，下标算术挪进了 kernel 里。另外，decode token 的旋转位置是 `valid_length - 1` 而不是 `valid_length`；`Qwen2StaticCacheRuntime.decode_token` 曾把后者写进文档并短暂使用，代价是相对参考实现 0.7 的 logit 最大偏差，token 也无法完全对齐。现在 64 个 token 全部一致。
 
 ### 为什么小分桶修不动
 
@@ -352,6 +352,25 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 同一个 pass 还暴露出第二个问题，值得记下来，因为修法是收窄的而不是通用的。`_match_rms_norm_consumers` 会把归一化折进读它的那个投影的 *prologue*，让 GEMV 在加载输入行的同时把它们缩放掉。对打包投影这是免费的，它的 prologue 是生成的 Metal。但对稠密投影不免费：它退回 MLX，会为 *每个* 读者重新推导一遍归一化，比只算一次更慢。现在这个匹配器只在投影带打包权重时才吸收归一化，稠密图保持原样。
 
+### 把 KV-cache 滚动链收成一个算子
+
+decode 每步要往一个固定容量的窗口里写每层的一个 key 和一个 value，而 torch 能表达这件事的写法都比这件事本身长。adapter 把该层 pair 最旧的那个 slot 切掉、把这一步的两行 stack 起来、cat 到窗口上，再把 pair 切开、squeeze 成两半，因为 attention 要分开读。每层十一个 op，再加上把 value 从刚算出的投影行里读回来所需的三个 view —— slice、reshape、transpose。24 层加起来是 312 个 op，占这个 step 995 个 op 的三分之一，而它们说的其实是一句话：窗口往前挪一格，把新的 key 和 value 写进腾出来的那一格，然后把窗口和它的两半交出来。
+
+`kv_cache_append` 就是这一句话。它吃整个分层 cache、这一步的 key，和打包的投影行，吐出新的 pair 和两个窗口。它的约定写在 `ir/ops/kernels.py` 里，语义就在那：cache 是 `[layers, 2, batch, heads, slots, dim]`，pair 在轴 1 上，`layer` 说明这一步拥有它的哪一层，`value_start` 说明 value 那一半从投影行的哪个位置开始 —— 算子直接在那里读，所以它的形状副本从不需要存在。重写在 `passes/cache.py` 的 `fuse_kv_cache_update`，它刻意很窄：concat 必须把 pair 造得比一个窗口正好长一个 slot，而这个窗口必须是 *同一个* pair 的前缀切片；两个半边必须由一个 slice 和一个 squeeze 解出、形状与算子输出完全一致；重写要删掉的任何值都不能被链外的算子读到。窗口少切两个 slot、value 不是投影来的、pair 还有第三个读者 —— 每一种都保持通用写法。它在流水线里排第一个，因为后面的 pass 会很高兴地把这些必须被看见的 view 整理掉。
+
+后端每层发一个 kernel。对每个 `(half, batch, head)`，所有 slot 是连续的一段，所以「丢掉最旧的一个再追加一个」等价于这段往后挪一行再读：除了最后一格是向量拷贝，末格从 key 张量或投影行里挑。每线程四个元素，bf16 窗口就是八个字节，唯一的分支只判最后一行。它仍然是把整个窗口拷一遍 —— 每层不到一百 KB —— 所以搬运的字节没有变，收益全部来自消失掉的那些 launch。`runtime/mlx_ops` 里的 MLX fallback 为自动调优和 kernel 拒绝的形状算出同样的三个输出，展开式 plan runner 也学会了绑定多输出算子，因此两条路径都不会退回解释执行。
+
+和上一节同样的测法 —— 同一个会话里关、开、关、开 —— 在 0.5B bf16 模型上：
+
+| | 改前 | 改后 |
+| --- | ---: | ---: |
+| 每步图 op 数 | 995 | 683 |
+| decode（每步同步） | 147.9 token/s（6.76 ms） | 154.6 token/s（6.47 ms） |
+| decode（异步） | 178.8 token/s（5.59 ms） | 188.5 token/s（5.30 ms） |
+| 与参考一致的 greedy token | 64 / 64 | 64 / 64 |
+
+三分之一图换来了 1.045x 和 1.054x，而不是三分之一的吞吐，这就是诚实的读法：这些是整个 step 里最便宜的算子，每个搬的窗口比最小的投影行还小。它真正确认的是成本确实按 launch 计 —— 一个只拷 90 kB 的算子和一个搬 2 MB 的算子花费相近，删掉 312 个换来的就是 launch 地板预言的那么多。顺理成章的下一步正是这次重写铺好却没有走的那一步：如果写入按 slot 计数寻址，窗口根本不必挪动，kernel 就只剩一次单行写。但那改变了 attention 读到的布局，属于 attention kernel 的事，而不是这里。
+
 ### 命令行与编译产物
 
 安装后可以用 `aoto` 编译 callable、module 或 HuggingFace 模型。产物也可以在不导入原始模型的情况下检查和执行。
@@ -390,7 +409,7 @@ aoto run model.aoto --input-file inputs.json --output outputs.json
 
 tensor 关键字参数会变成图输入，写作 `NAME=<json spec>`：`aoto compile ... --forward-kwarg position_ids='{"shape":[1,4],"dtype":"int64","data":[[0,1,2,3]]}'`，运行时用 `aoto run ... --kwarg position_ids=...`。`aoto inspect` 会把它们列在 `entrypoint.kwargs` 下。
 
-`aoto bench` 是编译器自身的回归门禁：测量一组固定 shape（projection、gated MLP、RMSNorm、causal attention 和 Qwen2 prefill 适配层），并可与记录的 baseline 比对：
+`aoto bench` 是编译器自身的回归门禁：测量一组固定 shape（projection、gated MLP、RMSNorm、causal attention、int4 GEMV，和 Qwen2 prefill／decode 适配层），并可与记录的 baseline 比对：
 
 ```bash
 aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-report.json
