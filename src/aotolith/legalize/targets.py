@@ -62,6 +62,7 @@ _SUPPORTED_OPS = {
     "aten.min.default": "amin",
     "aten.cumsum.default": "cumsum",
     "aten.cumprod.default": "cumprod",
+    "aten.logcumsumexp.default": "logcumsumexp",
     "aten.argmax.default": "argmax",
     "aten.argmin.default": "argmin",
     "aten.mean.default": "mean",

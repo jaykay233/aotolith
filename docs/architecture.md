@@ -69,6 +69,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
 | `aten.index.Tensor` | `index`，支持多轴 advanced indexing（含被静态/index 轴隔开的非相邻索引）和 index broadcasting |
 | `aten.cumsum.default`、`aten.cumprod.default` | `cumsum`、`cumprod`，沿单个静态轴执行前缀 scan，走 MLX |
+| `aten.logcumsumexp.default` | `logcumsumexp`，沿单个静态轴的 log 域 scan，逐步 `logaddexp`，走 MLX |
 | `aten.t.default` | `transpose`，rank-2 矩阵转置 |
 | `aten.gather.default` | `gather`，逐元素沿单个静态轴 gather |
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
@@ -128,6 +129,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.rsub.Scalar` | `rsub` |
 | `aten.div.Tensor`、`aten.div.Scalar` | `div` |
 | `aten.floor_divide.default`、`aten.floor_divide.Tensor`、`aten.floor_divide.Scalar` | `floor_divide` |
+| `aten.div.Tensor_mode`、`aten.div.Scalar_mode`（含原地形式） | 按 `rounding_mode` 选算子：`'trunc'` 是 `trunc_divide`、`'floor'` 是 `floor_divide`、`None` 是真除法 `div` |
 | `aten.remainder.Tensor`、`aten.remainder.Scalar`、`aten.remainder.Scalar_Tensor` | `remainder`；`Scalar_Tensor` 的被除数是标量，结果的符号仍跟随除数 |
 | `aten.fmod.Tensor`、`aten.fmod.Scalar` | `fmod` |
 | `aten.lerp.Tensor`、`aten.lerp.Scalar` | `lerp`，保留 tensor 或标量 weight |
@@ -135,6 +137,9 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.addcdiv.default` | `addcdiv`，保留 `value`（默认 1） |
 | `aten.pow.Tensor_Tensor`、`aten.pow.Tensor_Scalar`、`aten.pow.Scalar` | `pow` |
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
+| `aten.fmax.default`、`aten.fmin.default` | `fmax`、`fmin`，忽略 NaN 操作数，zero pair 按 `fmax` 取 `+0`、`fmin` 取 `-0` |
+| `aten.nextafter.default` | `nextafter`，按 IEEE-754 位模式步进，F16/BF16 在自己的位宽上走一步 |
+| `aten.gcd.default`、`aten.lcm.default` | `gcd`、`lcm`，只接受整数操作数，结果取幅值 |
 | `aten.logaddexp.default` | `logaddexp` |
 | `aten.atan2.default` | `atan2` |
 | `aten.heaviside.default` | `heaviside`，浮点与整数都支持 |

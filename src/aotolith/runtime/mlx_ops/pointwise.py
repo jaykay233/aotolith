@@ -187,10 +187,7 @@ def _evaluate_pointwise_mlx(
         return _mlx_lcm(left, right)
     if op.op == "logaddexp":
         left, right = _binary_mx_operands(op, arguments)
-        maximum = mx.where(left < right, right, left)
-        body = maximum + mx.log1p(mx.exp(-mx.abs(left - right)))
-        body = mx.where(mx.isinf(maximum), maximum, body)
-        return mx.where(mx.isnan(left) | mx.isnan(right), float("nan"), body)
+        return _mlx_logaddexp(left, right)
     if op.op == "atan2":
         left, right = _binary_mx_operands(op, arguments)
         return mx.arctan2(left, right)
@@ -602,6 +599,15 @@ def _mlx_signbit(value: mx.array) -> mx.array:
         return value < 0
     negative_zero = (value == 0.0) & (mx.sign(1.0 / value) < 0.0)
     return (value < 0.0) | negative_zero
+
+
+def _mlx_logaddexp(left: mx.array, right: mx.array) -> mx.array:
+    """``logaddexp`` on MLX, the shift ATen's log-domain kernels share."""
+
+    maximum = mx.where(left < right, right, left)
+    body = maximum + mx.log1p(mx.exp(-mx.abs(left - right)))
+    body = mx.where(mx.isinf(maximum), maximum, body)
+    return mx.where(mx.isnan(left) | mx.isnan(right), float("nan"), body)
 
 
 def _mlx_fmax(left: mx.array, right: mx.array) -> mx.array:

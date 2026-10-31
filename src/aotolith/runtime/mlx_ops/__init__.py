@@ -28,7 +28,7 @@ from ..bounds import (
 from .attention import _evaluate_attention_mlx, _mlx_variance
 from .layout import _MLX_LAYOUT_OPS, _evaluate_layout_mlx
 from .matmul import _apply_mlx_matmul_epilogue, _apply_mlx_matmul_norm
-from .pointwise import _evaluate_pointwise_mlx
+from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
 from .scatter import _mlx_scatter_reduce
 
 
@@ -233,6 +233,21 @@ def _evaluate_mlx_op(
         value = scan(env[op.inputs[0]], axis=axis)
         output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
         return value.astype(output_dtype)
+    if op.op == "logcumsumexp":
+        # The scan in the log domain: each step is ``logaddexp`` of the running
+        # total and the next element, which is stable by construction (the shift
+        # keeps every exponent at or below zero) and returns -inf, +inf and NaN
+        # the way ATen's kernels do instead of turning -inf - -inf into NaN.
+        value = env[op.inputs[0]]
+        axis = int(op.attrs["dim"]) % len(value.shape)
+        compute = value if value.dtype == mx.float32 else value.astype(mx.float32)
+        scanned = [mx.take(compute, 0, axis=axis)]
+        for position in range(1, compute.shape[axis]):
+            current = mx.take(compute, position, axis=axis)
+            scanned.append(_mlx_logaddexp(scanned[-1], current))
+        return mx.stack(scanned, axis=axis).astype(
+            _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        )
     if op.op == "cast":
         return env[op.inputs[0]].astype(
             _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]

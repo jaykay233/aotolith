@@ -193,6 +193,13 @@ CONTRACTS: dict[str, OpContract] = {
         attrs=(AttrSpec("dim", AttrKind.INT),),
         extra=_check_scan_shape,
     ),
+    "logcumsumexp": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.FLOATING_IN,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_scan_shape,
+    ),
     "sort": OpContract(
         arity=(1, 1),
         attrs=(

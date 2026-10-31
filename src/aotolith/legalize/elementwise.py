@@ -273,9 +273,10 @@ def _operation_inputs(
             raise ValueError(f"{op}.half_to_float must be a boolean, got {args[2]!r}")
         return ((_argument_ids(input_id, node_ids),), {"dim": dim})
 
-    if op in {"cumsum", "cumprod"}:
-        if len(args) not in {2, 3}:
-            raise ValueError(f"{op} expects two or three arguments, got {len(args)}")
+    if op in {"cumsum", "cumprod", "logcumsumexp"}:
+        arities = {2} if op == "logcumsumexp" else {2, 3}
+        if len(args) not in arities:
+            raise ValueError(f"{op} received unexpected arguments: {len(args)}")
         input_id, dim = args[:2]
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"{op}.dim must be an integer, got {dim!r}")
@@ -737,7 +738,7 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
         allowed.add("dim")
     if op in {"argmax", "argmin"}:
         allowed.update({"dim", "keepdim"})
-    if op in {"cumsum", "cumprod"}:
+    if op in {"cumsum", "cumprod", "logcumsumexp"}:
         allowed.update({"dim", "dtype"})
     if op == "flip":
         allowed.add("dims")
