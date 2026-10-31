@@ -28,6 +28,7 @@ from .msl import KernelArtifact, _MPP_HEADER
 from .norm import _emit_thread_rms_norm_prologue, _emit_warp_rms_norm_prologue
 from ..target import apple as target
 from ..target.apple import _select_mpp_gemm_config, _supports_mpp_matmul
+from ..ir.ops.kernels import _matmul_weight_group_size
 
 _MATMUL_MICROTILE = (4, 4)
 
@@ -57,6 +58,11 @@ _MATMUL_GEMV_THREADS_NARROW = 1024
 
 
 _MATMUL_GEMV_THREADS_WIDE = 128
+
+
+#: Four-bit weights come eight to an int32 word, which is the load width the
+#: packed GEMV walks the reduction in.
+_QUANTIZED_NIBBLES = 8
 
 
 def _gemv_threads(columns: int, transpose_right: bool) -> int:
@@ -436,6 +442,219 @@ def _emit_transposed_gemv_matmul_source(
         lines.append(f"{indent}float paired_gate = float((T)total);")
     lines.extend(
         [
+            f"{indent}if (lane == 0u) {{",
+            f"{indent}    out[{output_linear}] = (T)({value});",
+            f"{indent}}}",
+        ]
+    )
+    if not exact_columns:
+        lines.append("}")
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _packed_matmul_supported(graph: Graph, op: Operation) -> bool:
+    """Whether a folded packed-weight matmul has a native kernel.
+
+    The backend asks this before emitting a candidate, exactly as it asks the
+    dense shape rules elsewhere: a shape this build cannot stream should fall
+    back to MLX rather than fail the compile. The scale-free checks (batch
+    broadcast, dtype agreement) stay in the lowering, where a disagreement is a
+    malformed graph rather than an unsupported shape.
+    """
+
+    group_size = _matmul_weight_group_size(op)
+    if group_size is None:
+        return False
+    right_position = 2 if op.op == "addmm" else 1
+    if len(op.inputs) <= right_position + 1:
+        return False
+    if op.attrs.get("transpose_b") is not None:
+        return False
+    packed_type = graph.value(op.inputs[right_position]).type
+    left_position = 1 if op.op == "addmm" else 0
+    left_type = graph.value(op.inputs[left_position]).type
+    output_type = graph.value(op.outputs[0]).type
+    if len(packed_type.shape) < 2 or len(left_type.shape) < 2:
+        return False
+    columns, words = packed_type.shape[-2:]
+    reduction = words * _QUANTIZED_NIBBLES
+    if left_type.shape[-1] != reduction:
+        return False
+    return _supports_quantized_gemv_matmul(
+        left_type.shape[-2],
+        columns,
+        reduction,
+        group_size,
+        output_type.dtype,
+    )
+
+
+def _supports_quantized_gemv_matmul(
+    rows: int,
+    columns: int,
+    reduction: int,
+    group_size: int,
+    dtype: DType,
+) -> bool:
+    """Return whether a packed 4-bit weight can use the streaming GEMV.
+
+    The kernel walks the reduction in whole packed words, so the extent has to
+    be a multiple of eight, and it reads one scale per word group, so the group
+    size has to be too. Those are the only structural conditions; the rest is
+    the same one-row shape the dense GEMV needs.
+    """
+
+    return (
+        rows == 1
+        and dtype in {DType.F16, DType.BF16, DType.F32}
+        and reduction % _QUANTIZED_NIBBLES == 0
+        and group_size % _QUANTIZED_NIBBLES == 0
+        and reduction % group_size == 0
+        and columns > 0
+    )
+
+
+def _emit_quantized_gemv_matmul_source(
+    op: Operation,
+    graph: Graph,
+    reduction: int,
+    columns: int,
+    group_size: int,
+    batch_count: int,
+    left_batch_offset: str,
+    weight_batch_offset: str,
+    scales_batch_offset: str,
+) -> str:
+    """Emit a GEMV over a packed 4-bit weight, one warp per output column.
+
+    The body is the dense transposed GEMV with the weight load replaced by a
+    word load: one ``int`` carries eight weights, so the streaming loop moves a
+    quarter of the bytes for the same number of multiply-adds. Each lane takes
+    one word per step, decodes its eight nibbles, multiplies each by the
+    activations at the same positions and by the group's scale, and accumulates.
+
+    The scale multiply happens before the accumulate rather than after the
+    reduction, because a group's scale applies to its own slice of the reduction
+    and folding it out would need every group boundary to be a warp boundary.
+    """
+
+    threads = _gemv_threads(columns, True)
+    warps = threads // 32
+    exact_columns = columns % warps == 0
+    output_batch_offset = f"batch * {columns}u + " if batch_count > 1 else ""
+    output_linear = f"{output_batch_offset}column"
+    if op.op == "addmm":
+        left_position = 1
+        weight_position = 2
+        bias_position: int | None = 0
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+    else:
+        left_position = 0
+        weight_position = 1
+        bias_position = None
+        alpha = 1.0
+        beta = 1.0
+    scales_position = _matmul_quantized_scales_position(op, weight_position)
+    assert scales_position is not None
+    output_shape = graph.value(op.outputs[0]).type.shape
+
+    value = "total"
+    if bias_position is not None:
+        bias_type = graph.value(op.inputs[bias_position]).type
+        bias_offset = _offset_expression(bias_type.shape, output_shape, output_linear)
+        value = f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
+    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+
+    words = reduction // _QUANTIZED_NIBBLES
+    words_per_group = group_size // _QUANTIZED_NIBBLES
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint lane = tid % 32u;",
+        "uint warp = tid / 32u;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+    ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    lines.extend(
+        [
+            f"uint column = threadgroup_index * {warps}u + warp;",
+            f"const device int* weight_row = in_{weight_position} + "
+            f"{weight_batch_offset}column * {words}u;",
+            f"const device T* scale_row = in_{scales_position} + "
+            f"{scales_batch_offset}column * {words // words_per_group}u;",
+        ]
+    )
+    norm_slot = _matmul_norm_position(op)
+    if norm_slot is not None:
+        lines.extend(
+            _emit_warp_rms_norm_prologue(
+                op, norm_slot, left_position, reduction, left_batch_offset
+            )
+        )
+    if not exact_columns:
+        lines.append(f"if (column < {columns}u) {{")
+    indent = "    " if not exact_columns else ""
+    lines.extend(f"{indent}float acc{offset} = 0.0f;" for offset in range(8))
+    lines.extend(
+        [
+            f"{indent}for (uint index = lane; index < {words}u; index += 32u) {{",
+            f"{indent}    uint word = (uint)weight_row[index];",
+            f"{indent}    uint base = index * {_QUANTIZED_NIBBLES}u;",
+            f"{indent}    float scale = float(scale_row[index / {words_per_group}u]);",
+        ]
+    )
+    if norm_slot is None:
+        lines.extend(
+            [
+                f"{indent}    const device vec<T, 4>* activations = "
+                "reinterpret_cast<const device vec<T, 4>*>("
+                f"in_{left_position} + {left_batch_offset}base);",
+                f"{indent}    vec<T, 4> low = activations[0];",
+                f"{indent}    vec<T, 4> high = activations[1];",
+            ]
+        )
+        for offset in range(8):
+            source = "low" if offset < 4 else "high"
+            index_in_vector = offset % 4
+            lines.append(
+                f"{indent}    float x{offset} = float({source}[{index_in_vector}]);"
+            )
+    else:
+        lines.extend(
+            [
+                f"{indent}    vec<T, 4> norm_low = norm_source[index * 2u];",
+                f"{indent}    vec<T, 4> norm_high = norm_source[index * 2u + 1u];",
+                f"{indent}    vec<T, 4> weight_low = norm_weight_values[index * 2u];",
+                f"{indent}    vec<T, 4> weight_high = "
+                "norm_weight_values[index * 2u + 1u];",
+            ]
+        )
+        for offset in range(8):
+            source = "norm_low" if offset < 4 else "norm_high"
+            weight = "weight_low" if offset < 4 else "weight_high"
+            index_in_vector = offset % 4
+            lines.append(
+                f"{indent}    float x{offset} = float((T)(norm_scale * "
+                f"float({source}[{index_in_vector}]) * "
+                f"float({weight}[{index_in_vector}])));"
+            )
+    for offset in range(8):
+        lines.extend(
+            [
+                f"{indent}    int code{offset} = int((word >> "
+                f"{4 * offset}u) & 0xFu);",
+                f"{indent}    code{offset} = code{offset} >= 8 ? "
+                f"code{offset} - 16 : code{offset};",
+                f"{indent}    acc{offset} = fma(float(code{offset}), "
+                f"x{offset} * scale, acc{offset});",
+            ]
+        )
+    lines.extend(
+        [
+            f"{indent}}}",
+            f"{indent}float total = simd_sum(((acc0 + acc1) + (acc2 + acc3)) + "
+            "((acc4 + acc5) + (acc6 + acc7)));",
             f"{indent}if (lane == 0u) {{",
             f"{indent}    out[{output_linear}] = (T)({value});",
             f"{indent}}}",
@@ -1170,6 +1389,14 @@ def _emit_tiled_matmul_source(
     return "\n".join(f"        {line}" for line in lines)
 
 
+def _matmul_quantized_scales_position(op: Operation, right_position: int) -> int | None:
+    """Return the input slot holding the scales beside a packed weight."""
+
+    if _matmul_weight_group_size(op) is None:
+        return None
+    return right_position + 1
+
+
 def _matmul_epilogue_kind(op: Operation) -> str | None:
     """Return the fused activation epilogue attached to a matrix multiply."""
 
@@ -1238,7 +1465,12 @@ class MatmulLowering:
     def _compile_matmul(
         self, graph: Graph, op: Operation, index: int
     ) -> tuple[KernelArtifact, Any]:
+        right_position = 2 if op.op == "addmm" else 1
+        quantized = _matmul_quantized_scales_position(op, right_position) is not None
         expected_inputs = 3 if op.op == "addmm" else 2
+        if quantized:
+            # The packed weight and its scales ride in one extra slot.
+            expected_inputs += 1
         epilogue = _matmul_epilogue_kind(op)
         if epilogue is not None:
             # Either a gate value to scale by, or a second weight matrix.
@@ -1264,6 +1496,11 @@ class MatmulLowering:
         else:
             bias_id = None
             left_id, right_id = op.inputs[:2]
+
+        if quantized:
+            return self._compile_quantized_matmul(
+                graph, op, index, right_position=right_position
+            )
 
         left_type = graph.value(left_id).type
         right_type = graph.value(right_id).type
@@ -1487,6 +1724,136 @@ class MatmulLowering:
             name=name,
             source=source,
             header=header,
+            input_ids=op.inputs,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
+            kind=op.op,
+        )
+        return artifact, runtime
+
+    def _compile_quantized_matmul(
+        self,
+        graph: Graph,
+        op: Operation,
+        index: int,
+        *,
+        right_position: int,
+    ) -> tuple[KernelArtifact, Any]:
+        """Emit the streaming GEMV over a packed 4-bit weight.
+
+        Only the one-row shape is lowered natively. A wider left operand would
+        have to reuse each decoded weight over several rows, which is a tiled
+        kernel rather than this one, and the codegen declines so the MLX
+        fallback unpacks and runs - correct, and only paid for by prefill.
+        """
+
+        group_size = _matmul_weight_group_size(op)
+        assert group_size is not None
+        scales_position = _matmul_quantized_scales_position(op, right_position)
+        assert scales_position is not None
+        left_position = 1 if op.op == "addmm" else 0
+
+        packed_type = graph.value(op.inputs[right_position]).type
+        scales_type = graph.value(op.inputs[scales_position]).type
+        left_type = graph.value(op.inputs[left_position]).type
+        output_type = graph.value(op.outputs[0]).type
+        if len(packed_type.shape) < 2:
+            raise NotImplementedError("packed matmul weights must be rank >= 2")
+        columns, words = packed_type.shape[-2:]
+        rows = left_type.shape[-2] if len(left_type.shape) >= 2 else 0
+        reduction = words * _QUANTIZED_NIBBLES
+        if left_type.shape[-1] != reduction:
+            raise ValueError(
+                f"packed weight reduction {reduction} does not match the left "
+                f"operand's {left_type.shape[-1]}"
+            )
+        if scales_type.shape[-2:] != (columns, reduction // group_size):
+            raise ValueError(
+                f"packed weight scales shape {scales_type.shape} does not cover "
+                f"{columns} columns in groups of {group_size}"
+            )
+        if not _supports_quantized_gemv_matmul(
+            rows, columns, reduction, group_size, output_type.dtype
+        ):
+            raise NotImplementedError(
+                "the packed 4-bit matmul is only lowered natively for a single "
+                f"row with a reduction in whole words, got {rows} rows and "
+                f"{reduction} x {columns} in groups of {group_size}"
+            )
+        batch_shape = _matmul_batch_shape(
+            left_type.shape,
+            packed_type.shape,
+        )
+        if batch_shape is None:
+            raise NotImplementedError(
+                "packed matmul batch dimensions are not broadcast-compatible"
+            )
+        if _matmul_transpose_attribute(op, "transpose_a"):
+            raise NotImplementedError("packed matmul does not support a transposed left")
+        if _matmul_transpose_attribute(op, "transpose_b"):
+            raise ValueError(
+                "a packed weight already carries the [out, in] orientation, so "
+                "transpose_b must not be set"
+            )
+        if left_type.dtype != output_type.dtype or scales_type.dtype != output_type.dtype:
+            raise NotImplementedError(
+                "the packed matmul requires the activation, scales and output to "
+                "share one dtype"
+            )
+        batch_count = prod(batch_shape)
+        left_batch_offset = _broadcast_batch_offset_expression(
+            left_type.shape[:-2], batch_shape, rows * reduction
+        )
+        weight_batch_offset = _broadcast_batch_offset_expression(
+            packed_type.shape[:-2], batch_shape, columns * words
+        )
+        scales_batch_offset = _broadcast_batch_offset_expression(
+            scales_type.shape[:-2], batch_shape, columns * (reduction // group_size)
+        )
+
+        source = _emit_quantized_gemv_matmul_source(
+            op,
+            graph,
+            reduction,
+            columns,
+            group_size,
+            batch_count,
+            left_batch_offset,
+            weight_batch_offset,
+            scales_batch_offset,
+        )
+        threads = _gemv_threads(columns, True)
+        warps = threads // 32
+        batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
+        name = (
+            f"metal_{op.op}_gemv_int4_g{group_size}_{threads}"
+            f"{batch_suffix}_{index}"
+        )
+        kernel = msl._metal_kernel(
+            name,
+            tuple(f"in_{position}" for position in range(len(op.inputs))),
+            ("out",),
+            source,
+            "",
+        )
+        grid = (ceil(columns / warps) * threads, batch_count, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=(threads, 1, 1),
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header="",
             input_ids=op.inputs,
             output_ids=op.outputs,
             tensor_types=(output_type,),

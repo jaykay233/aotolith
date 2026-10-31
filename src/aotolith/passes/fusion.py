@@ -170,13 +170,17 @@ def fuse_residual_epilogue(graph: Graph) -> Graph:
                 )
             )
             residual_id = view_id
-        left_id, right_id = product.inputs
+        left_id = product.inputs[0]
+        # Everything after the left operand travels untouched: for a dense
+        # matmul that is the weight, and for a packed one it is the weight plus
+        # its group scales.
+        operands = product.inputs[1:]
         attrs = dict(product.attrs)
         attrs["alpha"] = 1.0
         attrs["beta"] = 1.0
         created = Operation(
             "addmm",
-            (residual_id, left_id, right_id),
+            (residual_id, left_id) + operands,
             (product.outputs[0] if chain else output_id,),
             attrs,
         )

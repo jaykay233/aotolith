@@ -36,10 +36,16 @@ from ..planning import plan_storage
 from ..codegen.attention import AttentionLowering
 from ..codegen.dtypes import _MLX_DTYPES
 from ..codegen.index import IndexLowering
-from ..codegen.matmul import MatmulLowering, _matmul_batch_shape
+from ..codegen.matmul import (
+    MatmulLowering,
+    _matmul_batch_shape,
+    _matmul_weight_group_size,
+    _packed_matmul_supported,
+)
 from ..codegen.msl import KernelArtifact
 from ..codegen.norm import NormLowering
 from ..codegen.pointwise import PointwiseLowering
+from ..codegen.quantize import QuantizationLowering
 from ..codegen.reduction import ReductionLowering
 from ..runtime.mlx_ops.__init__ import _evaluate_mlx_op
 from ..runtime.plan import CompiledPlan, _as_arrays
@@ -195,6 +201,7 @@ class AppleMetalBackend(
     PointwiseLowering,
     ReductionLowering,
     MatmulLowering,
+    QuantizationLowering,
     AttentionLowering,
     NormLowering,
     IndexLowering,
@@ -241,6 +248,8 @@ class AppleMetalBackend(
                 )
             elif op.op == "arange":
                 compiled = self._compile_arange(graph, op, index)
+            elif op.op == "dequantize_i4":
+                compiled = self._compile_dequantize_i4(graph, op, index)
             elif (
                 op.op in _CONSTANT_POINTWISE_OPS
                 and graph.value(op.outputs[0]).type.dtype in _INTEGRAL_DTYPES
@@ -271,6 +280,13 @@ class AppleMetalBackend(
                     # and no online rescaling, so it beats the generic runtime
                     # kernel without the prefill-oriented codegen switch.
                     compiled = self._compile_decode_attention(graph, op, index)
+            elif op.op in {"matmul", "addmm"} and _matmul_weight_group_size(op) is not None:
+                # A packed weight streams natively whether or not dense matmul
+                # codegen is on: the MLX fallback has to materialize the dense
+                # weight first, which is the allocation quantizing removes. It
+                # still has to be a shape the kernel handles, or it stays on MLX.
+                if _packed_matmul_supported(graph, op):
+                    compiled = self._compile_matmul(graph, op, index)
             elif (
                 self.codegen_matmul or self.autotune or self._wants_native(op)
             ) and op.op in {"matmul", "addmm"}:

@@ -22,6 +22,7 @@ def test_the_pipeline_runs_every_pass_once_in_the_documented_order() -> None:
         "canonicalize_batched_matmul",
         "fuse_attention",
         "fold_matmul_input_layouts",
+        "fold_quantized_weights",
         "fuse_rope",
         "fuse_residual_epilogue",
         "fuse_pointwise",

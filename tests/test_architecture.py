@@ -33,6 +33,11 @@ LAYERS: dict[str, int] = {
     "ir.types": 0,
     "selection": 0,
     "_version": 0,
+    # The int4 weight format: bit layout, packing, unpacking. NumPy and MLX
+    # only, and every consumer - the packer, the kernel, the fallback - has to
+    # read the same definition, so it sits as low as the primitives it is
+    # stated in terms of.
+    "quantize": 1,
     # The two lowest codegen pieces: what an MLX dtype maps to, and what a Metal
     # kernel header looks like. The target needs both to answer "can this
     # machine compile this at all", so they sit below it.
@@ -56,6 +61,7 @@ LAYERS: dict[str, int] = {
     "passes.layout": 3,
     "passes.canonicalize": 4,
     "passes.fusion": 4,
+    "passes.quantize": 4,
     "passes": 5,
     "passes.driver": 5,
     # The decomposition table: a filter over Torch's rules. It reaches back for
@@ -100,6 +106,8 @@ LAYERS: dict[str, int] = {
     "legalize.linalg": 4,
     "legalize.attention": 4,
     "legalize.kernels": 4,
+    "legalize.quantization": 4,
+    "codegen.quantize": 4,
     "codegen.norm": 5,
     "runtime.bounds": 5,
     # The composition point: trace, then legalize. It sits above both halves and
@@ -127,6 +135,7 @@ LAYERS: dict[str, int] = {
     "compiler": 11,
     # Entry points.
     "cli": 12,
+    "models.quantized": 11,
     "models.qwen2": 12,
 }
 
@@ -150,6 +159,7 @@ MODULE_PATHS = {
     "selection": "selection.py",
     "_version": "_version.py",
     "planning": "planning.py",
+    "quantize": "quantize.py",
     "passes": "passes/__init__.py",
     "passes.graph": "passes/graph.py",
     "passes.checks": "passes/checks.py",
@@ -163,6 +173,7 @@ MODULE_PATHS = {
     "passes.canonicalize": "passes/canonicalize.py",
     "passes.cse": "passes/cse.py",
     "passes.fusion": "passes/fusion.py",
+    "passes.quantize": "passes/quantize.py",
     "passes.driver": "passes/driver.py",
     "decompose": "decompose.py",
     "capture": "capture/__init__.py",
@@ -180,6 +191,7 @@ MODULE_PATHS = {
     "legalize.linalg": "legalize/linalg.py",
     "legalize.attention": "legalize/attention.py",
     "legalize.kernels": "legalize/kernels.py",
+    "legalize.quantization": "legalize/quantization.py",
     "target": "target/__init__.py",
     "target.apple": "target/apple.py",
     "codegen": "codegen/__init__.py",
@@ -192,6 +204,7 @@ MODULE_PATHS = {
     "codegen.norm": "codegen/norm.py",
     "codegen.matmul": "codegen/matmul.py",
     "codegen.attention": "codegen/attention.py",
+    "codegen.quantize": "codegen/quantize.py",
     "runtime": "runtime/__init__.py",
     "runtime.bounds": "runtime/bounds.py",
     "runtime.mlx_ops": "runtime/mlx_ops/__init__.py",
@@ -207,6 +220,7 @@ MODULE_PATHS = {
     "artifact": "artifact.py",
     "compiler": "compiler.py",
     "cli": "cli.py",
+    "models.quantized": "models/quantized.py",
     "models.qwen2": "models/qwen2.py",
 }
 

@@ -24,6 +24,7 @@ from .fusion import (
     fuse_rope,
 )
 from .layout import fold_matmul_input_layouts, simplify_layouts
+from .quantize import fold_quantized_weights
 
 #: Names and functions, in order, with the reason each one sits where it does.
 #: The names are kept so a test can assert the order without calling anything.
@@ -40,6 +41,10 @@ PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
     # The layouts a matmul can absorb are cheaper folded than emitted, and the
     # rope matcher reads the matmul's operand order afterwards.
     ("fold_matmul_input_layouts", fold_matmul_input_layouts),
+    # The packed weight replaces the weight operand itself, so it has to happen
+    # once the operand layouts are final and before any matcher reads the
+    # right operand as a matrix.
+    ("fold_quantized_weights", fold_quantized_weights),
     ("fuse_rope", fuse_rope),
     # The epilogues, additive ones before the pointwise sweep that would
     # otherwise swallow the region they need.

@@ -19,6 +19,7 @@ from .matmul import MatmulLowering
 from .msl import KernelArtifact
 from .norm import NormLowering
 from .pointwise import PointwiseLowering
+from .quantize import QuantizationLowering
 from .reduction import ReductionLowering
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     "MatmulLowering",
     "NormLowering",
     "PointwiseLowering",
+    "QuantizationLowering",
     "ReductionLowering",
 ]

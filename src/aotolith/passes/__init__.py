@@ -26,6 +26,7 @@ from .fusion import (
     fuse_rope,
 )
 from .layout import fold_matmul_input_layouts, simplify_layouts
+from .quantize import fold_quantized_weights
 
 __all__ = [
     "LAYOUT_OPS",
@@ -34,6 +35,7 @@ __all__ = [
     "canonicalize_batched_matmul",
     "eliminate_common_subexpressions",
     "fold_matmul_input_layouts",
+    "fold_quantized_weights",
     "fuse_activation_epilogue",
     "fuse_attention",
     "fuse_gate_up_projection",
