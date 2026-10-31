@@ -32,6 +32,7 @@ from .targets import (
     _INTEGRAL_ONLY_POINTWISE_OPS,
     _LDEXP_TARGET,
     _LOGICAL_BINARY_OPS,
+    _MATRIX_TRANSPOSE_INPLACE_TARGET,
     _NUMERIC_ATTRS,
     _PRELU_TARGET,
     _PROMOTABLE_POINTWISE_OPS,
@@ -1051,6 +1052,34 @@ def _lower_eye(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_inplace_matrix_transpose(lowering: Lowering, node: Any, target: str) -> bool:
+    """``t_`` writes a rank-2 transpose into its own operand.
+
+    An IR value is immutable, so the write rebinds the node to the transposed
+    view; that is faithful exactly when nothing reads the destination after it,
+    which is the rule the pointwise in-place spellings share.
+    """
+
+    _validate_inplace_legalization(node)
+    input_node = node.args[0]
+    input_type = _node_type(input_node)
+    if len(input_type.shape) != 2:
+        raise ValueError(
+            f"{target} is only supported for rank-2 tensors, got shape "
+            f"{input_type.shape}"
+        )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "transpose",
+            (_argument_ids(input_node, lowering.node_ids),),
+            {"dim0": 1, "dim1": 0},
+            _node_type(node),
+        ),
+    )
+    return True
+
+
 def _lower_empty(lowering: Lowering, node: Any, target: str) -> bool:
     """``empty`` allocates a buffer and promises nothing about its contents.
 
@@ -1106,5 +1135,6 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _COPY_TARGET: (_lower_copy,),
     **{target: (_lower_eye,) for target in _EYE_TARGETS},
     **{target: (_lower_empty,) for target in _EMPTY_TARGETS},
+    _MATRIX_TRANSPOSE_INPLACE_TARGET: (_lower_inplace_matrix_transpose,),
     _LDEXP_TARGET: (_lower_ldexp,),
 }

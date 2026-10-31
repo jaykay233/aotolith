@@ -6709,6 +6709,31 @@ def test_inplace_mul_keeps_reads_that_precede_the_write() -> None:
 
 
 @pytest.mark.parametrize(
+    ("shape", "apply"),
+    [
+        pytest.param((3, 4), lambda value: value.t_().contiguous(), id="t_"),
+        pytest.param(
+            (3, 4),
+            lambda value: value.transpose_(0, 1).contiguous(),
+            id="transpose_2d",
+        ),
+        pytest.param(
+            (2, 3, 4),
+            lambda value: value.transpose_(0, 2).contiguous(),
+            id="transpose_3d",
+        ),
+    ],
+)
+def test_inplace_layout_spellings_match_torch(shape, apply) -> None:
+    # A layout write is a rebinding too: the node becomes the transposed view,
+    # which is faithful because the tracer rebinds the name it wrote through.
+    values = torch.randn(*shape)
+    result = compile_callable(apply, (values,))
+    actual = result.plan(_torch_to_mlx(values))[0]
+    _assert_values_match(actual, apply(values.clone()))
+
+
+@pytest.mark.parametrize(
     "apply",
     [
         lambda value: value.relu_(),

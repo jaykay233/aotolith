@@ -49,7 +49,10 @@ _SUPPORTED_OPS = {
     "aten.view.default": "reshape",
     "aten._unsafe_view.default": "reshape",
     "aten.reshape.default": "reshape",
+    # ``aten.transpose.int`` names the axes; its in-place spelling reaches the
+    # same op with the same positional arguments.
     "aten.transpose.int": "transpose",
+    "aten.transpose_.default": "transpose",
     "aten.permute.default": "permute",
     "aten.expand.default": "expand",
     "aten.slice.Tensor": "slice",
@@ -496,6 +499,16 @@ _INDEX_TARGET = "aten.index.Tensor"
 _MATRIX_TRANSPOSE_TARGET = "aten.t.default"
 
 
+_MATRIX_TRANSPOSE_INPLACE_TARGET = "aten.t_.default"
+"""``t_`` is the same rank-2 transpose written into its own operand.
+
+An IR value is immutable, so the write is a rebinding to the transposed view,
+which is faithful when nothing reads the destination after it - the rule the
+pointwise in-place spellings share, and the reason this goes through the same
+validation.
+"""
+
+
 _STACK_TARGET = "aten.stack.default"
 
 
@@ -745,6 +758,10 @@ _INPLACE_TARGETS = {
     "aten.clamp_min_.Tensor",
     "aten.clamp_max_.default",
     "aten.clamp_max_.Tensor",
+    # A layout write is a rebinding too: the node is rebound to the transposed
+    # view, which is faithful exactly when nothing reads the destination after
+    # the write (the validation the in-place spellings share).
+    "aten.transpose_.default",
 } | set(_INPLACE_UNARY_OPS)
 
 
@@ -884,6 +901,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _SELECT_TARGET,
         _INDEX_TARGET,
         _MATRIX_TRANSPOSE_TARGET,
+        _MATRIX_TRANSPOSE_INPLACE_TARGET,
         _STACK_TARGET,
         _SCATTER_ADD_TARGET,
         _SCATTER_REDUCE_TARGET,
