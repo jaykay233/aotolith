@@ -207,6 +207,37 @@ CONTRACTS: dict[str, OpContract] = {
         attrs=(AttrSpec("dim", AttrKind.INT),),
         extra=_check_scan_shape,
     ),
+    # ``cummax``/``cummin`` are split the same way ``sort`` is: the running
+    # extremum and the running position of it are separate operators, so a graph
+    # that only reads the values does not run the index scan.
+    "cummax": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_scan_shape,
+    ),
+    "cummin": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_scan_shape,
+    ),
+    "cummax_indices": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_scan_shape,
+    ),
+    "cummin_indices": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("dim", AttrKind.INT),),
+        extra=_check_scan_shape,
+    ),
     # ``median`` and its index selection are two operators rather than one
     # multi-output op, for the same reason ``sort``/``argsort`` are: a graph that
     # reads only the value should not pay for the index scan.

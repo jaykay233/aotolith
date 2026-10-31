@@ -234,3 +234,99 @@ def test_median_runs_in_half_precision() -> None:
 
     assert actual.dtype == mx.bfloat16
     assert bool(mx.array_equal(actual, expected))
+
+
+@pytest.mark.parametrize(
+    "shape, dim",
+    [
+        pytest.param((4, 6), 1, id="rank2"),
+        pytest.param((3, 4, 5), 2, id="rank3"),
+        pytest.param((3, 4), 0, id="leading_axis"),
+        pytest.param((7,), 0, id="vector"),
+    ],
+)
+def test_cummax_and_cummin_match_pytorch(shape, dim) -> None:
+    torch.manual_seed(13)
+    value = torch.randn(*shape)
+
+    for scan in (torch.cummax, torch.cummin):
+        _, actual = _run_all(lambda v: scan(v, dim), value)
+        expected = scan(value, dim)
+        assert bool(mx.array_equal(actual[0], mx.array(expected.values.numpy())))
+        assert bool(mx.array_equal(actual[1], mx.array(expected.indices.numpy())))
+        assert actual[1].dtype == mx.int64
+
+
+def test_cummax_keeps_only_the_selection_that_is_read() -> None:
+    value = torch.randn(3, 6)
+
+    lowered, actual = _run(lambda v: torch.cummax(v, 1).values, value)
+
+    assert [op.op for op in lowered.ops] == ["cummax"]
+    assert bool(mx.array_equal(actual, mx.array(torch.cummax(value, 1).values.numpy())))
+
+
+def test_cummax_lets_a_nan_own_the_rest_of_the_scan() -> None:
+    # ATen ranks NaN above every value for ``cummax`` and below every value for
+    # ``cummin``, so it takes the running extremum and the position with it.
+    nan = float("nan")
+    value = torch.tensor(
+        [
+            [1.0, -1.0, nan, 2.0, 3.0],
+            [nan, 1.0, 2.0, 3.0, 4.0],
+            [nan, nan, nan, nan, nan],
+        ]
+    )
+
+    for scan in (torch.cummax, torch.cummin):
+        _, actual = _run_all(lambda v: scan(v, 1), value)
+        expected = scan(value, 1)
+        assert bool(
+            mx.allclose(actual[0], mx.array(expected.values.numpy()), equal_nan=True)
+        )
+        assert bool(mx.array_equal(actual[1], mx.array(expected.indices.numpy())))
+
+
+def test_cummax_reports_the_latest_position_of_a_repeated_extremum() -> None:
+    # Ties advance the position, which is why the running comparison is
+    # inclusive rather than strict.
+    value = torch.tensor([[3.0, 3.0, 2.0, 3.0], [1.0, 1.0, 1.0, 1.0]])
+
+    _, actual = _run_all(
+        lambda v: (
+            torch.cummax(v, 1).values,
+            torch.cummax(v, 1).indices,
+            torch.cummin(v, 1).values,
+            torch.cummin(v, 1).indices,
+        ),
+        value,
+    )
+
+    maxima, max_positions, minima, min_positions = actual
+    expected_max = torch.cummax(value, 1)
+    expected_min = torch.cummin(value, 1)
+    assert bool(mx.array_equal(maxima, mx.array(expected_max.values.numpy())))
+    assert bool(mx.array_equal(max_positions, mx.array(expected_max.indices.numpy())))
+    assert bool(mx.array_equal(minima, mx.array(expected_min.values.numpy())))
+    assert bool(mx.array_equal(min_positions, mx.array(expected_min.indices.numpy())))
+
+
+def test_cummax_runs_on_integers_and_half_precision() -> None:
+    integers = torch.randint(-3, 4, (3, 5))
+    lowered, actual = _run_all(lambda v: torch.cummax(v, 1), integers)
+    expected = torch.cummax(integers, 1)
+    assert [op.op for op in lowered.ops] == ["cummax", "cummax_indices"]
+    assert actual[0].dtype == mx.int64
+    assert bool(mx.array_equal(actual[0], mx.array(expected.values.numpy())))
+
+    halves = torch.randn(3, 6).to(torch.bfloat16)
+    array = mx.array(halves.float().numpy()).astype(mx.bfloat16)
+    lowered = rewrite(capture_fx(lambda v: torch.cummin(v, 1).values, (halves,)))
+    plan = AppleMetalBackend().compile(lowered)
+    result = plan(array)[0]
+    mx.eval(result)
+    expected = torch.cummin(halves, 1).values
+    assert result.dtype == mx.bfloat16
+    assert bool(
+        mx.array_equal(result, mx.array(expected.float().numpy()).astype(mx.bfloat16))
+    )

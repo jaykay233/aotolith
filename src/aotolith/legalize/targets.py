@@ -503,6 +503,17 @@ _NANSUM_TARGET = "aten.nansum.default"
 _SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
 
 
+_CUM_EXTREMUM_TARGETS = {
+    "aten.cummax.default": ("cummax", "cummax_indices"),
+    "aten.cummin.default": ("cummin", "cummin_indices"),
+}
+"""The running-extremum scans, mapped to their value and index operators.
+
+Both return ``(values, indices)`` and are consumed through ``getitem``, so the
+lowering reads the selection exactly like ``sort`` does.
+"""
+
+
 _MEDIAN_TARGETS = {
     "aten.median.default": False,
     "aten.median.dim": False,
@@ -645,6 +656,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _SCATTER_TARGETS
     | _COUNT_NONZERO_TARGETS
     | set(_MEDIAN_TARGETS)
+    | set(_CUM_EXTREMUM_TARGETS)
     | {
         _SELECT_TARGET,
         _INDEX_TARGET,

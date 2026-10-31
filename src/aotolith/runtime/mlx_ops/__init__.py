@@ -33,6 +33,45 @@ from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
 from .scatter import _mlx_scatter_reduce
 
 
+def _mlx_cum_extremum(
+    value: mx.array, axis: int, maximum: bool
+) -> tuple[mx.array, mx.array]:
+    """The running extremum of a scan and the position each step reports.
+
+    MLX has ``cummax``/``cummin`` but returns only the values, so the position
+    comes from the same loop rather than a second pass. ATen treats NaN as the
+    largest value for ``cummax`` and the smallest for ``cummin``, which makes a
+    NaN own the rest of the scan once it appears; the key folds that in while
+    the reported value stays the element that was read. A repeated extremum
+    reports the latest position, so the comparison is inclusive.
+    """
+
+    length = value.shape[axis]
+    if length == 0:
+        empty = mx.zeros_like(value)
+        return empty, empty.astype(mx.int32)
+    best = mx.take(value, 0, axis=axis)
+    shape = best.shape
+    best_index = mx.zeros(shape, dtype=mx.int32)
+    floating = value.dtype in (mx.float16, mx.bfloat16, mx.float32, mx.float64)
+    limit = float("inf") if maximum else float("-inf")
+    best_key = mx.where(mx.isnan(best), limit, best) if floating else best
+    values = [best]
+    indices = [best_index]
+    for position in range(1, length):
+        current = mx.take(value, position, axis=axis)
+        key = mx.where(mx.isnan(current), limit, current) if floating else current
+        better = key >= best_key if maximum else key <= best_key
+        best = mx.where(better, current, best)
+        best_key = mx.where(better, key, best_key)
+        best_index = mx.where(
+            better, mx.full(shape, position, dtype=mx.int32), best_index
+        )
+        values.append(best)
+        indices.append(best_index)
+    return mx.stack(values, axis=axis), mx.stack(indices, axis=axis)
+
+
 def _evaluate_mlx_op(
     graph: Graph, op: Operation, env: dict[str, mx.array]
 ) -> mx.array | tuple[mx.array, ...]:
@@ -288,6 +327,12 @@ def _evaluate_mlx_op(
         value = scan(env[op.inputs[0]], axis=axis)
         output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
         return value.astype(output_dtype)
+    if op.op in {"cummax", "cummin", "cummax_indices", "cummin_indices"}:
+        value = env[op.inputs[0]]
+        axis = int(op.attrs["dim"]) % len(value.shape)
+        values, indices = _mlx_cum_extremum(value, axis, op.op.startswith("cummax"))
+        picked = indices if op.op.endswith("_indices") else values
+        return picked.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
     if op.op == "logcumsumexp":
         # The scan in the log domain: each step is ``logaddexp`` of the running
         # total and the next element, which is stable by construction (the shift
