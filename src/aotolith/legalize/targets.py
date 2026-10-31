@@ -503,6 +503,20 @@ _NANSUM_TARGET = "aten.nansum.default"
 _SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
 
 
+_MEDIAN_TARGETS = {
+    "aten.median.default": False,
+    "aten.median.dim": False,
+    "aten.nanmedian.default": True,
+    "aten.nanmedian.dim": True,
+}
+"""The median spellings, mapped to whether they ignore NaN.
+
+``median.dim``/``nanmedian.dim`` return ``(values, indices)`` and are consumed
+through ``getitem``; the ``default`` forms reduce every axis and return a
+scalar, but they take the same lowering with all axes named.
+"""
+
+
 _EXTREMUM_DIM_TARGETS = {
     "aten.max.dim": ("amax", "argmax"),
     "aten.min.dim": ("amin", "argmin"),
@@ -630,6 +644,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _AND_OR_TARGETS
     | _SCATTER_TARGETS
     | _COUNT_NONZERO_TARGETS
+    | set(_MEDIAN_TARGETS)
     | {
         _SELECT_TARGET,
         _INDEX_TARGET,

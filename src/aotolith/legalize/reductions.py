@@ -22,6 +22,7 @@ from .targets import (
     _COUNT_NONZERO_TARGETS,
     _EXTREMUM_DIM_TARGETS,
     _LOGSUMEXP_TARGET,
+    _MEDIAN_TARGETS,
     _NANSUM_TARGET,
     _SORT_TARGETS,
     _TORCH_DTYPES,
@@ -773,6 +774,100 @@ def _sort_operations(
     return tuple(operations), produced
 
 
+def _median_operations(
+    node: object,
+    node_ids: dict[object, str],
+    first_op_index: int,
+) -> tuple[tuple[tuple[Operation, Value], ...], dict[int, str]]:
+    """Lower the median family into ``median`` and ``median_indices`` ops.
+
+    ``median.dim`` returns ``(values, indices)`` while ``median.default`` reduces
+    every axis and returns only the value; both are one operator with the
+    reduced axes named, and a selection nothing reads is left out.
+    """
+
+    target = str(getattr(node, "target", ""))
+    ignore_nan = _MEDIAN_TARGETS[target]
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{target} expects a tensor input")
+
+    input_node = args[0]
+    input_type = _node_type(input_node)
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+
+    dims_provided = target.endswith(".dim")
+    if dims_provided:
+        dim = args[1] if len(args) > 1 else kwargs.get("dim")
+        keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+        if not -rank <= dim < rank:
+            raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+        if not isinstance(keepdim, bool):
+            raise ValueError(f"{target}.keepdim must be a boolean, got {keepdim!r}")
+        dims = (dim % rank,)
+    else:
+        # ``median(x)`` reduces everything, and a scalar result cannot keep dims.
+        dims = tuple(range(rank))
+        keepdim = False
+
+    wanted: dict[int, object] = {}
+    if dims_provided:
+        for user in getattr(node, "users", {}):
+            if getattr(user, "target", None) is not operator.getitem:
+                raise ValueError(f"{target} outputs must be selected with getitem")
+            user_args = getattr(user, "args", ())
+            if len(user_args) != 2 or not isinstance(user_args[1], int):
+                raise ValueError(f"malformed {target} getitem: {user!r}")
+            index = user_args[1]
+            if index not in {0, 1}:
+                raise ValueError(f"{target} output index must be 0 or 1, got {index}")
+            if user.users:
+                wanted[index] = user
+    if not wanted:
+        # A full reduction has a single result, so its only reader is the node's
+        # own consumer and the value output is exactly what it wants.
+        wanted[0] = node
+
+    output_shape = tuple(
+        size for axis, size in enumerate(input_type.shape) if axis not in dims
+    )
+    if keepdim:
+        output_shape = tuple(
+            1 if axis in dims else size for axis, size in enumerate(input_type.shape)
+        )
+
+    operations: list[tuple[Operation, Value]] = []
+    produced: dict[int, str] = {}
+    attrs: dict[str, object] = {
+        "dims": dims,
+        "keepdim": keepdim,
+        "ignore_nan": ignore_nan,
+    }
+
+    def emit(name: str, index: int, dtype: DType) -> None:
+        output_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(
+                    name, (_argument_ids(input_node, node_ids),), (output_id,), attrs
+                ),
+                Value(output_id, TensorType(output_shape, dtype)),
+            )
+        )
+        produced[index] = output_id
+
+    if 0 in wanted:
+        emit("median", 0, input_type.dtype)
+    if 1 in wanted:
+        emit("median_indices", 1, DType.I64)
+    return tuple(operations), produced
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -830,6 +925,17 @@ def _lower_sort(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_median(lowering: Lowering, node: Any, target: str) -> bool:
+    produced, ids = _median_operations(node, lowering.node_ids, lowering.next_index())
+    lowering.emit_all(produced)
+    if str(getattr(node, "target", "")).endswith(".default"):
+        # The full reduction has one result and no ``getitem`` in between.
+        lowering.bind(node, ids[0])
+        return True
+    _bind_selected_users(lowering, node, ids)
+    return True
+
+
 def _lower_all_any(lowering: Lowering, node: Any, target: str) -> bool:
     return _lower_bundle(
         lowering, node, _all_any_operations, conjunction=target.startswith("aten.all.")
@@ -864,6 +970,7 @@ def _lower_count_nonzero(lowering: Lowering, node: Any, target: str) -> bool:
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     **{target: (_lower_extremum_dim,) for target in _EXTREMUM_DIM_TARGETS},
     **{target: (_lower_sort,) for target in _SORT_TARGETS},
+    **{target: (_lower_median,) for target in _MEDIAN_TARGETS},
     **{target: (_lower_all_any,) for target in _AND_OR_TARGETS},
     **{target: (_lower_variance,) for target in _VARIANCE_TARGETS},
     **{target: (_lower_count_nonzero,) for target in _COUNT_NONZERO_TARGETS},

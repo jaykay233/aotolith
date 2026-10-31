@@ -83,6 +83,13 @@ def _check_argsort(graph: Graph, op: Operation) -> None:
         )
 
 
+def _check_median_indices(graph: Graph, op: Operation) -> None:
+    """``median_indices`` reports positions, so it returns I64 like ``argsort``."""
+
+    _no_boolean_operand(graph, op)
+    _index_output_type(graph, op)
+
+
 def _check_topk(graph: Graph, op: Operation) -> None:
     _no_boolean_operand(graph, op)
     input_type = graph.value(op.inputs[0]).type
@@ -199,6 +206,30 @@ CONTRACTS: dict[str, OpContract] = {
         shape=ShapeRule.FREE,
         attrs=(AttrSpec("dim", AttrKind.INT),),
         extra=_check_scan_shape,
+    ),
+    # ``median`` and its index selection are two operators rather than one
+    # multi-output op, for the same reason ``sort``/``argsort`` are: a graph that
+    # reads only the value should not pay for the index scan.
+    "median": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.FLOATING_IN,
+        shape=ShapeRule.REDUCED,
+        axes="dims",
+        attrs=(
+            AttrSpec("dims", AttrKind.AXES),
+            AttrSpec("ignore_nan", AttrKind.BOOL),
+        ),
+    ),
+    "median_indices": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.REDUCED,
+        axes="dims",
+        attrs=(
+            AttrSpec("dims", AttrKind.AXES),
+            AttrSpec("ignore_nan", AttrKind.BOOL),
+        ),
+        extra=_check_median_indices,
     ),
     "sort": OpContract(
         arity=(1, 1),

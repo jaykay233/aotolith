@@ -15,6 +15,7 @@ family it happened in.
 from __future__ import annotations
 
 import mlx.core as mx
+from math import prod
 from typing import Any
 from ...ir import Graph
 from ...ir import Operation
@@ -127,6 +128,60 @@ def _evaluate_mlx_op(
         reduced = operation(value, axis=dims, keepdims=keepdim)
         output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
         return reduced.astype(output_dtype)
+    if op.op in {"median", "median_indices"}:
+        # MLX sorts along a single axis, so the reduced axes move to the back
+        # and collapse into one, the same transformation ``vector_norm`` makes.
+        value = env[op.inputs[0]]
+        rank = value.ndim
+        dims = tuple(int(dim) % rank for dim in op.attrs["dims"])
+        keepdim = bool(op.attrs.get("keepdim", False))
+        ignore_nan = bool(op.attrs["ignore_nan"])
+        remaining = [axis for axis in range(rank) if axis not in dims]
+        permuted = mx.transpose(value, remaining + list(dims))
+        prefix = tuple(value.shape[axis] for axis in remaining)
+        length = prod(value.shape[axis] for axis in dims)
+        flat = permuted.reshape(prefix + (length,))
+        # ATen returns the lower median: the element at (n - 1) / 2 of the
+        # ascending order. ``nanmedian`` counts only the present elements and
+        # sorts the NaNs past them, so the position is per row.
+        nan_mask = mx.isnan(flat)
+        present = ~nan_mask
+        counted = mx.sum(present, axis=-1)
+        ranked = mx.where(present, flat, float("inf")) if ignore_nan else flat
+        order = mx.argsort(ranked, axis=-1)
+        if ignore_nan:
+            position = mx.maximum(counted - 1, 0) // 2
+            selection = position[..., None]
+        else:
+            position = (length - 1) // 2
+            selection = mx.full(prefix + (1,), position, dtype=mx.int32)
+        index = mx.take_along_axis(order, selection, axis=-1)[..., 0]
+        if op.op == "median_indices":
+            picked = index
+            if not ignore_nan:
+                # ``median`` propagates NaN, and ATen names the first one as
+                # the position of the median it reported.
+                poisoned = mx.any(nan_mask, axis=-1)
+                first_nan = mx.argmax(nan_mask.astype(mx.int32), axis=-1)
+                picked = mx.where(poisoned, first_nan, picked)
+        else:
+            picked = mx.take_along_axis(ranked, index[..., None], axis=-1)[..., 0]
+            if ignore_nan:
+                # A row that is all NaN has no present element to report, and
+                # ATen answers NaN rather than the +inf placeholder.
+                chosen = mx.take_along_axis(present, index[..., None], axis=-1)[..., 0]
+                picked = mx.where(chosen, picked, float("nan"))
+            else:
+                poisoned = mx.any(nan_mask, axis=-1)
+                picked = mx.where(poisoned, float("nan"), picked)
+        if keepdim:
+            picked = picked.reshape(
+                tuple(
+                    1 if axis in dims else size for axis, size in enumerate(value.shape)
+                )
+            )
+        output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+        return picked.astype(output_dtype)
     if op.op == "log_softmax":
         value = env[op.inputs[0]]
         axis = int(op.attrs["dim"]) % value.ndim
