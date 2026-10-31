@@ -619,6 +619,38 @@ _DIAGONAL_COPY_TARGET = "aten.diagonal_copy.default"
 _VECTOR_NORM_TARGET = "aten.linalg_vector_norm.default"
 
 
+_EYE_TARGETS = frozenset({"aten.eye.default", "aten.eye.m"})
+"""``eye``, which Torch decomposes into two ``arange`` calls that it types as
+the narrowest integer that holds the length - ``uint8`` below 256 - and this IR
+has no unsigned type. The same expression is built here over I32 instead.
+"""
+
+
+_VAR_MEAN_TARGETS = {
+    "aten.var_mean.correction": "var",
+    "aten.var_mean.dim": "var",
+    "aten.var_mean.default": "var",
+    "aten.std_mean.correction": "std",
+    "aten.std_mean.dim": "std",
+    "aten.std_mean.default": "std",
+}
+"""``var_mean`` and ``std_mean``, mapped to the deviation they report.
+
+Both return ``(deviation, mean)`` and are consumed through ``getitem``, so one
+lowering covers all six spellings; Torch itself decomposes ``std_mean`` into
+``var_mean`` plus a square root when the target is not kept.
+"""
+
+
+_DIST_TARGET = "aten.dist.default"
+
+
+_ADDBMM_TARGET = "aten.addbmm.default"
+
+
+_LDEXP_TARGET = "aten.ldexp.Tensor"
+
+
 _LINALG_RESULT_TARGETS = frozenset(
     {
         "aten._linalg_solve_ex.default",
@@ -817,6 +849,8 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _RESIZE_TARGETS
     | _ANTIALIASED_RESIZE_TARGETS
     | _LINALG_RESULT_TARGETS
+    | _EYE_TARGETS
+    | set(_VAR_MEAN_TARGETS)
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)
@@ -848,5 +882,8 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _UNFOLD_TARGET,
         _COPY_TARGET,
         _LINALG_CHECK_TARGET,
+        _DIST_TARGET,
+        _ADDBMM_TARGET,
+        _LDEXP_TARGET,
     }
 )

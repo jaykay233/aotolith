@@ -330,3 +330,132 @@ def test_cummax_runs_on_integers_and_half_precision() -> None:
     assert bool(
         mx.array_equal(result, mx.array(expected.float().numpy()).astype(mx.bfloat16))
     )
+
+
+# ``var_mean``/``std_mean`` are two reductions ATen fuses into one node; the
+# frontend splits them back into the pair MLX already runs, sharing the
+# normalized axes and the correction so the pair stays consistent.
+VAR_MEAN_CASES = [
+    pytest.param(lambda v: torch.var_mean(v, dim=1), id="dim"),
+    pytest.param(lambda v: torch.var_mean(v), id="every_axis"),
+    pytest.param(lambda v: torch.var_mean(v, dim=0, correction=0), id="population"),
+    pytest.param(lambda v: torch.var_mean(v, dim=1, correction=2), id="correction"),
+    pytest.param(lambda v: torch.var_mean(v, dim=-1, keepdim=True), id="keepdim"),
+    pytest.param(lambda v: torch.var_mean(v, dim=(0, 2)), id="two_axes"),
+]
+
+
+@pytest.mark.parametrize("call", VAR_MEAN_CASES)
+def test_var_mean_matches_pytorch(call) -> None:
+    torch.manual_seed(23)
+    value = torch.randn(4, 6, 3) * 3.0
+
+    lowered, actual = _run_all(call, value)
+
+    expected = call(value)
+    assert [op.op for op in lowered.ops] == ["var", "mean"]
+    assert actual[0].dtype == mx.float32
+    assert bool(mx.allclose(actual[0], mx.array(expected[0].numpy()), atol=2e-6))
+    assert bool(mx.allclose(actual[1], mx.array(expected[1].numpy()), atol=2e-6))
+
+
+def test_var_mean_emits_only_the_member_the_graph_reads() -> None:
+    # The split is per-use: a graph that throws the mean away must not keep
+    # paying for the second reduction.
+    torch.manual_seed(24)
+    value = torch.randn(5, 7)
+
+    lowered, actual = _run_all(lambda v: torch.var_mean(v, dim=1)[0], value)
+
+    assert [op.op for op in lowered.ops] == ["var"]
+    expected = torch.var_mean(value, dim=1)[0]
+    assert bool(mx.allclose(actual[0], mx.array(expected.numpy()), atol=2e-6))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda v: torch.std_mean(v, dim=1), id="dim"),
+        pytest.param(lambda v: torch.std_mean(v), id="every_axis"),
+        pytest.param(lambda v: torch.std_mean(v, dim=0, correction=0), id="population"),
+        pytest.param(lambda v: torch.std_mean(v, dim=1, keepdim=True), id="keepdim"),
+    ],
+)
+def test_std_mean_matches_pytorch(call) -> None:
+    torch.manual_seed(25)
+    value = torch.randn(4, 6) * 2.0
+
+    lowered, actual = _run_all(call, value)
+
+    expected = call(value)
+    assert [op.op for op in lowered.ops] == ["std", "mean"]
+    assert bool(mx.allclose(actual[0], mx.array(expected[0].numpy()), atol=2e-6))
+    assert bool(mx.allclose(actual[1], mx.array(expected[1].numpy()), atol=2e-6))
+
+
+def test_var_mean_runs_in_half_precision() -> None:
+    torch.manual_seed(26)
+    halves = torch.randn(4, 6).to(torch.bfloat16)
+
+    lowered = rewrite(capture_fx(lambda v: torch.var_mean(v, dim=1), (halves,)))
+    plan = AppleMetalBackend().compile(lowered)
+    array = mx.array(halves.float().numpy()).astype(mx.bfloat16)
+    variance, mean = plan(array)
+    mx.eval(variance, mean)
+
+    expected = torch.var_mean(halves, dim=1)
+    assert [op.op for op in lowered.ops] == ["var", "mean"]
+    assert variance.dtype == mx.bfloat16
+    assert mean.dtype == mx.bfloat16
+    assert bool(
+        mx.allclose(
+            variance.astype(mx.float32),
+            mx.array(expected[0].float().numpy()),
+            atol=2e-2,
+        )
+    )
+    assert bool(
+        mx.allclose(
+            mean.astype(mx.float32),
+            mx.array(expected[1].float().numpy()),
+            atol=2e-2,
+        )
+    )
+
+
+@pytest.mark.parametrize("p", [0.5, 1.0, 2.0, 3.0, float("inf")])
+def test_dist_matches_pytorch(p) -> None:
+    # ``dist`` is ``(left - right).norm(p)`` with the difference gone before the
+    # norm, so the pair of operators is the whole implementation.
+    torch.manual_seed(27)
+    left = torch.randn(3, 8)
+    right = torch.randn(3, 8)
+
+    lowered, actual = _run_all(lambda a, b: torch.dist(a, b, p), left, right)
+
+    expected = torch.dist(left, right, p)
+    assert [op.op for op in lowered.ops] == ["sub", "vector_norm"]
+    assert bool(mx.allclose(actual[0], mx.array(expected.numpy()), atol=1e-5))
+
+
+def test_dist_reduces_the_whole_tensor_and_broadcasts_its_operands() -> None:
+    # ``dist`` has no ``dim``: it always answers one scalar, so a batched pair
+    # collapses to a rank-0 result instead of one value per row.
+    torch.manual_seed(28)
+    left = torch.randn(4, 5)
+    row = torch.randn(1, 5)
+    batched = torch.randn(3, 4, 5)
+
+    _, broadcast = _run_all(lambda a, b: torch.dist(a, b), left, row)
+    _, batched_actual = _run_all(lambda a, b: torch.dist(a, b), batched, left)
+
+    assert broadcast[0].shape == ()
+    assert bool(
+        mx.allclose(broadcast[0], mx.array(torch.dist(left, row).numpy()), atol=1e-5)
+    )
+    assert batched_actual[0].shape == ()
+    assert bool(
+        mx.allclose(
+            batched_actual[0], mx.array(torch.dist(batched, left).numpy()), atol=1e-5
+        )
+    )

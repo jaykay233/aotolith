@@ -8919,3 +8919,267 @@ def test_reduction_supports_narrower_output_dtype(reduction) -> None:
     mx.eval(actual, expected)
     assert actual.dtype == mx.float16
     assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+# ``eye``, ``ldexp`` and ``addbmm`` are the composites that joined the lowering
+# table last: ATen leaves each of them to the backend, and the decomposition
+# below is the one Torch's own reference implementation is written in. These
+# tests pin both halves - the operators the decomposition emits, and the numbers.
+
+EYE_CASES = [
+    pytest.param(4, None, torch.float32, mx.float32, id="square"),
+    pytest.param(3, 5, torch.float32, mx.float32, id="rectangular"),
+    pytest.param(5, 2, torch.float32, mx.float32, id="tall"),
+    pytest.param(2, 2, torch.float16, mx.float16, id="half"),
+    pytest.param(1, 4, torch.float32, mx.float32, id="single_row"),
+    pytest.param(3, 3, torch.int32, mx.int32, id="integer"),
+]
+
+
+@pytest.mark.parametrize(("rows", "columns", "dtype", "mlx_dtype"), EYE_CASES)
+def test_eye_is_the_equality_of_two_ranges(rows, columns, dtype, mlx_dtype) -> None:
+    def fn():
+        if columns is None:
+            return torch.eye(rows, dtype=dtype)
+        return torch.eye(rows, columns, dtype=dtype)
+
+    result = compile_callable(fn, ())
+
+    # The equality is the diagonal mask; the cast is the dtype the caller asked
+    # for. A square identity needs one range, a rectangular one needs both.
+    ops = [op.op for op in result.lowered_graph.ops]
+    assert ops[-2:] == ["eq", "cast"]
+    assert ops.count("arange") == (1 if columns is None or columns == rows else 2)
+
+    actual = result.plan()[0]
+    expected = mx.array(fn().numpy())
+    mx.eval(actual, expected)
+    assert actual.dtype == mlx_dtype
+    assert actual.shape == tuple(expected.shape)
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_eye_without_a_column_count_reuses_one_range() -> None:
+    # ``eye(n)`` is the square case of ``eye(n, m)``, so the second range must
+    # not survive as a second kernel when it is the same range.
+    result = compile_callable(lambda: torch.eye(6), ())
+
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "arange",
+        "unsqueeze",
+        "eq",
+        "cast",
+    ]
+    assert [kernel.kind for kernel in result.plan.kernels] == ["arange", "eq"]
+
+
+def test_eye_rejects_an_empty_side() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        compile_callable(lambda: torch.eye(0), ())
+
+
+def test_eye_composes_with_a_pointwise_operand() -> None:
+    torch.manual_seed(41)
+    x = torch.randn(3, 3)
+
+    result = compile_callable(lambda v: torch.eye(3) + v, (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "arange",
+        "unsqueeze",
+        "eq",
+        "cast",
+        "add",
+    ]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array((torch.eye(3) + x).numpy())
+    mx.eval(actual, expected)
+    assert bool(mx.array_equal(actual, expected))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "mlx_dtype"),
+    [
+        pytest.param(torch.float32, mx.float32, id="float32"),
+        pytest.param(torch.float16, mx.float16, id="float16"),
+    ],
+)
+def test_ldexp_scales_by_a_power_of_two(dtype, mlx_dtype) -> None:
+    torch.manual_seed(42)
+    value = torch.randn(3, 4, dtype=dtype)
+    exponent = torch.randint(-4, 5, (3, 4))
+
+    def fn(mantissa, power):
+        return torch.ldexp(mantissa, power)
+
+    result = compile_callable(fn, (value, exponent))
+
+    # The integer exponent is cast to the result dtype so the power stays a
+    # float one, and the multiply folds into a single pointwise region.
+    assert [op.op for op in result.lowered_graph.ops] == ["cast", "fused_elementwise"]
+
+    actual = result.plan(
+        mx.array(value.float().numpy(), dtype=mlx_dtype),
+        mx.array(exponent.numpy()),
+    )[0]
+    expected = mx.array(torch.ldexp(value, exponent).float().numpy(), dtype=mlx_dtype)
+    mx.eval(actual, expected)
+    assert actual.dtype == mlx_dtype
+    # ``2**k`` is exact for every integer a float can hold, so the scale itself
+    # introduces no rounding: only the product can round, and Torch rounds the
+    # same way.
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_ldexp_keeps_a_zero_and_an_unsigned_zero() -> None:
+    value = torch.tensor([0.0, -0.0, 1.5])
+    exponent = torch.tensor([3, 3, -1])
+
+    result = compile_callable(lambda a, b: torch.ldexp(a, b), (value, exponent))
+    actual = result.plan(mx.array(value.numpy()), mx.array(exponent.numpy()))[0]
+    expected = mx.array(torch.ldexp(value, exponent).numpy())
+    mx.eval(actual, expected)
+    assert bool(mx.array_equal(actual, expected))
+
+
+@pytest.mark.parametrize("codegen_matmul", [False, True])
+def test_addbmm_matches_pytorch(codegen_matmul) -> None:
+    def fn(bias, left, right):
+        return torch.addbmm(bias, left, right, beta=0.5, alpha=2.0)
+
+    torch.manual_seed(43)
+    inputs = (
+        torch.randn(2, 5),
+        torch.randn(3, 2, 4),
+        torch.randn(3, 4, 5),
+    )
+
+    result = compile_callable(fn, inputs, codegen_matmul=codegen_matmul)
+
+    # The batch product collapses into a single matrix before the scales fold
+    # in, so the whole expression is three operators and one kernel.
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "matmul",
+        "sum",
+        "fused_elementwise",
+    ]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "bias_shape",
+    [
+        pytest.param((5,), id="row"),
+        pytest.param((1, 5), id="leading_singleton"),
+        pytest.param((), id="scalar"),
+    ],
+)
+def test_addbmm_broadcasts_the_bias(bias_shape) -> None:
+    torch.manual_seed(44)
+    inputs = (
+        torch.randn(bias_shape),
+        torch.randn(2, 3, 4),
+        torch.randn(2, 4, 5),
+    )
+
+    def fn(bias, left, right):
+        return torch.addbmm(bias, left, right, beta=1.5, alpha=1.0)
+
+    result = compile_callable(fn, inputs)
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (3, 5)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
+def test_addbmm_drops_the_bias_at_beta_zero() -> None:
+    # ATen documents that a zero beta ignores ``input``, so an infinite one must
+    # not turn the result into NaN - which means the add cannot be emitted at
+    # all, rather than emitted with a zero scale.
+    torch.manual_seed(45)
+    bias = torch.tensor([[float("inf"), float("nan"), 1.0, -2.0, 0.5]])
+    left = torch.randn(2, 3, 4)
+    right = torch.randn(2, 4, 5)
+
+    def fn(input, batch1, batch2):
+        return torch.addbmm(input, batch1, batch2, beta=0.0, alpha=2.0)
+
+    result = compile_callable(fn, (bias, left, right))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["matmul", "sum", "mul"]
+    actual = result.plan(
+        mx.array(bias.numpy()), mx.array(left.numpy()), mx.array(right.numpy())
+    )[0]
+    expected = mx.array(fn(bias, left, right).numpy())
+    mx.eval(actual, expected)
+    assert not bool(mx.any(mx.isnan(actual)))
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
+def test_addbmm_drops_the_products_at_alpha_zero() -> None:
+    # The mirror case: a zero alpha ignores ``batch1``/``batch2``, so the NaN
+    # they carry must not reach a result that is only ``beta * input``.
+    torch.manual_seed(46)
+    bias = torch.randn(3, 5)
+    left = torch.full((2, 3, 4), float("nan"))
+    right = torch.full((2, 4, 5), float("nan"))
+
+    def fn(input, batch1, batch2):
+        return torch.addbmm(input, batch1, batch2, beta=1.5, alpha=0.0)
+
+    result = compile_callable(fn, (bias, left, right))
+
+    actual = result.plan(
+        mx.array(bias.numpy()), mx.array(left.numpy()), mx.array(right.numpy())
+    )[0]
+    expected = mx.array(fn(bias, left, right).numpy())
+    mx.eval(actual, expected)
+    assert not bool(mx.any(mx.isnan(actual)))
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_addbmm_at_zero_alpha_and_beta_answers_zeros() -> None:
+    torch.manual_seed(47)
+    inputs = (
+        torch.full((3, 5), float("inf")),
+        torch.full((2, 3, 4), float("nan")),
+        torch.full((2, 4, 5), float("nan")),
+    )
+
+    def fn(input, batch1, batch2):
+        return torch.addbmm(input, batch1, batch2, beta=0.0, alpha=0.0)
+
+    result = compile_callable(fn, inputs)
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_einsum_full_contraction_answers_a_scalar() -> None:
+    # ``einsum("ij,ij->")`` contracts every axis, and Torch spells that as a
+    # matrix product followed by a reshape to the rank-0 shape ``()``.
+    torch.manual_seed(48)
+    left = torch.randn(4, 5)
+    right = torch.randn(4, 5)
+
+    result = compile_callable(lambda a, b: torch.einsum("ij,ij->", a, b), (left, right))
+
+    assert [op.op for op in result.lowered_graph.ops] == [
+        "reshape",
+        "reshape",
+        "matmul",
+        "reshape",
+    ]
+    assert result.lowered_graph.ops[-1].attrs == {"shape": ()}
+
+    actual = result.plan(mx.array(left.numpy()), mx.array(right.numpy()))[0]
+    expected = mx.array(torch.einsum("ij,ij->", left, right).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == ()
+    assert mx.allclose(actual, expected, atol=1e-4, rtol=1e-4)

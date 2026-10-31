@@ -22,6 +22,7 @@ from .state import Lowering
 from .state import Handler
 from .refs import _argument_ids
 from .targets import (
+    _ADDBMM_TARGET,
     _DIAGONAL_COPY_TARGET,
     _DIAGONAL_TARGET,
     _LINALG_CHECK_TARGET,
@@ -549,12 +550,128 @@ def _lower_linalg_check(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_addbmm(lowering: Lowering, node: Any, target: str) -> bool:
+    """``addbmm`` is a batch of products summed into one, then scaled in.
+
+    ATen defines it as ``beta * input + alpha * sum_i(batch1_i @ batch2_i)``, so
+    the batch product is an ordinary batched ``matmul``, the sum collapses the
+    batch axis, and the two scale factors fold into pointwise multiplies that
+    the surrounding kernel absorbs. A factor of one is not emitted at all, and a
+    factor of zero drops its term instead of multiplying by it: ATen ignores the
+    term entirely, so an inf or NaN hiding in it must not reach the result.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 3:
+        raise ValueError(f"{target} expects three arguments, got {len(args)}")
+    input_id = _argument_ids(args[0], lowering.node_ids)
+    left_id = _argument_ids(args[1], lowering.node_ids)
+    right_id = _argument_ids(args[2], lowering.node_ids)
+    left = lowering.values[left_id].type
+    right = lowering.values[right_id].type
+    if len(left.shape) != 3 or len(right.shape) != 3:
+        raise ValueError(
+            f"{target} expects rank-3 operands, got {left.shape} and {right.shape}"
+        )
+    if left.shape[0] != right.shape[0] or left.shape[2] != right.shape[1]:
+        raise ValueError(
+            f"{target} operands {left.shape} and {right.shape} do not form a batch "
+            "of products"
+        )
+    kwargs = getattr(node, "kwargs", {})
+    beta = kwargs.get("beta", 1)
+    alpha = kwargs.get("alpha", 1)
+    for name, value in (("beta", beta), ("alpha", alpha)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{target}.{name} must be a number, got {value!r}")
+
+    output_type = _node_type(node)
+    rows, columns = left.shape[1], right.shape[2]
+    if alpha == 0:
+        if beta == 0:
+            # Both terms are ignored, so the result is zeros rather than a
+            # product of either operand with zero, which would answer NaN for
+            # any NaN or inf in them.
+            lowering.bind(node, lowering.emit("full", (), {"value": 0.0}, output_type))
+            return True
+        lowering.bind(node, _scaled_bias(lowering, input_id, beta, output_type))
+        return True
+
+    product_id = lowering.emit(
+        "matmul",
+        (left_id, right_id),
+        {},
+        TensorType((left.shape[0], rows, columns), left.dtype),
+    )
+    total_id = lowering.emit(
+        "sum",
+        (product_id,),
+        {"dims": (0,), "keepdim": False},
+        TensorType((rows, columns), left.dtype),
+    )
+    if alpha != 1:
+        total_id = lowering.emit(
+            "mul",
+            (total_id,),
+            {"scalar": alpha, "scalar_position": "rhs"},
+            TensorType((rows, columns), left.dtype),
+        )
+    if beta == 0:
+        lowering.bind(node, total_id)
+        return True
+    lowering.bind(
+        node,
+        lowering.emit(
+            "add",
+            (_scaled_bias(lowering, input_id, beta, output_type), total_id),
+            {},
+            output_type,
+        ),
+    )
+    return True
+
+
+def _scaled_bias(
+    lowering: Lowering, input_id: str, beta: float, output_type: TensorType
+) -> str:
+    """``beta * input``, widened to the output shape the add would have made."""
+
+    source = lowering.values[input_id].type
+    if beta != 1:
+        input_id = lowering.emit(
+            "mul",
+            (input_id,),
+            {"scalar": beta, "scalar_position": "rhs"},
+            source,
+        )
+    if len(source.shape) == 0 and output_type.shape:
+        # `expand` aligns from the right but refuses a rank-0 operand, so the
+        # scalar gets the singleton shape every output axis can broadcast from.
+        singleton = (1,) * len(output_type.shape)
+        input_id = lowering.emit(
+            "reshape",
+            (input_id,),
+            {"shape": singleton},
+            TensorType(singleton, source.dtype),
+        )
+        source = TensorType(singleton, source.dtype)
+    if source.shape != output_type.shape:
+        input_id = lowering.emit(
+            "expand",
+            (input_id,),
+            {"shape": output_type.shape},
+            TensorType(output_type.shape, source.dtype),
+        )
+    return input_id
+
+
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _MV_TARGET: (_lower_mv_or_trace,),
     _TRACE_TARGET: (_lower_mv_or_trace,),
     _DIAGONAL_TARGET: (_lower_diagonal,),
     _DIAGONAL_COPY_TARGET: (_lower_diagonal,),
     _LINALG_CHECK_TARGET: (_lower_linalg_check,),
+    _ADDBMM_TARGET: (_lower_addbmm,),
 }
 
 for _linalg_target in _LINALG_RESULTS:

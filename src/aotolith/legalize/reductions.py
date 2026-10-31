@@ -13,6 +13,7 @@ from math import isfinite, prod
 from collections.abc import Callable
 from typing import Any
 from ..ir import DType, Operation, TensorType, Value
+from ..shapes import broadcast_shapes
 from .fx import _node_type
 from .state import Lowering
 from .state import Handler
@@ -21,12 +22,14 @@ from .targets import (
     _AND_OR_TARGETS,
     _COUNT_NONZERO_TARGETS,
     _CUM_EXTREMUM_TARGETS,
+    _DIST_TARGET,
     _EXTREMUM_DIM_TARGETS,
     _LOGSUMEXP_TARGET,
     _MEDIAN_TARGETS,
     _NANSUM_TARGET,
     _SORT_TARGETS,
     _TORCH_DTYPES,
+    _VAR_MEAN_TARGETS,
     _VARIANCE_TARGETS,
     _VECTOR_NORM_TARGET,
 )
@@ -511,11 +514,16 @@ def _vector_norm_operation(
     )
 
 
-def _variance_operation(
+def _variance_arguments(
     node: object,
     node_ids: dict[object, str],
-) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
-    """Normalize ``var``/``std`` spellings onto ``dims``/``keepdim``/``correction``."""
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Normalize ``var``/``std`` spellings onto ``dims``/``keepdim``/``correction``.
+
+    The result type is the *reader's* when the call answers a tuple - that is
+    how ``var_mean`` reaches here - so the type is not part of what this
+    returns.
+    """
 
     target = str(getattr(node, "target", ""))
     args = getattr(node, "args", ())
@@ -578,8 +586,15 @@ def _variance_operation(
             "keepdim": keepdim,
             "correction": correction,
         },
-        _node_type(node),
     )
+
+
+def _variance_operation(
+    node: object,
+    node_ids: dict[object, str],
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    inputs, attrs = _variance_arguments(node, node_ids)
+    return inputs, attrs, _node_type(node)
 
 
 def _extremum_dim_operations(
@@ -1030,6 +1045,75 @@ def _lower_variance(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_var_mean(lowering: Lowering, node: Any, target: str) -> bool:
+    """``var_mean``/``std_mean`` are two reductions over the same axes.
+
+    Torch answers them as a pair, and the graph takes the members apart with
+    ``getitem``, so each member becomes its own operation and an unread one
+    costs nothing. ``mean`` takes the same axes with no correction: the mean of
+    a row is a plain reduction, whatever the deviation divides by.
+    """
+
+    op_name = _VAR_MEAN_TARGETS[target]
+    inputs, attrs = _variance_arguments(node, lowering.node_ids)
+    mean_attrs = {"dims": attrs["dims"], "keepdim": attrs["keepdim"]}
+    produced: dict[int, str] = {}
+    readers = list(node.users)
+    if not readers:
+        raise NotImplementedError(f"{target} result is never read")
+    for user in readers:
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{target} results must be selected with getitem")
+        if len(user.args) != 2 or user.args[1] not in {0, 1}:
+            raise ValueError(f"malformed {target} getitem: {user!r}")
+        index = user.args[1]
+        if index in produced:
+            continue
+        output_type = _node_type(user)
+        if index == 0:
+            produced[index] = lowering.emit(op_name, inputs, attrs, output_type)
+        else:
+            produced[index] = lowering.emit("mean", inputs, mean_attrs, output_type)
+    _bind_selected_users(lowering, node, produced)
+    return True
+
+
+def _lower_dist(lowering: Lowering, node: Any, target: str) -> bool:
+    """``dist`` is the p-norm of the difference, over every axis.
+
+    ATen defines it that way, and the norm is the vector one, so the scalar it
+    answers comes from the same reduction ``F.normalize`` uses.
+    """
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) < 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    p = args[2] if len(args) > 2 else kwargs.get("p", 2)
+    if not isinstance(p, (int, float)) or isinstance(p, bool):
+        raise ValueError(f"{target}.p must be a number, got {p!r}")
+    left_id = _argument_ids(args[0], lowering.node_ids)
+    right_id = _argument_ids(args[1], lowering.node_ids)
+    left = lowering.values[left_id].type
+    shape = broadcast_shapes((left.shape, lowering.values[right_id].type.shape))
+    difference_id = lowering.emit(
+        "sub",
+        (left_id, right_id),
+        {},
+        TensorType(shape, left.dtype),
+    )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "vector_norm",
+            (difference_id,),
+            {"ord": float(p), "dims": tuple(range(len(shape))), "keepdim": False},
+            _node_type(node),
+        ),
+    )
+    return True
+
+
 def _lower_logsumexp(lowering: Lowering, node: Any, target: str) -> bool:
     return _lower_bundle(lowering, node, _logsumexp_operations)
 
@@ -1049,8 +1133,10 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     **{target: (_lower_median,) for target in _MEDIAN_TARGETS},
     **{target: (_lower_all_any,) for target in _AND_OR_TARGETS},
     **{target: (_lower_variance,) for target in _VARIANCE_TARGETS},
+    **{target: (_lower_var_mean,) for target in _VAR_MEAN_TARGETS},
     **{target: (_lower_count_nonzero,) for target in _COUNT_NONZERO_TARGETS},
     _LOGSUMEXP_TARGET: (_lower_logsumexp,),
     _NANSUM_TARGET: (_lower_nansum,),
     _VECTOR_NORM_TARGET: (_lower_vector_norm,),
+    _DIST_TARGET: (_lower_dist,),
 }

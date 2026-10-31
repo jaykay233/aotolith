@@ -65,6 +65,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.bmm.default` | `matmul` |
 | `aten.addmm.default` | `addmm` |
 | `aten.baddbmm.default` | `addmm`，batch 维按 broadcasting 语义执行 |
+| `aten.addbmm.default` | 组合 lowering：`matmul` 把 batch 里每个乘积算出来后 `sum` 掉 batch 轴，`alpha`/`beta` 折进 pointwise 乘法，系数为 1 时不发 op；`beta` 或 `alpha` 为 0 时对应项整项丢弃（ATen 也是忽略它，而不是乘 0），因此 bias 或乘积里的 NaN/inf 不会渗进结果 |
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
 | `aten.index.Tensor` | `index`，支持多轴 advanced indexing（含被静态/index 轴隔开的非相邻索引）和 index broadcasting |
@@ -80,7 +81,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default`、`aten.clamp_`/`clamp_min_`/`clamp_max_`（`default`/`Tensor`/`Scalar`） | 与对应的非原地形式完全同构；编译结果返回新值，不回写调用方持有的 tensor |
 | `aten.relu_`、`aten.sigmoid_`、`aten.tanh_`、`aten.exp_`、`aten.expm1_`、`aten.log_`、`aten.log1p_`、`aten.neg_`、`aten.abs_`、`aten.sqrt_`、`aten.rsqrt_`、`aten.reciprocal_`、`aten.floor_`、`aten.ceil_`、`aten.round_`、`aten.trunc_`、`aten.erf_`（`.default`） | 与对应的函数式拼法同名算子。Torch 的分解不会把这些 kernel 改写成函数式加 `copy_`，所以每个原地拼法单独入表 |
 | `aten.copy_.default`；`fill_`/`zero_`/`masked_fill_`/`silu_`/`gelu_`/`mish_` 等由分解给出的 `copy_` | 写就是一次重新绑定：`copy_` 被 lowering 成源的 cast 加 broadcast，`zero_` 的常量由 `full_like` 产生 |
-| `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
+| `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape`，也接受 rank-0 的空 tuple shape `()`（全缩并的 einsum 就落在这里） |
 | `aten.transpose.int` | `transpose` |
 | `aten.permute.default` | `permute` |
 | `aten.expand.default` | `expand` |
@@ -112,7 +113,9 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.prod.default`、`aten.prod.dim_int` | `prod`，走 MLX reduction，支持多轴与 `keepdim` |
 | `aten.amax.default`、`aten.amin.default` | `amax`、`amin`，走 MLX reduction，支持多轴与 `keepdim` |
 | `aten.var.*`、`aten.std.*`（`correction`/`dim`/`default` 三种拼法） | `var`、`std`，走 MLX，支持多轴、`keepdim` 与整数或小数 `correction` |
+| `aten.var_mean.*`、`aten.std_mean.*`（`correction`/`dim`/`default` 三种拼法） | 拆成同一个 `var`/`std` 加一个共享 `dims`/`correction` 的 `mean`；图只读其中一个成员时，另一个不会发出来 |
 | `aten.linalg_vector_norm.default` | `vector_norm`，走 MLX，支持任意实数 `ord`、多轴与 `keepdim` |
+| `aten.dist.default` | 组合 lowering：`sub` 后接整条 tensor 的 `vector_norm`（`ord=p`），结果恒为 rank-0 标量，没有 `dim` 参数 |
 | `aten.repeat.default`（`Tensor.repeat`/`Tensor.tile`） | 展开成 `reshape -> expand -> reshape`，不生成 kernel |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
 | `aten.convolution.default` | `conv`，`stride`/`padding`/`dilation`/`groups` 进入 attribute，weight/bias 作为普通输入 |
@@ -145,6 +148,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.addcmul.default` | `addcmul`，保留 `value`（默认 1） |
 | `aten.addcdiv.default` | `addcdiv`，保留 `value`（默认 1） |
 | `aten.pow.Tensor_Tensor`、`aten.pow.Tensor_Scalar`、`aten.pow.Scalar` | `pow` |
+| `aten.ldexp.Tensor` | 展开成 `x * 2**e`：整数指数先 cast 到结果 dtype，`pow` 与 `mul` 落进同一个 pointwise 区域。`2**k` 对 float 能表示的整数指数是精确的，所以只有乘积会舍入 |
 | `aten.maximum.default`、`aten.minimum.default` | `maximum`、`minimum` |
 | `aten.fmax.default`、`aten.fmin.default` | `fmax`、`fmin`，忽略 NaN 操作数，zero pair 按 `fmax` 取 `+0`、`fmin` 取 `-0` |
 | `aten.nextafter.default` | `nextafter`，按 IEEE-754 位模式步进，F16/BF16 在自己的位宽上走一步 |
@@ -217,6 +221,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.masked_fill.Scalar` | `masked_fill`，bool mask 与标量填充值进入 IR |
 | `aten.scalar_tensor.default` | `scalar_tensor`，标量值和输出 dtype 进入 IR |
 | `aten.arange.default`、`aten.arange.start`、`aten.arange.start_step` | `arange`，参数规范化为 `start/end/step` attributes |
+| `aten.eye.default` | 展开成两个 `arange`（矩阵不是方阵时才有第二个）的 `eq`，再 cast 成声明的 dtype；Torch 自己的参考实现就是这么写的，只有它用 `uint8` 而这里用 I32。结果是常量，但走的是与 `arange` 相同的 kernel |
 | `aten.zeros.default`、`aten.ones.default`、`aten.full.default`、`aten.new_zeros.default`、`aten.new_ones.default`、`aten.new_full.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default` | `zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like`、`full_like`，shape/dtype 来自输出 metadata，填充值进入 IR |
 | `aten.cat.default` | `cat`，tensor 输入序列和拼接轴进入 IR |
 | `aten.stack.default` | 在前端展开为多个 `unsqueeze` 后接一个 `cat` |

@@ -23,11 +23,13 @@ from .targets import (
     _COMPARISON_OPS,
     _COPY_TARGET,
     _DIVIDE_ROUNDING_TARGETS,
+    _EYE_TARGETS,
     _FLOATING_DTYPES,
     _FLOAT_ONLY_POINTWISE_OPS,
     _INPLACE_TARGETS,
     _INTEGRAL_DTYPES,
     _INTEGRAL_ONLY_POINTWISE_OPS,
+    _LDEXP_TARGET,
     _LOGICAL_BINARY_OPS,
     _NUMERIC_ATTRS,
     _PRELU_TARGET,
@@ -292,12 +294,11 @@ def _operation_inputs(
         if len(args) != 2:
             raise ValueError(f"reshape expects two arguments, got {len(args)}")
         input_id, shape = args
-        if (
-            not isinstance(shape, (tuple, list))
-            or not shape
-            or not all(
-                isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
-            )
+        # An empty shape is the rank-0 reshape of a single element, which is
+        # how ``einsum`` spells a full contraction; the contract then checks
+        # that the input really has one element.
+        if not isinstance(shape, (tuple, list)) or not all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
         ):
             raise ValueError(f"reshape.shape must contain integers, got {shape!r}")
         return (
@@ -1002,9 +1003,90 @@ def _lower_copy(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_eye(lowering: Lowering, node: Any, target: str) -> bool:
+    """``eye`` is the equality of two ranges, and nothing to launch.
+
+    Torch's own reference implementation of ``eye`` is exactly that expression,
+    typed with the narrowest integer that holds the larger side - ``uint8``
+    below 256 - to keep the ranges small. This IR has no unsigned type, so the
+    same expression is built over I32; the comparison is over integers either
+    way and the cast to the declared dtype is what Torch does with it too.
+    """
+
+    args = getattr(node, "args", ())
+    if not 1 <= len(args) <= 2:
+        raise ValueError(f"{target} expects one or two arguments, got {len(args)}")
+    rows = args[0]
+    columns = args[1] if len(args) == 2 else rows
+    for name, value in (("n", rows), ("m", columns)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{target}.{name} must be an integer, got {value!r}")
+        if value <= 0:
+            raise ValueError(
+                f"{target}.{name} must be positive, got {value!r}: the static IR "
+                "has no zero-sized dimensions"
+            )
+
+    output_type = _node_type(node)
+    row_id = lowering.emit(
+        "arange",
+        (),
+        {"start": 0, "end": rows, "step": 1},
+        TensorType((rows,), DType.I32),
+    )
+    column_id = lowering.emit(
+        "arange",
+        (),
+        {"start": 0, "end": columns, "step": 1},
+        TensorType((columns,), DType.I32),
+    )
+    rows_id = lowering.emit(
+        "unsqueeze", (row_id,), {"dim": 1}, TensorType((rows, 1), DType.I32)
+    )
+    diagonal_id = lowering.emit(
+        "eq", (rows_id, column_id), {}, TensorType((rows, columns), DType.BOOL)
+    )
+    lowering.bind(node, lowering.emit("cast", (diagonal_id,), {}, output_type))
+    return True
+
+
+def _lower_ldexp(lowering: Lowering, node: Any, target: str) -> bool:
+    """``ldexp(x, e)`` is ``x * 2**e``, so the exponent becomes a scale.
+
+    The exponent is cast to the result dtype before the power: ``2.0 ** k`` is
+    exact for every integer ``k`` a float can represent, and the exponent is an
+    integer tensor by definition, so the cast loses nothing and keeps the power
+    a float one.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    value_id = _argument_ids(args[0], lowering.node_ids)
+    exponent_id = _argument_ids(args[1], lowering.node_ids)
+    output_type = _node_type(node)
+    exponent_type = lowering.values[exponent_id].type
+    if exponent_type.dtype != output_type.dtype:
+        exponent_id = lowering.emit(
+            "cast",
+            (exponent_id,),
+            {},
+            TensorType(exponent_type.shape, output_type.dtype),
+        )
+        exponent_type = TensorType(exponent_type.shape, output_type.dtype)
+    two_id = lowering.emit(
+        "scalar_tensor", (), {"value": 2.0}, TensorType((), output_type.dtype)
+    )
+    scale_id = lowering.emit("pow", (two_id, exponent_id), {}, exponent_type)
+    lowering.bind(node, lowering.emit("mul", (value_id, scale_id), {}, output_type))
+    return True
+
+
 # The generic path has no target of its own: it is the fallback the loop calls
 # when no family claimed the node.
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _PRELU_TARGET: (_lower_prelu,),
     _COPY_TARGET: (_lower_copy,),
+    **{target: (_lower_eye,) for target in _EYE_TARGETS},
+    _LDEXP_TARGET: (_lower_ldexp,),
 }
