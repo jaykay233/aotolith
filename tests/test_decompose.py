@@ -61,6 +61,27 @@ def test_attention_still_reaches_the_backend_as_one_operation() -> None:
     assert "attention" in {op.op for op in graph.ops}
 
 
+def test_the_normalizations_torch_leaves_to_backends_get_a_rule() -> None:
+    # ``core_aten_decompositions`` has no rule for either one: a backend is
+    # expected to implement the whole normalization as a kernel. This frontend
+    # has no such kernel, so it rewrites them into the moments it does lower.
+    table = {str(target) for target in aten_decompositions(NATIVE_TARGETS)}
+    for target in (
+        "aten.native_batch_norm.default",
+        "aten._native_batch_norm_legit.default",
+        "aten._native_batch_norm_legit.no_stats",
+        "aten._native_batch_norm_legit_no_training.default",
+        "aten.native_group_norm.default",
+    ):
+        assert target in table
+
+
+def test_keeping_a_normalization_leaves_it_alone() -> None:
+    kept = "aten.native_group_norm.default"
+    table = aten_decompositions(NATIVE_TARGETS | {kept})
+    assert kept not in {str(target) for target in table}
+
+
 def test_the_table_covers_the_long_tail() -> None:
     table = {str(target) for target in aten_decompositions(NATIVE_TARGETS)}
     # A sample of operators no backend would implement by hand.

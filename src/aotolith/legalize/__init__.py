@@ -124,6 +124,12 @@ def legalize(
         elif node.op == "call_function":
             if node in node_ids:
                 continue
+            if not node.users:
+                # Nothing reads this node, so the result pruning would drop it
+                # anyway; skipping it here also lets a dead allocation the
+                # tracer left behind (``aten.empty`` for a saved-tensor buffer)
+                # stay untranslated.
+                continue
             target = str(node.target)
             if node in lowering.empty_nodes and target in _EMPTY_COPY_TARGETS:
                 # An identity copy of an empty constant carries no arithmetic;
