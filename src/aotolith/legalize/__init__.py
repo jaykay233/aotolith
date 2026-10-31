@@ -31,6 +31,7 @@ from .fx import (
     _constant_tensor_message,
     _constant_value,
     _node_type,
+    _reject_data_dependent_shapes,
     _reject_unsupported_dropout,
     _tensor_type,
 )
@@ -117,6 +118,7 @@ def legalize(
     """
 
     _reject_unsupported_dropout(traced.graph)
+    _reject_data_dependent_shapes(traced.graph)
     lowering = Lowering(traced, promoted_constants)
     node_ids = lowering.node_ids
     values = lowering.values

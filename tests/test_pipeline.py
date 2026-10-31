@@ -4185,6 +4185,62 @@ def test_random_creation_operators_are_refused_by_name(fn, name) -> None:
         compile_callable(fn, (torch.randn(4, 3),))
 
 
+@pytest.mark.parametrize(
+    ("fn", "name"),
+    [
+        pytest.param(torch.nonzero, "nonzero", id="nonzero"),
+        pytest.param(torch.unique, "unique", id="unique"),
+        pytest.param(lambda x: torch.unique(x, dim=1), "unique", id="unique_dim"),
+        pytest.param(
+            lambda x: torch.masked_select(x, x > 0), "masked_select", id="masked_select"
+        ),
+        pytest.param(lambda x: x[x > 0], "boolean-mask indexing", id="mask_index"),
+        pytest.param(
+            lambda x: torch.bincount(torch.zeros(8, dtype=torch.int64)),
+            "bincount",
+            id="bincount",
+        ),
+    ],
+)
+def test_data_dependent_lengths_are_refused_by_name(fn, name) -> None:
+    # The IR wants positive constant dimensions, so a result whose length is a
+    # function of the values has nowhere to go. The node's metadata holds that
+    # length as a symbol, and the refusal reads it there so the message names
+    # the operator instead of leaking Torch's ``Eq(u0, 0)`` guard.
+    with pytest.raises(ValueError, match=f"{name} .*returns a length"):
+        compile_callable(fn, (torch.randn(4, 4),))
+
+
+def test_one_hot_without_num_classes_names_the_argument_that_fixes_it() -> None:
+    # ``one_hot`` reads its class count from the largest value, which is a guard
+    # on the data. With ``num_classes`` given the operator is a comparison and
+    # lowers normally, so the refusal has to point at that argument.
+    labels = torch.randint(0, 5, (2, 3))
+    with pytest.raises(ValueError, match="num_classes"):
+        compile_callable(lambda t: torch.nn.functional.one_hot(t).float(), (labels,))
+    compiled = compile_callable(
+        lambda t: torch.nn.functional.one_hot(t, 5).float(), (labels,)
+    )
+    _assert_values_match(
+        compiled.plan(_torch_to_mlx(labels))[0],
+        torch.nn.functional.one_hot(labels, 5).float(),
+    )
+
+
+def test_a_float64_decomposition_says_where_the_float64_came_from() -> None:
+    # ``quantile`` builds its result out of float64 constants, so the dtype
+    # refusal fires even though every input is float32. Saying that in the
+    # message is the difference between "pass float32" and "this operator is
+    # out of range", and only one of them is actionable.
+    for fn in (
+        lambda x: torch.quantile(x, 0.5),
+        lambda x: torch.nanquantile(x, 0.5),
+        lambda x: torch.linalg.matrix_rank(x),
+    ):
+        with pytest.raises(ValueError, match="float64.*decomposition"):
+            compile_callable(fn, (torch.randn(4, 4),))
+
+
 def test_attention_is_not_fused_when_probabilities_are_observed() -> None:
     def fn(query, key, value, mask):
         scores = torch.matmul(query, key.transpose(-2, -1)) * 0.1 + mask

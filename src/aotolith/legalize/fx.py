@@ -39,7 +39,14 @@ def _tensor_type(tensor: object, context: str) -> TensorType:
 
     dtype = _TORCH_DTYPES.get(str(tensor.dtype))
     if dtype is None:
-        raise ValueError(f"unsupported dtype: {tensor.dtype}")
+        raise ValueError(
+            f"unsupported dtype: {tensor.dtype} in {context}. The backend speaks "
+            "float16, bfloat16, float32, bool and the integer types. A float64 "
+            "tensor usually comes from a decomposition rather than the model - "
+            "quantile, nanquantile and matrix_rank build float64 constants out "
+            "of a float32 input - so those operators refuse here even though no "
+            "input asked for float64"
+        )
     if any(dim <= 0 for dim in tensor.shape):
         raise ValueError(
             f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}"
@@ -87,6 +94,66 @@ def _reject_unsupported_dropout(graph: object) -> None:
                 "no RNG state to reproduce it. Trace with dropout off - "
                 "model.eval() or p=0.0 - so dropout is the identity"
             )
+
+
+# Operator whose metadata produced a symbolic length, and the name a user knows
+# it by. ``unique`` reports itself through the tuple-returning ``_unique2`` and a
+# ``getitem``, so the trace records a builtin rather than the operator the model
+# called; climbing to the producer is what makes the refusal readable.
+_DATA_DEPENDENT_NAMES = {
+    "aten.nonzero.default": "nonzero",
+    "aten.unique.default": "unique",
+    "aten._unique2.default": "unique",
+    "aten.unique_dim.default": "unique",
+    "aten.unique_consecutive.default": "unique_consecutive",
+    "aten.masked_select.default": "masked_select",
+    "aten.bincount.default": "bincount",
+    "aten.index.Tensor": "boolean-mask indexing",
+}
+
+
+def _producing_target(node: object) -> str:
+    """The operator whose metadata gave this node its tensor."""
+
+    target = str(getattr(node, "target", "?"))
+    args = getattr(node, "args", ())
+    while target.startswith("<built-in function") and args:
+        source = next((arg for arg in args if hasattr(arg, "target")), None)
+        if source is None:
+            break
+        target = str(source.target)
+        args = getattr(source, "args", ())
+    return target
+
+
+def _reject_data_dependent_shapes(graph: object) -> None:
+    """Refuse a graph whose tensor lengths are computed from the values.
+
+    ``nonzero``, ``unique``, ``masked_select``, ``bincount`` and boolean-mask
+    indexing all return a tensor whose size depends on what is *in* the tensor.
+    The IR requires every dimension to be a positive constant, so there is
+    nothing to lower, and Torch's own tracing will not guard on the symbol
+    either. The node carries that symbol in its metadata before any lowerer
+    reads it, which is the one place where the offending operator still has a
+    name - so the refusal is written here, next to the dropout refusal, rather
+    than surfacing as a guard exception from a shape comparison.
+    """
+
+    for node in getattr(graph, "nodes", ()):
+        shape = getattr(getattr(node, "meta", {}).get("val"), "shape", None)
+        if shape is None or not any(hasattr(dim, "node") for dim in shape):
+            continue
+        target = _producing_target(node)
+        named = _DATA_DEPENDENT_NAMES.get(target)
+        subject = f"{named} ({target})" if named else target
+        raise ValueError(
+            f"{subject} returns a length computed from its values, and a plan "
+            "can only hold static shapes: the size is not known until the data "
+            "is, so Torch refuses to guard on it too. Pass the extent in from "
+            "the input shape instead - a dense mask of the input length, or an "
+            "explicit length argument - or run this operator outside the "
+            "compiled region"
+        )
 
 
 def _empty_value_nodes(traced: object) -> set[object]:
