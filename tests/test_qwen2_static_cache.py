@@ -586,3 +586,85 @@ def test_bucketed_runtime_keeps_one_copy_of_the_weights() -> None:
                 assert name in {"cosine_table", "sine_table"}
                 continue
             assert value is reference, name
+
+
+@pytest.mark.parametrize("length", [3, 8, 11])
+def test_bucketed_decode_matches_a_per_length_compile_step_by_step(length) -> None:
+    """Compare every decode step's logits, not just the greedy tokens.
+
+    Matching `argmax` chains is a weak test on a tiny random model: both sides
+    can collapse to the same repeated token while the distributions behind it
+    differ. Per-step logits, and the cache the step wrote, are the actual
+    contract the padding has to preserve.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    model = _bucketed_model(transformers)
+    prompt = [list(range(1, length + 1))]
+
+    exact = compile_qwen2_static_cache(
+        model,
+        prompt_length=length,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+    bucketed = _bucketed_runtime(model, [8, 16])
+
+    exact_logits, exact_compact = exact.prefill_ids(prompt)
+    bucket_logits, bucket_cache = bucketed.prefill_ids(prompt)
+    exact_cache = exact.pad_cache(exact_compact)
+    mx.eval(exact_logits, exact_cache, bucket_logits, bucket_cache)
+
+    assert mx.allclose(bucket_logits, exact_logits, atol=1e-5, rtol=1e-5)
+    # The real tokens live in the trailing window of both caches; the bucket's
+    # extra slots are the left padding the decode masks exclude.
+    assert mx.allclose(
+        bucket_cache[..., -length:, :],
+        exact_cache[..., -length:, :],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    valid_length = length
+    for _ in range(5):
+        token = mx.argmax(exact_logits[:, -1, :], axis=-1, keepdims=True).astype(
+            mx.int64
+        )
+        valid_length += 1
+        exact_logits, exact_cache = exact.decode_token(token, exact_cache, valid_length)
+        bucket = bucketed.bucket_for(length)
+        bucket_logits, bucket_cache = bucket.decode_token(
+            token, bucket_cache, valid_length
+        )
+        mx.eval(exact_logits, exact_cache, bucket_logits, bucket_cache)
+
+        assert mx.allclose(bucket_logits, exact_logits, atol=1e-5, rtol=1e-5)
+        assert mx.allclose(
+            bucket_cache[..., -valid_length:, :],
+            exact_cache[..., -valid_length:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_bucketed_save_writes_one_loadable_archive_per_bucket(tmp_path) -> None:
+    """Saving a bucket set keeps the ABI honest for every plan it holds."""
+
+    from aotolith.artifact import load_compiled_module
+
+    transformers = pytest.importorskip("transformers")
+    runtime = _bucketed_runtime(_bucketed_model(transformers), [8, 16])
+
+    paths = runtime.save(tmp_path / "qwen")
+    names = sorted(path.name for path in paths)
+    assert names == [
+        "qwen.16.decode.aoto",
+        "qwen.16.prefill.aoto",
+        "qwen.8.decode.aoto",
+        "qwen.8.prefill.aoto",
+    ]
+    for path in paths:
+        loaded = load_compiled_module(path)
+        assert len(loaded.lowered_graph.ops) > 0
+        assert loaded.input_count == (3 if "prefill" in path.name else 4)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from aotolith import bench
@@ -197,3 +199,53 @@ def test_render_table_lists_every_workload_and_its_skips() -> None:
 def test_bench_command_rejects_an_unknown_workload_name(capsys) -> None:
     assert main(["bench", "--workload", "not-a-workload"]) == 1
     assert "unknown workload" in capsys.readouterr().err
+
+
+# The cheapest real workload, used to exercise the CLI's exit codes end to end.
+_CLI_WORKLOAD = "rms_norm_32x4096"
+
+
+def _recorded_baseline(tmp_path, *, shrink_ops: int = 0):
+    """Run the CLI once to record a baseline, optionally tightened by hand.
+
+    Recording through the CLI rather than building the JSON here keeps the test
+    honest about the file the gate actually reads back.
+    """
+
+    path = tmp_path / "baseline.json"
+    assert main(["bench", "--workload", _CLI_WORKLOAD, "--repeats", "1", "--warmups", "0",
+                 "--update-baseline", str(path)]) == 0
+    if shrink_ops:
+        payload = json.loads(path.read_text())
+        entry = payload["workloads"][_CLI_WORKLOAD]
+        entry["input_ops"] -= shrink_ops
+        entry["lowered_ops"] -= shrink_ops
+        path.write_text(json.dumps(payload))
+    return path
+
+
+def test_bench_command_passes_against_its_own_baseline(tmp_path) -> None:
+    """A recorded report is the baseline it agrees with."""
+
+    baseline = _recorded_baseline(tmp_path)
+
+    assert main(["bench", "--workload", _CLI_WORKLOAD, "--repeats", "1",
+                 "--warmups", "0", "--baseline", str(baseline)]) == 0
+
+
+def test_bench_command_fails_the_gate_on_an_op_count_regression(tmp_path, capsys) -> None:
+    """The threshold check is a process exit code, not just a printed note.
+
+    This is what makes the CI job a gate: a pass that drops a fusion grows the
+    op count, and the step has to fail rather than log a warning.
+    """
+
+    baseline = _recorded_baseline(tmp_path, shrink_ops=1)
+
+    exit_code = main(["bench", "--workload", _CLI_WORKLOAD, "--repeats", "1",
+                      "--warmups", "0", "--baseline", str(baseline)])
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "regression:" in output
+    assert "gate: 2 regression(s)" in output
