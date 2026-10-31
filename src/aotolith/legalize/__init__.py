@@ -45,6 +45,7 @@ from . import (
     kernels,
     linalg,
     padding,
+    quantization,
     reductions,
     views,
 )
@@ -104,6 +105,7 @@ for _family in (
     padding,
     linalg,
     kernels,
+    quantization,
     elementwise,
 ):
     for _target, _handlers in _family.HANDLERS.items():

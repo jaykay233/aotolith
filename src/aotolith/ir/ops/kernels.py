@@ -362,14 +362,97 @@ def _check_attention(graph: Graph, op: Operation) -> None:
             )
 
 
+def _check_dequantize_i4(graph: Graph, op: Operation) -> None:
+    """The three facts a 4-bit unpack relies on, checked together.
+
+    The packed operand is a row of int32 words, the scales carry one value per
+    group along the same row, and the result is the row expanded eightfold. Each
+    of those is a relation *between* operands, which is why none of them fits the
+    shape and dtype fields.
+    """
+
+    packed_type = graph.value(op.inputs[0]).type
+    scales_type = graph.value(op.inputs[1]).type
+    output_type = graph.value(op.outputs[0]).type
+    if packed_type.dtype is not DType.I32:
+        raise ValueError(
+            f"dequantize_i4 packed weights must be int32 words, got {packed_type.dtype}"
+        )
+    if len(packed_type.shape) != 2:
+        raise ValueError(
+            f"dequantize_i4 packed weights must be [out, in/8], got {packed_type.shape}"
+        )
+    if len(scales_type.shape) != 2:
+        raise ValueError(
+            f"dequantize_i4 scales must be [out, in/group_size], got {scales_type.shape}"
+        )
+    group_size = op.attrs["group_size"]
+    assert isinstance(group_size, int)
+    rows, words = packed_type.shape
+    if scales_type.shape[0] != rows:
+        raise ValueError(
+            f"dequantize_i4 scales has {scales_type.shape[0]} rows but the packed "
+            f"weights have {rows}"
+        )
+    inner = words * 8
+    if inner % group_size != 0 or scales_type.shape[1] != inner // group_size:
+        raise ValueError(
+            f"dequantize_i4 scales shape {scales_type.shape} does not cover "
+            f"{inner} weights in groups of {group_size}"
+        )
+    if scales_type.dtype != output_type.dtype:
+        raise ValueError(
+            f"dequantize_i4 output dtype {output_type.dtype} must match the scales' "
+            f"{scales_type.dtype}"
+        )
+    if output_type.shape != (rows, inner):
+        raise ValueError(
+            f"dequantize_i4 output shape {output_type.shape} != {(rows, inner)}"
+        )
+
+
+def _matmul_weight_group_size(op: Operation) -> int | None:
+    """Return the int4 group size when the right operand is a packed weight.
+
+    A folded quantized matmul keeps the same operator and the same names: the
+    weight operand is the packed word tensor, the slot right after it holds the
+    group scales, and the transpose flag is gone (the packed layout *is* the
+    ``[out, in]`` orientation, so there is nothing left to transpose). Every
+    consumer therefore asks this function rather than looking for a marker in a
+    different place each time, and it lives with the contract table rather than
+    with the codegen, because the pass that creates the pair and the kernels
+    that read it sit on opposite sides of the pipeline.
+    """
+
+    value = op.attrs.get("weight_group_size")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            f"{op.op}.weight_group_size must be a positive integer, got {value!r}"
+        )
+    return value
+
+
 CONTRACTS: dict[str, OpContract] = {
     # Their compilers check the operands against the kernel they emit, so the
     # table only pins the arity and the number of results.
     "matmul": OpContract(
-        arity=(2, 5), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
+        arity=(2, 6), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
     ),
     "addmm": OpContract(
-        arity=(3, 4), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
+        arity=(3, 6), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
+    ),
+    # The unpack of a 4-bit weight. It has no kernel of its own: the pass that
+    # folds it into the matmul that reads it removes every instance a compiled
+    # model contains, and the MLX fallback only sees the ones a graph built by
+    # hand can hold.
+    "dequantize_i4": OpContract(
+        arity=(2, 2),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("group_size", AttrKind.INT),),
+        extra=_check_dequantize_i4,
     ),
     # A fused region may also hold no graph inputs at all: a chain that starts
     # from a constant producer (``x.zero_()`` fused into its consumer) is that
