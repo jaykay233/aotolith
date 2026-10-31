@@ -96,6 +96,63 @@ def _reject_unsupported_dropout(graph: object) -> None:
             )
 
 
+_RANDOM_TARGETS = {
+    "aten.rand.default": "rand",
+    "aten.rand_like.default": "rand_like",
+    "aten.randn.default": "randn",
+    "aten.randn_like.default": "randn_like",
+    "aten.randint.default": "randint",
+    "aten.randint.low": "randint",
+    "aten.randint_like.default": "randint_like",
+    "aten.randint_like.low_dtype": "randint_like",
+    "aten.randperm.default": "randperm",
+    "aten.multinomial.default": "multinomial",
+    "aten.bernoulli.default": "bernoulli",
+    "aten.normal.default": "normal",
+    "aten.normal.Tensor_float": "normal",
+    "aten.normal.float_Tensor": "normal",
+    "aten.uniform_.default": "uniform_",
+    "aten.normal_.default": "normal_",
+    "aten.exponential_.default": "exponential_",
+    "aten.cauchy_.default": "cauchy_",
+    "aten.log_normal_.default": "log_normal_",
+    "aten.geometric_.default": "geometric_",
+    "aten.random_.default": "random_",
+}
+"""Every way a traced graph can draw a number nobody asked the inputs for.
+
+``bernoulli`` is absent on purpose: dropout is where it comes from in a model,
+and it has its own refusal above with the advice that fits a training flag.
+``torch.bernoulli`` over a constant probability is decomposed by Torch into
+``rand`` compared against that probability, which is why ``rand`` is here.
+"""
+
+
+def _reject_random_draw(graph: object) -> None:
+    """Refuse a graph that samples, naming the operator and where to draw it.
+
+    A plan is replayed against its own argument buffers and holds no generator,
+    so a draw inside it would either reissue the one value tracing happened to
+    sample or advance state no caller can see. Both are wrong in a way no
+    error message downstream could explain, so the refusal is written here,
+    where the traced target still has a name.
+    """
+
+    for node in getattr(graph, "nodes", ()):
+        target = str(getattr(node, "target", ""))
+        named = _RANDOM_TARGETS.get(target)
+        if named is None:
+            continue
+        raise NotImplementedError(
+            f"{named} draws a random number ({target}), and a plan holds no "
+            "RNG state: replaying it would return the value tracing sampled "
+            "once, or advance a generator the caller cannot see. Draw the "
+            "tensor outside the compiled region and pass it in as an input, "
+            "so the plan stays a pure function of its arguments - seeding "
+            "does not help, because the plan never consumes the seed"
+        )
+
+
 # Operator whose metadata produced a symbolic length, and the name a user knows
 # it by. ``unique`` reports itself through the tuple-returning ``_unique2`` and a
 # ``getitem``, so the trace records a builtin rather than the operator the model

@@ -4193,30 +4193,79 @@ def test_dropout_is_the_identity_in_eval_mode() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fn", "name"),
+    ("fn", "name", "target"),
     [
-        pytest.param(lambda x: x + torch.rand(3), "aten.rand.default", id="rand"),
-        pytest.param(lambda x: x + torch.randn(3), "aten.randn.default", id="randn"),
-        pytest.param(torch.rand_like, "aten.rand_like.default", id="rand_like"),
-        pytest.param(torch.randn_like, "aten.randn_like.default", id="randn_like"),
+        pytest.param(
+            lambda x: x + torch.rand(3), "rand", "aten.rand.default", id="rand"
+        ),
+        pytest.param(
+            lambda x: x + torch.randn(3), "randn", "aten.randn.default", id="randn"
+        ),
+        pytest.param(
+            torch.rand_like, "rand_like", "aten.rand_like.default", id="rand_like"
+        ),
+        pytest.param(
+            torch.randn_like, "randn_like", "aten.randn_like.default", id="randn_like"
+        ),
         pytest.param(
             lambda x: x + torch.randint(0, 5, (3,)).float(),
+            "randint",
             "aten.randint.low",
             id="randint",
         ),
         pytest.param(
+            lambda x: torch.randint_like(x, 5),
+            "randint_like",
+            "aten.randint_like.default",
+            id="randint_like",
+        ),
+        pytest.param(
+            lambda x: torch.randperm(4).reshape(4, 1),
+            "randperm",
+            "aten.randperm.default",
+            id="randperm",
+        ),
+        pytest.param(
             lambda x: torch.multinomial(torch.ones(4), 2),
+            "multinomial",
             "aten.multinomial.default",
             id="multinomial",
         ),
+        pytest.param(
+            lambda x: x.clone().uniform_(),
+            "uniform_",
+            "aten.uniform_.default",
+            id="uniform_in_place",
+        ),
+        pytest.param(
+            lambda x: x.clone().normal_(),
+            "normal_",
+            "aten.normal_.default",
+            id="normal_in_place",
+        ),
+        pytest.param(
+            lambda x: x[:, :1].new_empty(4).exponential_(),
+            "exponential_",
+            "aten.exponential_.default",
+            id="exponential_in_place",
+        ),
+        pytest.param(
+            lambda x: torch.normal(x, 1.0),
+            "normal",
+            "aten.normal.Tensor_float",
+            id="normal_mean_std",
+        ),
     ],
 )
-def test_random_creation_operators_are_refused_by_name(fn, name) -> None:
-    # A plan carries no RNG state, so these cannot be made faithful. The
-    # refusal has to name the operator so the message reads as a decision
-    # rather than a missing case.
-    with pytest.raises(ValueError, match=name):
+def test_random_draws_are_refused_by_name(fn, name, target) -> None:
+    # A plan carries no RNG state, so a draw inside it cannot be faithful: the
+    # refusal has to name the operator and say where the draw belongs, rather
+    # than read as one more missing case.
+    with pytest.raises(NotImplementedError) as caught:
         compile_callable(fn, (torch.randn(4, 3),))
+    message = str(caught.value)
+    assert f"{name} draws a random number ({target})" in message
+    assert "outside the compiled region" in message
 
 
 @pytest.mark.parametrize(
