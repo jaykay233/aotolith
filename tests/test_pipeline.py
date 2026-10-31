@@ -2139,6 +2139,40 @@ def test_sort_values_and_indices_match_pytorch(dim, descending) -> None:
     assert mx.array_equal(indices, mx.array(expected_indices.numpy()))
 
 
+@pytest.mark.parametrize(
+    ("fn", "op"),
+    [
+        pytest.param(
+            lambda value: torch.sort(value, dim=1, stable=True).values,
+            "sort",
+            id="stable_sort",
+        ),
+        pytest.param(
+            lambda value: torch.sort(value, descending=True, stable=True).values,
+            "sort",
+            id="stable_sort_descending",
+        ),
+        pytest.param(
+            lambda value: torch.argsort(value, dim=-1, stable=True),
+            "argsort",
+            id="stable_argsort",
+        ),
+    ],
+)
+def test_a_stable_sort_spelling_lowers_like_the_plain_one(fn, op) -> None:
+    # ``stable=True`` traces to ``aten.sort.stable``, a target of its own whose
+    # arguments Torch records entirely as keywords. Ties are the one place the
+    # two spellings could disagree, so the input below has them.
+    x = torch.tensor([[3.0, 1.0, 2.0, 1.0], [0.5, -1.0, 4.0, 2.0]])
+    result = compile_callable(fn, (x,))
+    assert [operation.op for operation in result.lowered_graph.ops] == [op]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
 def test_sort_emits_only_the_selection_the_graph_reads() -> None:
     torch.manual_seed(58)
     x = torch.randn(3, 5)

@@ -760,16 +760,27 @@ def _sort_operations(
     if rank == 0:
         raise NotImplementedError(f"{target} requires a ranked tensor")
 
-    if target == "aten.sort.default":
-        dim = args[1] if len(args) > 1 else kwargs.get("dim", -1)
-        descending = args[2] if len(args) > 2 else kwargs.get("descending", False)
-        stable = args[3] if len(args) > 3 else kwargs.get("stable", False)
+    if target in {"aten.sort.default", "aten.sort.stable"}:
+        # ``sort.stable`` has a leading ``stable`` flag that ``sort.default``
+        # does not, and Torch records every argument of it as a keyword. The
+        # flag itself does not change the lowering: ties come out in whatever
+        # order the backend's ordering produced, which ``stable=False`` allows.
+        offset = 0
+        if target == "aten.sort.stable":
+            stable = args[1] if len(args) > 1 else kwargs.get("stable", True)
+            if stable is not None and not isinstance(stable, bool):
+                raise ValueError(f"{target}.stable must be a boolean, got {stable!r}")
+            offset = 1
+        dim = args[1 + offset] if len(args) > 1 + offset else kwargs.get("dim", -1)
+        descending = (
+            args[2 + offset]
+            if len(args) > 2 + offset
+            else kwargs.get("descending", False)
+        )
         if not isinstance(descending, bool):
             raise ValueError(
                 f"{target}.descending must be a boolean, got {descending!r}"
             )
-        if not isinstance(stable, bool):
-            raise ValueError(f"{target}.stable must be a boolean, got {stable!r}")
     else:
         if len(args) < 2:
             raise ValueError(f"{target} expects an input and k")
@@ -828,7 +839,7 @@ def _sort_operations(
         )
         produced[index] = output_id
 
-    if target == "aten.sort.default":
+    if target in {"aten.sort.default", "aten.sort.stable"}:
         attrs: dict[str, object] = {"dim": axis, "descending": descending}
         if 0 in wanted:
             emit("sort", dict(attrs), 0, input_type)

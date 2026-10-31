@@ -576,7 +576,10 @@ _PRELU_TARGET = "aten._prelu_kernel.default"
 _NANSUM_TARGET = "aten.nansum.default"
 
 
-_SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
+_SORT_TARGETS = {"aten.sort.default", "aten.sort.stable", "aten.topk.default"}
+"""``sort``, ``argsort`` and ``topk``. ``stable=True`` traces to its own target -
+``aten.sort.stable`` - and Torch passes every one of its arguments by keyword,
+so the lowering reads the flag from either place."""
 
 
 _KTHVALUE_TARGET = "aten.kthvalue.default"
