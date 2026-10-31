@@ -250,17 +250,18 @@ python examples/qwen_static_cache_benchmark.py --quantize 64 \
 
 | 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm` |
 | --- | --- | --- | --- | --- |
-| 仅 MLX fallback | 10 000 token/s | 119.0 token/s | **134.6 token/s** | 0.70x |
-| `--codegen-matmul` | 13 000 token/s | 178.4 token/s | **240.1 token/s** | **1.23x** |
-| `--codegen-matmul --codegen-attention` | 12 400 token/s | 176.8 token/s | 233.0 token/s | 1.21x |
+| 仅 MLX fallback | 9 500 token/s | 146.3 token/s | **174.8 token/s** | 0.90x |
+| `--codegen-matmul` | 11 800 token/s | 166.4 token/s | **231.7 token/s** | **1.21x** |
+| `--codegen-matmul --codegen-attention` | 12 400 token/s | 166.3 token/s | 232.3 token/s | 1.20x |
 
-（Qwen2.5-0.5B-Instruct、128 prompt token、greedy、batch 1、BF16、11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。这份构建多次运行下来，`--codegen-matmul` 的 decode 落在 240.0-240.2 token/s——这个配置稳定到可以读到小数点后一位——而 `--codegen-attention` 那行在 229.8-238.2 之间波动，prefill 在 11.6k-12.8k 之间波动。不加原生 attention 时 prefill 稳定在 13.0k 左右，加上后降到约 12.4k，这是 attention kernel 在 prefill 形状上 tile 更慢所致，不是 decode 的代价。`mlx_lm` 基线在同样几次运行里读到 190.5-195.0 token/s。）
+（Qwen2.5-0.5B-Instruct、128 prompt token、greedy、batch 1、BF16、11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。每一行都在同一个进程里带了自己的 `mlx_lm` 基线，这些基线读到 192.2-195.3 token/s。`--codegen-attention` 那行在 decode 上与上一行落在噪声内，prefill 这里甚至略高——attention kernel 在 prefill 形状上更慢的 tile 比这台机器的运行间波动还小。这台机器的绝对值在多次运行之间会差几个百分点；上面的几行适合互相比较，不适合和几周前记录的某次运行比。）
+
 
 token 一致不等于数字一致，两条路径离参考实现的距离也不同：在同一个模型的 24 层前向上，原生 kernel 的 logits 相对 PyTorch 平均 0.043、最大 0.38，而全走 MLX fallback 是平均 0.081、最大 1.5。也就是说打开 codegen 是把算术语义往 PyTorch 靠，而不是相反——所以它是个吞吐决策，不是精度决策。
 
 和 `mlx_lm` 对比应该看 `decode_async`，因为两者都把 host 循环摊到了多个 token 上；`decode_sync_each_step` 每个 token 都要同步一次设备，任何服务循环都不会这么做。异步路径此前落后于同步路径，现在反超，因为每个 step 只强制一次设备同步。
 
-decode 现在受权重带宽限制，而不是受 host 限制。构建一个 step 只需 0.98 ms Python，GPU 需要约 4.1 ms，所以 host 完全被异步队列盖住；在 plan 展开之前 host 要 6.2 ms，那时它才是瓶颈。一个 step 要流式读取 991 MB 权重（24 层的 `qkv` 2.07 MB、`o_proj` 1.61 MB、一个 17.4 MB 的成对 gate/up 矩阵、8.73 MB 的 `down`，再加 272 MB 的 LM head），按实测 4.17 ms 每个 token 算是 238 GB/s。
+decode 现在受权重带宽限制，而不是受 host 限制。构建一个 step 只需 0.98 ms Python，GPU 需要约 4.3 ms，所以 host 完全被异步队列盖住；在 plan 展开之前 host 要 6.2 ms，那时它才是瓶颈。一个 step 要流式读取 991 MB 权重（24 层的 `qkv` 2.07 MB、`o_proj` 1.61 MB、一个 17.4 MB 的成对 gate/up 矩阵、8.73 MB 的 `down`，再加 272 MB 的 LM head），按每 token 4.30 ms 算是 230 GB/s。
 
 剩下的余量在哪，看下面的单次速率就知道：272 MB 的 LM head 单次能跑到 412 GB/s，而 17.4 MB 的 MLP 单次只有 279 GB/s。这一节早先的解释是「输出只有 4864 列的一次 launch 填不满设备」，这个解释经不起实测检验，见下面的[为什么小分桶修不动](#为什么小分桶修不动)。
 
@@ -277,7 +278,7 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 | RoPE q / k | 48 | 1 KB | 7.8 us | - |
 | 加性 attention mask | 1 | 0.2 KB | 26.6 us | - |
 
-加起来是 3.96 ms 设备时间、991 MB，而整个 step 实测 4.17 ms。LM head 加 MLP 矩阵占了其中 74%，而它们是在搬字节，不是在等 launch；其余分散在 121 次每次最多搬 2 MB 的 launch 上。一个 step 带着 170 次有依赖的 launch。删掉便宜的 launch 不影响总量：把 query 和 key 的旋转合成一次 16 头旋转省掉了 24 次 launch 和 24 个图节点，decode 却是 232.9 token/s 对之前的 232.5，落在运行间波动内，所以没有保留。删掉搬运真实数据的 launch 就会影响：把 `gate` 和 `up` 合成一次 launch 读的仍是同样的 17.4 MB，但 launch 从两次变成一次，交替 A/B 测到 1.031x-1.038x。区别在于这次 launch 搬多少，而不在于有多少次。
+加起来是 3.96 ms 设备时间、991 MB，而整个 step 实测 4.30 ms。LM head 加 MLP 矩阵占了其中 74%，而它们是在搬字节，不是在等 launch；其余分散在每次最多搬 2 MB 的 launch 上。做这张表时一个 step 带着 170 次有依赖的 launch。删掉便宜的 launch 不影响总量：把 query 和 key 的旋转合成一次 16 头旋转省掉了 24 次 launch 和 24 个图节点，decode 却是 232.9 token/s 对之前的 232.5，落在运行间波动内，所以没有保留。删掉搬运真实数据的 launch 就会影响：把 `gate` 和 `up` 合成一次 launch 读的仍是同样的 17.4 MB，但 launch 从两次变成一次，交替 A/B 测到 1.031x-1.038x。区别在于这次 launch 搬多少，而不在于有多少次——直到 launch 多到发射本身不再免费，那就是[下一节](#从-decode-step-里砍掉-245-个-op)测的东西。
 
 有三种做法会把这个表测成“什么都没测”，而且看起来都很正常。一是每轮丢掉输出的数组，惰性图在到达设备之前就被释放，墙钟时间只覆盖 host 提交，带宽那一列会算出 1 TB/s 以上。二是传全零权重，驱动可以跳过读取，小分桶因此被抬高。一个分桶必须让每一轮的输出都活着，并且喂真实数值，它的数字才有意义；任何超过 `mx.sum` 读同样字节能达到的读数，测的是 harness 而不是 kernel。三是回放本身会往反方向偏：表里同一个分桶的 24 个实例是连着跑的，而真实 step 里每一层都要等上一层，所以 RoPE 和 attention 的单次数字是上界，整表的和只是近似整个 step。
 
@@ -313,7 +314,7 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 第三个是上面同一个表里的受控对比：同一份 warp-per-column kernel，在 272 MB 矩阵上跑到 412 GB/s，在 17.4 MB 上只有 279。差别只有字节数。
 
-三者合起来说明：一次 launch 能达到的速率取决于它读多少字节，而不是它的网格怎么划分。要让整个 step 都跑在 412 GB/s，那 991 MB 必须以几百 MB 一次的 launch 到达，但每一层都被切成五个严格串行的投影 —— `qkv`、`o_proj`、成对 gate/up、`down` —— 而最大的只有 17.4 MB，因为中间的非线性是真屏障。把 `gate` 和 `up` 配对正是利用了这一点，这也是为什么那一次改动测到 1.03x，而删掉 24 次 1 KB 的 launch 什么也没测到。所以每个 token 4.17 ms 就是这台设备上的 BF16 地板：要明显更快只能少读字节，也就是量化权重，而不是写更好的 kernel。
+三者合起来说明：一次 launch 能达到的速率取决于它读多少字节，而不是它的网格怎么划分。要让整个 step 都跑在 412 GB/s，那 991 MB 必须以几百 MB 一次的 launch 到达，但每一层都被切成五个严格串行的投影 —— `qkv`、`o_proj`、成对 gate/up、`down` —— 而最大的只有 17.4 MB，因为中间的非线性是真屏障。把 `gate` 和 `up` 配对正是利用了这一点，这也是为什么那一次改动测到 1.03x，而删掉 24 次 1 KB 的 launch 什么也没测到。要明显更快只能少读字节，也就是量化权重，而不是写更好的 kernel。
 
 ### 权重 int4，以及它到底买到了什么
 
@@ -323,24 +324,33 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 编译器怎么处理一个打包权重，取决于它乘多少行。单行 matmul —— decode —— *就是* 流式 kernel：`fold_quantized_weights` 把 `matmul(x, dequantize_i4(packed, scales))` 改写成带 `weight_group_size` 的单个 `matmul`，GEMV prologue 读字、用两条指令符号扩展每个 nibble（`(int)(word << 28) >> 28`）、乘 `x` 再乘组 scale、用 float 累加。整个过程中不存在解包后的权重。多行 matmul —— prefill —— 保留解包，因为 128 行时权重流只是乘法里便宜的那一半，int4 只会给算力受限的 pass 加解码工作；此时显式的 `dequantize_i4` 在 `codegen/quantize.py` 里 lower 成一个流式 kernel，而不是八个逐元素 MLX pass 加一次 stack、每层写出好几个全尺寸临时张量。
 
-Qwen2.5-0.5B-Instruct，128 个 prompt token，64 个 greedy decode token，`--codegen-attention`，M5 Pro：
-
-| | bf16 | int4 g64 | |
-| --- | ---: | ---: | ---: |
-| decode，每步同步 | 4.13 ms/token | 3.56 ms/token | 1.16x |
-| 每 token 权重字节 | 991 MB | 312 MB | 3.2x |
-| 峰值内存 | 4.12 GiB | 1.90 GiB | 2.2x |
-| prefill，128 token | 11.9 ms | 13.2 ms | 0.90x |
-
-1.16x 远小于字节数的 3.2x，kernel 自己的速率说明了原因：312 MB 用了 3.56 ms，也就是 88 GB/s，而 bf16 GEMV 跑到 240 GB/s。bf16 kernel 每 8 字节读一个 `vec<T, 4>`、做四次乘加。int4 kernel 每 4 字节读一个字，为同样 8 个权重做两次移位、一次掩码、一次选择、八次 FMA，要快三倍就需要八倍的指令吞吐。它停在 88 GB/s，是因为先耗尽的是 SIMD 管线而不是内存控制器。这是下一件要修的事，而且它不是 tiling 问题。
-
-异步那一列是另一个结论：bf16 193.7 token/s，int4 193.4，没动。当每步的设备时间降到 3.56 ms，host 循环已经喂不满队列，瓶颈变成了 launch 速率。单独把 decode kernel 做快，在这个数字上会显示为零。
-
-上表两行来自同一次背靠背测量，而那次会话的绝对值比前面的 bf16 表低 —— 异步 197-201 token/s，那张表记的是 240，同一份构建、HEAD 上同步口径也只读到 152 token/s。所以这里的绝对数字只能和同一行旁边的比，结论是那个比值。
+step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#从-decode-step-里砍掉-245-个-op)把 launch 数从 1239 压到 994，并测出这一项买到了什么。它留下要解决的问题是打包 kernel 本身：每 token 读 312 MB，但每字节的速率远低于 bf16 kernel。原因还没有定论：孤立测量在不同工作集常驻程度下读到 88 到 218 GB/s 不等，所以诚实的说法是这个速率取决于工作集，下一步是弄清冷流受限的到底是发射速率还是内存级并行。
 
 精度：int4 把每个权重四舍五入到组内 15 个取值之一，logits 因此会移动，而 greedy decode 是这个移动的混沌读数。以同一份取整后的权重跑 float32 CPU forward 作为基准，运行时偏离 0.51 —— 是 18.5 的 logit 尺度的 2.7% —— 而 torch 自己的 bf16 forward 偏离 0.41，即 2.2%。两者都是 bf16 噪声，都不是解码错误。greedy 于是能跟住取整后的 checkpoint 前 13 个 token，然后在一次接近平手的选择上翻转，64 个 token 里对上 16 个。所以 CI 不使用这个模型上的 token 相等：`tests/test_quantized_qwen2.py` 跑一个 2 层模型，那里检查是精确的 —— 每个 decode token 都必须与取整后的 reference 相同 —— 而 `--quantize` 会同时报告 bf16 reference 和取整后的 reference，任何一次运行都不会含糊它跟的是哪一个。
 
 自动调优也不是出路，而且在此之前它对这种模型连跑都跑不起来。`--autotune` 会给每个 op 都求一次 MLX fallback 当参考，但归一化、旋转和 attention 只降级到生成 kernel，所以编译一个 Transformer 会在第一个独立 `rms_norm` 上抛 `NotImplementedError`。现在它对这类 op 只测量自己，记录单条 benchmark，并在 selection reason 里说明这是唯一有效候选。
+
+### 从 decode step 里砍掉 245 个 op
+
+这个模型的 decode step 原来是 1239 个 op —— 147 个 cast、338 个 reshape、168 个 slice、49 个 multiply、49 个归一化 —— 而其中真正的 GPU 工作只占 5.7 ms 里的 2.5 ms。其余都是 launch 之间的间隙，平均每次约 4.6 µs，摊在 24 层、每层约十次严格串行的 launch 上：这样一条依赖链，靠一个微秒级提交的 host 线程是盖不住的，GPU 在命令之间空转。把 launch 数压下来比把任何一个 kernel 做快都更值。
+
+最大的一笔来自 PyTorch 写 RMSNorm 的方式。展开写它是 `(x.to(f32).pow(2).mean().rsqrt() * x.to(f32) * weight.to(f32)).to(x.dtype)`，前端忠实记录了五个 op：一次加宽 cast、一次不带 weight 的归一化、为 weight 的第二次加宽 cast、一次 multiply、一次收窄 cast。编译器早就有带 weight 的 `rms_norm`（它降级到同一个 Metal kernel），但没有任何规则把这种五 op 写法匹配上去，于是图里 49 个归一化各自变成五次 launch 和四个全宽临时张量。
+
+`fuse_norm_scale` 匹配这个序列，最后发出一个带 weight 的 `rms_norm`。每 token 因此从图里少掉 245 个 op——49 个被折叠的 multiply 在内，其余是只为喂它而存在的 cast 和 layout 工作——量化图上 1239 降到 994，bf16 图上 1191 降到 995。这个折叠不需要容差，因为它是逐位一致的：输入行和 weight 都以收窄后的 dtype 到达，融合 kernel 用 fp32 做乘积并只舍入一次，正是原来五 op 链做的事。pass 检查这个前提，不满足时不生效——真要一个独立 fp32 行的图保留它——`tests/test_passes_norm.py` 断言的是与未折叠图的逐位相等，而不是容差。
+
+在同一个交替会话里只对这一个 pass 做消融 —— 关、开、关、开 —— 所以每一对数字共享同一份机器热状态与负载：
+
+| | bf16 | int4 g64 |
+| --- | ---: | ---: |
+| 每步图 op 数 | 1191 → 995 | 1239 → 994 |
+| decode（每步同步） | 155.4 → 167.2 token/s（6.44 → 5.98 ms） | 179.0 → 228.3 token/s（5.59 → 4.38 ms） |
+| decode（异步） | 199.2 → 232.2 token/s（5.02 → 4.31 ms） | 195.3 → 272.8 token/s（5.12 → 3.67 ms） |
+| prefill，128 token | 11 208 → 12 298 token/s | 9 494 → 10 375 token/s |
+| 峰值内存 | 4.26 GiB，不变 | 1.99 → 1.89 GiB |
+
+结论落在前后配对值上：bf16 是 1.08x 和 1.17x，int4 是 1.28x 和 1.40x，prefill 是 1.09-1.10x，代价是每 token 少 245 个 op，没有任何 kernel 改动。折叠之后异步仍然领先同步 —— 4.31 ms 对 5.98 ms —— 说明 host 循环还盖在队列后面，这次折叠并没有把 launch 地板推到台前。每个 op 平摊的成本折叠前是 4.51 µs、折叠后是 4.41 µs：这就是这条发现的形状——这个 step 的耗时等于 op 数乘以一个常数，而常数没有随数量变。
+
+同一个 pass 还暴露出第二个问题，值得记下来，因为修法是收窄的而不是通用的。`_match_rms_norm_consumers` 会把归一化折进读它的那个投影的 *prologue*，让 GEMV 在加载输入行的同时把它们缩放掉。对打包投影这是免费的，它的 prologue 是生成的 Metal。但对稠密投影不免费：它退回 MLX，会为 *每个* 读者重新推导一遍归一化，比只算一次更慢。现在这个匹配器只在投影带打包权重时才吸收归一化，稠密图保持原样。
 
 ### 命令行与编译产物
 

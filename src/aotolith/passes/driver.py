@@ -24,6 +24,7 @@ from .fusion import (
     fuse_rope,
 )
 from .layout import fold_matmul_input_layouts, simplify_layouts
+from .norm import fuse_norm_scale
 from .quantize import fold_quantized_weights
 
 #: Names and functions, in order, with the reason each one sits where it does.
@@ -45,6 +46,10 @@ PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
     # once the operand layouts are final and before any matcher reads the
     # right operand as a matrix.
     ("fold_quantized_weights", fold_quantized_weights),
+    # The norm scale has to be inside the norm before anything looks for a
+    # projection to absorb a normalization into, and before the pointwise
+    # sweep would fuse the multiply into a standalone region.
+    ("fuse_norm_scale", fuse_norm_scale),
     ("fuse_rope", fuse_rope),
     # The epilogues, additive ones before the pointwise sweep that would
     # otherwise swallow the region they need.

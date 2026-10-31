@@ -352,7 +352,7 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 - `passes/checks.py` 放最笨的谓词：attribute 是不是合法的整数、静态 shape 能不能 broadcast。它们不看图。
 - `passes/matchers/` 一族一个模块（`attention`、`rope`、`norm`、`matmul`、`view`），只判断「这段子图是不是我要的形状」，命中就返回匹配结果，否则返回 `None`，自己不写回图。
 - `layout.py`、`canonicalize.py`、`fusion.py`、`cse.py` 才是改写，每个 pass 一个函数，签名统一是 `Graph -> Graph`。
-- `driver.py` 拥有顺序。以前这 11 步是 `compile_graph` 里的 11 行赋值，顺序的理由写不出来也没法单独测；现在 `PIPELINE` 是一个带名字的元组，每一步旁边写着它为什么在这个位置，`tests/test_passes.py` 钉住这个序列。`compiler.py` 只调用 `rewrite(graph)`。
+- `driver.py` 拥有顺序。以前这些步骤是 `compile_graph` 里的一串赋值，顺序的理由写不出来也没法单独测；现在 `PIPELINE` 是一个带名字的元组，每一步旁边写着它为什么在这个位置，`tests/test_passes.py` 钉住这个序列。`compiler.py` 只调用 `rewrite(graph)`。
 
 每一步为什么排在这个位置，写在 `passes/driver.py` 的 `PIPELINE` 里那一步的注释上；下面几节讲的是各步的匹配条件，以及它最终生成什么。
 
@@ -367,6 +367,10 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 GQA/MQA 有两种入口。直接调用 `F.scaled_dot_product_attention(..., enable_gqa=True)` 时，前端直接生成 `attention`；显式 `repeat_kv` 的分解图则通过 `unsqueeze -> expand -> reshape` 识别出原始 K/V。后一种模式会去掉物化复制，把 K/V head 数低于 Q head 数的 `attention` 交给 MLX。rank-4 下要求 Q head 数是 K/V head 数的整数倍；MQA 是 K/V head 数为 1 的特例。
 
 Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention`，GQA/MQA 同样复用这个 MLX 实现。rank-3 输入在调用前临时增加 head 轴，调用后 squeeze 回去。显式 mask 可以是与 Q/K/V 同 dtype 的 additive mask，也可以是 bool mask；bool mask 中 `True` 表示允许该 key 参与 attention。当 `safe_softmax=True` 且存在显式 mask 时，MLX lowering 会把整行都被 mask 的输出显式置零：additive mask 判断整行是否为 `-inf`，bool mask 判断整行是否为 `False`，避免 fused SDPA 产生 NaN 或错误结果。此时 `CompiledPlan.kernels` 只记录项目生成的 Metal kernel，不记录 MLX 内置的 attention 实现。开启 `codegen_attention=True` 后，满足条件的 additive-mask 或 bool-mask attention 会改为执行下面描述的生成 kernel；不满足条件的形状仍回退到 MLX。MLX fused SDPA、生成 kernel 与逐算子 `matmul/softmax` 存在浮点路径差异，测试按 dtype 使用 `2e-3` 到 `2e-2` 的容差。
+
+`fuse_norm_scale` 补的是前端折叠留下的一半。`F.rms_norm(input, normalized_shape, weight)` 在 `make_fx` 里不是单个 ATen target：前端的 pattern folding 只吃掉 `pow -> mean -> add -> rsqrt -> mul` 这一段，weight 的乘法留在图里，形状是 `cast(up) -> rms_norm(无 weight) -> cast(up weight) -> mul -> cast(narrow)`。这在语义上是同一次归一化，但图里是五个 op、四个全宽临时张量。pass 以那个无 weight 的 `rms_norm` 为锚点向后匹配，要求：命中一个无 weight、无 bias 的 `rms_norm`，它的唯一消费者是那个 `mul`，`mul` 的另一个操作数来自一次 `cast`，而该 `cast` 的输入形状等于 `normalized_shape`；行的 upcast 和 weight 的 upcast 都只在没有其他读者时才被删掉，这一点由 consumer 表证明而不是假定。改写本身逐位精确：输入行和 weight 都已经是收窄后的 dtype，融合 kernel 在 fp32 里做乘积并只舍入一次，与原来的五 op 链算的是同一串舍入；前提不满足时 pass 直接不生效。`tests/test_passes_norm.py` 断言的是与未折叠图的逐位相等。它排在 `fold_quantized_weights` 之后、`fuse_rope` 之前：必须晚于量化折叠（这样 weight 已是最终操作数），又必须早于任何把归一化吸收进投影 prologue 的 matcher，否则那段五 op 序列会被当成普通 pointwise 链。
+
+同一个 pass 还收紧了一处匹配条件。`_match_rms_norm_consumers` 会把归一化折进读它的投影的 prologue，让 GEMV 在加载输入行时顺便缩放。对打包权重这是免费的——prologue 本来就是生成的 Metal；但稠密投影退回 MLX，它会为每个读者重新推导一遍归一化，比算一次更慢。现在只有投影带 `weight_group_size` 时才吸收，稠密图保持一个独立的 `rms_norm`。
 
 ## 4. Pointwise 融合
 
@@ -605,7 +609,7 @@ kernel 在同一个循环里读 gate 行和 up 行（`in_1`、`in_2`），各自
 - 左侧超过一行时折叠被跳过（`M > 1` 时权重流是乘法里便宜的一半），显式 `dequantize_i4` 由 `codegen/quantize.py` 的 `QuantizationLowering` lower 成一个流式 kernel：一个字一个线程，解 8 个 nibble、乘组 scale、两次 `vec<T, 4>` 存储。相比 MLX fallback 的八个逐元素 pass 加一次 stack，它不产生中间全尺寸临时张量
 - 精度上 kernel 用 float 累加，`value`/`acc` 都是 float，只在写回时 cast。实测同一份取整后权重下，运行时相对 float32 CPU forward 的 logit 最大偏差 0.51，torch 自己的 bf16 forward 是 0.41，两者都是 bf16 噪声量级
 
-当前实测（Qwen2.5-0.5B，M5 Pro，bf16 与 int4 都开 `--codegen-attention`）：decode 4.13 → 3.56 ms/token（1.16x），峰值内存 4.12 → 1.90 GiB（2.2x），prefill 11.9 → 13.2 ms。kernel 只跑到 88 GB/s 而 bf16 GEMV 是 240 GB/s：每个 4 字节字要做两次移位、一次掩码、一次选择和八次 FMA，先耗尽的是 SIMD 管线而不是内存控制器。async 计时两边都是 193 token/s，说明每步 3.56 ms 时 host launch 速率已成新地板。
+当前实测（Qwen2.5-0.5B，M5 Pro，bf16 与 int4 都开 `--codegen-attention`）：int4 异步 decode 195.3 → 272.8 token/s，同步 179.0 → 228.3；bf16 异步 199.2 → 232.2，同步 155.4 → 167.2；prefill 提高约 1.1x；峰值内存 int4 1.99 → 1.89 GiB。这些是同一会话里对 `fuse_norm_scale` 做交替消融得到的配对值，量化的收益本身没有变化（每 token 991 MB → 312 MB，峰值 4.26 → 1.89 GiB）。打包 kernel 每 token 读 312 MB，但每字节速率远低于 bf16 kernel；孤立测量在不同工作集常驻程度下读到 88-218 GB/s，所以下一步要确定冷流受限的是发射速率还是内存级并行。
 
 ## 12. Metal attention codegen
 

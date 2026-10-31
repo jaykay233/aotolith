@@ -2,6 +2,12 @@
 
 RMS norm is a mean-square, a rsqrt, and a scale, and the fusion only applies
 when the reduction really feeds that scale and nothing else.
+
+Absorbing the norm into a projection is a trade the backend has to be able to
+keep: the generated GEMV recomputes the RMS scale inside the kernel it already
+launches, while the MLX fallback re-derives the whole normalization once per
+projection. The matcher therefore only folds into a projection that carries a
+packed weight, which is the case the generated kernel always handles.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from ..graph import (
     _retarget_input,
 )
 from ...ir import Graph, Operation
+from ...ir.ops.kernels import _matmul_weight_group_size
 
 
 def _match_rms_norm_consumers(
@@ -86,6 +93,14 @@ def _match_rms_norm_consumers(
         if projection.attrs.get("rms_norm_eps") is not None:
             return None
         if output_type.shape[:-2] != left_type.shape[:-2]:
+            return None
+        if _matmul_weight_group_size(projection) is None:
+            # Only a packed weight is guaranteed to run on the generated GEMV,
+            # and the prologue only pays there. A dense projection can fall back
+            # to MLX, which re-derives the normalization once per projection
+            # instead of reusing one materialized row; on Qwen2.5-0.5B that is
+            # 1.28x slower end to end than keeping the norm standalone, while
+            # the packed GEMV is 1.11x faster.
             return None
         attrs = dict(projection.attrs)
         attrs["rms_norm_eps"] = eps

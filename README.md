@@ -252,17 +252,18 @@ python examples/qwen_static_cache_benchmark.py --quantize 64 \
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 10 000 tok/s | 119.0 tok/s | **134.6 tok/s** | 0.70x |
-| `--codegen-matmul` | 13 000 tok/s | 178.4 tok/s | **240.1 tok/s** | **1.23x** |
-| `--codegen-matmul --codegen-attention` | 12 400 tok/s | 176.8 tok/s | 233.0 tok/s | 1.21x |
+| MLX fallback only | 9 500 tok/s | 146.3 tok/s | **174.8 tok/s** | 0.90x |
+| `--codegen-matmul` | 11 800 tok/s | 166.4 tok/s | **231.7 tok/s** | **1.21x** |
+| `--codegen-matmul --codegen-attention` | 12 400 tok/s | 166.3 tok/s | 232.3 tok/s | 1.20x |
 
-(Qwen2.5-0.5B-Instruct, 128 prompt tokens, greedy, batch 1, median of 11 repeats, BF16; the same 64 generated tokens as the PyTorch reference in every row. Across runs of this build the `--codegen-matmul` decode lands in 240.0-240.2 tokens/s — that configuration is stable enough to read to a tenth — while the `--codegen-attention` row varies in 229.8-238.2 and its prefill in 11.6k-12.8k. Prefill staying around 13.0k without native attention and dropping to roughly 12.4k with it is the attention kernel's slower tile on prefill shapes, not a decode cost. The `mlx_lm` baseline reads 190.5-195.0 tokens/s across the same runs.)
+(Qwen2.5-0.5B-Instruct, 128 prompt tokens, greedy, batch 1, median of 11 repeats, BF16; the same 64 generated tokens as the PyTorch reference in every row. Each row was run with its own `mlx_lm` baseline in the same process, and those baselines read 192.2-195.3 tokens/s. The `--codegen-attention` row is within noise of the one above it on decode, and its prefill reads a little higher here rather than lower — the attention kernel's slower tile on prefill shapes is smaller than this machine's run-to-run spread. Absolute rates move several percent between sessions; the rows above are comparable to each other and not to a session recorded weeks earlier.)
+
 
 `decode_async` is the figure to compare against `mlx_lm`, because both amortize the host loop across tokens; `decode_sync_each_step` pays a device sync every token, which no serving loop needs. The async path used to trail the synchronous one and now leads it, because the plan only forces a single device sync per step.
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without native kernels. `mlx_lm` produces those same 64 tokens, so the throughput comparison above also compares two implementations that agree on the answer. Agreeing on tokens is not the same as agreeing on numbers, and the two paths are not equally close to the reference: on the same model's 24-layer forward, the native kernels land a mean 0.043 / max 0.38 from PyTorch's logits, the MLX fallback a mean 0.081 / max 1.5. So enabling code generation moves the arithmetic toward PyTorch rather than away from it, which makes it a throughput decision and not an accuracy one.
 
-Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.1 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at the measured 4.17 ms per token is 238 GB/s.
+Decode is bound by weight bandwidth, not by the host. Building a step costs 0.98 ms of Python and the GPU needs about 4.3 ms, so the host is fully hidden behind the async queue; before the plan was unrolled the host cost 6.2 ms and *was* the limit. One step streams 991 MB of weights (24 layers of `qkv` 2.07 MB, `o_proj` 1.61 MB, one paired gate/up matrix of 17.4 MB, and `down` at 8.73 MB, plus the 272 MB LM head), which at 4.30 ms per token is 230 GB/s.
 
 Where the remaining headroom sits shows up in the per-launch rates below: the 272 MB LM head launch sustains 412 GB/s, while the 17.4 MB MLP launches sustain 279. An earlier version of this section blamed the narrow grid — a 4864-wide output supposedly cannot fill the device the way a 151936-wide one can. That explanation does not survive measurement; see [why the small buckets cannot be fixed](#why-the-small-buckets-cannot-be-fixed) below.
 
@@ -279,7 +280,7 @@ Per-bucket GPU cost for one decode step, measured by replaying each bucket enoug
 | RoPE q / k | 48 | 1 KB | 7.8 us | - |
 | additive attention mask | 1 | 0.2 KB | 26.6 us | - |
 
-That sums to 3.96 ms of device time and 991 MB, against 4.17 ms measured for the whole step. The LM head plus the MLP matrices are 74% of it, and they are moving bytes rather than waiting on dispatches; the rest is spread over 121 launches that each move 2 MB or less. A step carries 170 dependent launches. Removing one of the cheap ones does not move the total: folding the query and key rotary calls into one 16-head rotation removed 24 launches and 24 graph ops and decode stayed at 232.9 tokens/s against 232.5, inside the run-to-run band, so it was not kept. Removing one that carries real traffic does move it: pairing `gate` and `up` into one launch reads the same 17.4 MB but takes one launch instead of two, and measured 1.031x-1.038x across interleaved A/B runs. The difference is what the launch moves, not how many there are.
+That sums to 3.96 ms of device time and 991 MB, against 4.30 ms measured for the whole step. The LM head plus the MLP matrices are 74% of it, and they are moving bytes rather than waiting on dispatches; the rest is spread over launches that each move 2 MB or less. A step carried 170 dependent launches when this table was made. Removing one of the cheap ones does not move the total: folding the query and key rotary calls into one 16-head rotation removed 24 launches and 24 graph ops and decode stayed at 232.9 tokens/s against 232.5, inside the run-to-run band, so it was not kept. Removing one that carries real traffic does move it: pairing `gate` and `up` into one launch reads the same 17.4 MB but takes one launch instead of two, and measured 1.031x-1.038x across interleaved A/B runs. The difference is what the launch moves, not how many there are — until the launch count is large enough that the dispatches themselves stop being free, which is what [the next section](#cutting-245-operators-out-of-a-decode-step) measures.
 
 Two ways of producing this table measure nothing at all, and both look plausible. Dropping each round's output arrays frees the lazy graph before it reaches the device, so the wall clock covers host submission only and the bandwidth column comes out above 1 TB/s. Passing all-zero weights lets the driver skip the read, which inflates the small buckets. A bucket has to keep every round's outputs alive and feed real values before its numbers mean anything, and any figure that exceeds what `mx.sum` over the same bytes reaches is measuring the harness rather than the kernel. The replay also flatters the tiny buckets for the opposite reason: the 24 instances of a bucket run back to back there, while in the real step each layer waits for the previous one, so per-launch figures for RoPE and attention are upper bounds and the table's sum only approximates the step.
 
@@ -315,7 +316,7 @@ The projection beats MLX's reduction at every size, so this is not an implementa
 
 The third is the controlled comparison inside one table above: the same warp-per-column kernel reaches 412 GB/s on a 272 MB matrix and 279 GB/s on a 17.4 MB one. Only the bytes differ.
 
-What all three show is that the rate a launch reaches depends on how many bytes it reads, not on how its grid is shaped. To run the whole step at 412 GB/s its 991 MB would have to arrive in launches of hundreds of megabytes, but every layer is cut into five strictly dependent projections — `qkv`, `o_proj`, paired gate/up, `down` — and the largest is 17.4 MB, because the nonlinearity between them is a real barrier. Pairing `gate` and `up` is exactly the move that exploits this, and it is why that one change measured 1.03x while removing 24 launches of 1 KB measured nothing. 4.17 ms per token is therefore the BF16 floor on this device: going meaningfully faster needs fewer bytes, which means quantized weights, not a better kernel.
+What all three show is that the rate a launch reaches depends on how many bytes it reads, not on how its grid is shaped. To run the whole step at 412 GB/s its 991 MB would have to arrive in launches of hundreds of megabytes, but every layer is cut into five strictly dependent projections — `qkv`, `o_proj`, paired gate/up, `down` — and the largest is 17.4 MB, because the nonlinearity between them is a real barrier. Pairing `gate` and `up` is exactly the move that exploits this, and it is why that one change measured 1.03x while removing 24 launches of 1 KB measured nothing. Faster still means fewer bytes, which means quantized weights, not a better kernel.
 
 ### Weight-only int4, and what it actually bought
 
@@ -325,24 +326,34 @@ The format is stated once, in `aotolith/quantize.py`, because three pieces of co
 
 What the compiler does with a packed weight depends on how many rows it multiplies. A single-row matmul — decode — *is* the streaming kernel: `fold_quantized_weights` rewrites `matmul(x, dequantize_i4(packed, scales))` into one `matmul` carrying `weight_group_size`, and the GEMV prologue loads words, sign-extends each nibble with two instructions (`(int)(word << 28) >> 28`), multiplies by `x` and by the group scale, and accumulates in float. No unpacked weight exists at any point. A wider matmul — prefill — keeps the unpack, because with 128 rows the weight stream is the cheap part of the multiply and int4 would only add decoding to a compute-bound pass; there the explicit `dequantize_i4` lowers to one streaming kernel in `codegen/quantize.py` rather than to eight elementwise MLX passes and a stack that writes several full-sized temporaries per layer.
 
-On Qwen2.5-0.5B-Instruct, 128 prompt tokens, 64 greedy decode tokens, `--codegen-attention`, on the M5 Pro:
-
-| | bf16 | int4 g64 | |
-| --- | ---: | ---: | ---: |
-| decode, synchronized each step | 4.13 ms/token | 3.56 ms/token | 1.16x |
-| weight bytes per token | 991 MB | 312 MB | 3.2x |
-| peak memory | 4.12 GiB | 1.90 GiB | 2.2x |
-| prefill, 128 tokens | 11.9 ms | 13.2 ms | 0.90x |
-
-The 1.16x is much less than the 3.2x in bytes, and the kernel's own rate says why: 312 MB in 3.56 ms is 88 GB/s, against the 240 GB/s the bf16 GEMV reached. The bf16 kernel reads a `vec<T, 4>` and does four multiply-adds per 8 bytes. The int4 kernel reads one word — 4 bytes — and does two shifts, a mask, a select and eight FMAs for the same eight weights, so it needs eight times the instruction rate to go three times faster. The rows decode at 88 GB/s because the SIMD pipes, not the memory controller, are what run out. That is the next thing to fix, and it is not a tiling problem.
-
-The async numbers are a separate finding: 193.7 tok/s for bf16 and 193.4 for int4, unchanged. Once each step drops to 3.56 ms of device time the host loop can no longer keep the queue full, so the launch rate is now the floor. Making the decode kernel faster on its own would show up here as nothing.
-
-Both rows of that table come from one back-to-back session, and that session read lower in absolute terms than the bf16 table above — 197-201 tok/s async where that table records 240, on the same build, with HEAD reproducing 152 tok/s synchronized too. So the absolute numbers here are only comparable to the row beside them; the ratio is the claim.
+The step time tracks the launch count more than the bytes — [the next section](#cutting-245-operators-out-of-a-decode-step) takes the count from 1239 to 994 and measures what that bought. What it leaves as the remaining problem is the packed kernel itself, which reads 312 MB per token at well under the bf16 kernel's per-byte rate. Why is not settled: isolation measurements have ranged from 88 to 218 GB/s depending on how much of the working set stays resident between launches, so the honest statement is that the rate depends on the working set, and the next step is to find out whether the cold stream is limited by issue rate or by memory-level parallelism.
 
 Accuracy: int4 rounds each weight onto one of 15 values inside its group, so the logits move, and greedy decode is a chaotic readout of that movement. Against a float32 CPU forward on the *same* rounded weights, the runtime sits 0.51 off — 2.7% of the 18.5 logit scale — while torch's own bf16 forward on those weights sits 0.41, or 2.2%, away. Both are bf16 noise; neither is a decode error. Greedy then tracks the round-tripped checkpoint for 13 tokens and flips on a near-tie, matching 16 of 64 overall. So the CI gate does not use token equality on this model: `tests/test_quantized_qwen2.py` runs a 2-layer model where the check is exact — every decode token has to match the round-tripped reference — and `--quantize` reports both the bf16 reference and the round-tripped one so a run never hides which one it agrees with.
 
 Autotuning is not an escape either, and until now it could not even run on a model like this one. `--autotune` evaluated the MLX fallback for every operation in order to have a reference to compare against, but normalization, rotary, and attention only ever lower to generated kernels, so compiling a transformer raised `NotImplementedError` at the first standalone `rms_norm`. It now measures such an operation against itself, records the single benchmark, and notes in the selection reason that the kernel was the only valid candidate.
+
+### Cutting 245 Operators Out Of A Decode Step
+
+A decode step of this model was 1239 operations — 147 casts, 338 reshapes, 168 slices, 49 multiplies, 49 normalizations — and the GPU work in it took 2.5 ms of a 5.7 ms step. The rest was the gap between launches, about 4.6 µs each, across 24 layers of roughly ten strictly dependent launches: a chain that deep cannot be hidden by a host thread that queues each step in microseconds, because the GPU sits idle between commands. Cutting that count turned out to be worth more than making any single kernel faster.
+
+The largest single win was in how PyTorch spells RMSNorm. Written out, it is `(x.to(f32).pow(2).mean().rsqrt() * x.to(f32) * weight.to(f32)).to(x.dtype)`, which the importer faithfully records as five operations: a widen cast, a normalization without a weight, a second widen cast for the weight, a multiply, and a narrow cast. The compiler had a weighted `rms_norm` for exactly this shape since it lowers to the same Metal kernel, but nothing matched the five-op spelling to it, so each of the 49 normalizations in the graph became five launches and four full-width temporaries.
+
+`fuse_norm_scale` matches the sequence and emits one `rms_norm` carrying the weight. That is 245 operators gone from the step, the 49 multiplies among them and the rest casts and layout work that only existed to feed them: 1239 ops to 994, and 1191 to 995 on the bf16 model. The fold needs no tolerance because it is bit-identical: both the row and the weight arrive in the dtype the product is narrowed back to, and the fused kernel forms the product in fp32 and rounds once, which is exactly what the five-op chain did. The pass checks that precondition and declines when it does not hold — a graph that really wants a standalone fp32 row keeps one — and `tests/test_passes_norm.py` asserts bit equality against the unfolded graph rather than a tolerance.
+
+Measured by ablating exactly that pass in one interleaved session — off, on, off, on — so every pair below shares the machine's thermal and load state:
+
+| | bf16 | int4 g64 |
+| --- | ---: | ---: |
+| graph ops per decode step | 1191 → 995 | 1239 → 994 |
+| decode, synchronized each step | 155.4 → 167.2 tok/s (6.44 → 5.98 ms) | 179.0 → 228.3 tok/s (5.59 → 4.38 ms) |
+| decode, asynchronous | 199.2 → 232.2 tok/s (5.02 → 4.31 ms) | 195.3 → 272.8 tok/s (5.12 → 3.67 ms) |
+| prefill, 128 tokens | 11 208 → 12 298 tok/s | 9 494 → 10 375 tok/s |
+| peak memory | 4.26 GiB, unchanged | 1.99 → 1.89 GiB |
+
+The before/after pairs are what the ratios rest on, and they are 1.08x and 1.17x for bf16, 1.28x and 1.40x for int4, and 1.09-1.10x on prefill, for 245 fewer operators and no kernel change. Async still leads sync after the fold — 4.31 ms against 5.98 — so the host loop is still hidden behind the queue; the fold did not move the launch floor into view. The step's cost per operator reads 4.51 µs before and 4.41 µs after, which is the shape of the finding: the time is the operator count times a constant, and the constant did not move when the count did.
+
+The same pass exposed a second problem worth documenting because the fix is scoped rather than general. `_match_rms_norm_consumers` folds a normalization into the *prologue* of the projection that reads it, so the GEMV scales its input rows as it loads them. That is free for a packed projection, whose prologue is generated Metal. It is not free for a dense one, which falls back to MLX and would re-derive the normalization once per reader — slower than computing it once. The matcher now absorbs a normalization only when the projection carries a packed weight, and leaves dense graphs alone.
+
 
 ### Command Line And Artifacts
 

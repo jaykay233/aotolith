@@ -26,6 +26,7 @@ from .fusion import (
     fuse_rope,
 )
 from .layout import fold_matmul_input_layouts, simplify_layouts
+from .norm import fuse_norm_scale
 from .quantize import fold_quantized_weights
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "fuse_activation_epilogue",
     "fuse_attention",
     "fuse_gate_up_projection",
+    "fuse_norm_scale",
     "fuse_pointwise",
     "fuse_residual_epilogue",
     "fuse_rms_norm_epilogue",
