@@ -64,6 +64,11 @@ POINTWISE_OPS = frozenset(
         "addcmul",
         "addcdiv",
         "pow",
+        # ``ldexp`` scales by a power of two. It is an operator of its own
+        # rather than ``mul(x, exp2(k))`` because the scale has to be exact:
+        # a GPU's ``exp2`` can land an ulp off ``2**k`` for an integer ``k``,
+        # and the product then rounds too.
+        "ldexp",
         "neg",
         "abs",
         "square",

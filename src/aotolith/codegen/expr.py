@@ -323,6 +323,13 @@ def _emit_pointwise_expression(
     if op.op == "pow":
         left, right = _binary_operands(op, arguments, input_types)
         return f"metal::pow({left}, {right})"
+    if op.op == "ldexp":
+        # ``metal::ldexp`` adjusts the exponent field, so it is exact where
+        # ``exp2`` is an approximation of the same value. The second operand is
+        # an integer-valued float because that is what the lowering casts it to,
+        # and the conversion back is exact for every exponent it can hold.
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"metal::ldexp({left}, (int)({right}))"
     if op.op in {"maximum", "minimum"}:
         left, right = _binary_operands(op, arguments, input_types)
         comparison = "<" if op.op == "maximum" else ">"

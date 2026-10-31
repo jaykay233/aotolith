@@ -323,7 +323,29 @@ def _evaluate_pointwise_mlx(
     if op.op == "expm1":
         return mx.expm1(arguments[0])
     if op.op == "exp2":
-        return mx.exp2(arguments[0])
+        # MLX has no ``exp2`` binding; ``exp(x * ln2)`` is the same value to a
+        # couple of ulps, which is what this path is for - autotune compares a
+        # kernel against it with a tolerance.
+        return mx.exp(arguments[0] * log(2.0))
+    if op.op == "ldexp":
+        # Exact scaling: the power of two is an exponent field, and a GPU's
+        # ``exp2`` can land an ulp off it for an integer exponent. One field
+        # holds 2**-126 .. 2**127, so a larger exponent is split into three
+        # factors, which reach 2**-378 .. 2**381 and therefore every float32
+        # that has a representable answer. The factors go onto the mantissa one
+        # at a time: multiplying them together first would overflow to
+        # infinity, and a zero mantissa times that infinity is a NaN where the
+        # answer is zero. The parts share a sign, so the partial products stay
+        # between the mantissa and the answer, and only the answer itself can
+        # leave the range.
+        value, exponent = arguments
+        as_integer = exponent.astype(mx.int32)
+        head = mx.clip(as_integer, -126, 127)
+        middle = mx.clip(as_integer - head, -126, 127)
+        tail = mx.clip(as_integer - head - middle, -126, 127)
+        scaled = value * _mlx_power_of_two(head)
+        scaled = scaled * _mlx_power_of_two(middle)
+        return (scaled * _mlx_power_of_two(tail)).astype(_MLX_DTYPES[output_type.dtype])
     if op.op == "log":
         return mx.log(arguments[0])
     if op.op == "log2":
@@ -481,6 +503,19 @@ def _mlx_lgamma(value: mx.array) -> mx.array:
 
 
 _PSI_10 = 2.25175258906672110764
+
+
+def _mlx_power_of_two(exponent: mx.array) -> mx.array:
+    """``2**k`` for an integer ``k`` in ``[-126, 127]``, built from the bits.
+
+    ``exp2`` is a transcendental approximation and a GPU's fast path can land an
+    ulp off an integer power, which is what ``ldexp`` cannot afford. The
+    exponent field of a float32 is ``k + 127`` in the top nine bits, so writing
+    those bits *is* the power of two, exactly.
+    """
+
+    bits = mx.bitwise_left_shift(exponent.astype(mx.int32) + 127, 23)
+    return mx.view(bits, mx.float32)
 
 
 def _mlx_digamma(value: mx.array) -> mx.array:

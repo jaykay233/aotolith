@@ -9309,9 +9309,10 @@ def test_ldexp_scales_by_a_power_of_two(dtype, mlx_dtype) -> None:
 
     result = compile_callable(fn, (value, exponent))
 
-    # The integer exponent is cast to the result dtype so the power stays a
-    # float one, and the multiply folds into a single pointwise region.
-    assert [op.op for op in result.lowered_graph.ops] == ["cast", "fused_elementwise"]
+    # The integer exponent is cast to the result dtype, then the scaling is the
+    # operator itself: a separate ``exp2`` and multiply would round twice and
+    # break the exactness ``ldexp`` promises.
+    assert [op.op for op in result.lowered_graph.ops] == ["cast", "ldexp"]
 
     actual = result.plan(
         mx.array(value.float().numpy(), dtype=mlx_dtype),
@@ -9320,9 +9321,8 @@ def test_ldexp_scales_by_a_power_of_two(dtype, mlx_dtype) -> None:
     expected = mx.array(torch.ldexp(value, exponent).float().numpy(), dtype=mlx_dtype)
     mx.eval(actual, expected)
     assert actual.dtype == mlx_dtype
-    # ``2**k`` is exact for every integer a float can hold, so the scale itself
-    # introduces no rounding: only the product can round, and Torch rounds the
-    # same way.
+    # Scaling by a power of two only moves the exponent field, so this is the
+    # same bit pattern Torch produces, on every GPU.
     assert bool(mx.array_equal(actual, expected))
 
 

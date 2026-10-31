@@ -1247,34 +1247,44 @@ def _lower_empty(lowering: Lowering, node: Any, target: str) -> bool:
 
 
 def _lower_ldexp(lowering: Lowering, node: Any, target: str) -> bool:
-    """``ldexp(x, e)`` is ``x * 2**e``, so the exponent becomes a scale.
+    """``ldexp(x, e)`` is one operator, not ``x * 2**e``.
 
-    The exponent is cast to the result dtype and fed to ``exp2``: that is exact
-    for every integer ``k`` a float can represent, and the exponent is an
-    integer tensor by definition, so the cast loses nothing. ``pow(2.0, k)``
-    would be the same arithmetic on a correctly rounded libm, but GPUs compute
-    it with a fast path that can land an ulp off ``2**k`` - which then rounds
-    the product too, so ``ldexp`` stopped being the exact scaling it promises.
+    Both operands are cast to the result dtype first: the exponent is an
+    integer tensor by definition, and an integer mantissa promotes under ATen's
+    INT_TO_FLOAT rule, so the cast loses nothing in either direction. The scale
+    then comes from the operator itself rather than from ``exp2``, because
+    ``ldexp`` promises exact scaling: a GPU's ``exp2`` can land an ulp off
+    ``2**k``, and the product rounds that ulp in too.
     """
 
     args = getattr(node, "args", ())
     if len(args) != 2:
         raise ValueError(f"{target} expects two arguments, got {len(args)}")
-    value_id = _argument_ids(args[0], lowering.node_ids)
-    exponent_id = _argument_ids(args[1], lowering.node_ids)
     output_type = _node_type(node)
-    exponent_type = lowering.values[exponent_id].type
-    if exponent_type.dtype != output_type.dtype:
-        exponent_id = lowering.emit(
-            "cast",
-            (exponent_id,),
-            {},
-            TensorType(exponent_type.shape, output_type.dtype),
-        )
-        exponent_type = TensorType(exponent_type.shape, output_type.dtype)
-    scale_id = lowering.emit("exp2", (exponent_id,), {}, exponent_type)
-    lowering.bind(node, lowering.emit("mul", (value_id, scale_id), {}, output_type))
+    value_id = _cast_to(
+        lowering, _argument_ids(args[0], lowering.node_ids), output_type
+    )
+    exponent_id = _cast_to(
+        lowering, _argument_ids(args[1], lowering.node_ids), output_type
+    )
+    lowering.bind(
+        node, lowering.emit("ldexp", (value_id, exponent_id), {}, output_type)
+    )
     return True
+
+
+def _cast_to(lowering: Lowering, value_id: str, output_type: TensorType) -> str:
+    """Return ``value_id`` as ``output_type``'s dtype, casting when it differs."""
+
+    value_type = lowering.values[value_id].type
+    if value_type.dtype == output_type.dtype:
+        return value_id
+    return lowering.emit(
+        "cast",
+        (value_id,),
+        {},
+        TensorType(value_type.shape, output_type.dtype),
+    )
 
 
 # The generic path has no target of its own: it is the fallback the loop calls

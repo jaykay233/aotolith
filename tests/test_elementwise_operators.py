@@ -175,6 +175,71 @@ def test_the_mlx_fallback_agrees_with_the_kernel() -> None:
     assert bool(mx.allclose(actual, reference, atol=2e-6, rtol=2e-6))
 
 
+def test_the_mlx_fallback_has_an_exp2_and_an_exact_ldexp() -> None:
+    # Neither operator goes through an MLX binding: there is no ``exp2`` in MLX,
+    # and ``ldexp`` builds its power of two from the bits. Autotune asks the
+    # fallback for an answer before it compares a kernel against it, so a
+    # missing branch here fails a plan that otherwise compiled fine.
+    value = torch.tensor([[0.5, 1.5, -2.0, 3.25]])
+    exponent = torch.tensor([[3, -4, 0, 2]])
+
+    def fn(mantissa, power):
+        return torch.ldexp(torch.exp2(mantissa), power)
+
+    lowered = rewrite(capture_fx(fn, (value, exponent)))
+    native = AppleMetalBackend().compile(lowered)
+    fallback = AppleMetalBackend(
+        selection_overrides={
+            selection.output_id: "mlx" for selection in native.selections
+        }
+    ).compile(lowered)
+    assert not any(selection.is_native for selection in fallback.selections)
+
+    inputs = (mx.array(value.numpy()), mx.array(exponent.numpy()))
+    reference = fallback(*inputs)[0]
+    actual = native(*inputs)[0]
+    expected = mx.array(fn(value, exponent).numpy())
+    mx.eval(reference, actual, expected)
+
+    assert bool(mx.allclose(actual, expected, atol=2e-6, rtol=2e-6))
+    assert bool(mx.allclose(reference, expected, atol=2e-5, rtol=2e-5))
+
+
+def test_ldexp_survives_an_exponent_one_field_cannot_hold() -> None:
+    # ``2**k`` only fits an exponent field for ``k`` in ``[-126, 127]``. A
+    # mantissa small enough to bring the product back into range still has to
+    # be scaled correctly, and a zero mantissa has to stay signed zero rather
+    # than become ``0 * inf``. Only answers that would be denormal are allowed
+    # to differ: MLX flushes them to zero.
+    value = torch.tensor(
+        [[0.0, -0.0, 1.0, 0.5, 3.4e38, float("inf"), -float("inf"), 2.0**-126]]
+    )
+    exponent = torch.tensor([[200, 200, 200, 128, -200, 200, -200, -4]])
+
+    def fn(mantissa, power):
+        return torch.ldexp(mantissa, power)
+
+    lowered = rewrite(capture_fx(fn, (value, exponent)))
+    native = AppleMetalBackend().compile(lowered)
+    fallback = AppleMetalBackend(
+        selection_overrides={
+            selection.output_id: "mlx" for selection in native.selections
+        }
+    ).compile(lowered)
+
+    inputs = (mx.array(value.numpy()), mx.array(exponent.numpy()))
+    expected = mx.array(fn(value, exponent).numpy())
+    for plan, name in ((native, "the kernel"), (fallback, "the fallback")):
+        result = plan(*inputs)[0]
+        mx.eval(result, expected)
+        # Every lane but the last is exactly the bit pattern Torch produces.
+        assert bool(mx.array_equal(result[0, :-1], expected[0, :-1])), name
+        # ``2**-126 * 2**-4`` is denormal, so zero is allowed - and so is the
+        # denormal itself, because not every GPU flushes it.
+        last = result[0, -1].item()
+        assert last in (0.0, expected[0, -1].item()), name
+
+
 @pytest.mark.parametrize(
     "shape, weight_shape",
     [
