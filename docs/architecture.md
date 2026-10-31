@@ -118,6 +118,8 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.avg_pool2d.default`、`aten.avg_pool3d.default` | `pool`，保留 `ceil_mode`/`count_include_pad`/`divisor_override` |
 | `aten.adaptive_max_pool2d.default`、`aten.adaptive_max_pool3d.default` | `adaptive_pool`，按 `output_size` 逐个输出位置展开窗口 |
 | `aten._adaptive_avg_pool2d.default`、`aten._adaptive_avg_pool3d.default` | `adaptive_pool`，同上，取均值 |
+| `aten.upsample_nearest1d/2d/3d.default`、`aten.upsample_linear1d.default`、`aten.upsample_bilinear2d.default`、`aten.upsample_bicubic2d.default`、`aten.upsample_trilinear3d.default` | `resize`，mode、输出尺寸、`align_corners` 与每轴源缩放写入 attribute |
+| `aten._upsample_bilinear2d_aa.default`、`aten._upsample_bicubic2d_aa.default` | 按名字拒绝：抗锯齿会随缩放倍率加宽滤波器，是另一个算子而不是另一种 mode |
 | `aten.argmax.default`、`aten.argmin.default` | `argmax`、`argmin`，输出固定 I64 |
 | `aten.max.dim`、`aten.min.dim` | `amax`/`amin` 加 `argmax`/`argmin`，按被读取的输出选择 |
 | `aten.sort.default` | `sort` / `argsort`（按被读取的输出选择） |
@@ -584,7 +586,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
-## 12.5 卷积与池化
+## 12.5 卷积、池化与重采样
 
 卷积和池化不走 Metal codegen，而是直接用 MLX 原语（`mx.conv1d/2d/3d` 和 `as_strided`）。它们的开销在数据搬运而不在表达式求值，生成 kernel 只会把原语重写一遍。
 
@@ -594,6 +596,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 - 自适应池化没有固定步长，一个视图放不下所有窗口，于是按 `floor(i*size/out) .. ceil((i+1)*size/out)` 逐个输出位置展开；窗口边界是静态常量，展开成固定 unroll 而不是运行时循环。
 - MLX 0.32 的 reduction 在窗口内偏移不是单位步长（dilated 窗口）时会读错邻近元素，所以窗口视图先过一次 `mx.contiguous` 再归约。这份拷贝是正确性要求，不是性能选择。
 - 1D 池化不单独注册：Torch 自己把它分解成 `unsqueeze -> 2D pooling -> squeeze`，前端直接吃这条链。
+- 重采样是逐轴可分离的：`resize` 先沿一个空间轴取两次（bicubic 取四次）读并按权重混合，再沿下一个轴重复，所以 rank-5 的 trilinear 只要 6 次读，而不是每个 2×2×2 角都读一次。源坐标按 ATen 的 `area_pixel_compute_source_index` 算：`align_corners` 时两端对齐，否则输出像素中心映射到输入像素中心、负坐标钳到 0；cubic 的 4 个抽头会各自钳到边界，因为 ATen 是保持边缘像素而不是收缩窗口。调用方给的 `scale_factor` 会原样进入 attribute——`scale_factor=1.7` 的输出尺寸被取整，但源坐标仍用 `1/1.7` 而不是 `in/out`。
 
 ## 13. CompiledPlan 执行器
 

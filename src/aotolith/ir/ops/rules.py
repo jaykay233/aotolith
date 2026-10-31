@@ -65,6 +65,8 @@ class AttrKind(str, Enum):
     """A non-empty tuple of integers naming distinct axes."""
     INT_TUPLE = "int_tuple"
     """A tuple of integers, possibly empty."""
+    NUMBER_TUPLE = "number_tuple"
+    """A tuple of numbers, possibly empty."""
     INT_OR_NONE = "int_or_none"
     DIM_OR_NONE = "dim_or_none"
     LITERAL = "literal"
@@ -115,6 +117,12 @@ class AttrSpec:
                 isinstance(dim, int) and not isinstance(dim, bool) for dim in value
             ):
                 raise ValueError(f"{label} must be a tuple of integers, got {value!r}")
+        elif kind is AttrKind.NUMBER_TUPLE:
+            if not isinstance(value, tuple) or not all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            ):
+                raise ValueError(f"{label} must be a tuple of numbers, got {value!r}")
         elif kind is AttrKind.INT_OR_NONE:
             if value is None:
                 return None

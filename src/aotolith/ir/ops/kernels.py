@@ -65,6 +65,39 @@ def _check_pool_outputs(graph: Graph, op: Operation, shape: tuple[int, ...]) -> 
             )
 
 
+def _check_resize(graph: Graph, op: Operation) -> None:
+    input_type = graph.value(op.inputs[0]).type
+    spatial = len(input_type.shape) - 2
+    mode = op.attrs.get("mode")
+    if mode not in {"nearest", "linear", "bicubic"}:
+        raise ValueError(
+            f"{op.op}.mode must be nearest, linear or bicubic, got {mode!r}"
+        )
+    if mode == "bicubic" and spatial != 2:
+        raise ValueError("resize.bicubic is only defined over two spatial axes")
+    output_size = _spatial_integers(op, "output_size", spatial, floor=1)
+    scales = op.attrs.get("source_scale")
+    if (
+        not isinstance(scales, tuple)
+        or len(scales) != spatial
+        or not all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and float(item) > 0
+            for item in scales
+        )
+    ):
+        raise ValueError(
+            f"{op.op}.source_scale must be {spatial} positive numbers, got {scales!r}"
+        )
+    if not isinstance(op.attrs.get("align_corners", False), bool):
+        raise ValueError(f"{op.op}.align_corners must be a boolean")
+    expected = (*input_type.shape[:2], *output_size)
+    actual = graph.value(op.outputs[0]).type.shape
+    if actual != expected:
+        raise ValueError(f"{op.op} output shape {actual} != {expected}")
+
+
 def _check_pool(graph: Graph, op: Operation) -> None:
     input_type = graph.value(op.inputs[0]).type
     spatial = len(input_type.shape) - 2
@@ -343,6 +376,19 @@ CONTRACTS: dict[str, OpContract] = {
             AttrSpec("dilation", AttrKind.INT_TUPLE),
         ),
         extra=_check_pool,
+    ),
+    # A resize is a strided read plus per-axis interpolation weights, which is
+    # why its geometry is checked by hand rather than from the output shape.
+    "resize": OpContract(
+        arity=(1, 1),
+        rank=(3, 5),
+        dtype=DtypeRule.FLOATING_IN,
+        shape=ShapeRule.FREE,
+        attrs=(
+            AttrSpec("output_size", AttrKind.INT_TUPLE),
+            AttrSpec("source_scale", AttrKind.NUMBER_TUPLE),
+        ),
+        extra=_check_resize,
     ),
     "adaptive_pool": OpContract(
         arity=(1, 1),

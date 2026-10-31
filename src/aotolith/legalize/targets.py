@@ -693,6 +693,31 @@ _ADAPTIVE_AVG_POOL_TARGETS = frozenset(
 )
 
 
+# Antialiased resizing widens its filter with the scale factor, which is a
+# different operator rather than another mode; it stays a named refusal.
+_ANTIALIASED_RESIZE_TARGETS = frozenset(
+    {
+        "aten._upsample_bilinear2d_aa.default",
+        "aten._upsample_bicubic2d_aa.default",
+    }
+)
+
+
+# Resizing lowers to one op with a mode, because the modes differ only in the
+# weights they give the same strided read.
+_RESIZE_TARGETS = frozenset(
+    {
+        "aten.upsample_nearest1d.default",
+        "aten.upsample_nearest2d.default",
+        "aten.upsample_nearest3d.default",
+        "aten.upsample_linear1d.default",
+        "aten.upsample_bilinear2d.default",
+        "aten.upsample_bicubic2d.default",
+        "aten.upsample_trilinear3d.default",
+    }
+)
+
+
 _SQUEEZE_ALL_TARGET = "aten.squeeze.default"
 
 
@@ -720,6 +745,8 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _AVG_POOL_TARGETS
     | _ADAPTIVE_MAX_POOL_TARGETS
     | _ADAPTIVE_AVG_POOL_TARGETS
+    | _RESIZE_TARGETS
+    | _ANTIALIASED_RESIZE_TARGETS
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)

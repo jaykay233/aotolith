@@ -25,6 +25,7 @@ from .state import Handler, Lowering
 from .targets import (
     _ADAPTIVE_AVG_POOL_TARGETS,
     _ADAPTIVE_MAX_POOL_TARGETS,
+    _ANTIALIASED_RESIZE_TARGETS,
     _AVG_POOL_TARGETS,
     _CONV_TARGET,
     _MAX_POOL_TARGETS,
@@ -287,8 +288,106 @@ def _lower_adaptive_pool(lowering: Lowering, node: Any, target: str) -> bool:
 _POOL_TARGETS = _MAX_POOL_TARGETS | _AVG_POOL_TARGETS
 _ADAPTIVE_POOL_TARGETS = _ADAPTIVE_MAX_POOL_TARGETS | _ADAPTIVE_AVG_POOL_TARGETS
 
+
+# How each resizing target spells its arguments: the mode it interpolates with,
+# where `align_corners` sits (None for the nearest modes, which have none) and
+# where the per-axis source scales start.
+# ATen names the per-axis scales depth, height and width from the outside in.
+_SCALE_NAMES = ("scales_d", "scales_h", "scales_w")
+
+_RESIZE_SPELLINGS: dict[str, tuple[str, int | None, int]] = {
+    "aten.upsample_nearest1d.default": ("nearest", None, 2),
+    "aten.upsample_nearest2d.default": ("nearest", None, 2),
+    "aten.upsample_nearest3d.default": ("nearest", None, 2),
+    "aten.upsample_linear1d.default": ("linear", 2, 3),
+    "aten.upsample_bilinear2d.default": ("linear", 2, 3),
+    "aten.upsample_trilinear3d.default": ("linear", 2, 3),
+    "aten.upsample_bicubic2d.default": ("bicubic", 2, 3),
+}
+
+
+def _resize_operation(
+    node: Any, target: str, lowering: Lowering
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Read a resizing call into the mode, the output extent and its geometry.
+
+    ATen passes the scale factors it was called with, and they are not always
+    ``input / output`` - a ``scale_factor=1.7`` request keeps ``1 / 1.7`` while
+    the output extent is the rounded one. Folding them into one source scale per
+    axis here is what makes the traced call exact rather than the shapes'
+    approximation of it.
+    """
+
+    mode, align_position, scale_position = _RESIZE_SPELLINGS[target]
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    input_type = _node_type(args[0])
+    spatial = len(input_type.shape) - 2
+    output_size = _per_axis(
+        _pool_shape(_pool_argument(args, kwargs, 1, "output_size")),
+        "output_size",
+        spatial,
+        None,
+    )
+    if any(size <= 0 for size in output_size):
+        raise ValueError(f"{target} output_size must be positive, got {output_size}")
+    align_corners = False
+    if align_position is not None:
+        align_corners = _pool_argument(
+            args, kwargs, align_position, "align_corners", False
+        )
+        if not isinstance(align_corners, bool):
+            raise ValueError(
+                f"{target}.align_corners must be a boolean, got {align_corners!r}"
+            )
+    source_scale: list[float] = []
+    for axis, size in enumerate(output_size):
+        scale = _pool_argument(args, kwargs, scale_position + axis, _SCALE_NAMES[axis])
+        if scale is not None and (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or float(scale) <= 0
+        ):
+            raise ValueError(f"{target} scale must be positive, got {scale!r}")
+        source_scale.append(
+            input_type.shape[2 + axis] / size if scale is None else 1.0 / float(scale)
+        )
+    if mode == "bicubic" and spatial != 2:
+        raise ValueError(f"{target} is only defined over two spatial axes")
+    return (
+        (_argument_ids(args[0], lowering.node_ids),),
+        {
+            "mode": mode,
+            "output_size": output_size,
+            "align_corners": align_corners,
+            "source_scale": tuple(source_scale),
+        },
+    )
+
+
+def _lower_resize(lowering: Lowering, node: Any, target: str) -> bool:
+    inputs, attrs = _resize_operation(node, target, lowering)
+    shape = (*_node_type(node.args[0]).shape[:2], *attrs["output_size"])
+    lowering.bind(
+        node,
+        lowering.emit(
+            "resize", inputs, attrs, TensorType(shape, _node_type(node).dtype)
+        ),
+    )
+    return True
+
+
+def _lower_antialiased_resize(lowering: Lowering, node: Any, target: str) -> bool:
+    raise NotImplementedError(
+        f"{target} widens its filter with the scale factor, which is a different "
+        "operator rather than another mode; compile without antialias"
+    )
+
+
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _CONV_TARGET: (_lower_conv,),
     **{target: (_lower_pool,) for target in _POOL_TARGETS},
     **{target: (_lower_adaptive_pool,) for target in _ADAPTIVE_POOL_TARGETS},
+    **{target: (_lower_resize,) for target in _RESIZE_SPELLINGS},
+    **{target: (_lower_antialiased_resize,) for target in _ANTIALIASED_RESIZE_TARGETS},
 }

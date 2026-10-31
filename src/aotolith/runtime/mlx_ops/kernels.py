@@ -398,3 +398,135 @@ def _mlx_adaptive_pool(
         [item.reshape(*value.shape[:2], 1) for item in reduced_indices], axis=-1
     ).reshape(shape)
     return values, indices
+
+
+def _resize_positions(
+    source: int, target: int, align_corners: bool, scale: float
+) -> tuple[mx.array, mx.array]:
+    """The fractional source coordinate of every output position, and its floor.
+
+    This is ATen's ``area_pixel_compute_source_index``: with ``align_corners``
+    the two end points line up, and without it the output pixel's centre maps to
+    the input pixel's centre, which can land at a negative coordinate that the
+    caller clamps.
+    """
+
+    positions = mx.arange(target, dtype=mx.float32)
+    if align_corners:
+        factor = (source - 1) / (target - 1) if target > 1 else 0.0
+        return positions * factor, positions
+    coordinate = (positions + 0.5) * scale - 0.5
+    return coordinate, positions
+
+
+def _linear_axis(
+    source: int, target: int, align_corners: bool, scale: float
+) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...]]:
+    """The two taps and weights of a linear interpolation along one axis."""
+
+    coordinate, _ = _resize_positions(source, target, align_corners, scale)
+    # ATen clamps a linear coordinate that lands outside the first pixel; the
+    # upper end is handled by holding the last pixel rather than reading past it.
+    coordinate = mx.maximum(coordinate, 0.0)
+    low = mx.minimum(mx.floor(coordinate).astype(mx.int32), source - 1)
+    high = mx.minimum(low + 1, source - 1)
+    weight = coordinate - low.astype(mx.float32)
+    return (low, high), (mx.ones_like(weight) - weight, weight)
+
+
+def _cubic_coefficients(offset: mx.array) -> tuple[mx.array, ...]:
+    """ATen's four cubic weights for one fractional offset.
+
+    ``A = -0.75`` is the coefficient PyTorch fixes for bicubic resizing; the
+    four weights sum to one for every offset in ``[0, 1)``.
+    """
+
+    a = -0.75
+
+    def near(t: mx.array) -> mx.array:
+        return ((a * t - 5.0 * a) * t + 8.0 * a) * t - 4.0 * a
+
+    def far(t: mx.array) -> mx.array:
+        return ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0
+
+    return (
+        near(offset + 1.0),
+        far(offset),
+        far(1.0 - offset),
+        near(2.0 - offset),
+    )
+
+
+def _cubic_axis(
+    source: int, target: int, align_corners: bool, scale: float
+) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...]]:
+    """The four taps and weights of a cubic interpolation along one axis."""
+
+    coordinate, _ = _resize_positions(source, target, align_corners, scale)
+    lower = mx.floor(coordinate).astype(mx.int32)
+    # A cubic window reaches one pixel past each end, and ATen holds the edge
+    # pixel rather than shrinking the window, so every tap is clamped.
+    indices = tuple(mx.clip(lower + shift, 0, source - 1) for shift in (-1, 0, 1, 2))
+    return indices, _cubic_coefficients(coordinate - lower.astype(mx.float32))
+
+
+def _nearest_axis(
+    source: int, target: int, align_corners: bool, scale: float
+) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...]]:
+    """The single tap a nearest resizing reads along one axis."""
+
+    positions = mx.arange(target, dtype=mx.float32)
+    if align_corners:
+        factor = (source - 1) / (target - 1) if target > 1 else 0.0
+        coordinate = positions * factor
+    else:
+        coordinate = positions * scale
+    index = mx.clip(mx.floor(coordinate).astype(mx.int32), 0, source - 1)
+    return (index,), (mx.ones((target,), dtype=mx.float32),)
+
+
+_RESIZE_AXES = {
+    "nearest": _nearest_axis,
+    "linear": _linear_axis,
+    "bicubic": _cubic_axis,
+}
+
+
+def _broadcast_weights(weights: mx.array, axis: int, rank: int) -> mx.array:
+    """Weights for one spatial axis, shaped to broadcast over the activation."""
+
+    shape = [1] * rank
+    shape[2 + axis] = weights.shape[0]
+    return weights.reshape(shape)
+
+
+def _mlx_resize(graph: Graph, op: Operation, env: dict[str, mx.array]) -> mx.array:
+    """Resize by interpolating one spatial axis at a time.
+
+    A separable interpolation is the whole of ATen's bilinear, linear and
+    bicubic resizing: each pass blends along one axis, so a rank-5 activation
+    costs a handful of reads rather than one read per corner of a 4x4x4 window.
+    """
+
+    value = env[op.inputs[0]]
+    output_dtype = _MLX_DTYPES[graph.value(op.outputs[0]).type.dtype]
+    compute = (
+        value.astype(mx.float32) if value.dtype in (mx.float16, mx.bfloat16) else value
+    )
+    output_size = tuple(int(item) for item in op.attrs["output_size"])
+    scales = tuple(float(item) for item in op.attrs["source_scale"])
+    align_corners = bool(op.attrs.get("align_corners", False))
+    tap_geometry = _RESIZE_AXES[op.attrs["mode"]]
+    result = compute
+    for axis, (size, target, scale) in enumerate(
+        zip(result.shape[2:], output_size, scales)
+    ):
+        taps, weights = tap_geometry(size, target, align_corners, scale)
+        blended = None
+        for index, weight in zip(taps, weights):
+            taken = mx.take(result, index, axis=2 + axis)
+            term = taken * _broadcast_weights(weight, axis, taken.ndim)
+            blended = term if blended is None else blended + term
+        assert blended is not None
+        result = blended
+    return result.astype(output_dtype)

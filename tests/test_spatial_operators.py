@@ -365,3 +365,103 @@ def test_a_maximum_pooling_round_trips_through_its_unpooling() -> None:
     mx.eval(actual)
 
     _assert_close(actual, call(expected_values, expected_indices))
+
+
+def _interpolate(**kwargs):
+    return lambda input: F.interpolate(input, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("shape", "options"),
+    [
+        pytest.param((1, 2, 4, 4), {"size": (7, 7), "mode": "bilinear"}, id="bilinear"),
+        pytest.param(
+            (1, 2, 4, 4),
+            {"size": (7, 5), "mode": "bilinear", "align_corners": True},
+            id="bilinear-aligned",
+        ),
+        pytest.param(
+            (1, 2, 5, 5), {"size": (3, 3), "mode": "bilinear"}, id="bilinear-down"
+        ),
+        pytest.param(
+            (1, 2, 4, 4),
+            {"scale_factor": 1.7, "mode": "bilinear"},
+            id="bilinear-fraction",
+        ),
+        pytest.param((1, 2, 4, 4), {"size": (7, 7), "mode": "bicubic"}, id="bicubic"),
+        pytest.param(
+            (1, 2, 9, 9), {"scale_factor": 0.4, "mode": "bicubic"}, id="bicubic-down"
+        ),
+        pytest.param(
+            (1, 2, 3, 3, 3), {"size": (5, 4, 5), "mode": "trilinear"}, id="trilinear"
+        ),
+        pytest.param(
+            (1, 2, 3, 3, 3), {"size": (6, 6, 6), "mode": "nearest"}, id="nearest"
+        ),
+        pytest.param(
+            (1, 2, 4, 4),
+            {"scale_factor": 2.5, "mode": "nearest"},
+            id="nearest-fraction",
+        ),
+        pytest.param((1, 2, 5, 5), {"size": (1, 1), "mode": "bilinear"}, id="collapse"),
+        pytest.param((1, 2, 1, 1), {"size": (4, 4), "mode": "bilinear"}, id="from-one"),
+    ],
+)
+def test_resize_matches_pytorch(shape: tuple[int, ...], options: dict) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*shape)
+
+    compiled, actual, expected = _run(_interpolate(**options), value)
+
+    assert [op.op for op in compiled.input_graph.ops] == ["resize"]
+    _assert_close(actual, expected)
+
+
+def test_resize_in_half_precision_round_trips_the_dtype() -> None:
+    value = torch.randn(1, 2, 4, 4).half()
+
+    _, actual, expected = _run(_interpolate(size=(9, 9), mode="bilinear"), value)
+
+    assert actual.dtype == mx.float16
+    _assert_close(actual, expected, atol=2e-3)
+
+
+def test_resize_records_the_mode_and_the_source_scale() -> None:
+    graph = capture_fx(
+        lambda input: F.interpolate(
+            input, scale_factor=2, mode="bilinear", align_corners=True
+        ),
+        (torch.randn(1, 2, 4, 4),),
+    )
+    (resize,) = graph.ops
+    assert resize.op == "resize"
+    assert resize.attrs == {
+        "mode": "linear",
+        "output_size": (8, 8),
+        "align_corners": True,
+        "source_scale": (0.5, 0.5),
+    }
+
+
+def test_a_fractional_scale_factor_keeps_the_scale_it_was_called_with() -> None:
+    # The output extent is rounded, but the source coordinate uses 1/1.7, so
+    # the recorded scale is the request's rather than 4/6.
+    graph = capture_fx(
+        lambda input: F.interpolate(input, scale_factor=1.7, mode="bilinear"),
+        (torch.randn(1, 2, 4, 4),),
+    )
+    (resize,) = graph.ops
+    assert resize.attrs["output_size"] == (6, 6)
+    assert resize.attrs["source_scale"] == pytest.approx((1 / 1.7, 1 / 1.7))
+
+
+def test_an_antialiased_resize_is_refused_by_name() -> None:
+    value = torch.randn(1, 2, 8, 8)
+
+    with pytest.raises(NotImplementedError, match="antialias"):
+        capture_fx(
+            lambda input: F.interpolate(
+                input, size=(4, 4), mode="bilinear", antialias=True
+            ),
+            (value,),
+        )
