@@ -324,7 +324,7 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 编译器怎么处理一个打包权重，取决于它乘多少行。单行 matmul —— decode —— *就是* 流式 kernel：`fold_quantized_weights` 把 `matmul(x, dequantize_i4(packed, scales))` 改写成带 `weight_group_size` 的单个 `matmul`，GEMV prologue 读字、用两条指令符号扩展每个 nibble（`(int)(word << 28) >> 28`）、乘 `x` 再乘组 scale、用 float 累加。整个过程中不存在解包后的权重。多行 matmul —— prefill —— 保留解包，因为 128 行时权重流只是乘法里便宜的那一半，int4 只会给算力受限的 pass 加解码工作；此时显式的 `dequantize_i4` 在 `codegen/quantize.py` 里 lower 成一个流式 kernel，而不是八个逐元素 MLX pass 加一次 stack、每层写出好几个全尺寸临时张量。
 
-step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#从-decode-step-里砍掉-245-个-op)把 launch 数从 1239 压到 994，并测出这一项买到了什么。它留下要解决的问题是打包 kernel 本身：每 token 读 312 MB，但每字节的速率远低于 bf16 kernel。原因还没有定论：孤立测量在不同工作集常驻程度下读到 88 到 218 GB/s 不等，所以诚实的说法是这个速率取决于工作集，下一步是弄清冷流受限的到底是发射速率还是内存级并行。
+step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#从-decode-step-里砍掉-245-个-op)把 launch 数从 1239 压到 994，并测出这一项买到了什么。它留下的是一个「每次 launch 约 14 µs 固定成本」的 decode step：把这种 kernel 的单次 launch 隔离出来，得到 `t ≈ 14 µs + 字节 / 373 GB/s`，于是 2.3 MB 的 gate/up launch 花 20.8 µs（110 GB/s），72 MB 的 LM head 花 288 µs（252 GB/s）。threadgroup 尺寸只改几个百分点，更省的 nibble 解码连噪声都没超过，所以下一步是把一次 launch 用来验证多个 token，而不是把单行 kernel 做快。四个测量点见[架构文档](docs/architecture.md#小-launch-地板是固定的-14-µs不是带宽)。
 
 精度：int4 把每个权重四舍五入到组内 15 个取值之一，logits 因此会移动，而 greedy decode 是这个移动的混沌读数。以同一份取整后的权重跑 float32 CPU forward 作为基准，运行时偏离 0.51 —— 是 18.5 的 logit 尺度的 2.7% —— 而 torch 自己的 bf16 forward 偏离 0.41，即 2.2%。两者都是 bf16 噪声，都不是解码错误。greedy 于是能跟住取整后的 checkpoint 前 13 个 token，然后在一次接近平手的选择上翻转，64 个 token 里对上 16 个。所以 CI 不使用这个模型上的 token 相等：`tests/test_quantized_qwen2.py` 跑一个 2 层模型，那里检查是精确的 —— 每个 decode token 都必须与取整后的 reference 相同 —— 而 `--quantize` 会同时报告 bf16 reference 和取整后的 reference，任何一次运行都不会含糊它跟的是哪一个。
 
