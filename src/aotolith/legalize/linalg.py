@@ -1,13 +1,20 @@
-"""The small linear-algebra operators that have no native kernel and decompose into
-shaped reads of their operand.
+"""The linear-algebra operators: the ones that decompose into shaped reads, and
+the factorizations and solves that each get one IR operation.
 
 ``mv`` and ``trace`` are kept because their decomposition is worse than a direct
 lowering: ``mv`` really is a reshape plus a matmul, and ``trace`` is a diagonal
 read plus a sum. ``diagonal`` is a view, and the builder emits the permute that
-makes the diagonal contiguous so the reduction that follows is a plain one."""
+makes the diagonal contiguous so the reduction that follows is a plain one.
+
+The factorizations are the opposite case: one ATen call returns a tuple, the
+graph reads one member of it through ``getitem``, and each member is its own IR
+operator. ``_LINALG_RESULTS`` below is that mapping - output index to the
+operator that computes it - so adding a result is one row rather than one more
+lowering function."""
 
 from __future__ import annotations
 
+import operator
 from typing import Any
 from ..ir import Operation, TensorType, Value
 from .fx import _node_type
@@ -17,6 +24,7 @@ from .refs import _argument_ids
 from .targets import (
     _DIAGONAL_COPY_TARGET,
     _DIAGONAL_TARGET,
+    _LINALG_CHECK_TARGET,
     _MV_TARGET,
     _TRACE_TARGET,
 )
@@ -263,9 +271,291 @@ def _lower_diagonal(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# The factorization family
+# ---------------------------------------------------------------------------
+
+
+def _argument(node: Any, position: int, name: str, default: object) -> object:
+    """One argument of an ATen call, positional or by keyword."""
+
+    args = getattr(node, "args", ())
+    if len(args) > position:
+        return args[position]
+    return getattr(node, "kwargs", {}).get(name, default)
+
+
+def _triangle(node: Any, position: int, name: str, default: object) -> bool:
+    """A UPLO-style argument, as the boolean the IR records."""
+
+    value = _argument(node, position, name, default)
+    if isinstance(value, bool):
+        return value
+    if value not in {"L", "U"}:
+        raise ValueError(f"{_target(node)} triangle must be 'L' or 'U', got {value!r}")
+    return value == "U"
+
+
+def _target(node: Any) -> str:
+    return str(getattr(node, "target", "?"))
+
+
+def _plain(op_name: str) -> Any:
+    """A result computed by one operator from the first operand alone."""
+
+    def spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+        return op_name, {}, None
+
+    return spec
+
+
+def _solve_spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+    if not bool(_argument(node, 2, "left", True)):
+        raise NotImplementedError(
+            f"{_target(node)} over a left-hand-side matrix is not supported"
+        )
+    return "solve", {}, None
+
+
+def _triangular_spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+    kwargs = getattr(node, "kwargs", {})
+    upper = kwargs.get("upper")
+    if not isinstance(upper, bool):
+        raise ValueError(f"{_target(node)} requires a boolean 'upper'")
+    if not bool(kwargs.get("left", True)):
+        raise NotImplementedError(
+            f"{_target(node)} over a left-hand-side matrix is not supported"
+        )
+    attrs = {
+        "upper": upper,
+        "unit_diagonal": bool(kwargs.get("unitriangular", False)),
+        # ATen's ``trans`` argument is gone by the time the decomposition runs:
+        # it transposes the operand instead, which the graph already contains.
+        "transpose": False,
+    }
+    return "solve_triangular", attrs, None
+
+
+def _cholesky_spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+    # ``cholesky`` answers the lower factor; the upper one is its transpose.
+    upper = bool(_argument(node, 1, "upper", False))
+    return "cholesky", {}, "transpose_last_two" if upper else None
+
+
+def _eigh_spec(op_name: str) -> Any:
+    def spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+        # ``eigvalsh`` and ``eigh`` differ only in which result is read, so both
+        # arrive here; the triangle argument is the one ATen always passes on.
+        return op_name, {"upper": _triangle(node, 1, "UPLO", "L")}, None
+
+    return spec
+
+
+def _svd_spec(op_name: str) -> Any:
+    def spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+        # ATen's ``_linalg_svd`` defaults to the reduced factorization; the
+        # public ``torch.linalg.svd`` passes its ``full_matrices=True`` through
+        # explicitly, which is where the difference in result shapes comes from.
+        full = bool(_argument(node, 1, "full_matrices", False))
+        compute_uv = _argument(node, 2, "compute_uv", True)
+        if not compute_uv:
+            raise ValueError(f"{_target(node)} does not compute vectors")
+        return op_name, {"full_matrices": full}, None
+
+    return spec
+
+
+def _qr_spec(op_name: str) -> Any:
+    def spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+        mode = _argument(node, 1, "mode", "reduced")
+        if mode != "reduced":
+            raise NotImplementedError(
+                f"{_target(node)} mode {mode!r} is not supported; only the "
+                "reduced factorization is"
+            )
+        return op_name, {}, None
+
+    return spec
+
+
+def _pinv_spec(node: Any) -> tuple[str, dict[str, object], str | None]:
+    kwargs = getattr(node, "kwargs", {})
+    if bool(kwargs.get("hermitian", False)):
+        raise NotImplementedError(f"{_target(node)} does not support hermitian=True")
+    for name in ("atol", "rtol", "rcond"):
+        if _argument(node, 1, name, None) is not None:
+            raise NotImplementedError(
+                f"{_target(node)} does not support a custom {name}; the cutoff "
+                "is the decomposition's own"
+            )
+    return "pinv", {}, None
+
+
+# Output index -> the operator that computes it. Index order is ATen's, which is
+# also the order ``getitem`` selects from.
+_LINALG_RESULTS: dict[str, dict[int, Any]] = {
+    "aten._linalg_solve_ex.default": {0: _solve_spec},
+    "aten.linalg_solve.default": {0: _solve_spec},
+    "aten.linalg_solve_triangular.default": {0: _triangular_spec},
+    "aten.linalg_inv_ex.default": {0: _plain("inv")},
+    "aten._linalg_det.default": {0: _plain("det")},
+    "aten._linalg_slogdet.default": {
+        0: _plain("slogdet_sign"),
+        1: _plain("slogdet_logabsdet"),
+    },
+    "aten.linalg_cholesky_ex.default": {0: _cholesky_spec},
+    "aten.cholesky.default": {0: _cholesky_spec},
+    "aten._linalg_eigh.default": {
+        0: _eigh_spec("eigh_values"),
+        1: _eigh_spec("eigh_vectors"),
+    },
+    "aten._linalg_svd.default": {
+        0: _svd_spec("svd_u"),
+        1: _plain("svd_values"),
+        2: _svd_spec("svd_vh"),
+    },
+    "aten.linalg_qr.default": {0: _qr_spec("qr_q"), 1: _qr_spec("qr_r")},
+    "aten.linalg_pinv.atol_rtol_tensor": {0: _pinv_spec},
+    "aten.linalg_lu_factor_ex.default": {
+        0: _plain("lu_factor"),
+        1: _plain("lu_pivots"),
+    },
+    "aten.linalg_matrix_exp.default": {0: _plain("matrix_exp")},
+}
+
+
+def _linalg_readers(node: Any) -> tuple[dict[int, Any], bool]:
+    """Which results of a factorization the graph reads.
+
+    Returns the read result indices with the node that reads them - the
+    ``getitem`` for a factorization, or the call itself when Torch answers a
+    single tensor - and whether the call is that single-result form. A result
+    whose only reader is ``_linalg_check_errors`` is a diagnostic the graph
+    never computes with, so it is not read either.
+    """
+
+    selections = [
+        user
+        for user in getattr(node, "users", {})
+        if getattr(user, "target", None) is operator.getitem
+    ]
+    if not selections:
+        return {0: node}, True
+    wanted: dict[int, Any] = {}
+    for user in getattr(node, "users", {}):
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{_target(node)} results must be selected with getitem")
+        readers = [
+            reader
+            for reader in user.users
+            if str(getattr(reader, "target", "")) != _LINALG_CHECK_TARGET
+        ]
+        if readers:
+            if len(user.args) != 2 or not isinstance(user.args[1], int):
+                raise ValueError(f"malformed {_target(node)} getitem: {user!r}")
+            wanted[user.args[1]] = user
+    return wanted, False
+
+
+def _linalg_operations(
+    node: Any,
+    node_ids: dict[object, str],
+    first_op_index: int,
+    target: str,
+) -> tuple[tuple[tuple[Operation, Value], ...], dict[int, str]]:
+    """Lower the results of one factorization that the graph actually reads.
+
+    The operands are the call's own - a solve takes two, everything else one -
+    and each result's type is the reading node's, which is where Torch recorded
+    the shape the factorization promises.
+    """
+
+    spec = _LINALG_RESULTS[target]
+    wanted, direct = _linalg_readers(node)
+    unsupported = sorted(set(wanted) - set(spec))
+    if unsupported:
+        raise NotImplementedError(f"{target} result {unsupported} is not supported")
+    if direct and 0 not in spec:
+        raise NotImplementedError(f"{target} has no single-result form")
+
+    operands = getattr(node, "args", ())
+    if not operands:
+        raise ValueError(f"{target} expects a matrix operand")
+    matrix_id = _argument_ids(operands[0], node_ids)
+    operations: list[tuple[Operation, Value]] = []
+    produced: dict[int, str] = {}
+    for index in sorted(wanted):
+        output_type = _node_type(wanted[index])
+        op_name, attrs, post = spec[index](node)
+        if op_name in {"solve", "solve_triangular"}:
+            if len(operands) < 2:
+                raise ValueError(f"{target} expects a right-hand side")
+            inputs = (matrix_id, _argument_ids(operands[1], node_ids))
+        else:
+            inputs = (matrix_id,)
+        output_id = f"v{first_op_index + len(operations)}"
+        operations.append(
+            (
+                Operation(op_name, inputs, (output_id,), attrs),
+                Value(output_id, output_type),
+            )
+        )
+        if post == "transpose_last_two":
+            rank = len(output_type.shape)
+            transposed_id = f"v{first_op_index + len(operations)}"
+            operations.append(
+                (
+                    Operation(
+                        "transpose",
+                        (output_id,),
+                        (transposed_id,),
+                        {"dim0": rank - 2, "dim1": rank - 1},
+                    ),
+                    Value(transposed_id, output_type),
+                )
+            )
+            output_id = transposed_id
+        produced[index] = output_id
+    return tuple(operations), produced
+
+
+def _lower_linalg(lowering: Lowering, node: Any, target: str) -> bool:
+    produced, ids = _linalg_operations(
+        node, lowering.node_ids, lowering.next_index(), target
+    )
+    lowering.emit_all(produced)
+    readers, direct = _linalg_readers(node)
+    if direct:
+        lowering.bind(node, ids[0])
+        return True
+    for user in readers.values():
+        lowering.bind(user, ids[user.args[1]])
+    for user in node.users:
+        if user not in readers.values():
+            lowering.dead_nodes.add(user)
+    return True
+
+
+def _lower_linalg_check(lowering: Lowering, node: Any, target: str) -> bool:
+    """``_linalg_check_errors`` raises on a singular operand and returns nothing.
+
+    Torch's decompositions insert it after every factorization to turn the info
+    flag into an exception. The flag itself is a diagnostic, not a value the
+    graph computes with, so the node is dropped: a singular operand reaches the
+    device's own error instead.
+    """
+
+    lowering.dead_nodes.add(node)
+    return True
+
+
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _MV_TARGET: (_lower_mv_or_trace,),
     _TRACE_TARGET: (_lower_mv_or_trace,),
     _DIAGONAL_TARGET: (_lower_diagonal,),
     _DIAGONAL_COPY_TARGET: (_lower_diagonal,),
+    _LINALG_CHECK_TARGET: (_lower_linalg_check,),
 }
+
+for _linalg_target in _LINALG_RESULTS:
+    HANDLERS[_linalg_target] = (_lower_linalg,)

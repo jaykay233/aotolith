@@ -619,6 +619,43 @@ _DIAGONAL_COPY_TARGET = "aten.diagonal_copy.default"
 _VECTOR_NORM_TARGET = "aten.linalg_vector_norm.default"
 
 
+_LINALG_RESULT_TARGETS = frozenset(
+    {
+        "aten._linalg_solve_ex.default",
+        "aten.linalg_solve.default",
+        "aten.linalg_solve_triangular.default",
+        "aten.linalg_inv_ex.default",
+        "aten._linalg_det.default",
+        "aten._linalg_slogdet.default",
+        "aten.linalg_cholesky_ex.default",
+        "aten.cholesky.default",
+        "aten._linalg_eigh.default",
+        "aten._linalg_svd.default",
+        "aten.linalg_qr.default",
+        "aten.linalg_pinv.atol_rtol_tensor",
+        "aten.linalg_lu_factor_ex.default",
+        "aten.linalg_matrix_exp.default",
+    }
+)
+"""The factorizations and solves, each of which the graph reads through
+``getitem``.
+
+Torch ships a decomposition for ``aten.linalg_solve.default`` that rewrites it
+into ``_linalg_solve_ex``, and would apply it during tracing if the target were
+not kept - the results are the ones the lowerings here read, so every spelling
+stays here rather than depending on which direction that rule goes.
+"""
+
+
+_LINALG_CHECK_TARGET = "aten._linalg_check_errors.default"
+"""The diagnostic Torch inserts after a factorization.
+
+It raises on a singular operand and returns nothing, so there is no value to
+lower: the lowering drops it and a singular operand reaches the device's own
+error instead.
+"""
+
+
 _PAD_MODE_TARGETS = {
     "aten.reflection_pad1d.default": ("reflect", 1),
     "aten.reflection_pad2d.default": ("reflect", 2),
@@ -779,6 +816,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _ADAPTIVE_AVG_POOL_TARGETS
     | _RESIZE_TARGETS
     | _ANTIALIASED_RESIZE_TARGETS
+    | _LINALG_RESULT_TARGETS
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)
@@ -809,5 +847,6 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _SQUEEZE_ALL_TARGET,
         _UNFOLD_TARGET,
         _COPY_TARGET,
+        _LINALG_CHECK_TARGET,
     }
 )

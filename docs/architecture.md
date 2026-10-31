@@ -187,6 +187,19 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.dot.default` | 展开成 `mul -> sum`，不生成新算子 |
 | `aten.mv.default` | 展开成 `reshape -> matmul -> reshape`，向量作为 `(n, 1)` 列参与 |
 | `aten.trace.default` | 展开成 `reshape -> slice -> sum`，与 `diagonal` 同一个 strided view |
+| `aten._linalg_solve_ex.default`、`aten.linalg_solve.default` | `solve`；右操作数按 Torch 的规则区分向量与多列，batch 维单独广播 |
+| `aten.linalg_solve_triangular.default` | `solve_triangular`，保留 `upper`，`unitriangular` 时对角线换成 1 |
+| `aten.linalg_inv_ex.default` | `inv` |
+| `aten._linalg_det.default` | `det` |
+| `aten._linalg_slogdet.default` | `slogdet_sign`、`slogdet_logabsdet`，按被读取的输出选择 |
+| `aten.linalg_cholesky_ex.default`、`aten.cholesky.default` | `cholesky`；`upper=True` 时再接一次 `transpose` |
+| `aten._linalg_eigh.default` | `eigh_values`、`eigh_vectors`，保留 `UPLO`，按被读取的输出选择 |
+| `aten._linalg_svd.default` | `svd_values`、`svd_u`、`svd_vh`；`full_matrices=False` 时取前 `min(m, n)` 行列 |
+| `aten.linalg_qr.default` | `qr_q`、`qr_r`，只支持 `mode='reduced'` |
+| `aten.linalg_pinv.atol_rtol_tensor` | `pinv`；不支持自定义 `atol`/`rtol`/`rcond` 或 `hermitian=True` |
+| `aten.linalg_lu_factor_ex.default` | `lu_factor`、`lu_pivots`；pivot 由 MLX 的 0 基换成 ATen 的 1 基 |
+| `aten.linalg_matrix_exp.default` | `matrix_exp`，按行范数定缩放因子后做 Taylor 展开与平方 |
+| `aten._linalg_check_errors.default` | 诊断节点，直接丢弃：奇异操作数交给设备自身的错误 |
 | `aten.trunc.default` | `trunc` |
 | `aten.sign.default` | `sign` |
 | `aten.square.default` | `square` |
@@ -682,6 +695,10 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `dot`、`mv`、`trace` 都是既有算子的组合，没有新 kernel：`dot` 是 `mul -> sum`（整轴归约），`mv` 把向量 reshape 成 `(n, 1)` 后走 `matmul` 再把结果 reshape 回 `(m,)`，`trace` 复用 `diagonal` 的 strided view——整块 flatten 后按 `columns + 1` 取步长，再对这条对角线做 `sum`，因此矩形输入取的是较短的那条对角线，和 `torch.trace` 一致
 - `repeat`/`tile` 没有独立 op：每根轴拆成 `(repeat, size)` 后广播，因此 lowering 是 `reshape -> expand -> reshape`，不产生 kernel，也不需要复制。repeats 比 rank 短或长都按 PyTorch 的规则左补 1；全部为 1 时整条链消失；`repeat=0` 会产生 IR 不建模的空维度，在捕获期报错
 - `vector_norm` 走 MLX 的 `mx.linalg.norm`。MLX 只接受单个 norm 轴，所以 Runtime 先把被归约的轴 permute 到末尾并合并成一条，调用后再按 `keepdim` reshape 回去，因此任意轴集合都能用一份实现覆盖；`F.normalize` 就是 `vector_norm -> clamp_min -> expand -> div`，`F.cosine_similarity` 则是两条 `vector_norm` 加一个 `dot / max(norm 乘积, eps)` 的融合 pointwise 区域（它的分母钳位在 ATen 分解里是 `clamp_min_`，走原地 clamp 的 legalization）。FP16/BF16 输入同样先提升到 FP32 再归约
+- 分解与求解（`solve`、`solve_triangular`、`inv`、`det`、`slogdet`、`cholesky`、`eigh`、`svd`、`qr`、`pinv`、`lu_factor`、`matrix_exp`）全部走 MLX 的 CPU stream：这一版 MLX 的 `mx.linalg` 在 GPU 上没有实现，调用会直接报 "not yet supported on the GPU"。操作数仍是普通 MLX array，所以 MLX 自己负责搬运，代价是这一次往返而不是语义差异。这些 kernel 只接受 FP32，半精度操作数先提升再按 plan 声明的 dtype 转回，与 Torch 内部走 LAPACK 的做法一致；`matrix_exp` 的展开与平方也在 CPU stream 上做，因为 GPU 的 FP32 矩阵乘精度不足以支撑这条链的迭代
+- 一个分解返回的多个成员各自是一个 IR op，legalization 只发图里 `getitem` 真正读到的那几个，因此 `torch.linalg.svd(x)[1]` 只留下 `svd_values`，`eigh` 的两个成员、`slogdet` 的两个成员同理。伴随插入的 `_linalg_check_errors` 是诊断节点，没有值可算，直接在 legalization 里丢弃
+- `solve` 的右操作数按 Torch 自己的判据区分：一维，或者形状正好是矩阵的 batch 前缀加方程轴时读作向量（结果少一维），其余读作多列。batch 前缀单独广播，矩阵轴不参与——把操作数整体广播会把向量对齐到矩阵的列上，那是另一个线性方程组。`solve_triangular` 的 `unitriangular` 没有 MLX flag，做法是把对角线换成 1，同一个方程组
+- 会挑符号或次序的分解不保证与 Torch 逐元素相同：`eigh`/`svd` 的特征向量与奇异向量、`qr` 的一对、`lu_factor` 的一对都可能差一个符号或一个置换，能对上的是它们重构出的原矩阵；`eigh` 的特征值升序、奇异值降序这类由定义固定下来的部分是一致的
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持

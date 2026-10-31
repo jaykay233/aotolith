@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from ...op_sets import CONSTANT_OPS, POINTWISE_OPS
 from .. import Graph, Operation
-from . import constants, elementwise, indexing, kernels, reduction, view
+from . import constants, elementwise, indexing, kernels, linalg, reduction, view
 from .rules import AttrKind, AttrSpec, DtypeRule, OpContract, ShapeRule, check_contract
 
 _FAMILIES = (
@@ -29,6 +29,7 @@ _FAMILIES = (
     indexing.CONTRACTS,
     view.CONTRACTS,
     constants.CONTRACTS,
+    linalg.CONTRACTS,
 )
 
 OP_CONTRACTS: dict[str, OpContract] = {}

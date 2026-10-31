@@ -34,6 +34,7 @@ from .kernels import (
     _mlx_resize,
 )
 from .layout import _MLX_LAYOUT_OPS, _evaluate_layout_mlx
+from .linalg import _LINALG_OPS, _evaluate_linalg_mlx
 from .matmul import _apply_mlx_matmul_epilogue, _apply_mlx_matmul_norm
 from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
 from .scatter import _mlx_scatter_reduce
@@ -223,6 +224,8 @@ def _evaluate_mlx_op(
         return positions.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
     if op.op == "histc":
         return _mlx_histc(op, env, graph)
+    if op.op in _LINALG_OPS:
+        return _evaluate_linalg_mlx(graph, op, env)
     if op.op == "gather":
         source, indices = (env[value_id] for value_id in op.inputs)
         axis = int(op.attrs["dim"])
