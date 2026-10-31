@@ -50,26 +50,62 @@ def _geometry(op: Operation, name: str) -> int | tuple[int, ...]:
 def _mlx_convolution(graph: Graph, op: Operation, env: dict[str, mx.array]) -> mx.array:
     value = env[op.inputs[0]]
     weight = env[op.inputs[1]]
-    primitive = {1: mx.conv1d, 2: mx.conv2d, 3: mx.conv3d}.get(value.ndim - 2)
+    spatial = value.ndim - 2
+    primitive = {1: mx.conv1d, 2: mx.conv2d, 3: mx.conv3d}.get(spatial)
     if primitive is None:
         raise NotImplementedError(
-            f"convolution over {value.ndim - 2} spatial axes is not supported"
+            f"convolution over {spatial} spatial axes is not supported"
         )
-    result = primitive(
-        _channels_last(value),
-        _kernel_last(weight),
+    groups = int(op.attrs["groups"])
+    geometry = (
         _geometry(op, "stride"),
         _geometry(op, "padding"),
         _geometry(op, "dilation"),
-        int(op.attrs["groups"]),
     )
+    if spatial == 3 and groups != 1:
+        result = _grouped_conv3d(value, weight, *geometry, groups)
+    else:
+        result = primitive(
+            _channels_last(value), _kernel_last(weight), *geometry, groups
+        )
     # The kernel answers channels-last; the IR is channels-first throughout.
-    spatial = result.ndim - 2
     result = result.transpose(0, result.ndim - 1, *range(1, result.ndim - 1))
     if len(op.inputs) == 3:
         bias = env[op.inputs[2]]
         result = result + bias.reshape(1, -1, *([1] * spatial))
     return result
+
+
+def _grouped_conv3d(
+    value: mx.array,
+    weight: mx.array,
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+    groups: int,
+) -> mx.array:
+    """A grouped 3D convolution, one group at a time.
+
+    MLX groups 1D and 2D convolutions only. A group is a convolution of its own
+    input channels with its own slice of the weight, so running them separately
+    and concatenating along the channel axis is the same arithmetic; Torch
+    orders the output channels group-major, which is the order the pieces are
+    concatenated in. The pieces stay channels-last, as the primitive returns
+    them, so the caller's single transpose still applies.
+    """
+
+    outputs_per_group = weight.shape[0] // groups
+    inputs_per_group = value.shape[1] // groups
+    pieces = []
+    for group in range(groups):
+        inputs = value[:, group * inputs_per_group : (group + 1) * inputs_per_group]
+        kernels = weight[group * outputs_per_group : (group + 1) * outputs_per_group]
+        pieces.append(
+            mx.conv3d(
+                _channels_last(inputs), _kernel_last(kernels), stride, padding, dilation
+            )
+        )
+    return mx.concatenate(pieces, axis=-1)
 
 
 def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:

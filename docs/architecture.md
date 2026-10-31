@@ -76,9 +76,10 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.scatter_add.default` | `scatter`，`reduce=add` |
 | `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin`/`mean` |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
-| `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，仅在原值没有其他别名观察者时做 SSA legalization |
-| `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default`、`aten.clamp_`/`clamp_min_`/`clamp_max_`（`default`/`Tensor`/`Scalar`） | 与对应的非原地形式完全同构，只在被改写的原值没有其他消费者时接受；编译结果返回新值，不回写调用方持有的 tensor |
-| `aten.add_.Tensor` | `add`，仅在原值没有其他别名观察者时做 SSA legalization |
+| `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，写之后没有读者时才做 SSA legalization |
+| `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default`、`aten.clamp_`/`clamp_min_`/`clamp_max_`（`default`/`Tensor`/`Scalar`） | 与对应的非原地形式完全同构；编译结果返回新值，不回写调用方持有的 tensor |
+| `aten.relu_`、`aten.sigmoid_`、`aten.tanh_`、`aten.exp_`、`aten.expm1_`、`aten.log_`、`aten.log1p_`、`aten.neg_`、`aten.abs_`、`aten.sqrt_`、`aten.rsqrt_`、`aten.reciprocal_`、`aten.floor_`、`aten.ceil_`、`aten.round_`、`aten.trunc_`、`aten.erf_`（`.default`） | 与对应的函数式拼法同名算子。Torch 的分解不会把这些 kernel 改写成函数式加 `copy_`，所以每个原地拼法单独入表 |
+| `aten.copy_.default`；`fill_`/`zero_`/`masked_fill_`/`silu_`/`gelu_`/`mish_` 等由分解给出的 `copy_` | 写就是一次重新绑定：`copy_` 被 lowering 成源的 cast 加 broadcast，`zero_` 的常量由 `full_like` 产生 |
 | `aten.view.default`、`aten._unsafe_view.default`、`aten.reshape.default` | `reshape` |
 | `aten.transpose.int` | `transpose` |
 | `aten.permute.default` | `permute` |
@@ -303,7 +304,7 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 
 - 每个族导出 `HANDLERS: dict[target, tuple[handler, ...]]`。一个 target 可以有多个 handler，按顺序试；handler 返回 `False` 表示「不是我以为的形状」，于是下一个接管。`constant_pad_nd` 就靠这个：只有全负的 pad 才是 crop，其余交给通用路径。
 - 族 handler 全部拒绝之后才跑 `PRE_HANDLERS`，然后是通用逐元素路径。这个顺序是必须的：`rms_norm` 到达时已经被分解成乘法链，没有任何 target 名字可认，只能按形状匹配，所以它必须排在最后、并且在通用路径之前对所有节点尝试一次。
-- 就地算子（`scatter_`、`index_add_`）注册到它规范化后的那个 target 上，外面套一层「目的值没有别的读者」的检查。编译器建模的是 value 而不是 mutation，所以就地写只有在原值此后已死时才是合法化。
+- 就地算子（`scatter_`、`index_add_`、`add_`、`clamp_`、`relu_`、`copy_` 一族）注册到它规范化后的那个 target 上，外面套一层「写之后没有读者」的检查。编译器建模的是 value 而不是 mutation，所以就地写只是一次重新绑定：写在图里位置之前的读者读到的仍是旧值，与 Torch 一致，因为 tracer 会把被改写的名字重新绑定，`x.relu_()` 之后的使用指向的是这次写的结果；只有排在写之后的读者会读到过期值，那样的图直接拒绝。`zero_` 的常量来自 `full_like`，它读的是目的值，但不能算作这次写的观察者。
 
 死代码在同一次遍历里掉出去：没有被任何输出用到的 value 在组装程序时被丢弃，所以一个只读 `getitem(k=0)` 的分解图只发射可达的那部分。
 
@@ -591,7 +592,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 卷积和池化不走 Metal codegen，而是直接用 MLX 原语（`mx.conv1d/2d/3d` 和 `as_strided`）。它们的开销在数据搬运而不在表达式求值，生成 kernel 只会把原语重写一遍。
 
-- 卷积：IR 是 channels-first、weight 是 output-major，MLX 要 channels-last 和 kernel-major，所以一次 `conv` 是「转置 → 原语 → 转置」，bias 用一次 broadcast add 补上。`groups` 直接交给原语；几何参数按 rank 取值（`_geometry`），因为 `mx.conv1d` 只接受标量 stride/padding/dilation，而 `conv2d`/`conv3d` 要每个空间轴一个。
+- 卷积：IR 是 channels-first、weight 是 output-major，MLX 要 channels-last 和 kernel-major，所以一次 `conv` 是「转置 → 原语 → 转置」，bias 用一次 broadcast add 补上。`groups` 直接交给原语；几何参数按 rank 取值（`_geometry`），因为 `mx.conv1d` 只接受标量 stride/padding/dilation，而 `conv2d`/`conv3d` 要每个空间轴一个。`conv3d` 是例外：MLX 只对 1D/2D 接受非 1 的 `groups`，所以 3D 分组卷积按 group 拆成多次单组卷积，再沿通道轴拼接——每组各用自己的输入通道和 weight 切片，拼出来的顺序正是 Torch 的 group-major。
 - 池化：MLX 没有 pooling kernel，但窗口本身就是一次 strided 读。先按 padding 补一次（最大值用 `-inf`、均值用 0），并补上 ceil-mode 右侧溢出；再用 `as_strided` 把每个输出位置的全部窗口偏移读成一个视图，对窗口轴做一次 reduction。indices 来自同一次读：窗口内等于最大值的偏移被保留、取最小者，再按 stride/dilation/padding 换算成输入平面内的展平下标，所以重复最大值报告第一个，与 ATen 一致。
 - 均值的分母是同一份窗口读作用在 ones mask 上的和，所以 `count_include_pad=False` 只是把 mask 建在未 padding 的 extent 上，`divisor_override` 直接替换分母，ceil-mode 越界的那部分在两种 mask 里都计 0。
 - 自适应池化没有固定步长，一个视图放不下所有窗口，于是按 `floor(i*size/out) .. ceil((i+1)*size/out)` 逐个输出位置展开；窗口边界是静态常量，展开成固定 unroll 而不是运行时循环。

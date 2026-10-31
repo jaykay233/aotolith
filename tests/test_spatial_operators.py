@@ -45,6 +45,13 @@ def _assert_close(actual, expected, atol: float = 1e-4) -> None:
         pytest.param((2, 6, 8, 8), (9, 2, 3, 3), 1, 1, 1, 3, id="2d-grouped"),
         pytest.param((2, 4, 7, 7), (4, 1, 3, 3), 1, 1, 1, 4, id="2d-depthwise"),
         pytest.param((1, 2, 6, 6, 6), (3, 2, 3, 3, 3), 1, 1, 1, 1, id="3d"),
+        # MLX groups 1D and 2D convolutions only, so a grouped 3D convolution is
+        # split into one plain convolution per group.
+        pytest.param((1, 4, 6, 6, 6), (6, 2, 3, 3, 3), 1, 1, 1, 2, id="3d-grouped"),
+        pytest.param((1, 4, 6, 6, 6), (8, 1, 3, 3, 3), 1, 1, 1, 4, id="3d-depthwise"),
+        pytest.param(
+            (2, 6, 7, 5, 7), (9, 2, 2, 3, 2), 2, 1, 2, 3, id="3d-grouped-strided"
+        ),
     ],
 )
 def test_convolution_matches_pytorch(
