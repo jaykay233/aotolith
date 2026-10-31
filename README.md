@@ -363,16 +363,16 @@ A decode step writes one key and one value per layer into a fixed-capacity windo
 
 The backend emits one kernel per layer. Per `(half, batch, head)` the slots are one contiguous run, so dropping the oldest and appending one is that run read one row further along: every slot but the last is a vector copy from the source, and the last slot is picked from the key tensor or from the projection row. Four elements per thread is eight bytes for a bf16 window, and the only branch is the one on the final row. It is still a copy of the whole window — under a hundred kilobytes per layer — so the bytes moved are unchanged and the win is entirely the launches that disappeared. The MLX fallback in `runtime/mlx_ops` computes the same three outputs for autotuning and for shapes the kernel declines, and the unrolled plan runner learned to bind multi-output operators so neither path is interpreted.
 
-Measured the same way as the section above — the pass off, on, off, on, in one session — on the 0.5B bf16 model:
+Measured the same way as the section above — the pass off, on, off, on, in one session — on the 0.5B model, bf16 and int4:
 
-| | before | after |
+| | bf16 | int4 g64 |
 | --- | ---: | ---: |
-| graph ops per decode step | 995 | 683 |
-| decode, synchronized each step | 147.9 tok/s (6.76 ms) | 154.6 tok/s (6.47 ms) |
-| decode, asynchronous | 178.8 tok/s (5.59 ms) | 188.5 tok/s (5.30 ms) |
-| greedy tokens matching the reference | 64 / 64 | 64 / 64 |
+| graph ops per decode step | 995 → 683 | 994 → 682 |
+| decode, synchronized each step | 147.9 → 154.6 tok/s (6.76 → 6.47 ms) | 228.2 → 251.5 tok/s (4.38 → 3.98 ms) |
+| decode, asynchronous | 178.8 → 188.5 tok/s (5.59 → 5.30 ms) | 277.2 → 308.7 tok/s (3.61 → 3.24 ms) |
+| greedy tokens | unchanged, all 64 | unchanged, all 64 |
 
-A third of the graph bought 1.045x and 1.054x, not a third of the throughput, and that is the honest reading: these were the cheapest operators in the step, each moving a window smaller than the smallest projection row. What it does settle is that the cost really is per launch — an operator that only copies 90 kB costs about as much as one that moves 2 MB, and removing 312 of them is worth what the launch floor predicts. The obvious next move is the one this rewrite sets up but does not take: with the write indexed by a slot counter instead of by position, the window would not have to shift at all, and the kernel would be a single row store. That changes what attention reads, so it belongs with the attention kernel rather than here.
+A third of the graph bought 1.045x and 1.054x on bf16 and 1.10x and 1.11x on int4, not a third of the throughput, and that is the honest reading: these were the cheapest operators in the step, each moving a window smaller than the smallest projection row. The int4 ratios are larger because its step is shorter, so the same 312 launches were a larger share of it. What this settles is that the cost really is per launch — an operator that copies 90 kB costs about as much as one that moves 2 MB, and removing 312 of them is worth roughly what the launch floor predicts. The obvious next move is the one this rewrite sets up but does not take: with the write indexed by a slot counter instead of by position, the window would not have to shift at all, and the kernel would be a single row store. That changes what attention reads, so it belongs with the attention kernel rather than here.
 
 ### Command Line And Artifacts
 
