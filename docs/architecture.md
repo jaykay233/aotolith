@@ -113,6 +113,11 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.linalg_vector_norm.default` | `vector_norm`，走 MLX，支持任意实数 `ord`、多轴与 `keepdim` |
 | `aten.repeat.default`（`Tensor.repeat`/`Tensor.tile`） | 展开成 `reshape -> expand -> reshape`，不生成 kernel |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
+| `aten.convolution.default` | `conv`，`stride`/`padding`/`dilation`/`groups` 进入 attribute，weight/bias 作为普通输入 |
+| `aten.max_pool2d_with_indices.default`、`aten.max_pool3d_with_indices.default` | `pool`，窗口几何进入 attribute；是否同时写出 indices 由被读取的输出决定 |
+| `aten.avg_pool2d.default`、`aten.avg_pool3d.default` | `pool`，保留 `ceil_mode`/`count_include_pad`/`divisor_override` |
+| `aten.adaptive_max_pool2d.default`、`aten.adaptive_max_pool3d.default` | `adaptive_pool`，按 `output_size` 逐个输出位置展开窗口 |
+| `aten._adaptive_avg_pool2d.default`、`aten._adaptive_avg_pool3d.default` | `adaptive_pool`，同上，取均值 |
 | `aten.argmax.default`、`aten.argmin.default` | `argmax`、`argmin`，输出固定 I64 |
 | `aten.max.dim`、`aten.min.dim` | `amax`/`amin` 加 `argmax`/`argmin`，按被读取的输出选择 |
 | `aten.sort.default` | `sort` / `argsort`（按被读取的输出选择） |
@@ -267,6 +272,8 @@ FP16/BF16 的 CPU SDPA 分解图常把 Q/K/V 转成 FP32 计算，再把结果�
 
 - 前端自己 lower 的算子，分解只会变差。attention、`layer_norm`、`softmax` 有自己的 Metal kernel；`arange` 用 fma 余项加两次求和重建浮点序列，让结果只舍入一次；`sum`/`var` 要按各自 schema 归一化 `dim`/`keepdim`。把这些换成展开图是纯损失，所以它们在 `NATIVE_TARGETS` 里，且 `tests/test_decompose.py` 断言这张表和分解表没有交集。
 - 前端不认识的算子，分解是免费的覆盖面。`celu`、`glu`、`huber_loss`、`smooth_l1_loss`、`mse_loss`、`binary_cross_entropy_with_logits` 现在直接可编译，因为它们展开后的算子都已经支持；后续新算子只需补叶子算子（如 `lgamma`、`i0`、`erfinv`、`signbit`），不必再手写一整棵复合树。诊断信息也因此从“958 个不认识的复合算子名”收敛到“缺哪几个叶子算子”。
+
+归一化走的是反方向：`native_batch_norm` 和 `native_group_norm` 留在 `decompose.py` 的自定义规则里，展开成 moments（`mean`/`var`）+ `rsqrt` + 逐通道仿射，低精度输入在 float32 里累积；`instance_norm` 复用 group_norm 的展开。训练态的运行统计量更新被显式拒绝，因为计划的状态输入是不可变的。它们不需要专门的 kernel：展开后的算子已经在 pointwise 融合和 reduction 的覆盖里。
 
 分解得到的一条经验：有些组合 lowering 在分解表里已经有了完全相同的写法，`dot` 就是 `mul` 加一次全轴归约，所以 `_dot_operations` 已经删掉；但 `mv`、`trace`、`nansum`、`logsumexp`、`count_nonzero`、`all`/`any` 保留手写版本——`mv` 走 rank-2 matmul（分解会先物化一整块逐元素乘积），`trace` 用 strided 对角线视图（分解会复制对角线），`logsumexp` 用 `isinf` 而不是 `abs`+`eq`，`nansum` 的分解对整数输入会无条件发 `isnan`。判断标准是展开后的 IR 是否至少同样好，而不是“能不能删掉”。
 
@@ -577,6 +584,17 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 
 数值对比中最大绝对误差为 `9.766e-04`。该 kernel 仍明显慢于 MLX SDPA，且 GPU 时钟波动较大，单次绝对耗时不宜直接横向比较。QK/PV 已使用 SIMD matrix，64-key tile 也已向量化加载，但 tile 仍由 sequence 和静态 shared-memory 预算选择，没有运行时 autotune、split-key 或更细的流水；默认 `codegen_attention=False`。Q/K head dim 或 V head dim 超过 256，或者 attention 的 mask rank 不适合静态 offset 时，backend 不创建 kernel，Runtime 自动回退到 MLX。
 
+## 12.5 卷积与池化
+
+卷积和池化不走 Metal codegen，而是直接用 MLX 原语（`mx.conv1d/2d/3d` 和 `as_strided`）。它们的开销在数据搬运而不在表达式求值，生成 kernel 只会把原语重写一遍。
+
+- 卷积：IR 是 channels-first、weight 是 output-major，MLX 要 channels-last 和 kernel-major，所以一次 `conv` 是「转置 → 原语 → 转置」，bias 用一次 broadcast add 补上。`groups` 直接交给原语；几何参数按 rank 取值（`_geometry`），因为 `mx.conv1d` 只接受标量 stride/padding/dilation，而 `conv2d`/`conv3d` 要每个空间轴一个。
+- 池化：MLX 没有 pooling kernel，但窗口本身就是一次 strided 读。先按 padding 补一次（最大值用 `-inf`、均值用 0），并补上 ceil-mode 右侧溢出；再用 `as_strided` 把每个输出位置的全部窗口偏移读成一个视图，对窗口轴做一次 reduction。indices 来自同一次读：窗口内等于最大值的偏移被保留、取最小者，再按 stride/dilation/padding 换算成输入平面内的展平下标，所以重复最大值报告第一个，与 ATen 一致。
+- 均值的分母是同一份窗口读作用在 ones mask 上的和，所以 `count_include_pad=False` 只是把 mask 建在未 padding 的 extent 上，`divisor_override` 直接替换分母，ceil-mode 越界的那部分在两种 mask 里都计 0。
+- 自适应池化没有固定步长，一个视图放不下所有窗口，于是按 `floor(i*size/out) .. ceil((i+1)*size/out)` 逐个输出位置展开；窗口边界是静态常量，展开成固定 unroll 而不是运行时循环。
+- MLX 0.32 的 reduction 在窗口内偏移不是单位步长（dilated 窗口）时会读错邻近元素，所以窗口视图先过一次 `mx.contiguous` 再归约。这份拷贝是正确性要求，不是性能选择。
+- 1D 池化不单独注册：Torch 自己把它分解成 `unsqueeze -> 2D pooling -> squeeze`，前端直接吃这条链。
+
 ## 13. CompiledPlan 执行器
 
 本节中的 Runtime 只指编译结果的最小执行器。它按照 `CompiledPlan` 调用生成的 Metal kernel 或 MLX 回退算子，不实现请求调度、batching、采样或 serving。
@@ -598,6 +616,8 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 - sum/mean：调用生成的 static reduction kernel
 - layer_norm：调用生成的两遍 mean/variance reduction kernel
 - rms_norm：调用生成的平方和 reduction kernel
+- conv：把 activation 转成 channels-last、weight 转成 kernel-major 后调用 `mx.conv1d/2d/3d`，再转回 channels-first 并加 bias
+- pool/adaptive_pool：调用 `runtime.mlx_ops.kernels` 里的窗口实现，最大值模式按输出的个数决定是否同时返回 indices
 
 每个 graph input 在进入计划前会检查 shape 和 dtype。输出统一以 tuple 返回，即使图只有一个输出。
 

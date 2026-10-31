@@ -27,7 +27,7 @@ from ..bounds import (
     _mlx_take_checked,
 )
 from .attention import _evaluate_attention_mlx, _mlx_variance
-from .kernels import _mlx_convolution
+from .kernels import _mlx_adaptive_pool, _mlx_convolution, _mlx_pool
 from .layout import _MLX_LAYOUT_OPS, _evaluate_layout_mlx
 from .matmul import _apply_mlx_matmul_epilogue, _apply_mlx_matmul_norm
 from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
@@ -467,6 +467,10 @@ def _evaluate_mlx_op(
         return mx.concatenate([env[value_id] for value_id in op.inputs], axis=axis)
     if op.op == "conv":
         return _mlx_convolution(graph, op, env)
+    if op.op == "pool":
+        return _mlx_pool(graph, op, env)
+    if op.op == "adaptive_pool":
+        return _mlx_adaptive_pool(graph, op, env)
     if op.op in _MLX_LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
     if op.op == "matmul":

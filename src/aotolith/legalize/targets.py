@@ -672,6 +672,27 @@ _LAYER_NORM_TARGET = "aten.native_layer_norm.default"
 _CONV_TARGET = "aten.convolution.default"
 
 
+_MAX_POOL_TARGETS = frozenset(
+    {
+        "aten.max_pool2d_with_indices.default",
+        "aten.max_pool3d_with_indices.default",
+    }
+)
+
+
+_AVG_POOL_TARGETS = frozenset({"aten.avg_pool2d.default", "aten.avg_pool3d.default"})
+
+
+_ADAPTIVE_MAX_POOL_TARGETS = frozenset(
+    {"aten.adaptive_max_pool2d.default", "aten.adaptive_max_pool3d.default"}
+)
+
+
+_ADAPTIVE_AVG_POOL_TARGETS = frozenset(
+    {"aten._adaptive_avg_pool2d.default", "aten._adaptive_avg_pool3d.default"}
+)
+
+
 _SQUEEZE_ALL_TARGET = "aten.squeeze.default"
 
 
@@ -695,6 +716,10 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _AND_OR_TARGETS
     | _SCATTER_TARGETS
     | _COUNT_NONZERO_TARGETS
+    | _MAX_POOL_TARGETS
+    | _AVG_POOL_TARGETS
+    | _ADAPTIVE_MAX_POOL_TARGETS
+    | _ADAPTIVE_AVG_POOL_TARGETS
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)

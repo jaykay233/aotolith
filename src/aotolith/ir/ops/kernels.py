@@ -22,6 +22,103 @@ from .rules import (
 from ...shapes import can_broadcast
 
 
+def _spatial_integers(
+    op: Operation, name: str, spatial: int, *, floor: int
+) -> tuple[int, ...]:
+    """One per-axis attribute of a spatial operator, checked for range."""
+
+    value = op.attrs.get(name)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != spatial
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in value
+        )
+    ):
+        raise ValueError(f"{op.op}.{name} must be {spatial} integers, got {value!r}")
+    if any(item < floor for item in value):
+        raise ValueError(f"{op.op}.{name} must be at least {floor}, got {value!r}")
+    return value
+
+
+def _pool_mode(op: Operation) -> str:
+    mode = op.attrs.get("mode")
+    if mode not in {"max", "avg"}:
+        raise ValueError(f"{op.op}.mode must be 'max' or 'avg', got {mode!r}")
+    return mode
+
+
+def _check_pool_outputs(graph: Graph, op: Operation, shape: tuple[int, ...]) -> None:
+    """The values, and the flattened indices a maximum may also report."""
+
+    for position, value_id in enumerate(op.outputs):
+        value_type = graph.value(value_id).type
+        if value_type.shape != shape:
+            raise ValueError(
+                f"{op.op} output {position} shape {value_type.shape} != {shape}"
+            )
+        expected_dtype = DType.I64 if position else graph.value(op.inputs[0]).type.dtype
+        if value_type.dtype != expected_dtype:
+            raise ValueError(
+                f"{op.op} output {position} must be {expected_dtype.value}, got "
+                f"{value_type.dtype.value}"
+            )
+
+
+def _check_pool(graph: Graph, op: Operation) -> None:
+    input_type = graph.value(op.inputs[0]).type
+    spatial = len(input_type.shape) - 2
+    mode = _pool_mode(op)
+    kernel = _spatial_integers(op, "kernel", spatial, floor=1)
+    stride = _spatial_integers(op, "stride", spatial, floor=1)
+    padding = _spatial_integers(op, "padding", spatial, floor=0)
+    dilation = _spatial_integers(op, "dilation", spatial, floor=1)
+    ceil_mode = op.attrs.get("ceil_mode", False)
+    if not isinstance(ceil_mode, bool):
+        raise ValueError(f"{op.op}.ceil_mode must be a boolean, got {ceil_mode!r}")
+    if mode == "avg":
+        if not isinstance(op.attrs.get("count_include_pad", True), bool):
+            raise ValueError(f"{op.op}.count_include_pad must be a boolean")
+        override = op.attrs.get("divisor_override")
+        if override is not None and (
+            not isinstance(override, int) or isinstance(override, bool) or override <= 0
+        ):
+            raise ValueError(
+                f"{op.op}.divisor_override must be a positive integer or None, "
+                f"got {override!r}"
+            )
+    shape = list(input_type.shape[:2])
+    for size, step, window, spread, pad in zip(
+        input_type.shape[2:], stride, kernel, dilation, padding
+    ):
+        extent = size + 2 * pad - spread * (window - 1) - 1
+        if extent < 0:
+            raise ValueError(
+                f"{op.op}.kernel {kernel} does not fit the padded input "
+                f"{input_type.shape[2:]}"
+            )
+        if ceil_mode:
+            out = -(-extent // step) + 1
+            if (out - 1) * step >= size + pad:
+                out -= 1
+        else:
+            out = extent // step + 1
+        shape.append(out)
+    if len(op.outputs) == 2 and mode != "max":
+        raise ValueError(f"{op.op} only a maximum reports indices")
+    _check_pool_outputs(graph, op, tuple(shape))
+
+
+def _check_adaptive_pool(graph: Graph, op: Operation) -> None:
+    input_type = graph.value(op.inputs[0]).type
+    spatial = len(input_type.shape) - 2
+    _pool_mode(op)
+    output_size = _spatial_integers(op, "output_size", spatial, floor=1)
+    if len(op.outputs) == 2 and op.attrs.get("mode") != "max":
+        raise ValueError(f"{op.op} only a maximum reports indices")
+    _check_pool_outputs(graph, op, (*input_type.shape[:2], *output_size))
+
+
 def _conv_geometry(
     op: Operation, graph: Graph
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], int]:
@@ -230,5 +327,30 @@ CONTRACTS: dict[str, OpContract] = {
             AttrSpec("groups", AttrKind.INT),
         ),
         extra=_check_conv,
+    ),
+    # A pooling window is read once and reduced; the two modes differ only in
+    # the padding value and the reduction, so one contract covers both.
+    "pool": OpContract(
+        arity=(1, 1),
+        rank=(3, 5),
+        dtype=DtypeRule.FLOATING_IN,
+        shape=ShapeRule.FREE,
+        outputs=(1, 2),
+        attrs=(
+            AttrSpec("kernel", AttrKind.INT_TUPLE),
+            AttrSpec("stride", AttrKind.INT_TUPLE),
+            AttrSpec("padding", AttrKind.INT_TUPLE),
+            AttrSpec("dilation", AttrKind.INT_TUPLE),
+        ),
+        extra=_check_pool,
+    ),
+    "adaptive_pool": OpContract(
+        arity=(1, 1),
+        rank=(3, 5),
+        dtype=DtypeRule.FLOATING_IN,
+        shape=ShapeRule.FREE,
+        outputs=(1, 2),
+        attrs=(AttrSpec("output_size", AttrKind.INT_TUPLE),),
+        extra=_check_adaptive_pool,
     ),
 }

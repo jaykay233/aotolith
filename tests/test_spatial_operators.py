@@ -128,3 +128,240 @@ def test_a_transposed_convolution_is_refused_by_name() -> None:
             lambda input, weight: F.conv_transpose2d(input, weight, stride=2),
             (value, weight),
         )
+
+
+_MAX_POOL = {3: F.max_pool1d, 4: F.max_pool2d, 5: F.max_pool3d}
+_AVG_POOL = {3: F.avg_pool1d, 4: F.avg_pool2d, 5: F.avg_pool3d}
+_ADAPTIVE_MAX_POOL = {
+    3: F.adaptive_max_pool1d,
+    4: F.adaptive_max_pool2d,
+    5: F.adaptive_max_pool3d,
+}
+_ADAPTIVE_AVG_POOL = {
+    3: F.adaptive_avg_pool1d,
+    4: F.adaptive_avg_pool2d,
+    5: F.adaptive_avg_pool3d,
+}
+
+# One activation per spatial rank, so a parametrized case picks the rank of the
+# pooling it exercises without rewriting the callable.
+_POOL_SHAPES = {3: (2, 3, 12), 4: (2, 3, 9, 9), 5: (1, 2, 6, 6, 6)}
+
+
+def _indices(call, value: torch.Tensor) -> tuple[mx.array, torch.Tensor, torch.Tensor]:
+    expected_values, expected_indices = call(value)
+    compiled = compile_callable(call, (value,))
+    values, indices = compiled.plan(mx.array(value.numpy()))
+    mx.eval(values, indices)
+    assert indices.dtype == mx.int64
+    return values, indices, (expected_values, expected_indices)
+
+
+@pytest.mark.parametrize("rank", [3, 4, 5])
+@pytest.mark.parametrize(
+    ("kernel", "stride", "padding", "dilation", "ceil_mode"),
+    [
+        pytest.param(2, None, 0, 1, False, id="windows"),
+        pytest.param(3, 2, 1, 1, False, id="strided-padded"),
+        pytest.param(2, 2, 0, 1, True, id="ceil"),
+        pytest.param(2, 1, 1, 3, False, id="dilated"),
+    ],
+)
+def test_max_pool_matches_pytorch(
+    rank: int,
+    kernel: int,
+    stride: int | None,
+    padding: int,
+    dilation: int,
+    ceil_mode: bool,
+) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*_POOL_SHAPES[rank])
+    operation = _MAX_POOL[rank]
+
+    def call(input):
+        return operation(input, kernel, stride, padding, dilation, ceil_mode)
+
+    _, actual, expected = _run(call, value)
+
+    _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", [3, 4, 5])
+def test_max_pool_reports_the_indices_pytorch_reports(rank: int) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*_POOL_SHAPES[rank])
+    operation = _MAX_POOL[rank]
+
+    values, indices, (expected_values, expected_indices) = _indices(
+        lambda input: operation(input, 2, 2, return_indices=True), value
+    )
+
+    _assert_close(values, expected_values)
+    assert bool(mx.array_equal(indices, mx.array(expected_indices.numpy())))
+
+
+@pytest.mark.parametrize("rank", [3, 4, 5])
+@pytest.mark.parametrize(
+    ("kernel", "stride", "padding", "ceil_mode", "count_include_pad"),
+    [
+        pytest.param(2, None, 0, False, True, id="windows"),
+        pytest.param(3, 2, 1, False, True, id="strided-padded"),
+        pytest.param(3, 2, 1, False, False, id="padding-excluded"),
+        pytest.param(2, 2, 0, True, True, id="ceil"),
+        pytest.param(3, 2, 1, True, True, id="ceil-padded"),
+    ],
+)
+def test_average_pool_matches_pytorch(
+    rank: int,
+    kernel: int,
+    stride: int | None,
+    padding: int,
+    ceil_mode: bool,
+    count_include_pad: bool,
+) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*_POOL_SHAPES[rank])
+    operation = _AVG_POOL[rank]
+
+    def call(input):
+        return operation(input, kernel, stride, padding, ceil_mode, count_include_pad)
+
+    _, actual, expected = _run(call, value)
+
+    _assert_close(actual, expected)
+
+
+def test_average_pool_honours_a_divisor_override() -> None:
+    torch.manual_seed(0)
+    value = torch.randn(1, 2, 7, 7)
+
+    _, actual, expected = _run(
+        lambda input: F.avg_pool2d(input, 3, 2, 1, False, True, 5), value
+    )
+
+    _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", [3, 4, 5])
+@pytest.mark.parametrize("output_size", [1, 3])
+def test_adaptive_max_pool_matches_pytorch(rank: int, output_size: int) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*_POOL_SHAPES[rank])
+    operation = _ADAPTIVE_MAX_POOL[rank]
+
+    _, actual, expected = _run(lambda input: operation(input, output_size), value)
+
+    _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", [3, 4, 5])
+@pytest.mark.parametrize("output_size", [1, 2, 4])
+def test_adaptive_average_pool_matches_pytorch(rank: int, output_size: int) -> None:
+    torch.manual_seed(0)
+    value = torch.randn(*_POOL_SHAPES[rank])
+    operation = _ADAPTIVE_AVG_POOL[rank]
+
+    _, actual, expected = _run(lambda input: operation(input, output_size), value)
+
+    _assert_close(actual, expected)
+
+
+def test_adaptive_max_pool_reports_the_indices_pytorch_reports() -> None:
+    torch.manual_seed(0)
+    value = torch.randn(1, 2, 7, 7)
+
+    values, indices, (expected_values, expected_indices) = _indices(
+        lambda input: F.adaptive_max_pool2d(input, (2, 3), return_indices=True), value
+    )
+
+    _assert_close(values, expected_values)
+    assert bool(mx.array_equal(indices, mx.array(expected_indices.numpy())))
+
+
+def test_adaptive_pool_over_a_recipe_with_ragged_windows() -> None:
+    # Three outputs for seven inputs split into windows of three, two and two -
+    # the case a fixed window cannot express.
+    torch.manual_seed(0)
+    value = torch.randn(1, 2, 7, 7)
+
+    _, actual, expected = _run(
+        lambda input: F.adaptive_avg_pool2d(input, (2, 3)), value
+    )
+
+    _assert_close(actual, expected)
+
+
+def test_pooling_records_the_geometry_as_typed_attributes() -> None:
+    value = torch.randn(1, 2, 8, 8)
+
+    graph = capture_fx(
+        lambda input: F.avg_pool2d(
+            input, 3, 2, 1, ceil_mode=True, count_include_pad=False
+        ),
+        (value,),
+    )
+    (pool,) = graph.ops
+    assert pool.op == "pool"
+    assert pool.attrs == {
+        "mode": "avg",
+        "kernel": (3, 3),
+        "stride": (2, 2),
+        "padding": (1, 1),
+        "dilation": (1, 1),
+        "ceil_mode": True,
+        "count_include_pad": False,
+        "divisor_override": None,
+    }
+
+
+def test_a_pooling_module_runs_inside_a_network() -> None:
+    class Net(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+            self.pool = torch.nn.MaxPool2d(2)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.pool(torch.relu(self.conv(value)))
+
+    torch.manual_seed(0)
+    module = Net().eval()
+    value = torch.randn(2, 3, 8, 8)
+    with torch.no_grad():
+        expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    actual = compiled(value)[0]
+    mx.eval(actual)
+
+    assert [op.op for op in compiled.input_graph.ops] == ["conv", "relu", "pool"]
+    _assert_close(actual, expected)
+
+
+def test_a_half_precision_pooling_reduces_in_float32() -> None:
+    value = torch.randn(2, 4, 10, 10).half()
+
+    compiled, actual, expected = _run(lambda input: F.avg_pool2d(input, 3, 1, 1), value)
+
+    assert actual.dtype == mx.float16
+    _assert_close(actual, expected)
+
+
+def test_a_maximum_pooling_round_trips_through_its_unpooling() -> None:
+    # Unpooling scatters the values back to the indices the pooling reported,
+    # which is the one consumer that reads them.
+    torch.manual_seed(0)
+    value = torch.randn(1, 2, 6, 6)
+    expected_values, expected_indices = F.max_pool2d_with_indices(value, 2, 2)
+
+    def call(values, indices):
+        return F.max_unpool2d(values, indices, 2)
+
+    compiled = compile_callable(call, (expected_values, expected_indices))
+    actual = compiled.plan(
+        mx.array(expected_values.numpy()), mx.array(expected_indices.numpy())
+    )[0]
+    mx.eval(actual)
+
+    _assert_close(actual, call(expected_values, expected_indices))
