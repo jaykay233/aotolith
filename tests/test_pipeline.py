@@ -4227,6 +4227,17 @@ def test_one_hot_without_num_classes_names_the_argument_that_fixes_it() -> None:
     )
 
 
+def test_a_comparison_over_the_values_is_refused_with_advice() -> None:
+    # ``equal`` and ``allclose`` reduce over the data, so fake tracing has no
+    # example result to hand back and the plan has no shape to compile to. The
+    # message has to say where the comparison belongs instead of leaking
+    # Torch's ``DataDependentOutputException``.
+    value = torch.randn(4)
+    for fn in (torch.equal, torch.allclose):
+        with pytest.raises(ValueError, match="compare the plan's outputs"):
+            compile_callable(fn, (value, value))
+
+
 def test_a_float64_decomposition_says_where_the_float64_came_from() -> None:
     # ``quantile`` builds its result out of float64 constants, so the dtype
     # refusal fires even though every input is float32. Saying that in the

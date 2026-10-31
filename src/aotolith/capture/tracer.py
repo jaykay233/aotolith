@@ -54,6 +54,32 @@ def _data_dependent_message(error: BaseException) -> str:
     )
 
 
+def _data_dependent_output_error() -> type[BaseException]:
+    """The exception fake tracing raises for an output that is not a shape.
+
+    ``torch.equal`` and ``torch.allclose`` reduce over the values, so fake
+    tracing cannot make up an example result for them. Imported lazily for the
+    same reason as the guard: Torch stays inside the functions that need it.
+    """
+
+    try:
+        from torch._subclasses.fake_tensor import DataDependentOutputException
+    except ImportError:
+        return type("_NoDataDependentOutput", (Exception,), {})
+    return DataDependentOutputException
+
+
+def _data_output_message(error: BaseException) -> str:
+    return (
+        "the traced graph ends in an operator that reduces over the values - "
+        f"torch.equal, torch.allclose or a similar comparison ({error}). Fake "
+        "tracing keeps capture shape-only, so it has no example result to hand "
+        "back for a comparison, and the comparison has no shape to compile to. "
+        "Compile the model without it and compare the plan's outputs outside "
+        "the compiled region"
+    )
+
+
 def trace(
     fn: Callable[..., Any],
     example_inputs: Sequence[Any],
@@ -83,6 +109,8 @@ def trace(
         )(*example_inputs)
     except _guard_error() as exc:
         raise ValueError(_data_dependent_message(exc)) from exc
+    except _data_dependent_output_error() as exc:
+        raise ValueError(_data_output_message(exc)) from exc
     except AssertionError as exc:
         if "Please convert all Tensors to FakeTensors" not in str(exc):
             raise

@@ -5,8 +5,13 @@ a mapping from an ATen operator to a function that rewrites it into smaller
 operators *during* tracing. Torch ships 941 such rules in
 ``core_aten_decompositions``, which is most of the long tail the frontend
 would otherwise have to reject one operator at a time - ``lgamma``,
-``digamma``, ``i0``, ``aminmax``, ``celu``, the FFT family, and the ``out=``
-and gradient spellings of operators that already have a forward lowering.
+``digamma``, ``i0``, ``aminmax``, ``celu``, ``erfc``, ``nanmean``, and the
+``out=`` and gradient spellings of operators that already have a forward
+lowering.
+
+The FFT family is the exception worth knowing about: it does decompose, but
+into complex primitives, and the IR has no complex dtype, so ``torch.fft``
+still refuses - at the dtype rather than at the operator.
 
 Two reasons to use it rather than hand-writing every lowering:
 
