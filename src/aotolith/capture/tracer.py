@@ -50,7 +50,12 @@ def _data_dependent_message(error: BaseException) -> str:
         "usual sources are one_hot without num_classes (pass it explicitly), a "
         "reshape or view to a size computed from the values, and an operator "
         "whose result length depends on the data. Give the extent from the "
-        "input shape instead, or run this part outside the compiled region"
+        "input shape instead, or run this part outside the compiled region. A "
+        "check that reduces over the values lands here too - (x > 0).all(), or "
+        "a torch.distributions object built with the default validate_args - "
+        "and belongs outside the traced function as well: construct the "
+        "distribution with validate_args=False if the check is the only thing "
+        "in the way"
     )
 
 

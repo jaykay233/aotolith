@@ -4268,6 +4268,63 @@ def test_random_draws_are_refused_by_name(fn, name, target) -> None:
     assert "outside the compiled region" in message
 
 
+def test_a_distribution_sample_is_refused_as_a_draw() -> None:
+    # ``torch.distributions`` draws through operators a model never names -
+    # ``_standard_gamma``, ``_sample_dirichlet``, ``normal.Tensor_Tensor`` - so
+    # without these spellings the refusal would read as a missing lowering
+    # rather than as a draw the plan cannot replay. ``validate_args=False`` is
+    # what makes the sampler reach the draw at all: the default argument check
+    # reduces over the values and stops one step earlier, which the next test
+    # covers.
+    value = torch.randn(4)
+    cases = [
+        (
+            lambda v: torch.distributions.Normal(v, torch.ones(4), validate_args=False).sample(),
+            "normal",
+            "aten.normal.Tensor_Tensor",
+        ),
+        (
+            lambda v: torch.distributions.Gamma(v.abs() + 1, torch.ones(4), validate_args=False).sample(),
+            "the gamma sampler",
+            "aten._standard_gamma.default",
+        ),
+        (
+            lambda v: torch.distributions.Dirichlet(torch.ones(4), validate_args=False).sample(),
+            "the Dirichlet sampler",
+            "aten._sample_dirichlet.default",
+        ),
+        (
+            lambda v: torch.distributions.Categorical(
+                logits=v.reshape(1, 4), validate_args=False
+            ).sample(),
+            "multinomial",
+            "aten.multinomial.default",
+        ),
+        (lambda v: torch.poisson(v.abs() + 1), "poisson", "aten.poisson.default"),
+    ]
+    for fn, name, target in cases:
+        with pytest.raises(NotImplementedError) as caught:
+            compile_callable(fn, (value,))
+        message = str(caught.value)
+        assert f"{name} draws a random number ({target})" in message, target
+        assert "outside the compiled region" in message
+
+
+def test_a_value_check_names_validate_args_as_the_way_past_it() -> None:
+    # ``Distribution.__init__`` checks its arguments against the data unless
+    # told not to, and that check is a reduction over the values, so tracing
+    # stops before the draw. The advice has to point at ``validate_args=False``
+    # instead of listing shapes, which are not the problem here.
+    value = torch.randn(4)
+    with pytest.raises(ValueError) as caught:
+        compile_callable(
+            lambda v: torch.distributions.Normal(v, torch.ones(4)).sample(), (value,)
+        )
+    message = str(caught.value)
+    assert "reduces over the values" in message
+    assert "validate_args=False" in message
+
+
 @pytest.mark.parametrize(
     ("fn", "name"),
     [

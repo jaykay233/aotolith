@@ -111,6 +111,7 @@ _RANDOM_TARGETS = {
     "aten.normal.default": "normal",
     "aten.normal.Tensor_float": "normal",
     "aten.normal.float_Tensor": "normal",
+    "aten.normal.Tensor_Tensor": "normal",
     "aten.uniform_.default": "uniform_",
     "aten.normal_.default": "normal_",
     "aten.exponential_.default": "exponential_",
@@ -118,6 +119,12 @@ _RANDOM_TARGETS = {
     "aten.log_normal_.default": "log_normal_",
     "aten.geometric_.default": "geometric_",
     "aten.random_.default": "random_",
+    # ``torch.distributions`` samplers draw through operators the model never
+    # names, so they are listed by the distribution a reader would recognise.
+    "aten._standard_gamma.default": "the gamma sampler",
+    "aten._sample_dirichlet.default": "the Dirichlet sampler",
+    "aten.poisson.default": "poisson",
+    "aten.binomial.default": "binomial",
 }
 """Every way a traced graph can draw a number nobody asked the inputs for.
 
