@@ -57,6 +57,7 @@ POINTWISE_OPS = frozenset(
         "rsub",
         "div",
         "floor_divide",
+        "trunc_divide",
         "remainder",
         "fmod",
         "lerp",
@@ -79,6 +80,12 @@ POINTWISE_OPS = frozenset(
         "clamp_max",
         "maximum",
         "minimum",
+        "fmax",
+        "fmin",
+        # Shift counts make these two's-complement integer operations, but they
+        # are otherwise ordinary binary pointwise calls.
+        "bitwise_left_shift",
+        "bitwise_right_shift",
         # Transcendental functions, including the helpers the backend has to
         # implement itself because MSL has no equivalent.
         "sigmoid",
@@ -116,6 +123,9 @@ POINTWISE_OPS = frozenset(
         "atan2",
         "heaviside",
         "nan_to_num",
+        "nextafter",
+        "gcd",
+        "lcm",
         # Comparisons and masks. A comparison result is a boolean tensor that
         # feeds the region like any other intermediate.
         "eq",

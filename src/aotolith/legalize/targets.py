@@ -219,6 +219,19 @@ _SUPPORTED_OPS = {
     "aten.bitwise_xor.Tensor": "bitwise_xor",
     "aten.bitwise_xor.Scalar": "bitwise_xor",
     "aten.bitwise_not.default": "bitwise_not",
+    # Shifts have three spellings each: two tensors, a tensor and a scalar, and
+    # a scalar and a tensor.
+    "aten.bitwise_left_shift.Tensor": "bitwise_left_shift",
+    "aten.bitwise_left_shift.Tensor_Scalar": "bitwise_left_shift",
+    "aten.bitwise_left_shift.Scalar_Tensor": "bitwise_left_shift",
+    "aten.bitwise_right_shift.Tensor": "bitwise_right_shift",
+    "aten.bitwise_right_shift.Tensor_Scalar": "bitwise_right_shift",
+    "aten.bitwise_right_shift.Scalar_Tensor": "bitwise_right_shift",
+    "aten.fmax.default": "fmax",
+    "aten.fmin.default": "fmin",
+    "aten.gcd.default": "gcd",
+    "aten.lcm.default": "lcm",
+    "aten.nextafter.default": "nextafter",
     "aten.isnan.default": "isnan",
     "aten.isinf.default": "isinf",
     "aten.masked_fill.Scalar": "masked_fill",
@@ -291,6 +304,22 @@ _NUMERIC_ATTRS = {
 _COMPARISON_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}
 
 
+_DIVIDE_ROUNDING_TARGETS = frozenset(
+    {
+        "aten.div.Tensor_mode",
+        "aten.div.Scalar_mode",
+        "aten.div_.Tensor_mode",
+        "aten.div_.Scalar_mode",
+    }
+)
+"""``div`` spellings that carry a ``rounding_mode`` keyword.
+
+They are not a straight target-to-op mapping: ``rounding_mode='floor'`` is the
+existing ``floor_divide``, ``'trunc'`` is ``trunc_divide``, and ``None`` is true
+division, so ``lower_supported`` reads the keyword before choosing the IR op.
+"""
+
+
 _FLOAT_ONLY_POINTWISE_OPS = {
     "logit",
     "erfc",
@@ -318,6 +347,18 @@ _FLOAT_ONLY_POINTWISE_OPS = {
     "asinh",
     "acosh",
     "atanh",
+    # ``nextafter`` is float-only in ATen; ``gcd``/``lcm`` and the shifts are
+    # the mirror image and only accept integral operands.
+    "nextafter",
+}
+
+# Operators whose operands must be integral. ATen raises for a float argument,
+# so a float pair reaching these means the lowering is wrong.
+_INTEGRAL_ONLY_POINTWISE_OPS = {
+    "gcd",
+    "lcm",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
 }
 
 
@@ -334,6 +375,7 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "rsub",
     "div",
     "floor_divide",
+    "trunc_divide",
     "remainder",
     "fmod",
     "hypot",
@@ -342,6 +384,11 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "pow",
     "maximum",
     "minimum",
+    "fmax",
+    "fmin",
+    "nextafter",
+    "gcd",
+    "lcm",
     "logaddexp",
     "atan2",
     "heaviside",
@@ -351,6 +398,8 @@ _BINARY_OPS = _COMPARISON_OPS | {
     "bitwise_and",
     "bitwise_or",
     "bitwise_xor",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
 }
 
 
@@ -369,15 +418,23 @@ _PROMOTABLE_POINTWISE_OPS = {
     "mul",
     "div",
     "floor_divide",
+    "trunc_divide",
     "remainder",
     "fmod",
     "maximum",
     "minimum",
+    "fmax",
+    "fmin",
+    "nextafter",
+    "gcd",
+    "lcm",
     "logaddexp",
     "atan2",
     "bitwise_and",
     "bitwise_or",
     "bitwise_xor",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
 } | _COMPARISON_OPS
 
 
@@ -567,6 +624,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | set(_VARIANCE_TARGETS)
     | set(_PAD_MODE_TARGETS)
     | _INPLACE_TARGETS
+    | _DIVIDE_ROUNDING_TARGETS
     | set(_INPLACE_SCATTER_TARGETS)
     | _AND_OR_TARGETS
     | _SCATTER_TARGETS

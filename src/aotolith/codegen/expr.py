@@ -77,9 +77,16 @@ _INTEGER_POINTWISE_OPS = {
     "square",
     "maximum",
     "minimum",
+    "fmax",
+    "fmin",
     "floor_divide",
+    "trunc_divide",
     "remainder",
     "heaviside",
+    "gcd",
+    "lcm",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
     "clamp",
     "clamp_min",
     "clamp_max",
@@ -320,6 +327,24 @@ def _emit_pointwise_expression(
         comparison = "<" if op.op == "maximum" else ">"
         selected = f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
         return f"((metal::isnan({left}) || metal::isnan({right})) ? NAN : {selected})"
+    if op.op in {"fmax", "fmin"}:
+        # C99 fmax/fmin: a NaN operand is ignored instead of poisoning the
+        # result, which is what ATen's kernels do and maximum/minimum do not.
+        left, right = _binary_operands(op, arguments, input_types)
+        function = "fmax" if op.op == "fmax" else "fmin"
+        return f"tsc_{function}({left}, {right})"
+    if op.op == "nextafter":
+        left, right = _binary_operands(op, arguments, input_types)
+        # The neighbour of a half value is a different float than the neighbour
+        # of its float image, so the step is taken at the operand's width.
+        function = {
+            DType.F16: "tsc_nextafter_half",
+            DType.BF16: "tsc_nextafter_bfloat",
+        }.get(output_dtype, "tsc_nextafter")
+        return f"{function}({left}, {right})"
+    if op.op == "trunc_divide":
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"metal::trunc({left} / {right})"
     if op.op == "logaddexp":
         left, right = _binary_operands(op, arguments, input_types)
         return f"tsc_logaddexp({left}, {right})"
@@ -611,9 +636,28 @@ def _emit_integer_pointwise_expression(
         comparison = "<" if op.op == "maximum" else ">"
         return f"(({left}) {comparison} ({right}) ? ({right}) : ({left}))"
 
-    if op.op in {"floor_divide", "remainder"}:
+    if op.op in {"fmax", "fmin"}:
+        # No NaN to ignore on the integer path, so these are max/min.
         left, right = _binary_operands(op, arguments, input_types)
-        function = "floor_div" if op.op == "floor_divide" else "remainder"
+        comparison = ">" if op.op == "fmax" else "<"
+        return f"(({left}) {comparison} ({right}) ? ({left}) : ({right}))"
+
+    if op.op in {"gcd", "lcm"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        return f"tsc_{op.op}_{suffix}({left}, {right})"
+
+    if op.op in {"bitwise_left_shift", "bitwise_right_shift"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        function = "shl" if op.op == "bitwise_left_shift" else "shr"
+        return f"tsc_{function}_{suffix}({left}, {right})"
+
+    if op.op in {"floor_divide", "trunc_divide", "remainder"}:
+        left, right = _binary_operands(op, arguments, input_types)
+        function = {
+            "floor_divide": "floor_div",
+            "trunc_divide": "trunc_div",
+            "remainder": "remainder",
+        }[op.op]
         return f"tsc_{function}_{suffix}({left}, {right})"
 
     if op.op == "heaviside":

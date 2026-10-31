@@ -412,11 +412,19 @@ Apple Metal 的 `atan2` 在 signed zero 和双无穷象限上存在平台差异�
 
 `heaviside` 生成的表达式是 `x == 0 ? values : (x > 0 ? 1 : 0)`，与 ATen 的比较顺序一致：先判零，再判符号，所以 `-0.0` 取 `values`，而 NaN 两个比较都不成立、落到 0，而不是取 `values`。浮点与整数输入都支持，整数版本用整数常量，输出保持输入 dtype；bool 输入会被拒绝。
 
+`fmax`/`fmin` 走 `tsc_fmax`/`tsc_fmin`，而不是 MSL 的同名函数：C99 语义要求忽略 NaN 操作数（两侧都是 NaN 才返回 NaN），并且 `fmax(-0.0, +0.0)` 是 `+0.0`、`fmin(-0.0, +0.0)` 是 `-0.0`，两份零相加（`fmin` 是取负后再相加）正好给出这个符号，而比较只能拿到先出现的那一个。整数输入没有 NaN 可忽略，退回普通比较，因此这两个算子浮点与整型都支持。
+
+`nextafter` 不做近似，而是按 IEEE-754 位模式把幅值沿目标方向步进一格：`|target| > |value|` 时加一、否则减一，零按目标的符号返回最小次正规数，无穷在步进中自然落到最大有限值。kernel 内部一律用 `float` 计算，而半精度的「下一格」与 float 的下一格不是同一个数，所以 F16/BF16 分别走 `tsc_nextafter_half`/`tsc_nextafter_bfloat`：先把操作数收窄到自己的位宽，步进后再转回 float，写回时正好落在 ATen 给出的那个值上。
+
+`trunc_divide` 是 `div(rounding_mode='trunc')`：浮点就是 `trunc(a / b)`，整数上 C 的除法本来向零取整，只需单独处理除数为 `-1` 的情况以免 `INT_MIN / -1` 未定义。`rounding_mode='floor'` 仍映射到已有的 `floor_divide`，`None` 映射到真除法 `div`：三种拼写共用一条 lowering 规则，由关键字选算子。
+
+`gcd`/`lcm` 在二补码幅值上做欧几里得循环（`tsc_gcd_i32`/`tsc_gcd_i64`），因此 `INT_MIN` 的绝对值仍然可表示，`gcd(0, 0)` 是 0；`lcm` 按 ATen 的顺序先算 `|a| / gcd * b` 再取正，溢出时的回绕结果与参考 kernel 一致。
+
 bool 上的 `mul`/`add` 是逻辑与/逻辑或：ATen 自己的复合算子（例如 `isclose`，它是两个比较、一个缩放、一个偏移再用 bool 的 `*`/`&` 组合）就用这两个拼写合并谓词。kernel 里分别生成 `&&` 和 `||`，MLX 回退路径用 `mx.logical_and`/`mx.logical_or`，输出保持 BOOL。因此 `torch.isclose` 整条复合链会融合成一个 pointwise kernel，NaN 永不相等、相同的无穷相等、`equal_nan=True` 只翻转 NaN 那一路比较。
 
 整数常量和 `arange` 生成无 tensor 输入的 Metal kernel，直接把 I64 字面量写入 `long`，再 cast 到模板类型 `T`。整数 `arange` 使用 `long` 计算 `start + elem * step`；参数和输出长度在编译期校验，因此 `2**53` 以上的值仍能精确生成。`-2**63` 用 `(-9223372036854775807LL - 1LL)` 表示，避免整数类型的正数上限无法容纳该字面量。浮点 `arange` 不能直接用 double 走 GPU：Metal 没有 double，所以编译期把 `start`、`step` 这两个 Python double 各拆成 float 头尾（`hi` 是平台 float32 舍入值，`lo` 是剩下那部分），kernel 内先算 `factor * step_hi`，用 `fma` 拿到乘积的精确残差，再用 two-sum 求出 `product + start_hi` 的舍入误差，最后把两个误差和常量尾部一起加回去。这样每个元素等价于一次双精度求和后舍入，`arange(0, 1, 0.1)` 给出 0.9 而不是 float32 乘积的 0.90000004。
 
-I32/I64 pointwise 走同一融合框架，但中间变量使用 `int`/`long`，输入和输出保持原 dtype。tensor 与 Python 整数标量混合时，前端保留标量原始值，backend 再按 tensor 宽度取模并解释为二补码有符号数；因此 I32 的 `2**32 - 1` 等价于 `-1`，I64 的 `2**64 - 1` 也等价于 `-1`，不会先转成 float。加法、减法、乘法和一元负号按二补码回绕。`floor_divide` 先做 C 截断除法，再在余数非零且符号不一致时向负无穷调整；`remainder` 的结果跟除数同号。除数为 `-1` 时单独处理，避免 `INT_MIN / -1` 触发未定义行为，并按 PyTorch 回绕到 `INT_MIN`。
+I32/I64 pointwise 走同一融合框架，但中间变量使用 `int`/`long`，输入和输出保持原 dtype。tensor 与 Python 整数标量混合时，前端保留标量原始值，backend 再按 tensor 宽度取模并解释为二补码有符号数；因此 I32 的 `2**32 - 1` 等价于 `-1`，I64 的 `2**64 - 1` 也等价于 `-1`，不会先转成 float。加法、减法、乘法和一元负号按二补码回绕。`floor_divide` 先做 C 截断除法，再在余数非零且符号不一致时向负无穷调整；`remainder` 的结果跟除数同号。除数为 `-1` 时单独处理，避免 `INT_MIN / -1` 触发未定义行为，并按 PyTorch 回绕到 `INT_MIN`。`bitwise_left_shift`/`bitwise_right_shift` 在次数为负或不小于位宽时按 ATen 的定义把比特全部移出：左移得 0，算术右移得符号填充（负数 `-1`，否则 0），而不是留下 C 的未定义行为。
 
 ## 8. Metal softmax reduction
 

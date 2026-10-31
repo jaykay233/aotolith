@@ -64,6 +64,111 @@ inline float tsc_logsigmoid(float value) {
         - log1p(metal::exp(-metal::abs(value)));
 }
 
+inline float tsc_fmax(float left, float right) {
+    // C99 fmax semantics: a NaN operand is ignored, and a pair of zeros
+    // resolves to +0. The sum is exact for any zero pair and carries the sign
+    // ATen's kernels produce, which metal::fmax does not promise.
+    if (metal::isnan(left)) {
+        return right;
+    }
+    if (metal::isnan(right)) {
+        return left;
+    }
+    if (left == 0.0f && right == 0.0f) {
+        return left + right;
+    }
+    return left > right ? left : right;
+}
+
+inline float tsc_fmin(float left, float right) {
+    // The mirror image: a zero pair resolves to -0 unless both zeros are +0.
+    if (metal::isnan(left)) {
+        return right;
+    }
+    if (metal::isnan(right)) {
+        return left;
+    }
+    if (left == 0.0f && right == 0.0f) {
+        return -((-left) + (-right));
+    }
+    return left < right ? left : right;
+}
+
+inline float tsc_nextafter(float value, float target) {
+    // C nextafter via the IEEE-754 bit pattern, so it stays defined on
+    // infinity and on the zero sign, and matches ATen's bit-level kernel.
+    if (metal::isnan(value) || metal::isnan(target)) {
+        return value + target;
+    }
+    if (value == target) {
+        return target;
+    }
+    if (value == 0.0f) {
+        // The smallest subnormal with the target's sign.
+        return metal::copysign(as_type<float>(1u), target);
+    }
+    uint bits = as_type<uint>(value);
+    if ((target > value) == (value > 0.0f)) {
+        bits += 1u;
+    } else {
+        bits -= 1u;
+    }
+    return as_type<float>(bits);
+}
+
+inline ushort tsc_nextafter_bits(ushort bits, bool towards_larger, bool negative) {
+    // One step of the 16-bit pattern, skipping nothing: every representable
+    // value is a valid neighbour, and stepping past the largest magnitude
+    // reaches infinity the way the float version does.
+    if (negative) {
+        return towards_larger ? (ushort)(bits - 1u) : (ushort)(bits + 1u);
+    }
+    return towards_larger ? (ushort)(bits + 1u) : (ushort)(bits - 1u);
+}
+
+inline float tsc_nextafter_half(float value, float target) {
+    // The kernel computes in float, so the step has to happen at the operand's
+    // own width: a float neighbour would round straight back onto the operand
+    // when the result is stored as half.
+    half value_half = (half)value;
+    half target_half = (half)target;
+    if (metal::isnan(value_half) || metal::isnan(target_half)) {
+        return (float)(value_half + target_half);
+    }
+    if (value_half == target_half) {
+        return (float)target_half;
+    }
+    ushort bits = as_type<ushort>(value_half);
+    if (value_half == (half)0) {
+        return (float)as_type<half>((ushort)(1u | (bits & 0x8000u)));
+    }
+    bool towards_larger = target_half > value_half;
+    return (float)as_type<half>(
+        tsc_nextafter_bits(bits, towards_larger, bits >= 0x8000u)
+    );
+}
+
+inline float tsc_nextafter_bfloat(float value, float target) {
+    bfloat value_bfloat = bfloat(value);
+    bfloat target_bfloat = bfloat(target);
+    float value_float = (float)value_bfloat;
+    float target_float = (float)target_bfloat;
+    if (metal::isnan(value_float) || metal::isnan(target_float)) {
+        return value_float + target_float;
+    }
+    if (value_float == target_float) {
+        return target_float;
+    }
+    ushort bits = as_type<ushort>(value_bfloat);
+    if (value_float == 0.0f) {
+        return (float)as_type<bfloat>((ushort)(1u | (bits & 0x8000u)));
+    }
+    bool towards_larger = target_float > value_float;
+    return (float)as_type<bfloat>(
+        tsc_nextafter_bits(bits, towards_larger, bits >= 0x8000u)
+    );
+}
+
 inline float tsc_logaddexp(float left, float right) {
     if (metal::isnan(left) || metal::isnan(right)) {
         return NAN;
@@ -297,6 +402,107 @@ inline int tsc_mul_i32(int left, int right) {
 
 inline long tsc_mul_i64(long left, long right) {
     return (long)((unsigned long)left * (unsigned long)right);
+}
+
+inline int tsc_trunc_div_i32(int dividend, int divisor) {
+    // C division already truncates towards zero; only INT_MIN / -1 would trap.
+    if (divisor == -1) {
+        return tsc_neg_i32(dividend);
+    }
+    return dividend / divisor;
+}
+
+inline long tsc_trunc_div_i64(long dividend, long divisor) {
+    if (divisor == -1L) {
+        return tsc_neg_i64(dividend);
+    }
+    return dividend / divisor;
+}
+
+inline unsigned tsc_magnitude_u32(int value) {
+    return value < 0 ? (unsigned)0 - (unsigned)value : (unsigned)value;
+}
+
+inline unsigned long tsc_magnitude_u64(long value) {
+    return value < 0L ? (unsigned long)0 - (unsigned long)value
+                      : (unsigned long)value;
+}
+
+inline int tsc_gcd_i32(int left, int right) {
+    // Two's-complement magnitudes, so INT_MIN has a representable absolute
+    // value; ATen's gcd is defined on the magnitudes and returns a positive
+    // result for any sign combination, and gcd(0, 0) is 0.
+    unsigned a = tsc_magnitude_u32(left);
+    unsigned b = tsc_magnitude_u32(right);
+    while (b != 0u) {
+        unsigned remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return (int)a;
+}
+
+inline long tsc_gcd_i64(long left, long right) {
+    unsigned long a = tsc_magnitude_u64(left);
+    unsigned long b = tsc_magnitude_u64(right);
+    while (b != 0ul) {
+        unsigned long remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return (long)a;
+}
+
+inline int tsc_lcm_i32(int left, int right) {
+    // ATen forms |left| / gcd * right in the operand's own width and only then
+    // makes it positive, so a product that overflows lands on the same wrapped
+    // value as the reference kernel instead of on a wider magnitude.
+    int divisor = tsc_gcd_i32(left, right);
+    if (divisor == 0) {
+        return 0;
+    }
+    int product = (int)((unsigned)(left / divisor) * (unsigned)right);
+    return product < 0 ? (int)(0u - (unsigned)product) : product;
+}
+
+inline long tsc_lcm_i64(long left, long right) {
+    long divisor = tsc_gcd_i64(left, right);
+    if (divisor == 0L) {
+        return 0L;
+    }
+    long product = (long)((unsigned long)(left / divisor) * (unsigned long)right);
+    return product < 0L ? (long)(0ul - (unsigned long)product) : product;
+}
+
+inline int tsc_shl_i32(int value, int count) {
+    // ATen returns zero for a negative count or one at least as wide as the
+    // operand, rather than leaving the shift undefined the way C does.
+    if (count < 0 || count >= 32) {
+        return 0;
+    }
+    return (int)((unsigned)value << (unsigned)count);
+}
+
+inline long tsc_shl_i64(long value, long count) {
+    if (count < 0L || count >= 64L) {
+        return 0L;
+    }
+    return (long)((unsigned long)value << (unsigned long)count);
+}
+
+inline int tsc_shr_i32(int value, int count) {
+    // The same out-of-range rule, and an arithmetic shift so the sign fills.
+    if (count < 0 || count >= 32) {
+        return value < 0 ? -1 : 0;
+    }
+    return value >> count;
+}
+
+inline long tsc_shr_i64(long value, long count) {
+    if (count < 0L || count >= 64L) {
+        return value < 0L ? -1L : 0L;
+    }
+    return value >> count;
 }
 
 inline int tsc_floor_div_i32(int dividend, int divisor) {

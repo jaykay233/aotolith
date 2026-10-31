@@ -90,6 +90,9 @@ def _evaluate_pointwise_mlx(
         return mx.bitwise_xor(left, right)
     if op.op == "bitwise_not":
         return ~arguments[0]
+    if op.op in {"bitwise_left_shift", "bitwise_right_shift"}:
+        left, right = _binary_mx_operands(op, arguments)
+        return _mlx_shift(op.op, left, right)
     if op.op == "isnan":
         return mx.isnan(arguments[0])
     if op.op == "isinf":
@@ -160,6 +163,28 @@ def _evaluate_pointwise_mlx(
         comparison = left < right if op.op == "maximum" else left > right
         selected = mx.where(comparison, right, left)
         return mx.where(mx.isnan(left) | mx.isnan(right), float("nan"), selected)
+    if op.op in {"fmax", "fmin"}:
+        left, right = _binary_mx_operands(op, arguments)
+        # C99 fmax/fmin, which ignore a NaN operand; MLX's maximum/minimum
+        # propagate NaN the way the torch maximum/minimum kernels do. There is
+        # no NaN to ignore on an integer pair, so those go straight through.
+        if _MLX_DTYPE_TO_DTYPE.get(left.dtype) not in _FLOATING_DTYPES:
+            return (
+                mx.maximum(left, right) if op.op == "fmax" else mx.minimum(left, right)
+            )
+        if op.op == "fmax":
+            return _mlx_fmax(left, right)
+        return _mlx_fmin(left, right)
+    if op.op == "nextafter":
+        left, right = _binary_mx_operands(op, arguments)
+        return _mlx_nextafter(left, right)
+    if op.op in {"trunc_divide", "gcd", "lcm"}:
+        left, right = _binary_mx_operands(op, arguments)
+        if op.op == "trunc_divide":
+            return _mlx_trunc_divide(left, right)
+        if op.op == "gcd":
+            return _mlx_gcd(left, right)
+        return _mlx_lcm(left, right)
     if op.op == "logaddexp":
         left, right = _binary_mx_operands(op, arguments)
         maximum = mx.where(left < right, right, left)
@@ -577,3 +602,176 @@ def _mlx_signbit(value: mx.array) -> mx.array:
         return value < 0
     negative_zero = (value == 0.0) & (mx.sign(1.0 / value) < 0.0)
     return (value < 0.0) | negative_zero
+
+
+def _mlx_fmax(left: mx.array, right: mx.array) -> mx.array:
+    """C99 ``fmax`` on MLX, mirroring the Metal helper ``tsc_fmax``.
+
+    MLX's ``maximum`` propagates NaN, so the NaN cases are peeled off first and
+    a pair of zeros is summed, which is exact and lands on the sign ATen
+    reports: +0 unless both operands are -0.
+    """
+
+    selected = mx.where(left > right, left, right)
+    zeros = (left == 0.0) & (right == 0.0)
+    selected = mx.where(zeros, left + right, selected)
+    return mx.where(mx.isnan(left), right, mx.where(mx.isnan(right), left, selected))
+
+
+def _mlx_fmin(left: mx.array, right: mx.array) -> mx.array:
+    """C99 ``fmin`` on MLX, mirroring the Metal helper ``tsc_fmin``."""
+
+    selected = mx.where(left < right, left, right)
+    zeros = (left == 0.0) & (right == 0.0)
+    selected = mx.where(zeros, -((-left) + (-right)), selected)
+    return mx.where(mx.isnan(left), right, mx.where(mx.isnan(right), left, selected))
+
+
+# The integer view that shares a width with each floating dtype, so the bits of
+# a value can be stepped by one to get its neighbour.
+_NEXTAFTER_BITS = {
+    mx.float32: mx.int32,
+    mx.float16: mx.int16,
+    mx.bfloat16: mx.int16,
+}
+
+
+def _mlx_nextafter(value: mx.array, target: mx.array) -> mx.array:
+    """``nextafter`` on MLX, mirroring the Metal helper ``tsc_nextafter``.
+
+    MLX has no binding for it, so the IEEE-754 bit pattern is stepped by one in
+    the direction of the target: the magnitude grows when ``|target| > |value|``
+    and shrinks otherwise, which covers both signs with one rule.
+    """
+
+    bits_dtype = _NEXTAFTER_BITS.get(value.dtype)
+    if bits_dtype is None:
+        raise ValueError(f"nextafter is not implemented for {value.dtype}")
+    magnitude = mx.abs(value)
+    # The smallest subnormal of this dtype, as the value of bit pattern 1.
+    smallest = mx.view(mx.array([1], dtype=bits_dtype), value.dtype).reshape(())
+    step = mx.where(mx.abs(target) > magnitude, 1, -1)
+    neighbour = mx.view(mx.view(magnitude, bits_dtype) + step, value.dtype)
+    signed = mx.where(_mlx_signbit(value), -neighbour, neighbour)
+    from_zero = mx.where(_mlx_signbit(target), -smallest, smallest)
+    result = mx.where(value == 0.0, from_zero, signed)
+    return mx.where(value == target, target, result)
+
+
+def _mlx_trunc_divide(left: mx.array, right: mx.array) -> mx.array:
+    """Division truncated towards zero, mirroring ``tsc_trunc_div_*``."""
+
+    if _MLX_DTYPE_TO_DTYPE.get(left.dtype) in _FLOATING_DTYPES:
+        return mx.trunc(left / right)
+    # Integer division in C truncates, but MLX's floor_divide rounds down, so a
+    # negative quotient with a non-zero remainder has to be stepped back up.
+    quotient = mx.floor_divide(left, right)
+    remainder = mx.remainder(left, right)
+    inexact = (remainder != 0) & ((left < 0) != (right < 0))
+    return quotient + mx.where(inexact, 1, 0).astype(quotient.dtype)
+
+
+def _mlx_gcd(left: mx.array, right: mx.array) -> mx.array:
+    """Greatest common divisor of the magnitudes, mirroring ``tsc_gcd_*``."""
+
+    _, signed = _UNSIGNED_VIEWS[left.dtype]
+    divisor, _, _ = _euclid(left, right)
+    return mx.view(divisor, signed)
+
+
+def _mlx_lcm(left: mx.array, right: mx.array) -> mx.array:
+    """Least common multiple of the magnitudes, mirroring ``tsc_lcm_*``.
+
+    ``|a| / gcd * b`` is formed in the operand's own width and then made
+    positive, which is the order ATen uses: the product wraps first, so an
+    overflowing overflow pair lands on the same value as the reference kernel.
+    """
+
+    _, signed = _UNSIGNED_VIEWS[left.dtype]
+    divisor, left_bits, right_bits = _euclid(left, right)
+    zero = divisor == 0
+    safe = mx.where(zero, mx.ones_like(divisor), divisor)
+    quotient = mx.view(mx.floor_divide(left_bits, safe), signed)
+    product = quotient * right
+    return mx.where(
+        zero, mx.zeros_like(product), mx.view(_magnitude_bits(product), signed)
+    )
+
+
+# The unsigned view of each integer dtype: Euclid runs on bit patterns so that
+# the most negative value, whose magnitude does not fit the signed type, is
+# still handled the way the two's-complement MSL helpers handle it.
+_UNSIGNED_VIEWS = {
+    mx.int8: (mx.uint8, mx.int8),
+    mx.uint8: (mx.uint8, mx.uint8),
+    mx.int16: (mx.uint16, mx.int16),
+    mx.uint16: (mx.uint16, mx.uint16),
+    mx.int32: (mx.uint32, mx.int32),
+    mx.uint32: (mx.uint32, mx.uint32),
+    mx.int64: (mx.uint64, mx.int64),
+    mx.uint64: (mx.uint64, mx.uint64),
+}
+
+
+def _magnitude_bits(value: mx.array) -> mx.array:
+    """``|value|`` as the unsigned view of the same width."""
+
+    unsigned, _ = _UNSIGNED_VIEWS[value.dtype]
+    bits = mx.view(value, unsigned)
+    zero = mx.zeros_like(bits)
+    return mx.where(value < 0, zero - bits, bits)
+
+
+def _euclid(left: mx.array, right: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    """Euclid over unsigned magnitudes: ``(gcd, |left|, |right|)``."""
+
+    a = _magnitude_bits(left)
+    b = _magnitude_bits(right)
+    left_bits, right_bits = a, b
+    while bool(mx.any(b != 0).item()):
+        nonzero = b != 0
+        safe = mx.where(nonzero, b, mx.ones_like(b))
+        remainder = mx.where(nonzero, mx.remainder(a, safe), mx.zeros_like(b))
+        # A lane whose divisor is already zero keeps its dividend: that value is
+        # the answer, and swapping unconditionally would drop it.
+        a, b = mx.where(nonzero, b, a), remainder
+    return a, left_bits, right_bits
+
+
+_SHIFT_WIDTHS = {
+    mx.int8: 8,
+    mx.uint8: 8,
+    mx.int16: 16,
+    mx.uint16: 16,
+    mx.int32: 32,
+    mx.uint32: 32,
+    mx.int64: 64,
+    mx.uint64: 64,
+}
+
+
+def _mlx_shift(operation: str, left: mx.array, right: mx.array) -> mx.array:
+    """``bitwise_left_shift``/``bitwise_right_shift``, mirroring ``tsc_shl_*``.
+
+    ATen defines an out-of-range count to shift every bit out, so the left shift
+    yields zero and the right shift yields the sign fill. MLX inherits the
+    undefined behaviour of the hardware shift, so the count is clamped before
+    the shift and the out-of-range lanes are overwritten afterwards.
+    """
+
+    width = _SHIFT_WIDTHS.get(left.dtype)
+    if width is None:
+        raise ValueError(f"bitwise shift is not implemented for {left.dtype}")
+    zero = mx.zeros_like(right)
+    in_range = (right >= zero) & (right < mx.full(right.shape, width, right.dtype))
+    clamped = mx.minimum(
+        mx.maximum(right, zero), mx.full(right.shape, width - 1, right.dtype)
+    )
+    if operation == "bitwise_left_shift":
+        shifted = mx.left_shift(left, clamped)
+        return mx.where(in_range, shifted, mx.zeros_like(left))
+    shifted = mx.right_shift(left, clamped)
+    fill = mx.where(
+        left < mx.zeros_like(left), -mx.ones_like(left), mx.zeros_like(left)
+    )
+    return mx.where(in_range, shifted, fill)

@@ -21,10 +21,12 @@ from .targets import (
     _BINARY_OPS,
     _BITWISE_BINARY_OPS,
     _COMPARISON_OPS,
+    _DIVIDE_ROUNDING_TARGETS,
     _FLOATING_DTYPES,
     _FLOAT_ONLY_POINTWISE_OPS,
     _INPLACE_TARGETS,
     _INTEGRAL_DTYPES,
+    _INTEGRAL_ONLY_POINTWISE_OPS,
     _LOGICAL_BINARY_OPS,
     _NUMERIC_ATTRS,
     _PROMOTABLE_POINTWISE_OPS,
@@ -804,6 +806,28 @@ def _operation_attrs(op: str, kwargs: dict[str, object]) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
+def _rounding_mode_operation(node: Any) -> str:
+    """The IR op an ``aten.div`` spelling with a ``rounding_mode`` means.
+
+    ATen folds the rounding mode into the target name rather than passing it as
+    an attribute, so the same node can be three different IR operators: ``None``
+    is true division, ``"floor"`` rounds towards negative infinity (the
+    ``floor_divide`` operator, matching ``aten.floor_divide``), and ``"trunc"``
+    rounds towards zero.
+    """
+
+    rounding_mode = node.kwargs.get("rounding_mode")
+    if rounding_mode is None:
+        return "div"
+    if rounding_mode == "floor":
+        return "floor_divide"
+    if rounding_mode == "trunc":
+        return "trunc_divide"
+    raise ValueError(
+        f"div.rounding_mode must be None, 'floor' or 'trunc', got {rounding_mode!r}"
+    )
+
+
 def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
     """Lower a node through the positional ATen -> core-op mapping.
 
@@ -816,14 +840,25 @@ def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
     * a ``cat`` of zero-length constants loses those operands, and a ``cat``
       left with one operand is that operand, so the operation disappears;
     * ``make_fx`` lowers ``torch.square`` on integers to ``pow(x, 2)``, which
-      is a multiplication the integer path cannot express as a power.
+      is a multiplication the integer path cannot express as a power;
+    * a ``div`` with a ``rounding_mode`` keyword has three different meanings,
+      so the keyword picks between ``div``, ``floor_divide`` and
+      ``trunc_divide`` instead of the target naming one.
     """
 
-    if target not in _SUPPORTED_OPS:
+    if target not in _SUPPORTED_OPS and target not in _DIVIDE_ROUNDING_TARGETS:
         return False
-    if target in _INPLACE_TARGETS:
+    if target in _INPLACE_TARGETS or target in _DIVIDE_ROUNDING_TARGETS:
         _validate_inplace_legalization(node)
-    op_name = _SUPPORTED_OPS[target]
+    op_name = _SUPPORTED_OPS.get(target, "div")
+    call_kwargs = node.kwargs
+    if target in _DIVIDE_ROUNDING_TARGETS:
+        op_name = _rounding_mode_operation(node)
+        call_kwargs = {
+            name: value
+            for name, value in node.kwargs.items()
+            if name != "rounding_mode"
+        }
     call_args = node.args
     if target == "aten.masked_fill.Tensor":
         masked, mask, fill = call_args
@@ -848,10 +883,14 @@ def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
         scalar_attrs: dict[str, object] = {}
     else:
         inputs, scalar_attrs = _operation_inputs(
-            op_name, call_args, lowering.node_ids, node.kwargs
+            op_name, call_args, lowering.node_ids, call_kwargs
         )
-    attrs = _operation_attrs(op_name, node.kwargs)
+    attrs = _operation_attrs(op_name, call_kwargs)
     attrs.update(scalar_attrs)
+    if op_name in _INTEGRAL_ONLY_POINTWISE_OPS:
+        for input_id in inputs:
+            if lowering.values[input_id].type.dtype not in _INTEGRAL_DTYPES:
+                raise ValueError(f"{op_name} requires integral operands")
     # A Python float operand is a promotion category of its own: it lifts an
     # integer tensor to the default float dtype, which a table keyed only on the
     # tensor dtypes cannot see.
