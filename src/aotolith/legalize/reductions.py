@@ -24,6 +24,7 @@ from .targets import (
     _CUM_EXTREMUM_TARGETS,
     _DIST_TARGET,
     _EXTREMUM_DIM_TARGETS,
+    _KTHVALUE_TARGET,
     _LOGSUMEXP_TARGET,
     _MEDIAN_TARGETS,
     _NANSUM_TARGET,
@@ -1078,6 +1079,81 @@ def _lower_var_mean(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_kthvalue(lowering: Lowering, node: Any, target: str) -> bool:
+    """``kthvalue`` is one slot of the ordering, read off a sort.
+
+    ATen returns ``(values, indices)`` - the k-th smallest element along the
+    axis and where it came from - which is position ``k - 1`` of the ascending
+    order. So the lowering emits the sort's two results, keeps one slot of the
+    axis, and squeezes it away unless ``keepdim`` keeps it; an unread member of
+    the pair is never sorted for.
+    """
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) < 2:
+        raise ValueError(f"{target} expects a tensor input and k")
+    input_id = _argument_ids(args[0], lowering.node_ids)
+    input_type = lowering.values[input_id].type
+    rank = len(input_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a ranked tensor")
+    k = args[1]
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise ValueError(f"{target}.k must be an integer, got {k!r}")
+    dim = args[2] if len(args) > 2 else kwargs.get("dim", -1)
+    keepdim = args[3] if len(args) > 3 else kwargs.get("keepdim", False)
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+    if not -rank <= dim < rank:
+        raise ValueError(f"{target}.dim {dim} exceeds rank {rank}")
+    if not isinstance(keepdim, bool):
+        raise ValueError(f"{target}.keepdim must be a boolean, got {keepdim!r}")
+    axis = dim % rank
+    if not 1 <= k <= input_type.shape[axis]:
+        raise ValueError(
+            f"{target}.k must be between 1 and {input_type.shape[axis]}, got {k}"
+        )
+
+    slot_shape = input_type.shape[:axis] + (1,) + input_type.shape[axis + 1 :]
+
+    def selected(op_name: str, dtype: DType, output_type: TensorType) -> str:
+        ordered_id = lowering.emit(
+            op_name,
+            (input_id,),
+            {"dim": axis, "descending": False},
+            TensorType(input_type.shape, dtype),
+        )
+        sliced_id = lowering.emit(
+            "slice",
+            (ordered_id,),
+            {"dim": axis, "start": k - 1, "end": k, "step": 1},
+            TensorType(slot_shape, dtype),
+        )
+        if keepdim:
+            return sliced_id
+        return lowering.emit("squeeze", (sliced_id,), {"dim": axis}, output_type)
+
+    produced: dict[int, str] = {}
+    for user in node.users:
+        if getattr(user, "target", None) is not operator.getitem:
+            raise ValueError(f"{target} results must be selected with getitem")
+        if len(user.args) != 2 or user.args[1] not in {0, 1}:
+            raise ValueError(f"malformed {target} getitem: {user!r}")
+        index = user.args[1]
+        if index in produced:
+            continue
+        output_type = _node_type(user)
+        if index == 0:
+            produced[index] = selected("sort", input_type.dtype, output_type)
+        else:
+            produced[index] = selected("argsort", DType.I64, output_type)
+    if not produced:
+        raise NotImplementedError(f"{target} result is never read")
+    _bind_selected_users(lowering, node, produced)
+    return True
+
+
 def _lower_dist(lowering: Lowering, node: Any, target: str) -> bool:
     """``dist`` is the p-norm of the difference, over every axis.
 
@@ -1139,4 +1215,5 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _NANSUM_TARGET: (_lower_nansum,),
     _VECTOR_NORM_TARGET: (_lower_vector_norm,),
     _DIST_TARGET: (_lower_dist,),
+    _KTHVALUE_TARGET: (_lower_kthvalue,),
 }

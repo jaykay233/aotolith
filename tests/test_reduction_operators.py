@@ -345,6 +345,54 @@ VAR_MEAN_CASES = [
 ]
 
 
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_kthvalue_matches_pytorch(dim) -> None:
+    # ``kthvalue`` is one slot of the ascending order, so the pair is a sort
+    # kept down to a single position along the axis.
+    torch.manual_seed(29)
+    value = torch.randn(4, 6)
+
+    lowered, actual = _run_all(lambda v: torch.kthvalue(v, 3, dim=dim), value)
+
+    expected = torch.kthvalue(value, 3, dim=dim)
+    assert [op.op for op in lowered.ops] == [
+        "sort",
+        "slice",
+        "squeeze",
+        "argsort",
+        "slice",
+        "squeeze",
+    ]
+    assert bool(mx.array_equal(actual[0], mx.array(expected.values.numpy())))
+    assert bool(mx.array_equal(actual[1], mx.array(expected.indices.numpy())))
+
+
+def test_kthvalue_keeps_the_axis_when_asked() -> None:
+    torch.manual_seed(30)
+    value = torch.randn(3, 5)
+
+    lowered, actual = _run_all(
+        lambda v: torch.kthvalue(v, 2, dim=1, keepdim=True), value
+    )
+
+    expected = torch.kthvalue(value, 2, dim=1, keepdim=True)
+    assert [op.op for op in lowered.ops] == ["sort", "slice", "argsort", "slice"]
+    assert actual[0].shape == (3, 1)
+    assert bool(mx.array_equal(actual[0], mx.array(expected.values.numpy())))
+    assert bool(mx.array_equal(actual[1], mx.array(expected.indices.numpy())))
+
+
+def test_kthvalue_sorts_only_for_the_member_that_is_read() -> None:
+    torch.manual_seed(31)
+    value = torch.randn(4, 6)
+
+    lowered, actual = _run_all(lambda v: torch.kthvalue(v, 2, dim=1).values, value)
+
+    assert [op.op for op in lowered.ops] == ["sort", "slice", "squeeze"]
+    expected = torch.kthvalue(value, 2, dim=1).values
+    assert bool(mx.array_equal(actual[0], mx.array(expected.numpy())))
+
+
 @pytest.mark.parametrize("call", VAR_MEAN_CASES)
 def test_var_mean_matches_pytorch(call) -> None:
     torch.manual_seed(23)

@@ -566,6 +566,9 @@ _NANSUM_TARGET = "aten.nansum.default"
 _SORT_TARGETS = {"aten.sort.default", "aten.topk.default"}
 
 
+_KTHVALUE_TARGET = "aten.kthvalue.default"
+
+
 _CUM_EXTREMUM_TARGETS = {
     "aten.cummax.default": ("cummax", "cummax_indices"),
     "aten.cummin.default": ("cummin", "cummin_indices"),
@@ -853,6 +856,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _DIRECT_ATTENTION_TARGETS
     | _SEQUENCE_VIEW_TARGETS
     | _SORT_TARGETS
+    | {_KTHVALUE_TARGET}
     | set(_EXTREMUM_DIM_TARGETS)
     | set(_VARIANCE_TARGETS)
     | set(_PAD_MODE_TARGETS)

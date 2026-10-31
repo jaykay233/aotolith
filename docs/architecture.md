@@ -130,6 +130,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.max.dim`、`aten.min.dim` | `amax`/`amin` 加 `argmax`/`argmin`，按被读取的输出选择 |
 | `aten.sort.default` | `sort` / `argsort`（按被读取的输出选择） |
 | `aten.topk.default` | `topk` / `topk_indices`（按被读取的输出选择） |
+| `aten.kthvalue.default` | 组合 lowering：`sort`/`argsort` 后按 `k-1` 切一格，非 `keepdim` 时再 `squeeze`；pair 里没人读的那一半不会排序 |
 | `F.rms_norm` 的分解链 | `rms_norm`，由前端 pattern folding 生成 |
 | `aten.silu.default` | `silu` |
 | `aten.gelu.default` | `gelu` |
