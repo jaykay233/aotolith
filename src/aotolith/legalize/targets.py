@@ -531,6 +531,9 @@ _SCATTER_REDUCE_NAMES = {
 _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 
 
+_PRELU_TARGET = "aten._prelu_kernel.default"
+
+
 _NANSUM_TARGET = "aten.nansum.default"
 
 
@@ -703,6 +706,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _SCATTER_REDUCE_TARGET,
         _INDEX_ADD_TARGET,
         _LOGSIGMOID_TARGET,
+        _PRELU_TARGET,
         _NANSUM_TARGET,
         _REPEAT_TARGET,
         _DIAGONAL_TARGET,

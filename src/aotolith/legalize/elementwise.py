@@ -29,6 +29,7 @@ from .targets import (
     _INTEGRAL_ONLY_POINTWISE_OPS,
     _LOGICAL_BINARY_OPS,
     _NUMERIC_ATTRS,
+    _PRELU_TARGET,
     _PROMOTABLE_POINTWISE_OPS,
     _REDUCTION_OPS,
     _SUPPORTED_OPS,
@@ -923,6 +924,38 @@ def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_prelu(lowering: Lowering, node: Any, target: str) -> bool:
+    """PReLU is a slope on the negative half: ``where(x > 0, x, x * weight)``.
+
+    The weight arrives already reshaped by the caller's ``prelu`` (a scalar, or
+    ``1``-padded around the channel axis), so it broadcasts like any operand.
+    Written as three operators rather than one because that is what fuses: the
+    selection joins the surrounding elementwise region.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    value, weight = args
+    output_type = _node_type(node)
+    value_id = _argument_ids(value, lowering.node_ids)
+    weight_id = _argument_ids(weight, lowering.node_ids)
+    zero_id = lowering.emit(
+        "scalar_tensor", (), {"value": 0}, TensorType((), output_type.dtype)
+    )
+    positive_id = lowering.emit(
+        "gt", (value_id, zero_id), {}, TensorType(output_type.shape, DType.BOOL)
+    )
+    scaled_id = lowering.emit("mul", (value_id, weight_id), {}, output_type)
+    result_id = lowering.emit(
+        "where", (positive_id, value_id, scaled_id), {}, output_type
+    )
+    lowering.bind(node, result_id)
+    return True
+
+
 # The generic path has no target of its own: it is the fallback the loop calls
 # when no family claimed the node.
-HANDLERS: dict[str, tuple[Handler, ...]] = {}
+HANDLERS: dict[str, tuple[Handler, ...]] = {
+    _PRELU_TARGET: (_lower_prelu,),
+}

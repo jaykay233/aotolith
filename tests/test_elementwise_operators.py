@@ -169,3 +169,72 @@ def test_the_mlx_fallback_agrees_with_the_kernel() -> None:
     actual = native(*inputs)[0]
     mx.eval(reference, actual)
     assert bool(mx.allclose(actual, reference, atol=2e-6, rtol=2e-6))
+
+
+@pytest.mark.parametrize(
+    "shape, weight_shape",
+    [
+        pytest.param((2, 5), (5,), id="rank2_channel"),
+        pytest.param((2, 3, 4), (3,), id="rank3_channel"),
+        pytest.param((2, 3, 4, 4), (3,), id="rank4_channel"),
+        pytest.param((6,), (1,), id="vector"),
+    ],
+)
+def test_prelu_matches_pytorch(shape, weight_shape) -> None:
+    torch.manual_seed(3)
+    value = torch.randn(*shape)
+    weight = torch.randn(*weight_shape)
+
+    def call(v, w):
+        return torch.nn.functional.prelu(v, w)
+
+    compiled = compile_callable(call, (value, weight))
+    actual = compiled.plan(mx.array(value.numpy()), mx.array(weight.numpy()))[0]
+    mx.eval(actual)
+
+    expected = call(value, weight)
+    assert bool(mx.allclose(actual, mx.array(expected.numpy()), atol=1e-6, rtol=1e-6))
+    # The three operators of the slope are folded into the surrounding region
+    # instead of running one pass each.
+    assert [op.op for op in compiled.lowered_graph.ops][-1] == "fused_elementwise"
+    assert compiled.plan.selections[-1].is_native
+
+
+def test_prelu_zero_stays_zero_for_both_branches() -> None:
+    # ``where(x > 0, x, x * w)`` keeps a zero at the boundary from turning into
+    # a signed zero of the other branch.
+    value = torch.tensor([-1.0, 0.0, 1.0])
+    weight = torch.tensor([0.25])
+    compiled = compile_callable(
+        lambda v, w: torch.nn.functional.prelu(v, w), (value, weight)
+    )
+    actual = compiled.plan(mx.array(value.numpy()), mx.array(weight.numpy()))[0]
+    mx.eval(actual)
+
+    expected = torch.nn.functional.prelu(value, weight)
+    assert bool(mx.array_equal(actual, mx.array(expected.numpy())))
+
+
+def test_prelu_runs_in_half_precision() -> None:
+    torch.manual_seed(5)
+    value = torch.randn(2, 4).to(torch.bfloat16)
+    weight = torch.randn(4).to(torch.bfloat16)
+    compiled = compile_callable(
+        lambda v, w: torch.nn.functional.prelu(v, w), (value, weight)
+    )
+    actual = compiled.plan(
+        mx.array(value.float().numpy()).astype(mx.bfloat16),
+        mx.array(weight.float().numpy()).astype(mx.bfloat16),
+    )[0]
+    mx.eval(actual)
+
+    expected = torch.nn.functional.prelu(value, weight)
+    assert actual.dtype == mx.bfloat16
+    assert bool(
+        mx.allclose(
+            actual.astype(mx.float32),
+            mx.array(expected.float().numpy()),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+    )
