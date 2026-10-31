@@ -10,12 +10,14 @@ from __future__ import annotations
 from math import isfinite
 from typing import Any
 from ..ir import DType, TensorType
+from ..shapes import broadcast_shapes, can_broadcast
 from .fx import _node_type
 from .state import Lowering
 from .state import Handler
 from .refs import _argument_ids
 from .targets import (
     _INDEX_ADD_TARGET,
+    _INDEX_PUT_TARGETS,
     _INPLACE_SCATTER_TARGETS,
     _SCATTER_ADD_TARGET,
     _SCATTER_REDUCE_NAMES,
@@ -433,6 +435,128 @@ def _index_add_operation(
     )
 
 
+def _index_put_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    """Lower the write-through-index family into one ``index_put`` operation."""
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    if target.startswith("aten.index_put"):
+        unknown = sorted(set(kwargs) - {"accumulate"})
+        if unknown:
+            raise ValueError(
+                f"index_put received unsupported keyword arguments: {unknown}"
+            )
+        if len(args) not in {3, 4}:
+            raise ValueError(
+                f"index_put expects three or four arguments, got {len(args)}"
+            )
+        source, index_list, values = args[:3]
+        accumulate = args[3] if len(args) == 4 else kwargs.get("accumulate", False)
+        if not isinstance(index_list, (tuple, list)) or not index_list:
+            raise ValueError("index_put expects a non-empty index list")
+        axes = tuple(
+            position for position, index in enumerate(index_list) if index is not None
+        )
+        indices = [index for index in index_list if index is not None]
+        filled = False
+    elif target.startswith("aten.index_copy"):
+        if kwargs:
+            raise ValueError(
+                f"index_copy received unsupported keyword arguments: {sorted(kwargs)}"
+            )
+        if len(args) != 4:
+            raise ValueError(f"index_copy expects four arguments, got {len(args)}")
+        source, dim, indices, values = args
+        axes = (_positive_axis(dim, _node_type(source), target),)
+        indices = [indices]
+        filled = False
+        accumulate = False
+    else:
+        if kwargs:
+            raise ValueError(
+                f"index_fill received unsupported keyword arguments: {sorted(kwargs)}"
+            )
+        if len(args) != 4:
+            raise ValueError(f"index_fill expects four arguments, got {len(args)}")
+        source, dim, indices, value = args
+        axes = (_positive_axis(dim, _node_type(source), target),)
+        indices = [indices]
+        filled = True
+        accumulate = False
+        if not isinstance(value, (bool, int, float)):
+            raise NotImplementedError(
+                f"{target} expects a scalar fill value, got {value!r}"
+            )
+
+    if not isinstance(accumulate, bool):
+        raise ValueError(f"{target} accumulate must be a boolean, got {accumulate!r}")
+
+    source_type = _node_type(source)
+    rank = len(source_type.shape)
+    if rank == 0:
+        raise NotImplementedError(f"{target} requires a tensor with rank >= 1")
+    first_axis = axes[0]
+    last_axis = axes[-1]
+    if axes != tuple(range(first_axis, last_axis + 1)):
+        raise NotImplementedError(
+            f"non-contiguous {target} is not supported: indexed axes {axes}"
+        )
+    index_types = [_node_type(index) for index in indices]
+    for index_type in index_types:
+        if index_type.dtype not in {DType.I32, DType.I64}:
+            raise ValueError(
+                f"{target} indices must be int32 or int64, got {index_type.dtype.value}"
+            )
+
+    selection = (
+        source_type.shape[:first_axis]
+        + broadcast_shapes(tuple(index.shape for index in index_types))
+        + source_type.shape[last_axis + 1 :]
+    )
+    inputs = [_argument_ids(source, node_ids)]
+    inputs.extend(_argument_ids(index, node_ids) for index in indices)
+    attrs: dict[str, object] = {"axes": axes}
+    if filled:
+        attrs["value"] = value
+    else:
+        values_type = _node_type(values)
+        if values_type.dtype != source_type.dtype:
+            raise ValueError(
+                f"{target} values dtype must match the input dtype, got "
+                f"{values_type.dtype.value} and {source_type.dtype.value}"
+            )
+        if not can_broadcast(values_type.shape, selection):
+            raise ValueError(
+                f"{target} values shape {values_type.shape} does not broadcast "
+                f"to the selection {selection}"
+            )
+        if accumulate:
+            attrs["accumulate"] = True
+        inputs.append(_argument_ids(values, node_ids))
+
+    output_type = _node_type(node)
+    if output_type != source_type:
+        raise ValueError(
+            f"{target} output metadata {(output_type.shape, output_type.dtype)} "
+            f"does not match input {(source_type.shape, source_type.dtype)}"
+        )
+    return tuple(inputs), attrs, output_type
+
+
+def _positive_axis(dim: object, source_type: TensorType, target: str) -> int:
+    """The checked ``dim`` of a single-axis write."""
+
+    rank = len(source_type.shape)
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        raise ValueError(f"{target}.dim must be an integer, got {dim!r}")
+    if not -rank <= dim < rank:
+        raise ValueError(f"{target}.dim {dim} is outside rank {rank}")
+    return dim % rank
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -468,6 +592,12 @@ def _lower_index_add(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_index_put(lowering: Lowering, node: Any, target: str) -> bool:
+    inputs, attrs, output_type = _index_put_operation(node, lowering.node_ids)
+    lowering.bind(node, lowering.emit("index_put", inputs, attrs, output_type))
+    return True
+
+
 def _checked_in_place(handler: Handler) -> Handler:
     """Guard an in-place target with the mutation rule.
 
@@ -489,6 +619,11 @@ _BY_CANONICAL: dict[str, tuple[Handler, ...]] = {
     _SCATTER_ADD_TARGET: (_lower_scatter,),
     _SCATTER_REDUCE_TARGET: (_lower_scatter,),
     _INDEX_ADD_TARGET: (_lower_index_add,),
+    **{
+        target: (_lower_index_put,)
+        for target, in_place in _INDEX_PUT_TARGETS.items()
+        if not in_place
+    },
 }
 
 HANDLERS: dict[str, tuple[Handler, ...]] = {
@@ -503,5 +638,10 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
             _checked_in_place(handler) for handler in _BY_CANONICAL[canonical]
         )
         for in_place, canonical in _INPLACE_SCATTER_TARGETS.items()
+    },
+    **{
+        target: (_checked_in_place(_lower_index_put),)
+        for target, in_place in _INDEX_PUT_TARGETS.items()
+        if in_place
     },
 }

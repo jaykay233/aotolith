@@ -72,6 +72,68 @@ def _mlx_cum_extremum(
     return mx.stack(values, axis=axis), mx.stack(indices, axis=axis)
 
 
+def _mlx_index_put(op: Operation, env: dict[str, mx.array]) -> mx.array:
+    """Write ``values`` through an index list, like ATen's ``index_put``.
+
+    MLX's ``at`` only accumulates, so the write is flattened to linear positions
+    inside the indexed axes and applied with ``put_along_axis``. Accumulation
+    then becomes a second write into a zeroed region, which is what turns
+    repeated indices into a sum instead of a race.
+    """
+
+    source = env[op.inputs[0]]
+    axes = tuple(int(axis) for axis in op.attrs["axes"])
+    flat_indices = [env[value_id] for value_id in op.inputs[1 : 1 + len(axes)]]
+    first_axis = axes[0]
+    last_axis = axes[-1]
+    prefix = prod(source.shape[:first_axis])
+    inner = prod(source.shape[first_axis : last_axis + 1])
+    trailing = prod(source.shape[last_axis + 1 :])
+    linear = None
+    for axis, index in zip(axes, flat_indices, strict=True):
+        _check_take_indices(index, source.shape[axis])
+        stride = prod(source.shape[axis + 1 : last_axis + 1])
+        term = index.astype(mx.int32) * stride
+        linear = term if linear is None else linear + term
+    rows = prod(linear.shape)
+    selection = source.shape[:first_axis] + linear.shape + source.shape[last_axis + 1 :]
+    if "value" in op.attrs:
+        values = mx.array(op.attrs["value"], dtype=source.dtype)
+    else:
+        values = env[op.inputs[-1]]
+    while len(values.shape) < len(selection):
+        values = values.reshape((1,) + values.shape)
+    values = mx.broadcast_to(values, selection).reshape(prefix, rows, trailing)
+
+    written = mx.zeros((prefix, inner, trailing), dtype=source.dtype)
+    if op.attrs.get("accumulate", False):
+        if source.dtype == mx.int64:
+            # A two-word sum would drop the carry from the low word.
+            raise NotImplementedError(
+                "index_put cannot accumulate into an int64 tensor on MLX"
+            )
+        written = written.at[(slice(None), linear.reshape(-1), slice(None))].add(values)
+        return (source.reshape(prefix, inner, trailing) + written).reshape(source.shape)
+    positions = mx.broadcast_to(linear.reshape(1, rows, 1), (prefix, rows, trailing))
+    flat_source = source.reshape(prefix, inner, trailing)
+    if source.dtype == mx.int64:
+        # MLX's scatter kernels do not take int64, so the write happens on the
+        # two 32-bit halves and is folded back together.
+        low = mx.put_along_axis(
+            flat_source.astype(mx.uint32), positions, values.astype(mx.uint32), axis=1
+        )
+        high = mx.put_along_axis(
+            (flat_source >> 32).astype(mx.int32),
+            positions,
+            (values >> 32).astype(mx.int32),
+            axis=1,
+        )
+        combined = (high.astype(mx.int64) << 32) | low.astype(mx.int64)
+        return combined.astype(source.dtype).reshape(source.shape)
+    updated = mx.put_along_axis(flat_source, positions, values, axis=1)
+    return updated.reshape(source.shape)
+
+
 def _evaluate_mlx_op(
     graph: Graph, op: Operation, env: dict[str, mx.array]
 ) -> mx.array | tuple[mx.array, ...]:
@@ -112,6 +174,8 @@ def _evaluate_mlx_op(
             _check_advanced_index_indices(index, source.shape[axis])
         indexing = (slice(None),) * axes[0] + indices
         return source[indexing]
+    if op.op == "index_put":
+        return _mlx_index_put(op, env)
     if op.op == "gather":
         source, indices = (env[value_id] for value_id in op.inputs)
         axis = int(op.attrs["dim"])

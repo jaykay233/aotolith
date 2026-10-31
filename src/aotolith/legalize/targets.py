@@ -485,6 +485,24 @@ _SCATTER_REDUCE_TARGET = "aten.scatter_reduce.two"
 _INDEX_ADD_TARGET = "aten.index_add.default"
 
 
+_INDEX_PUT_TARGETS = {
+    "aten.index_put.default": False,
+    "aten.index_put_.default": True,
+    "aten.index_copy.default": False,
+    "aten.index_copy_.default": True,
+    "aten.index_fill.int_Scalar": False,
+    "aten.index_fill.int_Tensor": False,
+    "aten.index_fill_.int_Scalar": True,
+    "aten.index_fill_.int_Tensor": True,
+}
+"""The write-through-index spellings, mapped to whether they mutate in place.
+
+``index_put`` names every axis it writes, ``index_copy`` names one, and
+``index_fill`` is ``index_copy`` with a scalar; all three lower to the same
+``index_put`` IR operation once the selection is spelled out.
+"""
+
+
 _SCATTER_REDUCE_NAMES = {
     "sum": "add",
     "prod": "prod",
@@ -657,6 +675,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | _COUNT_NONZERO_TARGETS
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
+    | set(_INDEX_PUT_TARGETS)
     | {
         _SELECT_TARGET,
         _INDEX_TARGET,

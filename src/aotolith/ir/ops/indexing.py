@@ -25,7 +25,7 @@ from .shared import (
     _require_output,
     _unsupported_attrs,
 )
-from ...shapes import broadcast_shapes
+from ...shapes import broadcast_shapes, can_broadcast
 
 
 def _check_embedding(graph: Graph, op: Operation) -> None:
@@ -229,6 +229,62 @@ def _check_index_add(graph: Graph, op: Operation) -> None:
     _require_output(graph, op, source_type, "output metadata")
 
 
+def _check_index_put(graph: Graph, op: Operation) -> None:
+    """``index_put`` writes through the same index list ``index`` reads."""
+
+    source_type = graph.value(op.inputs[0]).type
+    axes_value = op.attrs["axes"]
+    filled = "value" in op.attrs
+    if filled:
+        value = op.attrs["value"]
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(f"index_put.value must be a scalar number, got {value!r}")
+    if len(op.inputs) != len(axes_value) + (1 if filled else 2):
+        raise ValueError(
+            f"index_put has {len(op.inputs) - 1} index operands for axes "
+            f"{axes_value} with {'a' if filled else 'no'} fill value"
+        )
+    first_axis = axes_value[0]
+    last_axis = axes_value[-1]
+    if axes_value != tuple(range(first_axis, last_axis + 1)):
+        raise NotImplementedError(
+            f"non-contiguous index_put is not supported: indexed axes {axes_value}"
+        )
+    if first_axis < 0 or last_axis >= len(source_type.shape):
+        raise ValueError(
+            f"index_put axes {axes_value} exceed source rank {len(source_type.shape)}"
+        )
+    index_values = op.inputs[1:-1] if not filled else op.inputs[1:]
+    index_shapes = tuple(
+        _index_tensor(graph, value_id, "index_put indices").shape
+        for value_id in index_values
+    )
+    selection = (
+        source_type.shape[:first_axis]
+        + broadcast_shapes(index_shapes)
+        + source_type.shape[last_axis + 1 :]
+    )
+    if not filled:
+        # The update can be a scalar or omit the leading axes, so it only has
+        # to broadcast to the region being written.
+        values_type = graph.value(op.inputs[-1]).type
+        if values_type.dtype != source_type.dtype:
+            raise ValueError(
+                "index_put values dtype must match the input dtype, got "
+                f"{values_type.dtype.value} and {source_type.dtype.value}"
+            )
+        if not can_broadcast(values_type.shape, selection):
+            raise ValueError(
+                f"index_put values shape {values_type.shape} does not broadcast "
+                f"to the selection {selection}"
+            )
+    accumulate = op.attrs.get("accumulate", False)
+    if not isinstance(accumulate, bool):
+        raise ValueError(f"index_put.accumulate must be a boolean, got {accumulate!r}")
+    _require_output(graph, op, source_type, "output metadata")
+    _unsupported_attrs(op, {"axes", "accumulate", "value"})
+
+
 CONTRACTS: dict[str, OpContract] = {
     "embedding": OpContract(
         arity=(2, 2),
@@ -250,6 +306,13 @@ CONTRACTS: dict[str, OpContract] = {
         shape=ShapeRule.FREE,
         attrs=(AttrSpec("axes", AttrKind.AXES),),
         extra=_check_index,
+    ),
+    "index_put": OpContract(
+        arity=(2, 10),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("axes", AttrKind.AXES),),
+        extra=_check_index_put,
     ),
     "gather": OpContract(
         arity=(2, 2),

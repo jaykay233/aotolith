@@ -1050,3 +1050,102 @@ def test_a_keyword_input_cannot_shadow_the_plan_argument() -> None:
             (_bf16(2, 8),),
             example_kwargs={"verify_index_bounds": _bf16(2, 8)},
         )
+
+
+def test_index_fill_writes_through_a_scalar() -> None:
+    def forward(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return torch.index_fill(value, 1, indices, -2.5)
+
+    torch.manual_seed(3)
+    value = torch.randn(4, 5)
+    indices = torch.tensor([1, 3])
+    compiled = compile_callable(forward, (value, indices))
+    assert [op.op for op in compiled.input_graph.ops] == ["index_put"]
+    assert compiled.input_graph.ops[0].attrs == {"axes": (1,), "value": -2.5}
+
+    actual = _run_single_output(compiled, value, indices)
+    assert mx.array_equal(actual, mx.array(forward(value, indices).numpy()))
+
+
+def test_index_copy_writes_a_slice() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, source: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.index_copy(value, 0, indices, source)
+
+    torch.manual_seed(4)
+    value = torch.randn(4, 5)
+    indices = torch.tensor([0, 2])
+    source = torch.randn(2, 5)
+    compiled = compile_callable(forward, (value, indices, source))
+
+    actual = _run_single_output(compiled, value, indices, source)
+    assert mx.array_equal(actual, mx.array(forward(value, indices, source).numpy()))
+
+
+def test_index_put_writes_several_axes_at_once() -> None:
+    def forward(
+        value: torch.Tensor, rows: torch.Tensor, columns: torch.Tensor
+    ) -> torch.Tensor:
+        return value.index_put((rows, columns), torch.zeros(2))
+
+    torch.manual_seed(5)
+    value = torch.randn(4, 5)
+    rows = torch.tensor([0, 3])
+    columns = torch.tensor([1, 2])
+    compiled = compile_callable(forward, (value, rows, columns))
+    # A single operation names both axes, so the write is one gather-position
+    # scatter rather than a chain of per-axis rewrites.
+    (operation,) = [op for op in compiled.input_graph.ops if op.op == "index_put"]
+    assert operation.attrs["axes"] == (0, 1)
+
+    actual = _run_single_output(compiled, value, rows, columns)
+    assert mx.array_equal(actual, mx.array(forward(value, rows, columns).numpy()))
+
+
+def test_index_put_accumulates_repeated_positions() -> None:
+    def forward(
+        value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        return value.index_put((indices,), update, accumulate=True)
+
+    value = torch.zeros(4)
+    indices = torch.tensor([1, 1, 2])
+    update = torch.tensor([1.0, 2.0, 3.0])
+    compiled = compile_callable(forward, (value, indices, update))
+    (operation,) = [op for op in compiled.input_graph.ops if op.op == "index_put"]
+    assert operation.attrs["accumulate"] is True
+
+    actual = _run_single_output(compiled, value, indices, update)
+    assert mx.allclose(actual, mx.array(forward(value, indices, update).numpy()))
+
+
+def test_index_put_writes_int64_by_splitting_the_word() -> None:
+    # MLX's scatter kernels do not take int64, so the write happens on the two
+    # 32-bit halves; the value below needs both of them.
+    def forward(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return torch.index_fill(value, 0, indices, 2**40 + 5)
+
+    value = torch.arange(20, dtype=torch.int64).reshape(4, 5)
+    indices = torch.tensor([0, 2])
+    compiled = compile_callable(forward, (value, indices))
+
+    actual = _run_single_output(compiled, value, indices)
+    expected = forward(value, indices)
+    assert actual.dtype == mx.int64
+    assert mx.array_equal(actual, mx.array(expected.numpy()))
+
+
+def test_inplace_index_fill_is_legalized_when_unobserved() -> None:
+    def forward(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        base = value.clone()
+        base.index_fill_(0, indices, 7.0)
+        return base
+
+    value = torch.randn(3, 4)
+    indices = torch.tensor([0, 2])
+    compiled = compile_callable(forward, (value, indices))
+    assert [op.op for op in compiled.input_graph.ops][-1] == "index_put"
+
+    actual = _run_single_output(compiled, value, indices)
+    assert mx.array_equal(actual, mx.array(forward(value, indices).numpy()))
