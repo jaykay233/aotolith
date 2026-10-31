@@ -100,6 +100,8 @@ def test_convolution_records_the_geometry_as_typed_attributes() -> None:
         "padding": (1, 1),
         "dilation": (1, 1),
         "groups": 1,
+        "transposed": False,
+        "output_padding": (0, 0),
     }
 
 
@@ -126,15 +128,131 @@ def test_a_convolution_module_binds_its_weight_and_bias() -> None:
     _assert_close(actual, expected)
 
 
-def test_a_transposed_convolution_is_refused_by_name() -> None:
+_CONV_TRANSPOSE = {3: F.conv_transpose1d, 4: F.conv_transpose2d, 5: F.conv_transpose3d}
+
+
+@pytest.mark.parametrize(
+    ("shape", "weight_shape", "stride", "padding", "dilation", "output_padding"),
+    [
+        pytest.param((2, 3, 7), (3, 5, 4), 2, 1, 1, 0, id="1d"),
+        pytest.param((2, 3, 6, 6), (3, 5, 3, 3), 2, 1, 1, 0, id="2d"),
+        pytest.param((2, 3, 6, 6), (3, 5, 3, 3), 2, 1, 1, 1, id="2d-output-padded"),
+        pytest.param((2, 3, 6, 6), (3, 5, 3, 3), 2, 1, 2, 1, id="2d-dilated"),
+        # Padding wider than the kernel crops the output, which is a forward
+        # convolution with a negative pad and so the case the pre-image crop
+        # exists for.
+        pytest.param((2, 3, 6, 6), (3, 5, 3, 3), 2, 4, 1, 0, id="2d-cropped"),
+        pytest.param((2, 3, 5, 5, 5), (3, 4, 2, 2, 2), 2, 1, 1, 0, id="3d"),
+        pytest.param((2, 3, 5, 5, 5), (3, 4, 2, 2, 2), 2, 1, 2, 1, id="3d-dilated"),
+    ],
+)
+def test_a_transposed_convolution_matches_pytorch(
+    shape: tuple[int, ...],
+    weight_shape: tuple[int, ...],
+    stride: int,
+    padding: int,
+    dilation: int,
+    output_padding: int,
+) -> None:
+    # Torch's transposed convolution is the MLX backward pass, which is only
+    # accurate to about 1e-2 in float32; the backend rebuilds it as a forward
+    # convolution over a zero-set input so this stays at the same 1e-4 as the
+    # forward direction.
+    torch.manual_seed(0)
+    value = torch.randn(*shape)
+    weight = torch.randn(*weight_shape)
+    bias = torch.randn(weight_shape[1])
+    operation = _CONV_TRANSPOSE[len(shape)]
+
+    def call(input, weight, bias):
+        return operation(
+            input,
+            weight,
+            bias,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            output_padding=output_padding,
+        )
+
+    compiled, actual, expected = _run(call, value, weight, bias)
+
+    _assert_close(actual, expected)
+    assert [op.op for op in compiled.input_graph.ops] == ["conv"]
+    assert compiled.input_graph.ops[0].attrs["transposed"] is True
+
+
+@pytest.mark.parametrize(
+    ("shape", "weight_shape", "groups"),
+    [
+        pytest.param((2, 4, 6), (4, 2, 3), 2, id="1d"),
+        pytest.param((2, 4, 6, 6), (4, 2, 3, 3), 2, id="2d"),
+        pytest.param((2, 4, 6, 6, 6), (4, 1, 3, 3, 3), 4, id="3d-depthwise"),
+    ],
+)
+def test_a_grouped_transposed_convolution_matches_pytorch(
+    shape: tuple[int, ...], weight_shape: tuple[int, ...], groups: int
+) -> None:
+    # Torch orders the output channels group-major, which is the order the
+    # per-group pieces come out in before the concatenate.
+    torch.manual_seed(2)
+    value = torch.randn(*shape)
+    weight = torch.randn(*weight_shape)
+    operation = _CONV_TRANSPOSE[len(shape)]
+
+    def call(input, weight):
+        return operation(
+            input, weight, stride=2, padding=1, groups=groups, output_padding=1
+        )
+
+    compiled, actual, expected = _run(call, value, weight)
+
+    _assert_close(actual, expected)
+    assert compiled.input_graph.ops[0].attrs["groups"] == groups
+
+
+def test_a_transposed_convolution_module_binds_its_weight_and_bias() -> None:
+    class Decoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.up = torch.nn.ConvTranspose2d(3, 4, 3, stride=2, padding=1)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.relu(self.up(value))
+
+    torch.manual_seed(3)
+    module = Decoder().eval()
+    value = torch.randn(2, 3, 5, 5)
+    with torch.no_grad():
+        expected = module(value)
+
+    compiled = compile_module(module, (value,))
+    actual = compiled(mx.array(value.numpy()))[0]
+    mx.eval(actual)
+
+    assert compiled.state_names == ("up.weight", "up.bias")
+    _assert_close(actual, expected)
+
+
+def test_transposed_convolution_records_the_flag_and_output_padding() -> None:
     value = torch.randn(1, 2, 5, 5)
     weight = torch.randn(2, 3, 3, 3)
 
-    with pytest.raises(NotImplementedError, match="transposed convolution"):
-        capture_fx(
-            lambda input, weight: F.conv_transpose2d(input, weight, stride=2),
-            (value, weight),
-        )
+    graph = capture_fx(
+        lambda input, weight: F.conv_transpose2d(
+            input, weight, stride=2, padding=1, output_padding=1
+        ),
+        (value, weight),
+    )
+    (conv,) = graph.ops
+    assert conv.attrs == {
+        "stride": (2, 2),
+        "padding": (1, 1),
+        "dilation": (1, 1),
+        "groups": 1,
+        "transposed": True,
+        "output_padding": (1, 1),
+    }
 
 
 _MAX_POOL = {3: F.max_pool1d, 4: F.max_pool2d, 5: F.max_pool3d}

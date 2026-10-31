@@ -82,6 +82,7 @@ _INTEGER_POINTWISE_OPS = {
     "floor_divide",
     "trunc_divide",
     "remainder",
+    "fmod",
     "heaviside",
     "gcd",
     "lcm",
@@ -651,12 +652,15 @@ def _emit_integer_pointwise_expression(
         function = "shl" if op.op == "bitwise_left_shift" else "shr"
         return f"tsc_{function}_{suffix}({left}, {right})"
 
-    if op.op in {"floor_divide", "trunc_divide", "remainder"}:
+    if op.op in {"floor_divide", "trunc_divide", "remainder", "fmod"}:
         left, right = _binary_operands(op, arguments, input_types)
+        # ``fmod`` is C's truncated remainder for the same reason it is
+        # ``trunc_divide`` times the divisor: the sign follows the dividend.
         function = {
             "floor_divide": "floor_div",
             "trunc_divide": "trunc_div",
             "remainder": "remainder",
+            "fmod": "fmod",
         }[op.op]
         return f"tsc_{function}_{suffix}({left}, {right})"
 

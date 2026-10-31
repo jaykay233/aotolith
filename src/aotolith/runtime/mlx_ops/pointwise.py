@@ -14,6 +14,7 @@ from ...ir import DType
 from ...ir import Operation
 from ...ir import TensorType
 from ...ir.ops import FLOATING_DTYPES as _FLOATING_DTYPES
+from ...ir.ops import INTEGRAL_DTYPES as _INTEGRAL_DTYPES
 from ...codegen.dtypes import _MLX_DTYPES, _MLX_DTYPE_TO_DTYPE
 from ...codegen.expr import _FINITE_LIMITS, _wrap_integer_scalar
 
@@ -194,7 +195,11 @@ def _evaluate_pointwise_mlx(
     if op.op == "fmod":
         left, right = _binary_mx_operands(op, arguments)
         # MLX has no fmod, and its remainder floored-adjusts the result, so
-        # rebuild the truncated form: fmod(a, b) = a - trunc(a / b) * b.
+        # rebuild the truncated form: fmod(a, b) = a - trunc(a / b) * b. On an
+        # integer dtype the quotient has to truncate as well, or a negative
+        # dividend would land on the floor-multiple instead.
+        if output_type.dtype in _INTEGRAL_DTYPES:
+            return left - _mlx_trunc_divide(left, right) * right
         return left - mx.trunc(left / right) * right
     if op.op == "hypot":
         left, right = _binary_mx_operands(op, arguments)

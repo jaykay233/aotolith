@@ -547,6 +547,22 @@ inline long tsc_remainder_i64(long dividend, long divisor) {
     return remainder;
 }
 
+inline int tsc_fmod_i32(int dividend, int divisor) {
+    // C's integer remainder truncates, which is fmod's definition; only
+    // INT_MIN / -1 would trap, and that quotient has no remainder.
+    if (divisor == -1) {
+        return 0;
+    }
+    return dividend % divisor;
+}
+
+inline long tsc_fmod_i64(long dividend, long divisor) {
+    if (divisor == -1L) {
+        return 0L;
+    }
+    return dividend % divisor;
+}
+
 inline int tsc_pow_i32(int base, int exponent) {
     if (exponent < 0) {
         return 0;

@@ -6654,6 +6654,26 @@ def test_integer_minimum_floor_division_by_negative_one_wraps(dtype) -> None:
     assert mx.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("divisor", [3, -3])
+def test_integer_fmod_follows_the_dividend(dtype, divisor: int) -> None:
+    # ``fmod`` truncates where ``remainder`` floors, so on a negative dividend
+    # the two disagree; the kernel uses C's integer remainder, which is the
+    # truncated form.
+    info = torch.iinfo(dtype)
+    value = torch.tensor([info.min, info.max, -7, -6, -1, 0, 1, 6, 7], dtype=dtype)
+
+    result = compile_callable(lambda tensor: torch.fmod(tensor, divisor), (value,))
+    source = result.plan.kernels[0].source
+    assert "tsc_fmod_" in source
+
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(torch.fmod(value, divisor))
+    mx.eval(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert mx.array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("divisor", [3.0, -3.0, 2.5])
 def test_float_floor_divide_and_remainder_match_pytorch(dtype, divisor) -> None:

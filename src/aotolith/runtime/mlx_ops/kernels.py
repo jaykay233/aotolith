@@ -62,7 +62,16 @@ def _mlx_convolution(graph: Graph, op: Operation, env: dict[str, mx.array]) -> m
         _geometry(op, "padding"),
         _geometry(op, "dilation"),
     )
-    if spatial == 3 and groups != 1:
+    if op.attrs.get("transposed", False):
+        result = _mlx_conv_transpose(
+            value,
+            weight,
+            *geometry,
+            _geometry(op, "output_padding"),
+            groups,
+            graph.value(op.outputs[0]).type.shape[2:],
+        )
+    elif spatial == 3 and groups != 1:
         result = _grouped_conv3d(value, weight, *geometry, groups)
     else:
         result = primitive(
@@ -74,6 +83,124 @@ def _mlx_convolution(graph: Graph, op: Operation, env: dict[str, mx.array]) -> m
         bias = env[op.inputs[2]]
         result = result + bias.reshape(1, -1, *([1] * spatial))
     return result
+
+
+def _zero_interleave(value: mx.array, axis: int, step: int) -> mx.array:
+    """Insert ``step - 1`` zeros after every element of one axis.
+
+    A transposed convolution places its input on every ``step``-th output
+    position and lets the kernel fill the rest, so the forward equivalent is a
+    convolution over the array this builds. The zeros come from multiplying a
+    broadcast of a one-hot vector: every product is either an element or a hard
+    zero, so this cannot introduce rounding.
+    """
+
+    shape = value.shape
+    extent = shape[axis]
+    expanded = shape[: axis + 1] + (1,) + shape[axis + 1 :]
+    one_hot = mx.concatenate(
+        [mx.ones((1,), dtype=value.dtype), mx.zeros((step - 1,), dtype=value.dtype)]
+    )
+    mask = [1] * len(expanded)
+    mask[axis + 1] = step
+    spread = (value.reshape(expanded) * one_hot.reshape(mask)).reshape(
+        shape[:axis] + (extent * step,) + shape[axis + 1 :]
+    )
+    # The last run of inserted zeros sits past the output and is dropped here,
+    # so the convolution below sees only positions it can reach.
+    window = [slice(None)] * len(shape)
+    window[axis] = slice(0, (extent - 1) * step + 1)
+    return spread[tuple(window)]
+
+
+def _mlx_conv_transpose(
+    value: mx.array,
+    weight: mx.array,
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+    output_padding: tuple[int, ...],
+    groups: int,
+    output_size: tuple[int, ...],
+) -> mx.array:
+    """A transposed convolution as one forward convolution over a zero-set input.
+
+    MLX's ``conv_transpose`` is its forward convolution run backwards, and that
+    path computes at a lower precision: in float32 it differs from Torch by
+    about 1e-2 once the stride is above one, while the same arithmetic through
+    ``conv_general`` with unit stride stays at 1e-6. So the operator is rebuilt
+    in the forward form Torch's definition implies:
+
+    * interleave the input with ``stride - 1`` zeros per axis, which puts every
+      input element on the output lattice position it contributes from,
+    * convolve with the kernel flipped rather than the input flipped,
+    * pad the left by ``dilation * (kernel - 1) - padding``, the translation
+      from the transposed convention to the forward one; a negative value is
+      the crop Torch applies to the output,
+    * grow the right by ``output_padding``, which is a fringe Torch computes
+      rather than blank rows.
+
+    The result is channels-last, like the primitive's, so the caller applies the
+    same single transpose and bias add as for the forward direction.
+    """
+
+    spatial = value.ndim - 2
+    if spatial not in (1, 2, 3):
+        raise NotImplementedError(
+            f"convolution over {spatial} spatial axes is not supported"
+        )
+    # ``_geometry`` collapses a one-axis tuple to an integer, because that is
+    # what the 1D primitive takes; here every axis is handled the same way.
+    stride, padding, dilation, output_padding = (
+        tuple(geometry if isinstance(geometry, tuple) else (geometry,))
+        for geometry in (stride, padding, dilation, output_padding)
+    )
+    flip = (slice(None), *([slice(None, None, -1)] * spatial), slice(None))
+    kernel = [spread * (size - 1) for size, spread in zip(weight.shape[2:], dilation)]
+    before = [max(item - pad, 0) for item, pad in zip(kernel, padding)]
+    after = [
+        max(item - pad + extra, 0)
+        for item, pad, extra in zip(kernel, padding, output_padding)
+    ]
+    # Output positions the transposed convention crops from the front, which an
+    # asymmetric forward padding cannot express as a negative pad.
+    start = [max(pad - item, 0) for item, pad in zip(kernel, padding)]
+
+    def one_group(inputs: mx.array, kernels: mx.array) -> mx.array:
+        # Torch stores the transposed weight input-major; MLX wants
+        # (out, *kernel, in), and correlation rather than convolution, so the
+        # spatial axes are reversed.
+        arranged = kernels.transpose((1, *range(2, kernels.ndim), 0))
+        interleaved = _channels_last(inputs)
+        for axis, step in enumerate(stride):
+            if step != 1:
+                interleaved = _zero_interleave(interleaved, axis + 1, step)
+        convolved = mx.conv_general(
+            interleaved,
+            arranged[flip],
+            1,
+            (tuple(before), tuple(after)),
+            kernel_dilation=dilation,
+        )
+        if any(start):
+            window = [slice(None)] * convolved.ndim
+            for axis, (offset, size) in enumerate(zip(start, output_size)):
+                window[axis + 1] = slice(offset, offset + size)
+            convolved = convolved[tuple(window)]
+        return convolved
+
+    if groups == 1:
+        return one_group(value, weight)
+    inputs_per_group = value.shape[1] // groups
+    pieces = [
+        one_group(
+            value[:, group * inputs_per_group : (group + 1) * inputs_per_group],
+            weight[group * inputs_per_group : (group + 1) * inputs_per_group],
+        )
+        for group in range(groups)
+    ]
+    # Torch orders the output channels group-major, which is this order.
+    return mx.concatenate(pieces, axis=-1)
 
 
 def _grouped_conv3d(

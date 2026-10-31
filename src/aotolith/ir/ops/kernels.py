@@ -196,29 +196,86 @@ def _check_conv(graph: Graph, op: Operation) -> None:
     if not (input_type.dtype == weight_type.dtype == output_type.dtype):
         raise NotImplementedError("conv requires identical input/weight/output dtypes")
     stride, padding, dilation, groups = _conv_geometry(op, graph)
-    batch, channels = input_type.shape[:2]
-    out_channels, weight_channels = weight_type.shape[:2]
-    if channels % groups or out_channels % groups:
-        raise ValueError(
-            f"conv groups {groups} must divide the {channels} input and "
-            f"{out_channels} output channels"
+    transposed = op.attrs.get("transposed", False)
+    if not isinstance(transposed, bool):
+        raise ValueError(f"conv.transposed must be a boolean, got {transposed!r}")
+    output_padding = op.attrs.get("output_padding", ())
+    if (
+        not isinstance(output_padding, tuple)
+        or len(output_padding) != len(input_type.shape) - 2
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in output_padding
         )
-    if weight_channels != channels // groups:
-        raise ValueError(
-            f"conv weight has {weight_channels} channels per group, which does "
-            f"not match {channels} inputs in {groups} groups"
-        )
-    expected = [batch, out_channels]
-    for size, kernel, step, pad, spread in zip(
-        input_type.shape[2:], weight_type.shape[2:], stride, padding, dilation
     ):
-        extent = size + 2 * pad - spread * (kernel - 1) - 1
-        if extent < 0:
+        raise ValueError(
+            f"conv.output_padding must be {len(input_type.shape) - 2} integers, "
+            f"got {output_padding!r}"
+        )
+    batch, channels = input_type.shape[:2]
+    if transposed:
+        # A transposed convolution keeps the weight in the input-major layout
+        # Torch uses for it: one row per input channel, one column block per
+        # output channel of that group.
+        weight_channels, block = weight_type.shape[:2]
+        if weight_channels != channels:
             raise ValueError(
-                f"conv kernel {weight_type.shape[2:]} does not fit the padded "
-                f"input {input_type.shape[2:]}"
+                f"conv weight has {weight_channels} rows, which does not match "
+                f"{channels} inputs"
             )
-        expected.append(extent // step + 1)
+        if channels % groups:
+            raise ValueError(
+                f"conv groups {groups} must divide the {channels} input channels"
+            )
+        out_channels = block * groups
+        expected = [batch, out_channels]
+        for size, kernel, step, pad, spread, extra in zip(
+            input_type.shape[2:],
+            weight_type.shape[2:],
+            stride,
+            padding,
+            dilation,
+            output_padding,
+        ):
+            if extra < 0 or extra >= max(step, spread):
+                raise ValueError(
+                    f"conv.output_padding {extra} must be smaller than the "
+                    f"stride {step} or the dilation {spread}"
+                )
+            expected.append(
+                (size - 1) * step - 2 * pad + spread * (kernel - 1) + 1 + extra
+            )
+        if any(size < 1 for size in expected[2:]):
+            raise ValueError(
+                f"conv output shape {tuple(expected)} has an empty spatial axis"
+            )
+    else:
+        if any(output_padding):
+            raise ValueError(
+                "conv.output_padding is only nonzero for a transposed convolution"
+            )
+        out_channels, weight_channels = weight_type.shape[:2]
+        if channels % groups or out_channels % groups:
+            raise ValueError(
+                f"conv groups {groups} must divide the {channels} input and "
+                f"{out_channels} output channels"
+            )
+        if weight_channels != channels // groups:
+            raise ValueError(
+                f"conv weight has {weight_channels} channels per group, which does "
+                f"not match {channels} inputs in {groups} groups"
+            )
+        expected = [batch, out_channels]
+        for size, kernel, step, pad, spread in zip(
+            input_type.shape[2:], weight_type.shape[2:], stride, padding, dilation
+        ):
+            extent = size + 2 * pad - spread * (kernel - 1) - 1
+            if extent < 0:
+                raise ValueError(
+                    f"conv kernel {weight_type.shape[2:]} does not fit the padded "
+                    f"input {input_type.shape[2:]}"
+                )
+            expected.append(extent // step + 1)
     if output_type.shape != tuple(expected):
         raise ValueError(f"conv output shape {output_type.shape} != {tuple(expected)}")
     if len(op.inputs) == 3:
@@ -362,6 +419,8 @@ CONTRACTS: dict[str, OpContract] = {
             AttrSpec("padding", AttrKind.INT_TUPLE),
             AttrSpec("dilation", AttrKind.INT_TUPLE),
             AttrSpec("groups", AttrKind.INT),
+            AttrSpec("transposed", AttrKind.BOOL),
+            AttrSpec("output_padding", AttrKind.INT_TUPLE),
         ),
         extra=_check_conv,
     ),

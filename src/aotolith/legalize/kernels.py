@@ -6,11 +6,12 @@ three, and writing a second one would only be slower. So the whole job in this
 module is reading ATen's spelling of the geometry - a list of per-axis strides,
 a symmetric padding, a dilation - and handing it over as typed attributes.
 
-The one spelling that does not survive the trip is a transposed convolution:
-Torch states it as the same operator with a flag, while the MLX kernel wants its
-weight in a different layout and, on the Metal path, computes it at a lower
-precision than the forward direction. It stays an error rather than a silent
-approximation.
+A transposed convolution is the same operator read backwards: Torch states it
+with a flag on ``aten.convolution`` and puts the weight in input-major layout.
+MLX has its own ``conv_transpose`` but computes it on a reduced-precision path
+(the stride>1 form differs from Torch by ~1e-2 in float32), so the backend
+builds the forward equivalent instead and keeps the parity the rest of the
+pipeline has. See ``runtime/mlx_ops/kernels.py`` for that construction.
 """
 
 from __future__ import annotations
@@ -62,17 +63,10 @@ def _conv_operation(
         raise ValueError(
             f"convolution.transposed must be a boolean, got {transposed!r}"
         )
-    if transposed:
-        raise NotImplementedError(
-            "a transposed convolution is not lowered: MLX computes it in a "
-            "different weight layout and, on the Metal path, at a lower "
-            "precision than the forward direction"
-        )
     output_padding = args[7]
-    if output_padding is not None and any(int(item) for item in output_padding):
-        raise NotImplementedError(
-            "convolution.output_padding only grows the output of a transposed "
-            "convolution, which is not lowered"
+    if transposed and output_padding is None:
+        raise ValueError(
+            "convolution.output_padding must be present for a transposed convolution"
         )
     groups = args[8]
     if not isinstance(groups, int) or isinstance(groups, bool):
@@ -90,6 +84,12 @@ def _conv_operation(
         "padding": _int_tuple(args[4], "padding", spatial),
         "dilation": _int_tuple(args[5], "dilation", spatial),
         "groups": groups,
+        "transposed": transposed,
+        "output_padding": _int_tuple(
+            (0,) * spatial if output_padding is None else output_padding,
+            "output_padding",
+            spatial,
+        ),
     }
     inputs = [
         _argument_ids(input_node, node_ids),

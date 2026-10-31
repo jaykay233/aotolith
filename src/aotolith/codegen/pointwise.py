@@ -275,6 +275,7 @@ def _validate_integer_pointwise_op(
         "floor_divide",
         "trunc_divide",
         "remainder",
+        "fmod",
         "gcd",
         "lcm",
         "bitwise_left_shift",

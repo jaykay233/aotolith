@@ -120,7 +120,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.dist.default` | 组合 lowering：`sub` 后接整条 tensor 的 `vector_norm`（`ord=p`），结果恒为 rank-0 标量，没有 `dim` 参数 |
 | `aten.repeat.default`（`Tensor.repeat`/`Tensor.tile`） | 展开成 `reshape -> expand -> reshape`，不生成 kernel |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
-| `aten.convolution.default` | `conv`，`stride`/`padding`/`dilation`/`groups` 进入 attribute，weight/bias 作为普通输入 |
+| `aten.convolution.default` | `conv`，`stride`/`padding`/`dilation`/`groups`/`transposed`/`output_padding` 进入 attribute，weight/bias 作为普通输入；`transposed` 为真时 weight 是 Torch 的输入主序 `(in, out/groups, *kernel)` |
 | `aten.max_pool2d_with_indices.default`、`aten.max_pool3d_with_indices.default` | `pool`，窗口几何进入 attribute；是否同时写出 indices 由被读取的输出决定 |
 | `aten.avg_pool2d.default`、`aten.avg_pool3d.default` | `pool`，保留 `ceil_mode`/`count_include_pad`/`divisor_override` |
 | `aten.adaptive_max_pool2d.default`、`aten.adaptive_max_pool3d.default` | `adaptive_pool`，按 `output_size` 逐个输出位置展开窗口 |
@@ -617,6 +617,7 @@ score 和 online-softmax 状态使用 float，低精度 PV 使用 FP16/BF16 概�
 卷积和池化不走 Metal codegen，而是直接用 MLX 原语（`mx.conv1d/2d/3d` 和 `as_strided`）。它们的开销在数据搬运而不在表达式求值，生成 kernel 只会把原语重写一遍。
 
 - 卷积：IR 是 channels-first、weight 是 output-major，MLX 要 channels-last 和 kernel-major，所以一次 `conv` 是「转置 → 原语 → 转置」，bias 用一次 broadcast add 补上。`groups` 直接交给原语；几何参数按 rank 取值（`_geometry`），因为 `mx.conv1d` 只接受标量 stride/padding/dilation，而 `conv2d`/`conv3d` 要每个空间轴一个。`conv3d` 是例外：MLX 只对 1D/2D 接受非 1 的 `groups`，所以 3D 分组卷积按 group 拆成多次单组卷积，再沿通道轴拼接——每组各用自己的输入通道和 weight 切片，拼出来的顺序正是 Torch 的 group-major。
+- 转置卷积不走 MLX 的 `conv_transpose`：那条路径就是它自己前向卷积的反向，float32 下 stride 大于 1 时和 Torch 差到 1e-2。改成用前向形式重写：输入按 stride 补零插空（乘一个 one-hot 广播，每项不是原值就是精确零），kernel 沿空间轴翻转，左填充 `dilation * (kernel - 1) - padding`（负值就是 Torch 对输出的裁剪，前向卷积的对称 padding 表达不了，所以卷积后再切片），右侧多补 `output_padding`（那是 Torch 真正算出来的边条，不是补零）。这条路径的误差与普通卷积一样是 1e-6；`groups` 按 group 切片后逐组做，再沿通道轴拼接。代价是插入零后输入膨胀到 stride² 倍，重活仍落在一次前向卷积上。
 - 池化：MLX 没有 pooling kernel，但窗口本身就是一次 strided 读。先按 padding 补一次（最大值用 `-inf`、均值用 0），并补上 ceil-mode 右侧溢出；再用 `as_strided` 把每个输出位置的全部窗口偏移读成一个视图，对窗口轴做一次 reduction。indices 来自同一次读：窗口内等于最大值的偏移被保留、取最小者，再按 stride/dilation/padding 换算成输入平面内的展平下标，所以重复最大值报告第一个，与 ATen 一致。
 - 均值的分母是同一份窗口读作用在 ones mask 上的和，所以 `count_include_pad=False` 只是把 mask 建在未 padding 的 extent 上，`divisor_override` 直接替换分母，ceil-mode 越界的那部分在两种 mask 里都计 0。
 - 自适应池化没有固定步长，一个视图放不下所有窗口，于是按 `floor(i*size/out) .. ceil((i+1)*size/out)` 逐个输出位置展开；窗口边界是静态常量，展开成固定 unroll 而不是运行时循环。
