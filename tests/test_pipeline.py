@@ -4676,6 +4676,25 @@ def test_unbind_lowering_returns_each_squeezed_tensor() -> None:
     assert all(mx.allclose(a, e) for a, e in zip(actual, expected, strict=True))
 
 
+def test_split_defaults_to_the_leading_axis() -> None:
+    # ``torch.split(x, n)`` and ``torch.chunk(x, n)`` trace with ``dim=0``
+    # elided, the same way ``unbind`` does, so the elided spelling has to work.
+    torch.manual_seed(84)
+    x = torch.randn(4, 6)
+
+    split = compile_callable(lambda value: torch.split(value, 2), (x,))
+    chunked = compile_callable(lambda value: torch.chunk(value, 2), (x,))
+
+    assert [op.op for op in split.lowered_graph.ops] == ["slice", "slice"]
+    assert [op.op for op in chunked.lowered_graph.ops] == ["slice", "slice"]
+
+    actual = split.plan(mx.array(x.numpy()))
+    expected = tuple(mx.array(value.numpy()) for value in torch.split(x, 2))
+    mx.eval(*actual, *expected)
+    assert len(actual) == len(expected) == 2
+    assert all(mx.array_equal(a, e) for a, e in zip(actual, expected, strict=True))
+
+
 def test_unbind_defaults_to_the_leading_axis() -> None:
     def unbind_leading(x):
         return torch.unbind(x)
@@ -8997,6 +9016,44 @@ def test_eye_composes_with_a_pointwise_operand() -> None:
     assert bool(mx.array_equal(actual, expected))
 
 
+def test_empty_is_materialized_as_zeros() -> None:
+    # Torch leaves the contents of ``empty`` unspecified, so any value satisfies
+    # it; the plan picks zeros so a buffer nobody wrote stays deterministic.
+    # ``empty_like`` reaches the same lowering even though Torch's own
+    # decomposition rewrites it into ``empty_permuted``.
+    torch.manual_seed(39)
+    x = torch.randn(4, 6)
+
+    literal = compile_callable(lambda v: torch.empty(2, 3), (x,))
+    like = compile_callable(lambda v: torch.empty_like(v), (x,))
+
+    assert [op.op for op in literal.lowered_graph.ops] == ["zeros"]
+    assert [op.op for op in like.lowered_graph.ops] == ["zeros"]
+
+    filled = literal.plan(mx.array(x.numpy()))[0]
+    shaped = like.plan(mx.array(x.numpy()))[0]
+    expected = mx.zeros((2, 3))
+    mx.eval(filled, shaped)
+    assert filled.shape == (2, 3) and shaped.shape == (4, 6)
+    assert bool(mx.array_equal(filled, expected))
+    assert bool(mx.array_equal(shaped, mx.zeros((4, 6))))
+
+
+def test_a_filled_empty_buffer_folds_into_the_constant() -> None:
+    # The usual spelling is allocate-then-fill, and the fill makes the
+    # allocation dead: the whole pair is one constant.
+    torch.manual_seed(40)
+    x = torch.randn(3, 4)
+
+    result = compile_callable(lambda v: torch.empty_like(v).fill_(2.5), (x,))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["full_like"]
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array((torch.empty_like(x).fill_(2.5)).numpy())
+    mx.eval(actual, expected)
+    assert bool(mx.array_equal(actual, expected))
+
+
 @pytest.mark.parametrize(
     ("dtype", "mlx_dtype"),
     [
@@ -9159,6 +9216,76 @@ def test_addbmm_at_zero_alpha_and_beta_answers_zeros() -> None:
     expected = mx.array(fn(*inputs).numpy())
     mx.eval(actual, expected)
     assert bool(mx.array_equal(actual, expected))
+
+
+@pytest.mark.parametrize(
+    ("alpha", "beta"),
+    [
+        pytest.param(1.0, 1.0, id="plain"),
+        pytest.param(2.0, 0.5, id="scaled"),
+        pytest.param(-1.5, 3.0, id="mixed_signs"),
+    ],
+)
+def test_addmv_matches_pytorch(alpha, beta) -> None:
+    def fn(input, matrix, vector):
+        return torch.addmv(input, matrix, vector, beta=beta, alpha=alpha)
+
+    torch.manual_seed(49)
+    inputs = (torch.randn(3), torch.randn(3, 4), torch.randn(4))
+
+    result = compile_callable(fn, inputs)
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (3,)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "input_shape",
+    [
+        pytest.param((3,), id="vector"),
+        pytest.param((), id="scalar"),
+        pytest.param((1,), id="singleton"),
+    ],
+)
+def test_addmv_broadcasts_the_addend(input_shape) -> None:
+    def fn(input, matrix, vector):
+        return torch.addmv(input, matrix, vector)
+
+    torch.manual_seed(50)
+    inputs = (torch.randn(input_shape), torch.randn(3, 4), torch.randn(4))
+
+    result = compile_callable(fn, inputs)
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == (3,)
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
+
+
+def test_addmv_drops_the_addend_at_beta_zero() -> None:
+    # Same rule as ``addbmm``: ATen ignores the addend when beta is zero, so an
+    # infinite one must not turn the product into NaN.
+    def fn(input, matrix, vector):
+        return torch.addmv(input, matrix, vector, beta=0.0, alpha=2.0)
+
+    torch.manual_seed(51)
+    inputs = (
+        torch.full((3,), float("inf")),
+        torch.randn(3, 4),
+        torch.randn(4),
+    )
+
+    result = compile_callable(fn, inputs)
+    assert "add" not in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    expected = mx.array(fn(*inputs).numpy())
+    mx.eval(actual, expected)
+    assert not bool(mx.any(mx.isnan(actual)))
+    assert mx.allclose(actual, expected, atol=2e-2, rtol=5e-3)
 
 
 def test_einsum_full_contraction_answers_a_scalar() -> None:

@@ -66,6 +66,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.addmm.default` | `addmm` |
 | `aten.baddbmm.default` | `addmm`，batch 维按 broadcasting 语义执行 |
 | `aten.addbmm.default` | 组合 lowering：`matmul` 把 batch 里每个乘积算出来后 `sum` 掉 batch 轴，`alpha`/`beta` 折进 pointwise 乘法，系数为 1 时不发 op；`beta` 或 `alpha` 为 0 时对应项整项丢弃（ATen 也是忽略它，而不是乘 0），因此 bias 或乘积里的 NaN/inf 不会渗进结果 |
+| `aten.addmv.default` | 组合 lowering：`mv` 的 `reshape -> matmul -> reshape` 加两个系数；被加项按 pointwise 广播，可以是 rank-0。系数为 0 的处理与 `addbmm` 相同 |
 | `aten.embedding.default` | `embedding` |
 | `aten.index_select.default` | `index_select`，沿单个静态轴 gather |
 | `aten.index.Tensor` | `index`，支持多轴 advanced indexing（含被静态/index 轴隔开的非相邻索引）和 index broadcasting |
@@ -223,6 +224,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.arange.default`、`aten.arange.start`、`aten.arange.start_step` | `arange`，参数规范化为 `start/end/step` attributes |
 | `aten.eye.default` | 展开成两个 `arange`（矩阵不是方阵时才有第二个）的 `eq`，再 cast 成声明的 dtype；Torch 自己的参考实现就是这么写的，只有它用 `uint8` 而这里用 I32。结果是常量，但走的是与 `arange` 相同的 kernel |
 | `aten.zeros.default`、`aten.ones.default`、`aten.full.default`、`aten.new_zeros.default`、`aten.new_ones.default`、`aten.new_full.default`、`aten.zeros_like.default`、`aten.ones_like.default`、`aten.full_like.default` | `zeros`、`ones`、`full`、`new_zeros`、`new_ones`、`new_full`、`zeros_like`、`ones_like`、`full_like`，shape/dtype 来自输出 metadata，填充值进入 IR |
+| `aten.empty.memory_format`、`aten.empty_permuted.default`、`aten.empty_like.default`、`aten.new_empty.default` | `zeros`：`empty` 对内容不作任何承诺，任何值都满足它，取零让「没人写过就读」的图保持确定性。`empty_permuted` 的第二个参数是物理布局，IR 是 dense 的，logical shape 来自输出 metadata |
 | `aten.cat.default` | `cat`，tensor 输入序列和拼接轴进入 IR |
 | `aten.stack.default` | 在前端展开为多个 `unsqueeze` 后接一个 `cat` |
 | `aten.split.Tensor`、`aten.split_with_sizes.default` | 在前端展开为多个 `slice` |

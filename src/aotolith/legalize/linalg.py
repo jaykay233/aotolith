@@ -23,6 +23,7 @@ from .state import Handler
 from .refs import _argument_ids
 from .targets import (
     _ADDBMM_TARGET,
+    _ADDMV_TARGET,
     _DIAGONAL_COPY_TARGET,
     _DIAGONAL_TARGET,
     _LINALG_CHECK_TARGET,
@@ -631,6 +632,85 @@ def _lower_addbmm(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_addmv(lowering: Lowering, node: Any, target: str) -> bool:
+    """``addmv`` is ``beta * input + alpha * mat @ vec``.
+
+    The product reuses the shape ``mv`` already lowers through - the vector as
+    one column, the rank-2 ``matmul``, and the column flattened again - so the
+    only decisions left are the two scale factors. A zero factor drops its term
+    rather than multiplying by it, because ATen ignores that operand and a
+    multiply would carry an inf or a NaN out of a term the result does not
+    contain.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) != 3:
+        raise ValueError(f"{target} expects three arguments, got {len(args)}")
+    input_id = _argument_ids(args[0], lowering.node_ids)
+    matrix_id = _argument_ids(args[1], lowering.node_ids)
+    vector_id = _argument_ids(args[2], lowering.node_ids)
+    matrix = lowering.values[matrix_id].type
+    vector = lowering.values[vector_id].type
+    if len(matrix.shape) != 2:
+        raise ValueError(f"{target} requires a rank-2 matrix, got {matrix.shape}")
+    rows, columns = matrix.shape
+    if vector.shape != (columns,):
+        raise ValueError(
+            f"{target} vector shape {vector.shape} does not match the matrix "
+            f"reduction size {columns}"
+        )
+    kwargs = getattr(node, "kwargs", {})
+    beta = kwargs.get("beta", 1)
+    alpha = kwargs.get("alpha", 1)
+    for name, value in (("beta", beta), ("alpha", alpha)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{target}.{name} must be a number, got {value!r}")
+
+    output_type = _node_type(node)
+    if alpha == 0:
+        if beta == 0:
+            lowering.bind(node, lowering.emit("full", (), {"value": 0.0}, output_type))
+            return True
+        lowering.bind(node, _scaled_bias(lowering, input_id, beta, output_type))
+        return True
+
+    column_id = lowering.emit(
+        "reshape",
+        (vector_id,),
+        {"shape": (columns, 1)},
+        TensorType((columns, 1), vector.dtype),
+    )
+    product_id = lowering.emit(
+        "matmul", (matrix_id, column_id), {}, TensorType((rows, 1), matrix.dtype)
+    )
+    total_id = lowering.emit(
+        "reshape",
+        (product_id,),
+        {"shape": (rows,)},
+        TensorType((rows,), matrix.dtype),
+    )
+    if alpha != 1:
+        total_id = lowering.emit(
+            "mul",
+            (total_id,),
+            {"scalar": alpha, "scalar_position": "rhs"},
+            TensorType((rows,), matrix.dtype),
+        )
+    if beta == 0:
+        lowering.bind(node, total_id)
+        return True
+    lowering.bind(
+        node,
+        lowering.emit(
+            "add",
+            (_scaled_bias(lowering, input_id, beta, output_type), total_id),
+            {},
+            output_type,
+        ),
+    )
+    return True
+
+
 def _scaled_bias(
     lowering: Lowering, input_id: str, beta: float, output_type: TensorType
 ) -> str:
@@ -672,6 +752,7 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _DIAGONAL_COPY_TARGET: (_lower_diagonal,),
     _LINALG_CHECK_TARGET: (_lower_linalg_check,),
     _ADDBMM_TARGET: (_lower_addbmm,),
+    _ADDMV_TARGET: (_lower_addmv,),
 }
 
 for _linalg_target in _LINALG_RESULTS:

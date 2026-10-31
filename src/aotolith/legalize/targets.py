@@ -626,6 +626,23 @@ has no unsigned type. The same expression is built here over I32 instead.
 """
 
 
+_EMPTY_TARGETS = frozenset(
+    {
+        "aten.empty.memory_format",
+        "aten.empty_permuted.default",
+        "aten.empty_like.default",
+        "aten.new_empty.default",
+    }
+)
+"""The allocations whose contents Torch leaves unspecified.
+
+Torch's decomposition table rewrites ``empty_like`` into ``empty_permuted``, so
+every spelling is kept here and the lowering answers all four; a plan that
+reads a buffer nobody wrote then stays deterministic instead of reading
+whatever the device happened to leave in it.
+"""
+
+
 _VAR_MEAN_TARGETS = {
     "aten.var_mean.correction": "var",
     "aten.var_mean.dim": "var",
@@ -646,6 +663,9 @@ _DIST_TARGET = "aten.dist.default"
 
 
 _ADDBMM_TARGET = "aten.addbmm.default"
+
+
+_ADDMV_TARGET = "aten.addmv.default"
 
 
 _LDEXP_TARGET = "aten.ldexp.Tensor"
@@ -884,6 +904,8 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _LINALG_CHECK_TARGET,
         _DIST_TARGET,
         _ADDBMM_TARGET,
+        _ADDMV_TARGET,
         _LDEXP_TARGET,
+        *_EMPTY_TARGETS,
     }
 )

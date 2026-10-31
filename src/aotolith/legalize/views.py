@@ -56,9 +56,17 @@ def _sequence_view_operations(
         raise ValueError(f"{target} received unsupported keyword arguments: {kwargs!r}")
 
     if target in {"aten.split.Tensor", "aten.split_with_sizes.default"}:
-        if len(args) != 3:
-            raise ValueError(f"{target} expects three arguments, got {len(args)}")
-        input_node, _, dim = args
+        if len(args) == 2:
+            # ``torch.split(x, n)`` traces with the default ``dim=0`` elided,
+            # exactly as ``unbind`` does below.
+            input_node, _ = args
+            dim = 0
+        elif len(args) == 3:
+            input_node, _, dim = args
+        else:
+            raise ValueError(
+                f"{target} expects two or three arguments, got {len(args)}"
+            )
     else:
         if target == "aten.unbind.int" and len(args) == 1:
             # ``torch.unbind(x)`` traces with the default ``dim=0`` elided.

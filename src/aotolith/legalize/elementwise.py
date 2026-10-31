@@ -23,6 +23,7 @@ from .targets import (
     _COMPARISON_OPS,
     _COPY_TARGET,
     _DIVIDE_ROUNDING_TARGETS,
+    _EMPTY_TARGETS,
     _EYE_TARGETS,
     _FLOATING_DTYPES,
     _FLOAT_ONLY_POINTWISE_OPS,
@@ -1050,6 +1051,22 @@ def _lower_eye(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_empty(lowering: Lowering, node: Any, target: str) -> bool:
+    """``empty`` allocates a buffer and promises nothing about its contents.
+
+    Nothing reads a value Torch left unspecified, so any content satisfies the
+    contract; the lowering picks zeros, which keeps a plan that does read such a
+    buffer deterministic instead of reading whatever the device left behind. The
+    shape comes from the node's own output metadata, which is where all four
+    spellings carry it - ``empty_permuted`` also passes a physical layout, but
+    the IR is dense and the logical shape is the one the graph sees.
+    """
+
+    output_type = _node_type(node)
+    lowering.bind(node, lowering.emit("zeros", (), {"value": 0.0}, output_type))
+    return True
+
+
 def _lower_ldexp(lowering: Lowering, node: Any, target: str) -> bool:
     """``ldexp(x, e)`` is ``x * 2**e``, so the exponent becomes a scale.
 
@@ -1088,5 +1105,6 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _PRELU_TARGET: (_lower_prelu,),
     _COPY_TARGET: (_lower_copy,),
     **{target: (_lower_eye,) for target in _EYE_TARGETS},
+    **{target: (_lower_empty,) for target in _EMPTY_TARGETS},
     _LDEXP_TARGET: (_lower_ldexp,),
 }

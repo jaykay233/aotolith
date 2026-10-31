@@ -382,14 +382,14 @@ Tensor cores need Apple GPU family 9 or later, so both tensor-core paths are gat
 | Area | Coverage |
 |---|---|
 | Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode; Qwen2.5-0.5B-Instruct validated |
-| Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, `addbmm` (batch products summed into one matrix), including supported batch broadcasting |
+| Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, `addbmm` (batch products summed into one matrix), `mv`/`addmv`, including supported batch broadcasting |
 | Linear algebra | `solve`, `solve_triangular`, `inv`, `det`, `slogdet`, `cholesky`, `eigh`, `svd`, `qr`, `pinv`, `lu_factor` and `matrix_exp`, each lowered per selected output |
 | Indexing | Embedding, `index_select`, advanced indexing, `gather`, `scatter`, `scatter_add`, `index_add`, and the `scatter_reduce` reductions `sum`/`prod`/`amax`/`amin`/`mean` |
 | Transformer operations | Scaled dot-product attention, decomposed causal attention, softmax, log_softmax, logsumexp, sum/mean/prod/amax/amin/nansum/nanmean/var/std/var_mean/std_mean/count_nonzero reductions, `all`/`any`, `vector_norm`, `dist`, `F.normalize` and `F.cosine_similarity`, cumsum/cumprod, LayerNorm (including mean/rstd), RMSNorm, SiLU, GELU, SwiGLU, and other common pointwise operations including `ldexp` |
 | Spatial operations | `conv1d`/`conv2d`/`conv3d` with stride, padding, dilation and groups; `max_pool`/`avg_pool`/`adaptive_max_pool`/`adaptive_avg_pool` in 1D, 2D and 3D, including `ceil_mode`, `count_include_pad`, `divisor_override` and the pooled indices; BatchNorm, GroupNorm and InstanceNorm decomposed into moments plus a per-channel affine |
 | Resizing | `interpolate`/`upsample` in nearest, linear, bilinear, trilinear and bicubic modes, with `align_corners` and fractional scale factors; antialiased resizing is refused by name |
 | Ordering and selection | `argmax`, `argmin`, `max`/`min` with `dim` (values/indices), `sort` (values/indices), `topk` (values/indices, largest or smallest), each lowered per selected output |
-| Layout and data movement | View/reshape (including a rank-0 target), transpose/permute, slice, `split`/`chunk`/`unbind`, `squeeze` (including the all-axes form), expand, `repeat`/`tile`, `diagonal` and `unfold` as strided views, cat/stack, constant/reflect/replicate padding, flip/roll, clone, casts, `eye`, and static constants |
+| Layout and data movement | View/reshape (including a rank-0 target), transpose/permute, slice, `split`/`chunk`/`unbind` (including the elided-dimension spelling), `squeeze` (including the all-axes form), expand, `repeat`/`tile`, `diagonal` and `unfold` as strided views, cat/stack, constant/reflect/replicate padding, flip/roll, clone, casts, `eye`, `empty` (materialized as zeros, since Torch leaves its contents unspecified), and static constants |
 | Dtypes | FP16, BF16, FP32, bool, I32, and I64 where supported by the operation |
 | KV cache | Static-shape prefill/decode graph contracts and layout; allocation and paging remain external |
 
