@@ -77,6 +77,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.scatter.src`、`aten.scatter.value` | `scatter`，沿单个静态轴写入 tensor 或 scalar |
 | `aten.scatter_add.default` | `scatter`，`reduce=add` |
 | `aten.scatter_reduce.two` | `scatter`，`reduce` 取 `add`/`prod`/`amax`/`amin`/`mean` |
+| `aten.masked_scatter.default` | 组合 lowering：`cast` -> `cumsum` -> 减一 -> `clamp` -> `gather` -> `where`，mask 的先 `expand`/flatten；mask 的前缀和就是每个位置该取的第几个源元素 |
 | `aten.index_add.default` | `index_add`，1-D index 沿单个静态轴累加 |
 | `aten.scatter_.src`、`aten.scatter_.value`、`aten.scatter_add_.default`、`aten.scatter_reduce_.two`、`aten.index_add_.default` | 与对应的非原地形式共用一个 lowering，写之后没有读者时才做 SSA legalization |
 | `aten.add_.Tensor`/`aten.add_.Scalar`、`aten.sub_.Tensor`/`aten.sub_.Scalar`、`aten.mul_.Tensor`/`aten.mul_.Scalar`、`aten.div_.Tensor`/`aten.div_.Scalar`、`aten.remainder_.Tensor`/`aten.remainder_.Scalar`、`aten.bitwise_and_`/`bitwise_or_`/`bitwise_xor_`/`bitwise_not_.default`、`aten.logical_not_.default`、`aten.clamp_`/`clamp_min_`/`clamp_max_`（`default`/`Tensor`/`Scalar`） | 与对应的非原地形式完全同构；编译结果返回新值，不回写调用方持有的 tensor |
@@ -86,7 +87,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.transpose.int` | `transpose` |
 | `aten.permute.default` | `permute` |
 | `aten.expand.default` | `expand` |
-| `aten.slice.Tensor` | `slice` |
+| `aten.slice.Tensor` | `slice`；`dim`/`start`/`end`/`step` 的缺省按 ATen schema 补齐，trace 只写调用方真正传的那几个（`cumulative_trapezoid` 发的是三参数形式） |
 | `aten.select.int` | 在前端展开为单元素 `slice + squeeze` |
 | `aten.flip.default` | `flip` |
 | `aten.roll.default` | `roll` |
@@ -118,6 +119,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.var_mean.*`、`aten.std_mean.*`（`correction`/`dim`/`default` 三种拼法） | 拆成同一个 `var`/`std` 加一个共享 `dims`/`correction` 的 `mean`；图只读其中一个成员时，另一个不会发出来 |
 | `aten.linalg_vector_norm.default` | `vector_norm`，走 MLX，支持任意实数 `ord`、多轴与 `keepdim` |
 | `aten.dist.default` | 组合 lowering：`sub` 后接整条 tensor 的 `vector_norm`（`ord=p`），结果恒为 rank-0 标量，没有 `dim` 参数 |
+| `aten._cdist_forward.default` | 组合 lowering：两组点的 batch 前缀互相广播后各长出一条点轴，`sub` 出逐点差分，再用 `vector_norm` 归约特征轴；`p` 直接交给 `vector_norm`，`compute_mode` 不参与 |
 | `aten.repeat.default`（`Tensor.repeat`/`Tensor.tile`） | 展开成 `reshape -> expand -> reshape`，不生成 kernel |
 | `aten.native_layer_norm.default` | `layer_norm` 加按需展开的 `mean`/rstd 方差链 |
 | `aten.convolution.default` | `conv`，`stride`/`padding`/`dilation`/`groups`/`transposed`/`output_padding` 进入 attribute，weight/bias 作为普通输入；`transposed` 为真时 weight 是 Torch 的输入主序 `(in, out/groups, *kernel)` |
@@ -173,6 +175,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.tanh.default` | `tanh` |
 | `aten.relu.default` | `relu` |
 | `aten.leaky_relu.default` | `leaky_relu` |
+| `aten.rrelu_with_noise.default` | eval 态折成 `leaky_relu`，斜率取区间中点 `(lower + upper) / 2`；训练态逐元素采样斜率，点名算子拒绝 |
 | `aten.elu.default` | `elu`，保留 ATen 的 `alpha`/`scale`/`input_scale`（`selu` 就是 scale=1.0507 的形式） |
 | `aten.hardswish.default` | `hardswish` |
 | `aten.hardsigmoid.default` | `hardsigmoid` |
@@ -196,6 +199,8 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.trace.default` | 展开成 `reshape -> slice -> sum`，与 `diagonal` 同一个 strided view |
 | `aten._linalg_solve_ex.default`、`aten.linalg_solve.default` | `solve`；右操作数按 Torch 的规则区分向量与多列，batch 维单独广播 |
 | `aten.linalg_solve_triangular.default` | `solve_triangular`，保留 `upper`，`unitriangular` 时对角线换成 1 |
+| `aten.cholesky_solve.default` | 组合 lowering：`A = LLᵀ` 下的 `A⁻¹B` 就是两次 `solve_triangular`，第二次读转置后的 view；`upper=True` 时两步的角色对调 |
+| `aten.cholesky_inverse.default` | 组合 lowering：同样的两次 `solve_triangular`，右端换成 `arange` 相等造出的单位矩阵，并按 batch 前缀 `expand` |
 | `aten.linalg_inv_ex.default` | `inv` |
 | `aten._linalg_det.default` | `det` |
 | `aten._linalg_slogdet.default` | `slogdet_sign`、`slogdet_logabsdet`，按被读取的输出选择 |
