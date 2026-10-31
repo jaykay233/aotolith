@@ -15,6 +15,32 @@ from __future__ import annotations
 
 from ..ir import DType
 
+
+# Torch keeps the mutated spelling of an elementwise operator for the ops whose
+# ATen kernel has one: decomposing ``x.relu_()`` leaves ``aten.relu_`` in the
+# graph rather than ``relu`` followed by a ``copy_``. Each mutation means the
+# same arithmetic as its functional spelling, so the two share a core operator
+# and the write is just a rebinding in the graph the legalizer builds.
+_INPLACE_UNARY_OPS = {
+    "aten.relu_.default": "relu",
+    "aten.sigmoid_.default": "sigmoid",
+    "aten.tanh_.default": "tanh",
+    "aten.exp_.default": "exp",
+    "aten.expm1_.default": "expm1",
+    "aten.log_.default": "log",
+    "aten.log1p_.default": "log1p",
+    "aten.neg_.default": "neg",
+    "aten.abs_.default": "abs",
+    "aten.sqrt_.default": "sqrt",
+    "aten.rsqrt_.default": "rsqrt",
+    "aten.reciprocal_.default": "reciprocal",
+    "aten.floor_.default": "floor",
+    "aten.ceil_.default": "ceil",
+    "aten.round_.default": "round",
+    "aten.trunc_.default": "trunc",
+    "aten.erf_.default": "erf",
+}
+
 _SUPPORTED_OPS = {
     "aten.mm.default": "matmul",
     "aten.bmm.default": "matmul",
@@ -262,7 +288,7 @@ _SUPPORTED_OPS = {
     "aten.scatter.value": "scatter",
     "aten.scatter_add.default": "scatter",
     "aten.index_add.default": "index_add",
-}
+} | _INPLACE_UNARY_OPS
 
 
 _EMPTY_COPY_TARGETS = frozenset(
@@ -627,7 +653,7 @@ _INPLACE_TARGETS = {
     "aten.clamp_min_.Tensor",
     "aten.clamp_max_.default",
     "aten.clamp_max_.Tensor",
-}
+} | set(_INPLACE_UNARY_OPS)
 
 
 _CONSTANT_PAD_TARGET = "aten.constant_pad_nd.default"
@@ -640,6 +666,9 @@ _TRACE_TARGET = "aten.trace.default"
 
 
 _LOGSUMEXP_TARGET = "aten.logsumexp.default"
+
+
+_COPY_TARGET = "aten.copy_.default"
 
 
 _INPLACE_SCATTER_TARGETS = {
@@ -779,5 +808,6 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _CONV_TARGET,
         _SQUEEZE_ALL_TARGET,
         _UNFOLD_TARGET,
+        _COPY_TARGET,
     }
 )

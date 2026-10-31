@@ -6674,14 +6674,107 @@ def test_cosine_similarity_compiles_into_fused_pointwise_ops() -> None:
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_inplace_mul_rejects_an_aliasing_observer() -> None:
+def test_inplace_mul_keeps_reads_that_precede_the_write() -> None:
+    # ``observed`` is computed from the value *before* the write, so lowering the
+    # mutation as a new binding is faithful: only a reader placed after the
+    # write would see a stale value.
     def fn(value):
         observed = value + 1.0
         value.mul_(2.0)
         return observed + value
 
-    with pytest.raises(NotImplementedError, match="aliasing observer"):
-        compile_callable(fn, (torch.randn(3),))
+    values = torch.randn(3)
+    result = compile_callable(fn, (values,))
+    actual = result.plan(_torch_to_mlx(values))[0]
+    _assert_values_match(actual, fn(values))
+
+
+@pytest.mark.parametrize(
+    "apply",
+    [
+        lambda value: value.relu_(),
+        lambda value: value.sigmoid_(),
+        lambda value: value.tanh_(),
+        lambda value: value.exp_(),
+        lambda value: value.expm1_(),
+        lambda value: value.log_(),
+        lambda value: value.log1p_(),
+        lambda value: value.neg_(),
+        lambda value: value.abs_(),
+        lambda value: value.sqrt_(),
+        lambda value: value.rsqrt_(),
+        lambda value: value.reciprocal_(),
+        lambda value: value.floor_(),
+        lambda value: value.ceil_(),
+        lambda value: value.round_(),
+        lambda value: value.trunc_(),
+        lambda value: value.erf_(),
+    ],
+)
+def test_inplace_unary_spellings_match_torch(apply) -> None:
+    # Torch keeps the mutated spelling these ATen kernels have, so the unary
+    # table has to accept ``relu_`` and friends alongside ``relu``.
+    values = torch.tensor([-2.0, -0.5, 0.0, 0.5, 1.0, 2.5])
+    result = compile_callable(apply, (values,))
+    actual = result.plan(_torch_to_mlx(values))[0]
+    _assert_values_match(actual, apply(values.clone()))
+
+
+@pytest.mark.parametrize(
+    "apply",
+    [
+        lambda value: torch.nn.functional.silu(value, inplace=True),
+        lambda value: torch.nn.functional.hardsigmoid(value, inplace=True),
+        lambda value: torch.nn.functional.hardswish(value, inplace=True),
+        lambda value: torch.nn.functional.mish(value, inplace=True),
+        lambda value: torch.nn.functional.elu(value, inplace=True),
+        lambda value: torch.nn.functional.leaky_relu(value, inplace=True),
+        lambda value: torch.nn.functional.selu(value, inplace=True),
+        lambda value: torch.nn.functional.hardtanh(value, 0.0, 6.0, inplace=True),
+        lambda value: torch.ops.aten.gelu_(value),
+    ],
+)
+def test_inplace_activations_that_decompose_into_copy_match_torch(apply) -> None:
+    # These have no ``*_`` ATen kernel, so the decomposition computes the
+    # functional form and writes it back with ``copy_``, which legalizes into
+    # the same rebinding the arithmetic in-place ops use.
+    values = torch.tensor([-2.0, -0.5, 0.0, 0.5, 1.0, 2.5])
+    result = compile_callable(apply, (values,))
+    actual = result.plan(_torch_to_mlx(values))[0]
+    _assert_values_match(actual, apply(values.clone()))
+
+
+def test_fill_zero_and_masked_fill_mutations_match_torch() -> None:
+    values = torch.tensor([[-1.0, 2.0], [3.0, -4.0]])
+
+    def fill(value):
+        return value.fill_(2.5)
+
+    def zero(value):
+        value.zero_()
+        return value + 1.0
+
+    def masked(value):
+        return value.masked_fill_(value < 0.0, 0.0)
+
+    for fn in (fill, zero, masked):
+        result = compile_callable(fn, (values,))
+        actual = result.plan(_torch_to_mlx(values))[0]
+        _assert_values_match(actual, fn(values.clone()))
+
+
+def test_copy_mutation_casts_and_broadcasts_like_torch() -> None:
+    def narrow(value):
+        return value.copy_(value.to(torch.float16) * 3.0)
+
+    def broadcast(value):
+        return value.copy_(value.sum(dim=0))
+
+    values = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    for fn in (narrow, broadcast):
+        result = compile_callable(fn, (values,))
+        actual = result.plan(_torch_to_mlx(values))[0]
+        _assert_values_match(actual, fn(values.clone()))
 
 
 def test_boolean_mul_and_add_are_conjunction_and_disjunction() -> None:

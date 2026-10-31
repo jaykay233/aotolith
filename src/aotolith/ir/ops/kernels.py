@@ -314,8 +314,12 @@ CONTRACTS: dict[str, OpContract] = {
     "addmm": OpContract(
         arity=(3, 4), dtype=DtypeRule.ANY, shape=ShapeRule.FREE, native=True
     ),
+    # A fused region may also hold no graph inputs at all: a chain that starts
+    # from a constant producer (``x.zero_()`` fused into its consumer) is that
+    # constant evaluated elementwise, and the runtime materializes it from the
+    # shape it carries.
     "fused_elementwise": OpContract(
-        arity=(1, 8),
+        arity=(0, 8),
         rank=(0, 8),
         dtype=DtypeRule.ANY,
         shape=ShapeRule.FREE,

@@ -197,7 +197,9 @@ model = AutoModelForCausalLM.from_pretrained(
     model_id,
     dtype=torch.bfloat16,
 ).eval()
-prompt_ids = tokenizer.encode("Explain KV cache in one sentence", add_special_tokens=False)[:128]
+prompt_ids = tokenizer.encode(
+    "Explain KV cache in one sentence", add_special_tokens=False
+)[:128]
 
 runtime = compile_qwen2_static_cache(
     model,

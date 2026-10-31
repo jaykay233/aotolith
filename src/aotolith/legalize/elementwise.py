@@ -21,6 +21,7 @@ from .targets import (
     _BINARY_OPS,
     _BITWISE_BINARY_OPS,
     _COMPARISON_OPS,
+    _COPY_TARGET,
     _DIVIDE_ROUNDING_TARGETS,
     _FLOATING_DTYPES,
     _FLOAT_ONLY_POINTWISE_OPS,
@@ -610,10 +611,6 @@ def _operation_inputs(
         return tuple(inputs), attrs
 
     if op in {"leaky_relu", "elu"}:
-        allowed = {2} if op == "leaky_relu" else {2, 3, 4}
-        if len(args) not in allowed:
-            raise ValueError(f"{op} expects {allowed} arguments, got {len(args)}")
-        attrs: dict[str, object] = {}
         names = (
             ["negative_slope"]
             if op == "leaky_relu"
@@ -623,7 +620,21 @@ def _operation_inputs(
                 "input_scale",
             ]
         )
-        for name, argument in zip(names, args[1:]):
+        if len(args) > 1 + len(names):
+            raise ValueError(
+                f"{op} expects at most {1 + len(names)} arguments, got {len(args)}"
+            )
+        attrs: dict[str, object] = {}
+        # The functional spellings pass these positionally, while the in-place
+        # kernels keep the tuning constants as keywords, so both are read here.
+        arguments = dict(zip(names, args[1:]))
+        for name in names[len(arguments) :]:
+            if name in kwargs:
+                arguments[name] = kwargs[name]
+        for name in names:
+            if name not in arguments:
+                continue
+            argument = arguments[name]
             if not isinstance(argument, (int, float)) or isinstance(argument, bool):
                 raise ValueError(f"{op}.{name} must be a number, got {argument!r}")
             attrs[name] = float(argument)
@@ -954,8 +965,46 @@ def _lower_prelu(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_copy(lowering: Lowering, node: Any, target: str) -> bool:
+    """``copy_`` is the destination's value becoming the source's.
+
+    Torch casts and broadcasts the source into the destination, so the lowering
+    is those two operations and nothing else. Readers of the destination that
+    precede the write already saw the old value, and the tracer rebinds the
+    mutated name afterwards, so rebinding this node to the copied value is the
+    whole write.
+    """
+
+    _validate_inplace_legalization(node)
+    args = getattr(node, "args", ())
+    if len(args) < 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    destination_id = _argument_ids(args[0], lowering.node_ids)
+    source_id = _argument_ids(args[1], lowering.node_ids)
+    destination = lowering.values[destination_id].type
+    source = lowering.values[source_id].type
+    if source.dtype != destination.dtype:
+        source_id = lowering.emit(
+            "cast",
+            (source_id,),
+            {},
+            TensorType(source.shape, destination.dtype),
+        )
+        source = TensorType(source.shape, destination.dtype)
+    if source.shape != destination.shape:
+        source_id = lowering.emit(
+            "expand",
+            (source_id,),
+            {"shape": destination.shape},
+            TensorType(destination.shape, destination.dtype),
+        )
+    lowering.bind(node, source_id)
+    return True
+
+
 # The generic path has no target of its own: it is the fallback the loop calls
 # when no family claimed the node.
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _PRELU_TARGET: (_lower_prelu,),
+    _COPY_TARGET: (_lower_copy,),
 }

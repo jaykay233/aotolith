@@ -35,16 +35,47 @@ def _canonical_scatter_target(target: str) -> str:
 
 
 def _validate_inplace_legalization(node: object) -> None:
+    """Reject an in-place write that something reads after it.
+
+    Lowering rebinds the mutated node to the value the write produces, and the
+    node it wrote into keeps its old value. That is faithful to Torch as long as
+    every other reader of the destination sits *before* the write in the graph:
+    the loop lowers nodes in order, so those readers already captured the
+    pre-write value. A reader placed after the write (including the graph's
+    ``output``) would silently see the stale value instead, which is why it is
+    refused rather than miscompiled.
+
+    Torch's tracer rebinds the mutated name, so a program that keeps using the
+    tensor after ``x.relu_()`` reaches the graph as ``relu_(x)`` followed by
+    readers of that node rather than of ``x``.
+    """
+
     args = getattr(node, "args", ())
     if not args:
         raise ValueError("in-place operation has no input")
     source = args[0]
-    users = set(getattr(source, "users", ()))
-    if users != {node}:
+    observers = [user for user in getattr(source, "users", ()) if user is not node]
+    if not observers:
+        return
+    graph = getattr(node, "graph", None)
+    positions = {}
+    if graph is not None:
+        positions = {
+            candidate: position for position, candidate in enumerate(graph.nodes)
+        }
+    write_position = positions.get(node)
+    if write_position is None:
         raise NotImplementedError(
             "in-place operation has aliasing observers and cannot be lowered "
             f"safely: {getattr(node, 'target', '<unknown>')}"
         )
+    for observer in observers:
+        read_position = positions.get(observer)
+        if read_position is None or read_position >= write_position:
+            raise NotImplementedError(
+                "in-place operation is read after its write and cannot be "
+                f"lowered safely: {getattr(node, 'target', '<unknown>')}"
+            )
 
 
 def _embedding_operation(

@@ -267,14 +267,19 @@ def test_inplace_add_is_legalized_when_unobserved() -> None:
     assert mx.array_equal(actual, mx.array(expected.numpy()))
 
 
-def test_inplace_add_rejects_aliasing_observer() -> None:
+def test_inplace_add_keeps_reads_that_precede_the_write() -> None:
     def forward(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         observed = value + 1
         value.add_(1)
         return observed, value
 
-    with pytest.raises(NotImplementedError, match="aliasing observers"):
-        compile_callable(forward, (torch.arange(5, dtype=torch.float32),))
+    values = torch.arange(5, dtype=torch.float32)
+    compiled = compile_callable(forward, (values,))
+    expected = forward(values.clone())
+    actual = compiled.plan(mx.array(values.numpy()))
+    mx.eval(*actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert mx.allclose(got, mx.array(want.numpy()))
 
 
 def _run_single_output(compiled, *tensors: torch.Tensor) -> mx.array:
@@ -355,7 +360,7 @@ def test_inplace_scatter_reduce_is_legalized(reduce_name: str) -> None:
     assert mx.allclose(actual, mx.array(forward(value, indices, update).numpy()))
 
 
-def test_inplace_scatter_rejects_aliasing_observer() -> None:
+def test_inplace_scatter_keeps_reads_that_precede_the_write() -> None:
     def forward(
         value: torch.Tensor, indices: torch.Tensor, update: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -363,10 +368,16 @@ def test_inplace_scatter_rejects_aliasing_observer() -> None:
         mutated = value.index_add_(0, indices, update)
         return observed, mutated
 
-    with pytest.raises(NotImplementedError, match="aliasing observers"):
-        compile_callable(
-            forward, (torch.zeros(3), torch.tensor([0, 1]), torch.randn(2))
-        )
+    rows, columns = torch.zeros(3), torch.tensor([0, 1])
+    update = torch.tensor([1.0, 2.0])
+    compiled = compile_callable(forward, (rows, columns, update))
+    expected = forward(rows.clone(), columns, update)
+    actual = compiled.plan(
+        mx.array(rows.numpy()), mx.array(columns.numpy()), mx.array(update.numpy())
+    )
+    mx.eval(*actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert mx.allclose(got, mx.array(want.numpy()))
 
 
 def test_inplace_scatter_returns_the_update_without_writing_back() -> None:
