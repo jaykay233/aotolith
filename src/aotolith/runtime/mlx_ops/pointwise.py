@@ -528,10 +528,18 @@ def _mlx_digamma(value: mx.array) -> mx.array:
         return accumulated + mx.where(current == 10.0, _PSI_10, asymptotic)
 
     # The same reduction the Metal helper does: subtract the nearest integer so
-    # the angle is in [-0.5, 0.5] (exact by Sterbenz' lemma), and use cos/sin
-    # instead of 1/tan so the error stays relative at both ends.
+    # the angle is in [-0.5, 0.5] (exact by Sterbenz' lemma), then use the
+    # small-angle series for the cotangent. cos/sin would lose digits near a
+    # pole, where sin is tiny but carries the platform's absolute error.
     reduced = compute - mx.round(compute)
-    reflected = series(1.0 - compute) - pi * mx.cos(pi * reduced) / mx.sin(pi * reduced)
+    angle = pi * reduced
+    cubic = angle * angle
+    series_cot = 1.0 / angle - angle * (
+        1.0 / 3.0
+        + cubic * (1.0 / 45.0 + cubic * (2.0 / 945.0 + cubic * (1.0 / 4725.0)))
+    )
+    cot = mx.where(mx.abs(angle) < 0.25, series_cot, mx.cos(angle) / mx.sin(angle))
+    reflected = series(1.0 - compute) - pi * cot
     negative = compute < 0.0
     # ATen reports NaN at the negative integers, where the reflection terms
     # disagree. It is evaluated eagerly here and selected away, so the tan pole

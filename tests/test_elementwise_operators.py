@@ -71,13 +71,17 @@ def test_the_family_matches_pytorch(call) -> None:
 
 
 @pytest.mark.parametrize(
-    "call",
+    ("call", "rtol"),
     [
-        pytest.param(lambda v: torch.tan(v + 1.0), id="tan"),
-        pytest.param(lambda v: torch.atan(v * 2.0), id="atan"),
+        # tan's condition number is 1 + tan^2, so a single-precision argument
+        # reduction - which is all a GPU's `tan` has - moves a large tangent by
+        # tens of ulps even though the input is bit-identical. atan's
+        # derivative is at most one, so the same tolerance stays at 2e-6.
+        pytest.param(lambda v: torch.tan(v + 1.0), 1e-4, id="tan"),
+        pytest.param(lambda v: torch.atan(v * 2.0), 2e-6, id="atan"),
     ],
 )
-def test_the_family_fuses_like_any_other_pointwise_operator(call) -> None:
+def test_the_family_fuses_like_any_other_pointwise_operator(call, rtol) -> None:
     # The arithmetic around the operator joins the same region, so the whole
     # expression is one kernel rather than three.
     torch.manual_seed(3)
@@ -87,7 +91,7 @@ def test_the_family_fuses_like_any_other_pointwise_operator(call) -> None:
 
     assert [op.op for op in compiled.lowered_graph.ops] == ["fused_elementwise"]
     assert bool(
-        mx.allclose(actual, mx.array(call(value).numpy()), atol=2e-6, rtol=2e-6)
+        mx.allclose(actual, mx.array(call(value).numpy()), atol=2e-6, rtol=rtol)
     )
 
 

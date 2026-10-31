@@ -1249,10 +1249,12 @@ def _lower_empty(lowering: Lowering, node: Any, target: str) -> bool:
 def _lower_ldexp(lowering: Lowering, node: Any, target: str) -> bool:
     """``ldexp(x, e)`` is ``x * 2**e``, so the exponent becomes a scale.
 
-    The exponent is cast to the result dtype before the power: ``2.0 ** k`` is
-    exact for every integer ``k`` a float can represent, and the exponent is an
-    integer tensor by definition, so the cast loses nothing and keeps the power
-    a float one.
+    The exponent is cast to the result dtype and fed to ``exp2``: that is exact
+    for every integer ``k`` a float can represent, and the exponent is an
+    integer tensor by definition, so the cast loses nothing. ``pow(2.0, k)``
+    would be the same arithmetic on a correctly rounded libm, but GPUs compute
+    it with a fast path that can land an ulp off ``2**k`` - which then rounds
+    the product too, so ``ldexp`` stopped being the exact scaling it promises.
     """
 
     args = getattr(node, "args", ())
@@ -1270,10 +1272,7 @@ def _lower_ldexp(lowering: Lowering, node: Any, target: str) -> bool:
             TensorType(exponent_type.shape, output_type.dtype),
         )
         exponent_type = TensorType(exponent_type.shape, output_type.dtype)
-    two_id = lowering.emit(
-        "scalar_tensor", (), {"value": 2.0}, TensorType((), output_type.dtype)
-    )
-    scale_id = lowering.emit("pow", (two_id, exponent_id), {}, exponent_type)
+    scale_id = lowering.emit("exp2", (exponent_id,), {}, exponent_type)
     lowering.bind(node, lowering.emit("mul", (value_id, scale_id), {}, output_type))
     return True
 

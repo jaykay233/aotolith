@@ -336,6 +336,24 @@ inline float tsc_digamma_series(float value) {
     return accumulated + metal::log(x) - 0.5f / x - series;
 }
 
+inline float tsc_cot(float angle) {
+    // cot(x) = 1/x - x/3 - x^3/45 - 2x^5/945 - ...
+    //
+    // Near a multiple of pi the hardware sin has an *absolute* error of about
+    // an ulp of one, and sin(x) itself is tiny there, so cos/sin loses that
+    // many digits of a large cotangent. The series keeps the result relative:
+    // dividing by the angle is exact, and the correction terms are small.
+    float magnitude = metal::abs(angle);
+    if (magnitude < 0.25f) {
+        float square = angle * angle;
+        return 1.0f / angle - angle * (1.0f / 3.0f
+            + square * (1.0f / 45.0f
+            + square * (2.0f / 945.0f
+            + square * (1.0f / 4725.0f))));
+    }
+    return metal::cos(angle) / metal::sin(angle);
+}
+
 inline float tsc_digamma(float value) {
     const float pi = 3.14159265358979323846f;
     if (metal::isnan(value)) {
@@ -354,12 +372,11 @@ inline float tsc_digamma(float value) {
         }
         // Reflection: psi(x) = psi(1 - x) - pi * cot(pi x). The fractional part
         // is reduced to [-0.5, 0.5] by subtracting the nearest integer, which
-        // is exact by Sterbenz' lemma; evaluating tan(pi * r) at a fractional
-        // part close to +-1 is not. cot is written as cos/sin rather than
-        // 1/tan so the error stays relative at both ends of the reduced range.
+        // is exact by Sterbenz' lemma; evaluating the cotangent at a fractional
+        // part close to +-1 is not. ``tsc_cot`` takes the small-angle branch
+        // when the reduced angle is near zero, which is exactly the pole case.
         float reduced = value - metal::rint(value);
-        return tsc_digamma_series(1.0f - value)
-            - pi * metal::cos(pi * reduced) / metal::sin(pi * reduced);
+        return tsc_digamma_series(1.0f - value) - pi * tsc_cot(pi * reduced);
     }
     return tsc_digamma_series(value);
 }
