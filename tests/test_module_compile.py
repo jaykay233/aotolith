@@ -575,7 +575,9 @@ def test_a_none_leaf_in_the_output_is_dropped() -> None:
 
     with torch.no_grad():
         expected = module(query, key, key, need_weights=False)[0]
-    compiled = compile_module(module, (query, key, key), example_kwargs={"need_weights": False})
+    compiled = compile_module(
+        module, (query, key, key), example_kwargs={"need_weights": False}
+    )
     actual = compiled(
         mx.array(query.numpy()), mx.array(key.numpy()), mx.array(key.numpy())
     )

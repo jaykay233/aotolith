@@ -37,6 +37,7 @@ from .targets import (
     _PRELU_TARGET,
     _PROMOTABLE_POINTWISE_OPS,
     _REDUCTION_OPS,
+    _RRELU_TARGET,
     _SUPPORTED_OPS,
     _TORCH_DTYPES,
 )
@@ -358,10 +359,18 @@ def _operation_inputs(
         )
 
     if op == "slice":
-        if len(args) not in {4, 5}:
-            raise ValueError(f"slice expects four or five arguments, got {len(args)}")
-        input_id, dim, start, end = args[:4]
-        step = args[4] if len(args) == 5 else 1
+        # ``aten.slice.Tensor`` defaults ``dim``, ``start``, ``end`` and
+        # ``step``, and a trace may fill in only some of them:
+        # ``torch.cumulative_trapezoid`` emits the three-argument form
+        # ``(self, dim, start)``. Read the defaults here rather than refusing a
+        # spelling the schema allows.
+        if not 2 <= len(args) <= 5:
+            raise ValueError(f"slice expects two to five arguments, got {len(args)}")
+        input_id = args[0]
+        dim = args[1] if len(args) > 1 else 0
+        start = args[2] if len(args) > 2 else None
+        end = args[3] if len(args) > 3 else None
+        step = args[4] if len(args) > 4 else 1
         if not isinstance(dim, int) or isinstance(dim, bool):
             raise ValueError(f"slice.dim must be an integer, got {dim!r}")
         if start is not None and (
@@ -1230,6 +1239,60 @@ def _lower_inplace_matrix_transpose(lowering: Lowering, node: Any, target: str) 
     return True
 
 
+def _lower_rrelu(lowering: Lowering, node: Any, target: str) -> bool:
+    """RReLU in eval mode is a leaky ReLU with the midpoint slope.
+
+    ATen samples one slope per element from ``[lower, upper)`` while training,
+    so the traced ``rrelu_with_noise`` call carries a noise tensor to write into
+    and a plan has nothing to sample with. In eval mode the slope is fixed at
+    ``(lower + upper) / 2`` for the whole tensor and no noise is drawn, which is
+    the ``leaky_relu`` operator exactly; the noise argument is the fresh
+    allocation that call adds, and nothing reads it.
+    """
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if not args:
+        raise ValueError(f"{target} expects an input tensor")
+
+    def argument(position: int, name: str, default: Any) -> Any:
+        if len(args) > position:
+            return args[position]
+        return kwargs.get(name, default)
+
+    lower = argument(2, "lower", 0.125)
+    upper = argument(3, "upper", 1.0 / 3.0)
+    training = argument(4, "training", False)
+    for name, value in (("lower", lower), ("upper", upper)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise NotImplementedError(
+                f"{target}.{name} is a {type(value).__name__}, not a number; a "
+                "slope read from a tensor has no place in a static plan"
+            )
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"{target}.{name} must lie in [0, 1], got {value!r}")
+    if not isinstance(training, bool):
+        raise ValueError(f"{target}.training must be a boolean, got {training!r}")
+    if training:
+        raise NotImplementedError(
+            "RReLU samples a slope per element while training "
+            f"({target} with training=True), and a plan holds no RNG state: "
+            "replaying it would return the slopes tracing happened to draw. "
+            "Switch the module to eval() - the slope is then the midpoint of "
+            "the range - or use LeakyReLU with a fixed slope"
+        )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "leaky_relu",
+            (_argument_ids(args[0], lowering.node_ids),),
+            {"negative_slope": (float(lower) + float(upper)) / 2.0},
+            _node_type(node),
+        ),
+    )
+    return True
+
+
 def _lower_empty(lowering: Lowering, node: Any, target: str) -> bool:
     """``empty`` allocates a buffer and promises nothing about its contents.
 
@@ -1291,6 +1354,7 @@ def _cast_to(lowering: Lowering, value_id: str, output_type: TensorType) -> str:
 # when no family claimed the node.
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     _PRELU_TARGET: (_lower_prelu,),
+    _RRELU_TARGET: (_lower_rrelu,),
     _COPY_TARGET: (_lower_copy,),
     **{target: (_lower_eye,) for target in _EYE_TARGETS},
     **{target: (_lower_empty,) for target in _EMPTY_TARGETS},

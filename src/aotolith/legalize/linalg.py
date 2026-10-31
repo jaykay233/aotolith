@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import operator
 from typing import Any
-from ..ir import Operation, TensorType, Value
+from ..ir import DType, Operation, TensorType, Value
+from ..shapes import broadcast_shapes
 from .fx import _node_type
 from .state import Lowering
 from .state import Handler
@@ -24,6 +25,9 @@ from .refs import _argument_ids
 from .targets import (
     _ADDBMM_TARGET,
     _ADDMV_TARGET,
+    _CDIST_TARGET,
+    _CHOLESKY_INVERSE_TARGET,
+    _CHOLESKY_SOLVE_TARGET,
     _DIAGONAL_COPY_TARGET,
     _DIAGONAL_TARGET,
     _LINALG_CHECK_TARGET,
@@ -539,6 +543,252 @@ def _lower_linalg(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _transposed_factor(
+    lowering: Lowering, factor_id: str, factor_type: TensorType
+) -> str:
+    """The factor with its matrix axes swapped, as a view.
+
+    ``solve_triangular`` at runtime reads the triangle it is told and nothing
+    else: the transposed-operand flag ATen used to carry is gone by the time a
+    graph reaches here, and the frontend expresses it as a ``transpose`` node
+    instead. The Cholesky solves below need the same thing, so they emit it
+    too.
+    """
+
+    rank = len(factor_type.shape)
+    return lowering.emit(
+        "transpose",
+        (factor_id,),
+        {"dim0": rank - 2, "dim1": rank - 1},
+        factor_type,
+    )
+
+
+def _triangular_solves(
+    lowering: Lowering,
+    node: Any,
+    factor_id: str,
+    factor_type: TensorType,
+    right_id: str,
+    upper: bool,
+    output_type: TensorType,
+) -> str:
+    """Solve ``A x = b`` for ``A`` given through its Cholesky factor.
+
+    ``upper`` false is the lower factor of ``A = L Lᵀ``, so the two steps are
+    ``L y = b`` and then ``Lᵀ x = y``, the second one reading the transposed
+    factor as an upper triangle; the upper factor swaps the roles. Both steps
+    are the ``solve_triangular`` operator the frontend already has, so nothing
+    new runs on the device.
+    """
+
+    transposed_id = _transposed_factor(lowering, factor_id, factor_type)
+    if upper:
+        first_factor, second_factor, second_upper = transposed_id, factor_id, True
+    else:
+        first_factor, second_factor, second_upper = factor_id, transposed_id, True
+    first = lowering.emit(
+        "solve_triangular",
+        (first_factor, right_id),
+        {"upper": False, "unit_diagonal": False, "transpose": False},
+        output_type,
+    )
+    return lowering.emit(
+        "solve_triangular",
+        (second_factor, first),
+        {"upper": second_upper, "unit_diagonal": False, "transpose": False},
+        output_type,
+    )
+
+
+def _lower_cholesky_solve(lowering: Lowering, node: Any, target: str) -> bool:
+    """``cholesky_solve(B, L)`` is two triangular solves against the factor.
+
+    ATen answers ``A⁻¹B`` where ``A = L Lᵀ`` (or ``UᵀU`` when ``upper`` is set),
+    which is exactly what solving the two triangular systems does, so the
+    right-hand side never has to be inverted or re-factored.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) < 2:
+        raise ValueError(f"{target} expects a right-hand side and a factor")
+    upper = _argument(node, 2, "upper", False)
+    if not isinstance(upper, bool):
+        raise ValueError(f"{target}.upper must be a boolean, got {upper!r}")
+    right_id = _argument_ids(args[0], lowering.node_ids)
+    factor_id = _argument_ids(args[1], lowering.node_ids)
+    lowering.bind(
+        node,
+        _triangular_solves(
+            lowering,
+            node,
+            factor_id,
+            _node_type(args[1]),
+            right_id,
+            upper,
+            _node_type(node),
+        ),
+    )
+    return True
+
+
+def _lower_cholesky_inverse(lowering: Lowering, node: Any, target: str) -> bool:
+    """``cholesky_inverse(L)`` is ``cholesky_solve`` against an identity.
+
+    Reading the inverse off the factor is what ATen's ``potri`` does, so the
+    same two triangular solves answer it; the identity is the equality of two
+    ranges, the expression ``eye`` already lowers to, expanded over the batch
+    axes the factor carries.
+    """
+
+    args = getattr(node, "args", ())
+    if not args:
+        raise ValueError(f"{target} expects a Cholesky factor")
+    upper = _argument(node, 1, "upper", False)
+    if not isinstance(upper, bool):
+        raise ValueError(f"{target}.upper must be a boolean, got {upper!r}")
+    factor_node = args[0]
+    factor_type = _node_type(factor_node)
+    shape = factor_type.shape
+    if len(shape) < 2:
+        raise ValueError(f"{target} requires a matrix factor, got shape {shape}")
+    rows, columns = shape[-2:]
+    if rows != columns:
+        raise ValueError(f"{target} requires a square factor, got {rows}x{columns}")
+    factor_id = _argument_ids(factor_node, lowering.node_ids)
+    dtype = factor_type.dtype
+
+    row_id = lowering.emit(
+        "arange",
+        (),
+        {"start": 0, "end": rows, "step": 1},
+        TensorType((rows,), DType.I32),
+    )
+    column_id = lowering.emit(
+        "arange",
+        (),
+        {"start": 0, "end": columns, "step": 1},
+        TensorType((columns,), DType.I32),
+    )
+    rows_id = lowering.emit(
+        "unsqueeze", (row_id,), {"dim": 1}, TensorType((rows, 1), DType.I32)
+    )
+    diagonal_id = lowering.emit(
+        "eq", (rows_id, column_id), {}, TensorType((rows, columns), DType.BOOL)
+    )
+    identity_id = lowering.emit(
+        "cast", (diagonal_id,), {}, TensorType((rows, columns), dtype)
+    )
+    if shape[:-2]:
+        identity_id = lowering.emit(
+            "expand", (identity_id,), {"shape": shape}, TensorType(shape, dtype)
+        )
+    lowering.bind(
+        node,
+        _triangular_solves(
+            lowering,
+            node,
+            factor_id,
+            factor_type,
+            identity_id,
+            upper,
+            _node_type(node),
+        ),
+    )
+    return True
+
+
+def _lower_cdist(lowering: Lowering, node: Any, target: str) -> bool:
+    """``cdist`` is the p-norm of every pairwise difference.
+
+    The two operand batches broadcast against each other, each point grows a
+    singleton axis for the other side's points, and the norm reduces the
+    feature axis that is left. ``vector_norm`` already carries the general
+    order rules - ``0`` counts the entries that differ, ``±inf`` take the
+    extremum, anything else is the p-th root of the power sum - so no order is
+    special-cased here. The pairwise difference is materialized, which is the
+    same cost ATen's non-matrix-product path pays.
+    """
+
+    args = getattr(node, "args", ())
+    if len(args) < 2:
+        raise ValueError(f"{target} expects two point sets")
+    order = _argument(node, 2, "p", 2.0)
+    if not isinstance(order, (int, float)) or isinstance(order, bool):
+        raise ValueError(f"{target}.p must be a number, got {order!r}")
+    compute_mode = _argument(node, 3, "compute_mode", None)
+    if compute_mode not in (None, 0, 1, 2):
+        raise ValueError(
+            f"{target}.compute_mode must be None, 0, 1 or 2, got {compute_mode!r}"
+        )
+    left_node, right_node = args[0], args[1]
+    left_type = _node_type(left_node)
+    right_type = _node_type(right_node)
+    if len(left_type.shape) < 2 or len(right_type.shape) < 2:
+        raise ValueError(
+            f"{target} requires a point axis and a feature axis, got shapes "
+            f"{left_type.shape} and {right_type.shape}"
+        )
+    if left_type.dtype != right_type.dtype:
+        raise ValueError(
+            f"{target} operands must share a dtype, got {left_type.dtype.value} "
+            f"and {right_type.dtype.value}"
+        )
+    if left_type.shape[-1] != right_type.shape[-1]:
+        raise ValueError(
+            f"{target} feature axes differ: {left_type.shape[-1]} and "
+            f"{right_type.shape[-1]}"
+        )
+
+    dtype = left_type.dtype
+    left_batch, right_batch = left_type.shape[:-2], right_type.shape[:-2]
+    left_points, right_points = left_type.shape[-2], right_type.shape[-2]
+    features = left_type.shape[-1]
+    batch_rank = max(len(left_batch), len(right_batch))
+
+    def paired(
+        prefix: tuple[int, ...], points: int, on_the_left: bool
+    ) -> tuple[int, ...]:
+        padded = (1,) * (batch_rank - len(prefix)) + prefix
+        return padded + (
+            (points, 1, features) if on_the_left else (1, points, features)
+        )
+
+    left_shape = paired(left_batch, left_points, True)
+    right_shape = paired(right_batch, right_points, False)
+    left_id = _argument_ids(left_node, lowering.node_ids)
+    right_id = _argument_ids(right_node, lowering.node_ids)
+    if left_shape != left_type.shape:
+        left_id = lowering.emit(
+            "reshape", (left_id,), {"shape": left_shape}, TensorType(left_shape, dtype)
+        )
+    if right_shape != right_type.shape:
+        right_id = lowering.emit(
+            "reshape",
+            (right_id,),
+            {"shape": right_shape},
+            TensorType(right_shape, dtype),
+        )
+    difference_shape = broadcast_shapes((left_shape, right_shape))
+    difference_id = lowering.emit(
+        "sub", (left_id, right_id), {}, TensorType(difference_shape, dtype)
+    )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "vector_norm",
+            (difference_id,),
+            {
+                "ord": float(order),
+                "dims": (len(difference_shape) - 1,),
+                "keepdim": False,
+            },
+            _node_type(node),
+        ),
+    )
+    return True
+
+
 def _lower_linalg_check(lowering: Lowering, node: Any, target: str) -> bool:
     """``_linalg_check_errors`` raises on a singular operand and returns nothing.
 
@@ -859,6 +1109,9 @@ HANDLERS: dict[str, tuple[Handler, ...]] = {
     _DIAGONAL_TARGET: (_lower_diagonal,),
     _DIAGONAL_COPY_TARGET: (_lower_diagonal,),
     _LINALG_CHECK_TARGET: (_lower_linalg_check,),
+    _CHOLESKY_SOLVE_TARGET: (_lower_cholesky_solve,),
+    _CHOLESKY_INVERSE_TARGET: (_lower_cholesky_inverse,),
+    _CDIST_TARGET: (_lower_cdist,),
     _ADDBMM_TARGET: (_lower_addbmm,),
     _ADDMV_TARGET: (_lower_addmv,),
     _TRILINEAR_TARGET: (_lower_trilinear,),

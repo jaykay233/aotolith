@@ -19,6 +19,7 @@ from .targets import (
     _HISTC_TARGET,
     _INDEX_ADD_TARGET,
     _INDEX_PUT_TARGETS,
+    _MASKED_SCATTER_TARGET,
     _SEARCHSORTED_TARGETS,
     _INPLACE_SCATTER_TARGETS,
     _SCATTER_ADD_TARGET,
@@ -823,6 +824,135 @@ def _lower_histc(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_masked_scatter(lowering: Lowering, node: Any, target: str) -> bool:
+    """``masked_scatter`` copies ``source`` into the masked positions in order.
+
+    ATen consumes the source as a flat sequence, handing the n-th element to
+    the n-th position the mask selects (row-major). The running count of the
+    mask is exactly that n, so the count scan answers which source element each
+    position takes; a gather brings it in and a select keeps it only where the
+    mask is set. Unselected positions scan a count of zero or of the full
+    total, so the gathered index is clamped into range and discarded - a
+    position the mask never reaches cannot read past the source.
+
+    The source must hold at least as many elements as the mask selects, which
+    ATen checks at run time and a static plan cannot; a shorter source answers
+    the clamped last element instead of raising.
+    """
+
+    args = getattr(node, "args", ())
+    kwargs = getattr(node, "kwargs", {})
+    if len(args) < 3:
+        raise ValueError(f"{target} expects a mask and a source, got {len(args)}")
+    self_node, mask_node, source_node = args[0], args[1], args[2]
+    if kwargs:
+        raise ValueError(
+            f"{target} received unsupported keyword arguments: {sorted(kwargs)}"
+        )
+    self_type = _node_type(self_node)
+    mask_type = _node_type(mask_node)
+    source_type = _node_type(source_node)
+    if mask_type.dtype != DType.BOOL:
+        raise ValueError(
+            f"{target} mask must be a bool tensor, got {mask_type.dtype.value}"
+        )
+    if source_type.dtype != self_type.dtype:
+        raise ValueError(
+            f"{target} source dtype {source_type.dtype.value} does not match "
+            f"the destination's {self_type.dtype.value}"
+        )
+    if len(mask_type.shape) > len(self_type.shape) or not can_broadcast(
+        mask_type.shape, self_type.shape
+    ):
+        raise ValueError(
+            f"{target} mask shape {mask_type.shape} does not broadcast to "
+            f"{self_type.shape}"
+        )
+    elements = 1
+    for size in self_type.shape:
+        elements *= size
+    available = 1
+    for size in source_type.shape:
+        available *= size
+    if available <= 0:
+        raise ValueError(f"{target} source is empty")
+    dtype = self_type.dtype
+
+    self_id = _argument_ids(self_node, lowering.node_ids)
+    mask_id = _argument_ids(mask_node, lowering.node_ids)
+    source_id = _argument_ids(source_node, lowering.node_ids)
+
+    # The mask may be a broadcast view of the destination (a single row against
+    # a batch, say), so it is widened first: the scan below indexes positions,
+    # and a position is only meaningful against the full shape.
+    if mask_type.shape != self_type.shape:
+        mask_id = lowering.emit(
+            "expand",
+            (mask_id,),
+            {"shape": self_type.shape},
+            TensorType(self_type.shape, DType.BOOL),
+        )
+    if source_type.shape != (available,):
+        source_id = lowering.emit(
+            "reshape",
+            (source_id,),
+            {"shape": (available,)},
+            TensorType((available,), dtype),
+        )
+    self_id = lowering.emit(
+        "reshape",
+        (self_id,),
+        {"shape": (elements,)},
+        TensorType((elements,), dtype),
+    )
+    mask_id = lowering.emit(
+        "reshape",
+        (mask_id,),
+        {"shape": (elements,)},
+        TensorType((elements,), DType.BOOL),
+    )
+    counted_id = lowering.emit(
+        "cast", (mask_id,), {}, TensorType((elements,), DType.I32)
+    )
+    scanned_id = lowering.emit(
+        "cumsum",
+        (counted_id,),
+        {"dim": 0},
+        TensorType((elements,), DType.I32),
+    )
+    position_id = lowering.emit(
+        "sub",
+        (scanned_id,),
+        {"scalar": 1, "scalar_position": "rhs"},
+        TensorType((elements,), DType.I32),
+    )
+    bounded_id = lowering.emit(
+        "clamp",
+        (position_id,),
+        {"min": 0, "max": available - 1},
+        TensorType((elements,), DType.I32),
+    )
+    gathered_id = lowering.emit(
+        "gather",
+        (source_id, bounded_id),
+        {"dim": 0},
+        TensorType((elements,), dtype),
+    )
+    chosen_id = lowering.emit(
+        "where",
+        (mask_id, gathered_id, self_id),
+        {},
+        TensorType((elements,), dtype),
+    )
+    lowering.bind(
+        node,
+        lowering.emit(
+            "reshape", (chosen_id,), {"shape": self_type.shape}, _node_type(node)
+        ),
+    )
+    return True
+
+
 def _checked_in_place(handler: Handler) -> Handler:
     """Guard an in-place target with the mutation rule.
 
@@ -851,6 +981,7 @@ _BY_CANONICAL: dict[str, tuple[Handler, ...]] = {
     },
     **{target: (_lower_searchsorted,) for target in _SEARCHSORTED_TARGETS},
     _HISTC_TARGET: (_lower_histc,),
+    _MASKED_SCATTER_TARGET: (_lower_masked_scatter,),
 }
 
 HANDLERS: dict[str, tuple[Handler, ...]] = {

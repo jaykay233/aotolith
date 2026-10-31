@@ -540,6 +540,14 @@ values being placed come first.
 _HISTC_TARGET = "aten.histc.default"
 
 
+_MASKED_SCATTER_TARGET = "aten.masked_scatter.default"
+"""``masked_scatter``, which fills the mask's positions from a flat source.
+
+There is no dedicated operator for it: the running count of the mask says which
+source element each position takes, so the lowering is a scan, a gather and a
+select."""
+
+
 _INDEX_PUT_TARGETS = {
     "aten.index_put.default": False,
     "aten.index_put_.default": True,
@@ -571,6 +579,12 @@ _LOGSIGMOID_TARGET = "aten.log_sigmoid_forward.default"
 
 
 _PRELU_TARGET = "aten._prelu_kernel.default"
+
+
+_RRELU_TARGET = "aten.rrelu_with_noise.default"
+"""RReLU. In eval mode its slope is fixed at the midpoint of ATen's range, so it
+is a leaky ReLU; while training each element samples its own slope, which a
+static plan cannot reproduce."""
 
 
 _NANSUM_TARGET = "aten.nansum.default"
@@ -679,6 +693,25 @@ lowering covers all six spellings; Torch itself decomposes ``std_mean`` into
 
 
 _DIST_TARGET = "aten.dist.default"
+
+
+_CHOLESKY_SOLVE_TARGET = "aten.cholesky_solve.default"
+"""``cholesky_solve``, which the graph keeps because it is two triangular solves
+rather than a factorization.
+
+Torch has no decomposition for it, so the target arrives as written and the
+lowering expands it against the ``solve_triangular`` operator."""
+
+
+_CHOLESKY_INVERSE_TARGET = "aten.cholesky_inverse.default"
+"""``cholesky_inverse``, the same two solves against an identity."""
+
+
+_CDIST_TARGET = "aten._cdist_forward.default"
+"""``cdist``, a pairwise p-norm.
+
+``torch.cdist`` writes this target; the public spelling only chooses the
+``compute_mode`` the kernel would use, and the norm itself is the same."""
 
 
 _ADDBMM_TARGET = "aten.addbmm.default"
@@ -912,7 +945,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)
     | set(_SEARCHSORTED_TARGETS)
-    | {_HISTC_TARGET}
+    | {_HISTC_TARGET, _MASKED_SCATTER_TARGET}
     | {
         _SELECT_TARGET,
         _INDEX_TARGET,
@@ -924,6 +957,7 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _INDEX_ADD_TARGET,
         _LOGSIGMOID_TARGET,
         _PRELU_TARGET,
+        _RRELU_TARGET,
         _NANSUM_TARGET,
         _REPEAT_TARGET,
         _DIAGONAL_TARGET,
@@ -941,6 +975,9 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
         _COPY_TARGET,
         _LINALG_CHECK_TARGET,
         _DIST_TARGET,
+        _CHOLESKY_SOLVE_TARGET,
+        _CHOLESKY_INVERSE_TARGET,
+        _CDIST_TARGET,
         _ADDBMM_TARGET,
         _ADDMV_TARGET,
         _TRILINEAR_TARGET,

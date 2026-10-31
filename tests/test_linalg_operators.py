@@ -231,3 +231,91 @@ def test_every_factorization_spelling_is_kept_from_decomposition() -> None:
     # targets were not kept, which operator the frontend sees would depend on
     # the direction that rule happens to go.
     assert set(_LINALG_RESULTS) <= NATIVE_TARGETS
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_matches_pytorch(system, upper) -> None:
+    # ``cholesky_solve`` answers ``A⁻¹B`` from the factor of ``A``; the lowering
+    # runs the two triangular solves that definition spells out, so the plan
+    # reads the same operator ``solve_triangular`` already is.
+    factor = torch.linalg.cholesky(system)
+    if upper:
+        factor = factor.T.contiguous()
+    rhs = torch.randn(4, 3)
+    call = lambda b, l: torch.cholesky_solve(b, l, upper=upper)  # noqa: E731
+    compiled, actual = _plan(call, rhs, factor)
+    _assert_close(np.asarray(actual[0], dtype=np.float64), call(rhs, factor).numpy())
+    assert [op.op for op in compiled.lowered_graph.ops] == [
+        "transpose",
+        "solve_triangular",
+        "solve_triangular",
+    ]
+
+
+def test_cholesky_solve_broadcasts_a_batched_factor(system) -> None:
+    factor = torch.linalg.cholesky(system)
+    factors = torch.stack([factor, factor * 2.0])
+    rhs = torch.randn(2, 4, 3)
+    _, actual = _plan(torch.cholesky_solve, rhs, factors)
+    _assert_close(
+        np.asarray(actual[0], dtype=np.float64),
+        torch.cholesky_solve(rhs, factors).numpy(),
+    )
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_inverse_matches_pytorch(system, upper) -> None:
+    # ``potri``'s answer, read off the factor: the same two solves with an
+    # identity right-hand side.
+    factor = torch.linalg.cholesky(system)
+    if upper:
+        factor = factor.T.contiguous()
+    call = lambda l: torch.cholesky_inverse(l, upper=upper)  # noqa: E731
+    _, actual = _plan(call, factor)
+    _assert_close(np.asarray(actual[0], dtype=np.float64), call(factor).numpy())
+
+
+def test_cholesky_inverse_builds_the_identity_over_the_batch_axes(system) -> None:
+    factor = torch.linalg.cholesky(system)
+    factors = torch.stack([factor, factor * 3.0])
+    _, actual = _plan(torch.cholesky_inverse, factors)
+    _assert_close(
+        np.asarray(actual[0], dtype=np.float64),
+        torch.cholesky_inverse(factors).numpy(),
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param(0.0, id="zero-norm"),
+        pytest.param(1.0, id="manhattan"),
+        pytest.param(2.0, id="euclidean"),
+        pytest.param(3.0, id="general-p"),
+        pytest.param(float("inf"), id="maximum"),
+    ],
+)
+def test_cdist_matches_pytorch(order) -> None:
+    # ``cdist`` is the p-norm of every pairwise difference, so each order is the
+    # same lowering with a different exponent - including the 0-"norm", which
+    # counts the entries that differ.
+    torch.manual_seed(23)
+    left = torch.randn(3, 5)
+    right = torch.randn(4, 5)
+    call = lambda a, b: torch.cdist(a, b, order)  # noqa: E731
+    compiled, actual = _plan(call, left, right)
+    expected = call(left, right)
+    assert actual[0].shape == expected.shape
+    _assert_close(np.asarray(actual[0], dtype=np.float64), expected.numpy())
+    assert "vector_norm" in [op.op for op in compiled.lowered_graph.ops]
+
+
+def test_cdist_broadcasts_the_point_set_batches() -> None:
+    torch.manual_seed(25)
+    left = torch.randn(2, 3, 5)
+    right = torch.randn(4, 5)  # one set of points against a batch of the other
+    call = lambda a, b: torch.cdist(a, b)  # noqa: E731
+    _, actual = _plan(call, left, right)
+    expected = call(left, right)
+    assert actual[0].shape == expected.shape
+    _assert_close(np.asarray(actual[0], dtype=np.float64), expected.numpy())

@@ -10,6 +10,7 @@ import torch
 from aotolith import (
     compile_callable,
     compile_graph,
+    compile_module,
     eliminate_common_subexpressions,
     fuse_pointwise,
     load_compiled_module,
@@ -18,6 +19,7 @@ from aotolith import (
 import aotolith.codegen.msl as metal_msl
 import aotolith.runtime.mlx_ops.pointwise as metal_pointwise
 import aotolith.target.apple as metal_target
+from aotolith.capture import capture_fx
 from aotolith.ir import DType, Graph, Operation, TensorType, Value
 
 
@@ -1103,6 +1105,106 @@ def test_scatter_value_uses_mlx_without_a_kernel() -> None:
     expected = _torch_to_mlx(fn(source, indices))
     mx.eval(actual, expected)
     assert mx.array_equal(actual, expected)
+
+
+def test_masked_scatter_fills_the_masked_positions_in_order() -> None:
+    # ATen consumes the source as a flat sequence and hands the n-th element to
+    # the n-th position the mask selects, so the running count of the mask is
+    # the index: a scan, a gather and a select, with no kernel of its own.
+    def fn(value, mask, source):
+        return value.masked_scatter(mask, source)
+
+    torch.manual_seed(53)
+    value = torch.randn(3, 4)
+    mask = torch.rand(3, 4) > 0.5
+    source = torch.randn(3, 4)
+    graph = capture_fx(fn, (value, mask, source))
+
+    assert [op.op for op in graph.ops] == [
+        "reshape",
+        "reshape",
+        "reshape",
+        "cast",
+        "cumsum",
+        "sub",
+        "clamp",
+        "gather",
+        "where",
+        "reshape",
+    ]
+    result = compile_callable(fn, (value, mask, source))
+    actual = result.plan(
+        _torch_to_mlx(value), _torch_to_mlx(mask), _torch_to_mlx(source)
+    )[0]
+    expected = _torch_to_mlx(fn(value, mask, source))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_masked_scatter_accepts_a_source_exactly_as_long_as_the_mask() -> None:
+    def fn(value, mask, source):
+        return value.masked_scatter(mask, source)
+
+    value = torch.zeros(2, 3)
+    mask = torch.tensor([[True, False, True], [False, True, False]])
+    source = torch.tensor([1.0, 2.0, 3.0])
+    result = compile_callable(fn, (value, mask, source))
+
+    actual = result.plan(
+        _torch_to_mlx(value), _torch_to_mlx(mask), _torch_to_mlx(source)
+    )[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, _torch_to_mlx(fn(value, mask, source)))
+
+
+def test_masked_scatter_broadcasts_a_row_mask_over_the_batch() -> None:
+    def fn(value, mask, source):
+        return value.masked_scatter(mask, source)
+
+    torch.manual_seed(59)
+    value = torch.randn(2, 4)
+    mask = torch.tensor([True, False, True, False])
+    source = torch.randn(2, 4)
+    graph = capture_fx(fn, (value, mask, source))
+
+    assert [op.op for op in graph.ops][:2] == ["expand", "reshape"]
+    result = compile_callable(fn, (value, mask, source))
+    actual = result.plan(
+        _torch_to_mlx(value), _torch_to_mlx(mask), _torch_to_mlx(source)
+    )[0]
+    expected = _torch_to_mlx(fn(value, mask, source))
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_masked_scatter_keeps_the_unmasked_destination() -> None:
+    def fn(value, mask, source):
+        return value.masked_scatter(mask, source)
+
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    mask = torch.zeros(2, 3, dtype=torch.bool)
+    source = torch.tensor([9.0])
+    result = compile_callable(fn, (value, mask, source))
+
+    actual = result.plan(
+        _torch_to_mlx(value), _torch_to_mlx(mask), _torch_to_mlx(source)
+    )[0]
+    mx.eval(actual)
+    assert mx.array_equal(actual, _torch_to_mlx(value))
+
+
+def test_masked_scatter_rejects_a_non_boolean_mask() -> None:
+    # ATen's own meta kernel refuses the graph before the lowering sees it, so
+    # the check here is that the caller gets an error naming the mask rather
+    # than a silently different answer.
+    def fn(value, mask, source):
+        return value.masked_scatter(mask, source)
+
+    value = torch.zeros(3)
+    mask = torch.tensor([0.0, 1.0, 0.0])
+    source = torch.ones(3)
+    with pytest.raises(RuntimeError, match="bool or uint8"):
+        compile_callable(fn, (value, mask, source))
 
 
 def test_scatter_does_not_mutate_the_input_tensor() -> None:
@@ -3006,6 +3108,44 @@ def test_singleton_flip_and_zero_roll_are_identities() -> None:
     assert result.lowered_graph.outputs == ("arg0", "arg0")
 
 
+def test_a_slice_spelling_that_omits_the_trailing_defaults_lowers() -> None:
+    # ``aten.slice.Tensor`` defaults ``start``, ``end`` and ``step``, and a
+    # trace fills in only as many as the call passed: ``cumulative_trapezoid``
+    # emits the three-argument form. The lowering reads the schema's defaults
+    # rather than refusing a spelling the operator allows.
+    def fn(value):
+        return torch.cumulative_trapezoid(value)
+
+    torch.manual_seed(67)
+    value = torch.randn(3, 5)
+    graph = capture_fx(fn, (value,))
+    omitted = [op for op in graph.ops if op.op == "slice" and op.attrs["end"] is None]
+    assert len(omitted) == 1
+    assert omitted[0].attrs["start"] == 1
+    assert omitted[0].attrs["step"] == 1
+
+    result = compile_callable(fn, (value,))
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_cumulative_trapezoid_with_an_explicit_spacing_matches_pytorch() -> None:
+    def fn(value, spacing):
+        return torch.cumulative_trapezoid(value, spacing, dim=1)
+
+    torch.manual_seed(71)
+    value = torch.randn(2, 4, 5)
+    spacing = torch.rand(4).cumsum(0)
+    result = compile_callable(fn, (value, spacing))
+
+    actual = result.plan(_torch_to_mlx(value), _torch_to_mlx(spacing))[0]
+    expected = _torch_to_mlx(fn(value, spacing))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_out_of_range_slice_is_not_removed_as_identity() -> None:
     tensor_type = TensorType((4,), DType.F32)
     values = {
@@ -4279,17 +4419,23 @@ def test_a_distribution_sample_is_refused_as_a_draw() -> None:
     value = torch.randn(4)
     cases = [
         (
-            lambda v: torch.distributions.Normal(v, torch.ones(4), validate_args=False).sample(),
+            lambda v: torch.distributions.Normal(
+                v, torch.ones(4), validate_args=False
+            ).sample(),
             "normal",
             "aten.normal.Tensor_Tensor",
         ),
         (
-            lambda v: torch.distributions.Gamma(v.abs() + 1, torch.ones(4), validate_args=False).sample(),
+            lambda v: torch.distributions.Gamma(
+                v.abs() + 1, torch.ones(4), validate_args=False
+            ).sample(),
             "the gamma sampler",
             "aten._standard_gamma.default",
         ),
         (
-            lambda v: torch.distributions.Dirichlet(torch.ones(4), validate_args=False).sample(),
+            lambda v: torch.distributions.Dirichlet(
+                torch.ones(4), validate_args=False
+            ).sample(),
             "the Dirichlet sampler",
             "aten._sample_dirichlet.default",
         ),
@@ -5561,6 +5707,60 @@ def test_selu_keeps_the_positive_branch_unscaled_by_input_scale() -> None:
     mx.eval(actual_negative)
     expected_negative = mx.array(fn(negative).numpy())
     assert mx.allclose(actual_negative, expected_negative, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper"),
+    [
+        pytest.param(None, None, id="aten-defaults"),
+        pytest.param(0.05, 0.5, id="explicit-range"),
+    ],
+)
+def test_rrelu_in_eval_mode_is_a_leaky_relu_with_the_midpoint_slope(
+    lower, upper
+) -> None:
+    # ATen samples a slope per element while training and fixes it at the
+    # midpoint of the range in eval, so the traced call lowers to the leaky
+    # ReLU the same ATen kernel would have answered with.
+    def fn(value):
+        if lower is None:
+            return torch.nn.functional.rrelu(value, training=False)
+        return torch.nn.functional.rrelu(value, lower, upper, training=False)
+
+    torch.manual_seed(37)
+    value = torch.randn(4, 6) * 2.0
+    result = compile_callable(fn, (value,))
+
+    assert [op.op for op in result.lowered_graph.ops] == ["leaky_relu"]
+    midpoint = (0.125 + 1.0 / 3.0) / 2.0 if lower is None else (lower + upper) / 2.0
+    assert result.lowered_graph.ops[0].attrs["negative_slope"] == pytest.approx(
+        midpoint
+    )
+    actual = result.plan(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(fn(value))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rrelu_module_compiles_in_eval_mode() -> None:
+    module = torch.nn.RReLU(0.1, 0.4).eval()
+    torch.manual_seed(41)
+    value = torch.randn(3, 5)
+    compiled = compile_module(module, (value,))
+
+    actual = compiled(_torch_to_mlx(value))[0]
+    expected = _torch_to_mlx(module(value))
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rrelu_refuses_to_draw_a_slope_while_training() -> None:
+    value = torch.randn(4, 6)
+    with pytest.raises(NotImplementedError, match="RReLU samples a slope"):
+        compile_callable(
+            lambda current: torch.nn.functional.rrelu(current, training=True),
+            (value,),
+        )
 
 
 @pytest.mark.parametrize("approximate", [None, "tanh"])
