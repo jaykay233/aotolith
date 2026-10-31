@@ -45,10 +45,18 @@ from . import (
     reductions,
     views,
 )
-from .targets import _EMPTY_COPY_TARGETS
+from .targets import _COPY_TARGET, _EMPTY_COPY_TARGETS, _INPLACE_TARGETS
 from .state import Lowering
 
 Handler = Any
+
+_WRITE_TARGETS = _INPLACE_TARGETS | {_COPY_TARGET}
+"""Every target that stores into an operand rather than producing a value.
+
+Their results are usually unread - the program reads the buffer they filled -
+so the dead-node rule below cannot use "nothing reads this" as a reason to drop
+them.
+"""
 
 
 def _empty_value_nodes(traced: Any) -> set[Any]:
@@ -142,13 +150,21 @@ def legalize(
         elif node.op == "call_function":
             if node in node_ids:
                 continue
-            if not node.users:
+            target = str(node.target)
+            if not node.users and target not in _WRITE_TARGETS:
                 # Nothing reads this node, so the result pruning would drop it
                 # anyway; skipping it here also lets a dead allocation the
                 # tracer left behind (``aten.empty`` for a saved-tensor buffer)
                 # stay untranslated.
+                #
+                # An in-place op is the exception, and needs the opposite
+                # treatment: its value being unread says nothing about the
+                # store it performs. A write that fills one slice of a buffer
+                # is dead to the dataflow and live to the program's result -
+                # ``F.pad(mode="circular")`` is written exactly that way - so
+                # these reach the lowering, where the aliasing check either
+                # accepts the write as a rebinding or refuses the graph.
                 continue
-            target = str(node.target)
             if node in lowering.empty_nodes and target in _EMPTY_COPY_TARGETS:
                 # An identity copy of an empty constant carries no arithmetic;
                 # it exists only to be concatenated away.

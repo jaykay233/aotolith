@@ -14,7 +14,7 @@ from ..ir import DType, Operation, TensorType, Value
 from .fx import _fold_empty_cat_operands, _node_type
 from .state import Lowering
 from .state import Handler
-from .indexing import _validate_inplace_legalization
+from .indexing import _validate_inplace_legalization, _view_chain
 from .padding import _constant_pad_arguments
 from .refs import _argument_ids
 from .targets import (
@@ -968,6 +968,150 @@ def _lower_prelu(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _slice_window(
+    chain: list[Any], shape: tuple[int, ...]
+) -> dict[int, tuple[int, int]] | None:
+    """Compose a chain of ``slice`` views into per-axis windows of the root.
+
+    Torch's slice coordinates are relative to the slice's own operand, and a
+    view's operand is another view of the same storage, so the axes are shared
+    and only the windows narrow. Every step is intersected here; anything the
+    composition cannot express - a step, a non-slice view, a negative bound it
+    cannot resolve - returns ``None`` and the caller falls back to refusing.
+    """
+
+    windows = {axis: (0, size) for axis, size in enumerate(shape)}
+    for view in reversed(chain[:-1]):
+        if str(getattr(view, "target", "")) != "aten.slice.Tensor":
+            return None
+        args = getattr(view, "args", ())
+        if len(args) < 4:
+            return None
+        _, axis, start, end = args[:4]
+        step = args[4] if len(args) > 4 else getattr(view, "kwargs", {}).get("step", 1)
+        if step != 1 or isinstance(axis, bool) or not isinstance(axis, int):
+            return None
+        size = shape[axis]
+        start = 0 if start is None else start
+        end = size if end is None else end
+        if not isinstance(start, int) or not isinstance(end, int):
+            return None
+        if start < 0:
+            start += size
+        if end < 0:
+            end += size
+        low, high = windows[axis]
+        windows[axis] = (max(low, start), min(high, end))
+    return windows
+
+
+def _slice_of(
+    lowering: Lowering,
+    value_id: str,
+    ranges: list[tuple[int, int, int]],
+) -> str:
+    """Emit one ``slice`` per ``(axis, start, end)`` in order and return the last."""
+
+    current = value_id
+    for axis, start, end in ranges:
+        current_type = lowering.values[current].type
+        shape = (
+            current_type.shape[:axis] + (end - start,) + current_type.shape[axis + 1 :]
+        )
+        current = lowering.emit(
+            "slice",
+            (current,),
+            {"dim": axis, "start": start, "end": end, "step": 1},
+            TensorType(shape, current_type.dtype),
+        )
+    return current
+
+
+def _functional_slice_write(
+    lowering: Lowering,
+    node: Any,
+    source_id: str,
+    destination: TensorType,
+) -> bool:
+    """Lower ``copy_`` into a slice as a cat grid over the buffer it rewrites.
+
+    A write into a slice is not a rebinding of the buffer: the buffer's readers
+    are separate nodes over the same storage, and Torch lets them observe the
+    write. Rebuilding the buffer out of the pieces around the window, with the
+    source in the window's place, is the same thing as a value; every later
+    reader of the buffer picks up the rebuilt value because the lowering keeps
+    the root's binding current. Two axes make a 3x3 grid, and the same nesting
+    covers any number of them.
+
+    Returns ``False`` when the destination is not a slice the composition can
+    express, so the caller can fall back to its usual rebinding (and its
+    refusal, when that is unsafe).
+    """
+
+    chain = _view_chain(node.args[0])
+    root = chain[-1]
+    root_id = lowering.node_ids.get(root)
+    if root_id is None:
+        return False
+    root_type = lowering.values[root_id].type
+    if len(chain) == 1:
+        # Nothing was selected: the write covers the buffer, so the buffer's
+        # value simply becomes the source.
+        lowering.node_ids[root] = source_id
+        lowering.bind(node, source_id)
+        return True
+    windows = _slice_window(chain, root_type.shape)
+    if windows is None:
+        return False
+    selected = [
+        axis
+        for axis, (low, high) in windows.items()
+        if (low, high) != (0, root_type.shape[axis])
+    ]
+    for axis in selected:
+        low, high = windows[axis]
+        if low >= high:
+            # An empty window writes nothing, and Torch raises on the shape
+            # mismatch between an empty destination and the source.
+            return False
+    splits = {
+        axis: [
+            (0, windows[axis][0]),
+            windows[axis],
+            (windows[axis][1], root_type.shape[axis]),
+        ]
+        for axis in selected
+    }
+
+    def assemble(position: int, chosen: list[tuple[int, int, int]]) -> str:
+        if position == len(selected):
+            if all((low, high) == windows[axis] for axis, low, high in chosen):
+                return source_id
+            return _slice_of(lowering, root_id, chosen)
+        axis = selected[position]
+        pieces = [
+            assemble(position + 1, chosen + [(axis, start, end)])
+            for start, end in splits[axis]
+            if start < end
+        ]
+        if len(pieces) == 1:
+            return pieces[0]
+        shape = list(lowering.values[pieces[0]].type.shape)
+        shape[axis] = sum(lowering.values[piece].type.shape[axis] for piece in pieces)
+        return lowering.emit(
+            "cat",
+            tuple(pieces),
+            {"dim": axis},
+            TensorType(tuple(shape), root_type.dtype),
+        )
+
+    rebuilt_id = assemble(0, [])
+    lowering.node_ids[root] = rebuilt_id
+    # The write's own value is the window it filled, not the buffer it rebuilt.
+    lowering.bind(node, source_id)
+    return True
+
+
 def _lower_copy(lowering: Lowering, node: Any, target: str) -> bool:
     """``copy_`` is the destination's value becoming the source's.
 
@@ -976,9 +1120,12 @@ def _lower_copy(lowering: Lowering, node: Any, target: str) -> bool:
     precede the write already saw the old value, and the tracer rebinds the
     mutated name afterwards, so rebinding this node to the copied value is the
     whole write.
+
+    A destination that is a view needs one more step: the write reaches storage
+    the view's ancestors read, so the buffer is rebuilt as a cat and its
+    binding updated instead of only the written slice's.
     """
 
-    _validate_inplace_legalization(node)
     args = getattr(node, "args", ())
     if len(args) < 2:
         raise ValueError(f"{target} expects two arguments, got {len(args)}")
@@ -1001,6 +1148,9 @@ def _lower_copy(lowering: Lowering, node: Any, target: str) -> bool:
             {"shape": destination.shape},
             TensorType(destination.shape, destination.dtype),
         )
+    if _functional_slice_write(lowering, node, source_id, destination):
+        return True
+    _validate_inplace_legalization(node)
     lowering.bind(node, source_id)
     return True
 

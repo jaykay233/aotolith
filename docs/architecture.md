@@ -97,6 +97,7 @@ HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 m
 | `aten.constant_pad_nd.default` | `pad`，常量填充；pads 按最内层维优先的 (before, after) 对解释，全零时折叠成恒等；负数条目按 ATen 语义裁剪展开后的 extent，前端先发 `slice` 再把负宽度钳成 0 的 `pad` |
 | `aten.reflection_pad1d.default`、`aten.reflection_pad2d.default` | 展开成 `slice`/`flip`/`cat` 视图链；负数条目按 ATen 语义先展开再裁剪，不生成 kernel |
 | `aten.replication_pad1d.default`、`aten.replication_pad2d.default` | 展开成 `slice`/`expand`/`cat` 视图链；负数条目同样先展开再裁剪 |
+| `F.pad(mode="circular")`（trace 后是一串 `new_empty` 加切片 `copy_`） | 没有专门的 ATen target：Torch 先分配空 tensor，再逐段把边界切片 `copy_` 进去。切片写由 `copy_` 的 legalization 展开 —— 重建目标张量，把未改动的窗口与新窗口用 `cat` 拼起来 —— 所以 circular padding 落地为 `zeros`/`slice`/`cat`，不生成 kernel |
 | `aten.triu.default`、`aten.tril.default` | `triu`、`tril`，支持 batch 维和 `diagonal` |
 | `aten.unsqueeze.default` | `unsqueeze` |
 | `aten.squeeze.dim` | `squeeze` |
@@ -325,7 +326,9 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 
 - 每个族导出 `HANDLERS: dict[target, tuple[handler, ...]]`。一个 target 可以有多个 handler，按顺序试；handler 返回 `False` 表示「不是我以为的形状」，于是下一个接管。`constant_pad_nd` 就靠这个：只有全负的 pad 才是 crop，其余交给通用路径。
 - 族 handler 全部拒绝之后才跑 `PRE_HANDLERS`，然后是通用逐元素路径。这个顺序是必须的：`rms_norm` 到达时已经被分解成乘法链，没有任何 target 名字可认，只能按形状匹配，所以它必须排在最后、并且在通用路径之前对所有节点尝试一次。
-- 就地算子（`scatter_`、`index_add_`、`add_`、`clamp_`、`relu_`、`copy_` 一族）注册到它规范化后的那个 target 上，外面套一层「写之后没有读者」的检查。编译器建模的是 value 而不是 mutation，所以就地写只是一次重新绑定：写在图里位置之前的读者读到的仍是旧值，与 Torch 一致，因为 tracer 会把被改写的名字重新绑定，`x.relu_()` 之后的使用指向的是这次写的结果；只有排在写之后的读者会读到过期值，那样的图直接拒绝。`zero_` 的常量来自 `full_like`，它读的是目的值，但不能算作这次写的观察者。
+- 就地算子（`scatter_`、`index_add_`、`add_`、`clamp_`、`relu_`、`copy_` 一族）注册到它规范化后的那个 target 上，外面套一层「写之后没有读者」的检查。编译器建模的是 value 而不是 mutation，所以就地写只是一次重新绑定：写在图里位置之前的读者读到的仍是旧值，与 Torch 一致，因为 tracer 会把被改写的名字重新绑定，`x.relu_()` 之后的使用指向的是这次写的结果；只有排在写之后的读者会读到过期值，那样的图直接拒绝。`zero_` 的常量来自 `full_like`，它读的是目的值，但**不能**算作这次写的观察者。
+- 检查沿视图链向上走：`x[0].t().copy_(...)` 的读者可能在根 buffer 上，而不是在被写的那个视图节点上。`slice`、`select`、`narrow`、`transpose`、`permute`、`view`/`reshape`/`_unsafe_view`、`expand`、`squeeze`/`unsqueeze`、`t`、`detach`、`alias` 都算视图，写视图时逐个祖先检查「除链上下一个节点之外还有没有别的读者」，有就拒绝，因为那条读者会看到被改写后的存储。`aten.t_`、`aten.transpose_` 同样按这条路径落成 rebinding，不生成 kernel。
+- 写进切片（`x[:, 1:3].copy_(v)`，以及 circular padding 那种「先 `new_empty` 再逐段 `copy_`」）重建张量而不是原地改 buffer：`_functional_slice_write` 把切片还原成一组 `slice`，把被写的窗口换成新值，再用 `cat` 按原序拼回去。下标步长不是 1、或者窗口跨越多根轴时逐轴退化成一串 `slice`；无法还原成静态窗口的写法仍按上面的规则拒绝。
 
 死代码在同一次遍历里掉出去：没有被任何输出用到的 value 在组装程序时被丢弃，所以一个只读 `getitem(k=0)` 的分解图只发射可达的那部分。
 

@@ -1755,6 +1755,78 @@ def test_reflect_and_replicate_pad_crop_like_pytorch(shape, pads, mode) -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_circular_pad_wraps_the_border() -> None:
+    def fn(x):
+        return torch.nn.functional.pad(x, (2, 1), mode="circular")
+
+    source = mx.array([[1.0, 2.0, 3.0]])
+    result = compile_callable(fn, (torch.zeros(1, 3),))
+    actual = result.plan(source)[0]
+    mx.eval(actual)
+    # Wrap-around takes the far border rather than mirroring or repeating the
+    # near one, which is what separates circular padding from the other modes.
+    assert actual.tolist() == [[2.0, 3.0, 1.0, 2.0, 3.0, 1.0]]
+
+
+@pytest.mark.parametrize(
+    ("shape", "pads"),
+    [
+        ((3, 8), (2, 1)),
+        ((4, 6), (3, 3)),
+        ((2, 5, 7), (1, 2)),
+        ((2, 3, 4, 5), (1, 2, 2, 1)),
+        ((1, 1, 5, 5), (2, 2, 1, 1)),
+        ((2, 6), (-1, -2)),
+        ((3, 5, 7), (1, -2, 0, 2)),
+    ],
+)
+def test_circular_pad_matches_pytorch(shape, pads) -> None:
+    # Torch builds circular padding as an allocation it fills a slice at a
+    # time. The lowering rebuilds that buffer as a cat grid instead, so this
+    # also covers the in-place write that no rebinding could represent.
+    def fn(x):
+        return torch.nn.functional.pad(x, pads, mode="circular")
+
+    torch.manual_seed(56)
+    x = torch.randn(shape)
+    result = compile_callable(fn, (x,))
+    # Every piece is a view or a cat. The single allocation kernel is the
+    # buffer Torch opens with `new_empty`, which the first write's pieces still
+    # read before later writes cover them.
+    assert {op.op for op in result.lowered_graph.ops} <= {"slice", "cat", "zeros"}
+    assert all(kernel.kind == "zeros" for kernel in result.plan.kernels)
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected)
+
+
+def test_write_through_a_view_refuses_when_the_storage_is_read_elsewhere() -> None:
+    def fn(x):
+        written = x[0].t()
+        other = x[1]
+        written.copy_(torch.zeros(3, 4))
+        return written + other.sum()
+
+    with pytest.raises(NotImplementedError, match="in-place write through a view"):
+        compile_callable(fn, (torch.randn(2, 4, 3),))
+
+
+def test_write_through_a_view_rebinds_when_nothing_else_reads_it() -> None:
+    def fn(x):
+        written = x[0].t()
+        written.copy_(torch.zeros(3, 4))
+        return written.T
+
+    values = torch.randn(2, 4, 3)
+    result = compile_callable(fn, (values,))
+    actual = result.plan(mx.array(values.numpy()))[0]
+    expected = mx.array(fn(values).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
 def test_reflect_pad_composes_with_a_matmul_tail() -> None:
     # A padded activation feeding a linear layer stays in one graph, so the
     # border pieces are concatenated once and read straight into the kernel.

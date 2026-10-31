@@ -34,6 +34,50 @@ def _canonical_scatter_target(target: str) -> str:
     return _INPLACE_SCATTER_TARGETS.get(target, target)
 
 
+_ALIASING_VIEW_TARGETS = frozenset(
+    {
+        "aten.slice.Tensor",
+        "aten.select.int",
+        "aten.narrow.Tensor",
+        "aten.transpose.int",
+        "aten.permute.default",
+        "aten.view.default",
+        "aten._unsafe_view.default",
+        "aten.reshape.default",
+        "aten.expand.default",
+        "aten.squeeze.dim",
+        "aten.squeeze.dims",
+        "aten.unsqueeze.default",
+        "aten.t.default",
+        "aten.detach.default",
+        "aten.alias.default",
+    }
+)
+"""The operators whose result shares its operand's storage.
+
+Only the writes matter here: a write through one of these mutates the storage
+the operand reads, so a *different* node over the same storage sees the write
+in Torch and keeps its old value in this compiler. Anything not listed is
+treated as producing a value of its own, which is what the IR models.
+"""
+
+
+def _view_chain(node: object) -> list[object]:
+    """Return ``node``'s chain of storage-sharing ancestors, outermost first."""
+
+    chain = [node]
+    seen = {id(node)}
+    while True:
+        current = chain[-1]
+        if str(getattr(current, "target", "")) not in _ALIASING_VIEW_TARGETS:
+            return chain
+        args = getattr(current, "args", ())
+        if not args or not hasattr(args[0], "users") or id(args[0]) in seen:
+            return chain
+        seen.add(id(args[0]))
+        chain.append(args[0])
+
+
 def _validate_inplace_legalization(node: object) -> None:
     """Reject an in-place write that something reads after it.
 
@@ -48,12 +92,35 @@ def _validate_inplace_legalization(node: object) -> None:
     Torch's tracer rebinds the mutated name, so a program that keeps using the
     tensor after ``x.relu_()`` reaches the graph as ``relu_(x)`` followed by
     readers of that node rather than of ``x``.
+
+    A write through a view has one more way to go wrong. Rebinding covers the
+    readers of the *destination* node, but the storage it shares with the view's
+    ancestors is reachable through their other users too, and those keep the
+    pre-write value. A buffer that is allocated and then filled a slice at a
+    time - which is how ``F.pad(mode="circular")`` is written, and how a
+    hand-written cache update looks - is exactly that shape, so it is refused
+    instead of being lowered into reads of the untouched allocation.
     """
 
     args = getattr(node, "args", ())
     if not args:
         raise ValueError("in-place operation has no input")
     source = args[0]
+    chain = _view_chain(source)
+    for ancestor, reader in zip(chain[1:], chain[:-1]):
+        other_users = [
+            user for user in getattr(ancestor, "users", ()) if user is not reader
+        ]
+        if other_users:
+            raise NotImplementedError(
+                f"in-place write through a view cannot be lowered safely: "
+                f"{getattr(node, 'target', '<unknown>')} writes into a view of "
+                f"{getattr(chain[-1], 'target', '<unknown>')}, and "
+                f"{len(other_users)} other node(s) read that storage. "
+                f"Allocating a buffer and filling its slices in place is the "
+                f"usual source - F.pad(mode='circular') is one - and the same "
+                f"value can be written as a cat of the pieces"
+            )
     observers = [user for user in getattr(source, "users", ()) if user is not node]
     if not observers:
         return
