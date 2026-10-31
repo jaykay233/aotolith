@@ -67,11 +67,25 @@ def _constant_tensor_message(traced: object, node: object) -> str:
     )
 
 
-def _reject_unsupported_attention_dropout(graph: object) -> None:
+def _reject_unsupported_dropout(graph: object) -> None:
+    """Refuse any graph that draws a dropout mask.
+
+    ``aten.bernoulli_.float`` is the one random operator dropout leaves in a
+    traced graph, whether it comes from ``nn.Dropout``, ``F.dropout``, or the
+    dropout hand-rolled inside attention. The mask is sampled per call, and a
+    static plan has no RNG state to reproduce it, so nothing downstream could
+    be faithful. The advice differs by caller, so the message names the
+    operator and the two fixed points (eval mode, ``p=0``) rather than assuming
+    which spelling produced it.
+    """
+
     for node in getattr(graph, "nodes", ()):
         if str(getattr(node, "target", "")) == "aten.bernoulli_.float":
             raise NotImplementedError(
-                "scaled_dot_product_attention dropout is not supported"
+                "dropout is not supported: the traced graph draws a random "
+                "bernoulli mask (aten.bernoulli_.float), and a static plan has "
+                "no RNG state to reproduce it. Trace with dropout off - "
+                "model.eval() or p=0.0 - so dropout is the identity"
             )
 
 

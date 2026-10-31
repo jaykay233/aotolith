@@ -710,6 +710,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - `mx.fast.metal_kernel` 对象只在当前进程内做 LRU cache；跨进程时会从 artifact 中的 MSL source 重建，MLX 自身的编译缓存不在本项目的 ABI 内
 - matmul codegen 支持 rank-2 和 batch 前缀可广播的 rank-3/4；SIMD matrix 只覆盖 FP16/BF16 完整输出块，完整 reduction 和 8 对齐输出列使用 8 元素向量加载，尾块与 F32 仍走标量路径。MPP 路径需要 `__HAVE_TENSOR__`，并且编译期会实际加载一个 kernel 来确认它装得上；两条路径都还没有 split-K
 - 没有反向传播和训练支持
+- plan 里没有 RNG state，所以随机算子不进入覆盖范围：`rand`、`randn`、`rand_like`、`randn_like`、`randint`、`randint_like`、`randperm`、`multinomial`、`uniform_`、`normal_` 都以点名该 target 的 `unsupported FX target` 拒绝。`bernoulli` 采样出的 mask 就是 dropout 在 trace 里留下的那条 `aten.bernoulli_.float`，因此它先被识别成 dropout 再报错，消息直接给出两个确定性的替代点（`model.eval()` 或 `p=0`），不会伪装成 attention 的问题
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
 - Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 走每层自己的 `mlp.act_fn`（因此 `silu`、两种 `gelu` 拼法以及其他 pointwise 激活都按模型本身的算式编译；`silu_mul` 的 matmul epilogue 折叠仍只识别 `silu`，`gelu` MLP 会多出一条独立的 pointwise kernel），构造时把该激活单独跑一遍捕获，无法 lower 的激活（例如带参数的 `PReLU`）在模型捕获之前就以点名该层的消息报错。sliding-window 层仍然被拒绝（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）：适配层的 mask 由自己构造，普通 causal mask 与窗口 mask 语义不同，而当前 transformers 版本自身的 sliding 路径在同一条 cache 上就会抛 `TypeError`，没有可对照的参考实现
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现

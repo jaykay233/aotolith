@@ -31,7 +31,7 @@ from .fx import (
     _constant_tensor_message,
     _constant_value,
     _node_type,
-    _reject_unsupported_attention_dropout,
+    _reject_unsupported_dropout,
     _tensor_type,
 )
 from ..ir import Graph, Value
@@ -108,7 +108,7 @@ def legalize(
     passed.
     """
 
-    _reject_unsupported_attention_dropout(traced.graph)
+    _reject_unsupported_dropout(traced.graph)
     lowering = Lowering(traced, promoted_constants)
     node_ids = lowering.node_ids
     values = lowering.values
