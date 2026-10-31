@@ -9,15 +9,17 @@ from __future__ import annotations
 
 from math import isfinite
 from typing import Any
-from ..ir import DType, TensorType
+from ..ir import DType, Operation, TensorType, Value
 from ..shapes import broadcast_shapes, can_broadcast
 from .fx import _node_type
 from .state import Lowering
 from .state import Handler
 from .refs import _argument_ids
 from .targets import (
+    _HISTC_TARGET,
     _INDEX_ADD_TARGET,
     _INDEX_PUT_TARGETS,
+    _SEARCHSORTED_TARGETS,
     _INPLACE_SCATTER_TARGETS,
     _SCATTER_ADD_TARGET,
     _SCATTER_REDUCE_NAMES,
@@ -557,6 +559,116 @@ def _positive_axis(dim: object, source_type: TensorType, target: str) -> int:
     return dim % rank
 
 
+def _searchsorted_operations(
+    node: object, node_ids: dict[object, str], first_op_index: int
+) -> tuple[tuple[tuple[Operation, Value], ...], str]:
+    """Lower ``searchsorted``/``bucketize`` into one placement search.
+
+    ``bucketize`` puts the values first and the boundaries second, so the
+    operand order is the only difference between the two spellings. A scalar
+    value becomes a constant so the search has a single shape rule.
+    """
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    unknown = sorted(set(kwargs) - {"right", "side"})
+    if unknown:
+        raise ValueError(f"{target} received unsupported keyword arguments: {unknown}")
+    if len(args) != 2:
+        raise ValueError(f"{target} expects two arguments, got {len(args)}")
+    right = kwargs.get("right")
+    if "side" in kwargs:
+        side = kwargs["side"]
+        if side not in {"left", "right"}:
+            raise ValueError(f"{target}.side must be left or right, got {side!r}")
+        right = side == "right"
+    if right is None:
+        right = False
+    if not isinstance(right, bool):
+        raise ValueError(f"{target}.right must be a boolean, got {right!r}")
+
+    if target.startswith("aten.bucketize"):
+        values, boundaries = args
+    else:
+        boundaries, values = args
+
+    operations: list[tuple[Operation, Value]] = []
+    boundary_type = _node_type(boundaries)
+    if isinstance(values, (bool, int, float)):
+        scalar_id = f"v{first_op_index}"
+        operations.append(
+            (
+                Operation("scalar_tensor", (), (scalar_id,), {"value": values}),
+                Value(scalar_id, TensorType((), boundary_type.dtype)),
+            )
+        )
+        values_id = scalar_id
+        values_shape: tuple[int, ...] = ()
+    else:
+        values_type = _node_type(values)
+        if values_type.dtype != boundary_type.dtype:
+            raise ValueError(
+                f"{target} values dtype must match the boundaries, got "
+                f"{values_type.dtype.value} and {boundary_type.dtype.value}"
+            )
+        values_id = _argument_ids(values, node_ids)
+        values_shape = values_type.shape
+
+    output_id = f"v{first_op_index + len(operations)}"
+    operations.append(
+        (
+            Operation(
+                "searchsorted",
+                (_argument_ids(boundaries, node_ids), values_id),
+                (output_id,),
+                {"right": right},
+            ),
+            Value(output_id, TensorType(values_shape, DType.I64)),
+        )
+    )
+    return tuple(operations), output_id
+
+
+def _histc_operation(
+    node: object, node_ids: dict[object, str]
+) -> tuple[tuple[str, ...], dict[str, object], TensorType]:
+    """Read ``histc``'s bin count and range, which are attributes on ATen."""
+
+    target = str(getattr(node, "target", ""))
+    args = getattr(node, "args", ())
+    kwargs = dict(getattr(node, "kwargs", {}))
+    if kwargs:
+        raise ValueError(
+            f"{target} received unsupported keyword arguments: {sorted(kwargs)}"
+        )
+    if not 1 <= len(args) <= 4:
+        raise ValueError(f"{target} expects one to four arguments, got {len(args)}")
+    values = args[0]
+    bins = args[1] if len(args) > 1 else 100
+    low = args[2] if len(args) > 2 else 0
+    high = args[3] if len(args) > 3 else 0
+    if not isinstance(bins, int) or isinstance(bins, bool):
+        raise ValueError(f"{target}.bins must be an integer, got {bins!r}")
+    for name, value in (("min", low), ("max", high)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{target}.{name} must be a scalar number, got {value!r}")
+        if not isfinite(float(value)):
+            raise ValueError(f"{target}.{name} must be finite, got {value!r}")
+    if bins <= 0:
+        raise ValueError(f"{target}.bins must be positive, got {bins}")
+    if low > high:
+        raise ValueError(f"{target}.min {low} exceeds {target}.max {high}")
+
+    values_type = _node_type(values)
+    output_type = TensorType((bins,), values_type.dtype)
+    return (
+        (_argument_ids(values, node_ids),),
+        {"bins": bins, "min": float(low), "max": float(high)},
+        output_type,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -598,6 +710,21 @@ def _lower_index_put(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_searchsorted(lowering: Lowering, node: Any, target: str) -> bool:
+    produced, output_id = _searchsorted_operations(
+        node, lowering.node_ids, lowering.next_index()
+    )
+    lowering.emit_all(produced)
+    lowering.bind(node, output_id)
+    return True
+
+
+def _lower_histc(lowering: Lowering, node: Any, target: str) -> bool:
+    inputs, attrs, output_type = _histc_operation(node, lowering.node_ids)
+    lowering.bind(node, lowering.emit("histc", inputs, attrs, output_type))
+    return True
+
+
 def _checked_in_place(handler: Handler) -> Handler:
     """Guard an in-place target with the mutation rule.
 
@@ -624,6 +751,8 @@ _BY_CANONICAL: dict[str, tuple[Handler, ...]] = {
         for target, in_place in _INDEX_PUT_TARGETS.items()
         if not in_place
     },
+    **{target: (_lower_searchsorted,) for target in _SEARCHSORTED_TARGETS},
+    _HISTC_TARGET: (_lower_histc,),
 }
 
 HANDLERS: dict[str, tuple[Handler, ...]] = {

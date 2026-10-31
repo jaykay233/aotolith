@@ -15,7 +15,7 @@ family it happened in.
 from __future__ import annotations
 
 import mlx.core as mx
-from math import prod
+from math import isfinite, prod
 from typing import Any
 from ...ir import Graph
 from ...ir import Operation
@@ -134,6 +134,40 @@ def _mlx_index_put(op: Operation, env: dict[str, mx.array]) -> mx.array:
     return updated.reshape(source.shape)
 
 
+def _mlx_histc(op: Operation, env: dict[str, mx.array], graph: Graph) -> mx.array:
+    """Count values into uniform bins the way ``histc`` does.
+
+    ATen re-derives the range from the data when ``min == max`` (and widens it by
+    one when the data is a single value), puts the exact maximum in the last
+    bin, and leaves the NaNs out. Everything else falls where
+    ``floor((v - min) / (max - min) * bins)`` puts it, and a position outside the
+    bins is not counted at all.
+    """
+
+    values = env[op.inputs[0]]
+    bins = int(op.attrs["bins"])
+    low = float(op.attrs["min"])
+    high = float(op.attrs["max"])
+    compute = values.astype(mx.float32)
+    if low == high:
+        low = float(mx.min(compute).item())
+        high = float(mx.max(compute).item())
+        if not isfinite(low) or not isfinite(high):
+            raise ValueError("histc: the range of the input is not finite")
+        if low == high:
+            low, high = low - 1.0, high + 1.0
+
+    scaled = (compute - low) * bins / (high - low)
+    positions = mx.floor(scaled).astype(mx.int32).reshape(-1)
+    positions = mx.where(compute.reshape(-1) == high, bins - 1, positions)
+    counted = (positions >= 0) & (positions < bins) & ~mx.isnan(compute.reshape(-1))
+    counts = mx.zeros((bins,), dtype=mx.float32)
+    # A rejected position still writes, but with a zero weight into bin 0, so
+    # the accumulation stays one vectorized scatter.
+    counts = counts.at[mx.where(counted, positions, 0)].add(counted.astype(mx.float32))
+    return counts.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+
+
 def _evaluate_mlx_op(
     graph: Graph, op: Operation, env: dict[str, mx.array]
 ) -> mx.array | tuple[mx.array, ...]:
@@ -176,6 +210,13 @@ def _evaluate_mlx_op(
         return source[indexing]
     if op.op == "index_put":
         return _mlx_index_put(op, env)
+    if op.op == "searchsorted":
+        boundaries, values = (env[value_id] for value_id in op.inputs)
+        side = "right" if op.attrs.get("right", False) else "left"
+        positions = mx.searchsorted(boundaries, values, side=side)
+        return positions.astype(_MLX_DTYPES[graph.value(op.outputs[0]).type.dtype])
+    if op.op == "histc":
+        return _mlx_histc(op, env, graph)
     if op.op == "gather":
         source, indices = (env[value_id] for value_id in op.inputs)
         axis = int(op.attrs["dim"])

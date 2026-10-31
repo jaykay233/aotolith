@@ -8,7 +8,7 @@ shape they write. Those checks are inter-operator, so they live in hooks.
 
 from __future__ import annotations
 
-from .. import Graph, Operation, TensorType
+from .. import DType, Graph, Operation, TensorType
 from .rules import (
     AttrKind,
     AttrSpec,
@@ -285,6 +285,43 @@ def _check_index_put(graph: Graph, op: Operation) -> None:
     _unsupported_attrs(op, {"axes", "accumulate", "value"})
 
 
+def _check_searchsorted(graph: Graph, op: Operation) -> None:
+    """``searchsorted`` reads a sorted boundary list and places each value in it."""
+
+    sorted_type = graph.value(op.inputs[0]).type
+    values_type = graph.value(op.inputs[1]).type
+    if len(sorted_type.shape) != 1:
+        # ATen grows the boundaries to a leading batch, which needs the batch
+        # dims of the values to line up; the 1-D list is the common case.
+        raise NotImplementedError(
+            f"searchsorted needs a 1-D boundary list, got {sorted_type.shape}"
+        )
+    if sorted_type.dtype != values_type.dtype:
+        raise ValueError(
+            "searchsorted boundaries and values must share a dtype, got "
+            f"{sorted_type.dtype.value} and {values_type.dtype.value}"
+        )
+    _require_output(
+        graph, op, TensorType(values_type.shape, DType.I64), "output metadata"
+    )
+    _unsupported_attrs(op, {"right"})
+
+
+def _check_histc(graph: Graph, op: Operation) -> None:
+    """``histc`` counts into a fixed number of bins over ``[min, max]``."""
+
+    input_type = graph.value(op.inputs[0]).type
+    bins = op.attrs["bins"]
+    if bins <= 0:
+        raise ValueError(f"histc.bins must be positive, got {bins}")
+    low = op.attrs["min"]
+    high = op.attrs["max"]
+    if low > high:
+        raise ValueError(f"histc.min {low} exceeds histc.max {high}")
+    _require_output(graph, op, TensorType((bins,), input_type.dtype), "output metadata")
+    _unsupported_attrs(op, {"bins", "min", "max"})
+
+
 CONTRACTS: dict[str, OpContract] = {
     "embedding": OpContract(
         arity=(2, 2),
@@ -313,6 +350,24 @@ CONTRACTS: dict[str, OpContract] = {
         shape=ShapeRule.FREE,
         attrs=(AttrSpec("axes", AttrKind.AXES),),
         extra=_check_index_put,
+    ),
+    "searchsorted": OpContract(
+        arity=(2, 2),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("right", AttrKind.BOOL),),
+        extra=_check_searchsorted,
+    ),
+    "histc": OpContract(
+        arity=(1, 1),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(
+            AttrSpec("bins", AttrKind.NONNEGATIVE_INT),
+            AttrSpec("min", AttrKind.NUMBER),
+            AttrSpec("max", AttrKind.NUMBER),
+        ),
+        extra=_check_histc,
     ),
     "gather": OpContract(
         arity=(2, 2),

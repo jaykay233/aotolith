@@ -485,6 +485,22 @@ _SCATTER_REDUCE_TARGET = "aten.scatter_reduce.two"
 _INDEX_ADD_TARGET = "aten.index_add.default"
 
 
+_SEARCHSORTED_TARGETS = {
+    "aten.searchsorted.Tensor": "searchsorted",
+    "aten.searchsorted.Scalar": "searchsorted",
+    "aten.bucketize.Tensor": "bucketize",
+    "aten.bucketize.Scalar": "bucketize",
+}
+"""The search spellings, mapped to the operand order each one takes.
+
+``bucketize`` is ``searchsorted`` with the arguments the other way round: the
+values being placed come first.
+"""
+
+
+_HISTC_TARGET = "aten.histc.default"
+
+
 _INDEX_PUT_TARGETS = {
     "aten.index_put.default": False,
     "aten.index_put_.default": True,
@@ -676,6 +692,8 @@ NATIVE_TARGETS: frozenset[str] = frozenset(
     | set(_MEDIAN_TARGETS)
     | set(_CUM_EXTREMUM_TARGETS)
     | set(_INDEX_PUT_TARGETS)
+    | set(_SEARCHSORTED_TARGETS)
+    | {_HISTC_TARGET}
     | {
         _SELECT_TARGET,
         _INDEX_TARGET,
