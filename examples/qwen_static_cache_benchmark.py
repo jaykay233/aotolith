@@ -100,6 +100,33 @@ def _reference_tokens(
     return generated
 
 
+def _round_trip_weights(model: torch.nn.Module, group_size: int) -> None:
+    """Replace each projection weight by its own int4 round trip, in place.
+
+    The runtime packs these same tensors, and quantizing a value that is already
+    on the int4 grid returns the same words - the group's widest element rounds
+    to +-7, so the scale recomputes unchanged. So the words the runtime streams
+    are byte-identical to the ones this reference consumed, which is the only
+    way to tell a decode bug from a rounding difference. The embedding stays
+    untouched because the runtime leaves it in bf16 too.
+    """
+
+    from aotolith.quantize import dequantize_int4, quantize_int4
+
+    targets = [model.lm_head]
+    for layer in model.model.layers:
+        attention = layer.self_attn
+        targets.extend((attention.q_proj, attention.k_proj, attention.v_proj))
+        targets.extend((attention.o_proj, layer.mlp.gate_proj))
+        targets.extend((layer.mlp.up_proj, layer.mlp.down_proj))
+    with torch.no_grad():
+        for module in targets:
+            weight = module.weight
+            packed, scales = quantize_int4(weight.float().cpu().numpy(), group_size)
+            restored = dequantize_int4(packed, scales, group_size)
+            weight.copy_(torch.from_numpy(restored).to(weight.dtype))
+
+
 def _prefill_once(
     runtime: Qwen2StaticCacheRuntime,
     prompt: list[int],
@@ -212,6 +239,16 @@ def main() -> None:
     parser.add_argument("--codegen-matmul", action="store_true")
     parser.add_argument("--codegen-attention", action="store_true")
     parser.add_argument("--autotune", action="store_true")
+    parser.add_argument(
+        "--quantize",
+        type=int,
+        default=None,
+        metavar="GROUP",
+        help=(
+            "weight-only int4 with this group size (for example 64); the "
+            "streaming kernel is selected whether or not --codegen-matmul is on"
+        ),
+    )
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument(
         "--mlx-baseline",
@@ -242,6 +279,17 @@ def main() -> None:
             prompt,
             args.decode_tokens,
         )
+    # The bf16 reference is taken first, while the weights are still pristine;
+    # then the same weights are rounded onto the int4 grid, so the second
+    # reference is what a checkpoint that arrived already quantized would say.
+    quantized_reference_tokens: list[int] | None = None
+    if args.quantize is not None:
+        _round_trip_weights(model, args.quantize)
+        quantized_reference_tokens = _reference_tokens(
+            model,
+            prompt,
+            args.decode_tokens,
+        )
 
     compile_start = time.perf_counter()
     runtime = compile_qwen2_static_cache(
@@ -251,6 +299,7 @@ def main() -> None:
         codegen_matmul=args.codegen_matmul,
         codegen_attention=args.codegen_attention,
         autotune=args.autotune,
+        quantize=args.quantize,
     )
     compile_seconds = time.perf_counter() - compile_start
 
@@ -315,6 +364,36 @@ def main() -> None:
             None,
         )
     )
+    quantized_reference_match = (
+        None
+        if quantized_reference_tokens is None
+        else generated == quantized_reference_tokens
+    )
+    quantized_reference_agreement = (
+        None
+        if quantized_reference_tokens is None
+        else sum(
+            int(actual == expected)
+            for actual, expected in zip(
+                generated, quantized_reference_tokens, strict=True
+            )
+        )
+        / len(generated)
+    )
+    first_quantized_mismatch = (
+        None
+        if quantized_reference_tokens is None
+        else next(
+            (
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(generated, quantized_reference_tokens, strict=True)
+                )
+                if actual != expected
+            ),
+            None,
+        )
+    )
     sync_e2e = [
         prefill + decode
         for prefill, decode in zip(
@@ -336,6 +415,9 @@ def main() -> None:
         "backend": "aotolith-apple-metal",
         "model_path": model_path,
         "model_dtype": "bfloat16",
+        "weight_quantization": (
+            None if args.quantize is None else f"int4-group{args.quantize}"
+        ),
         "device": str(mx.default_device()),
         "load_s": load_seconds,
         "compile_s": compile_seconds,
@@ -390,6 +472,10 @@ def main() -> None:
             None if reference_tokens is None else generated == reference_tokens
         ),
         "first_reference_mismatch": first_reference_mismatch,
+        "quantized_reference_tokens": quantized_reference_tokens,
+        "quantized_reference_tokens_match": quantized_reference_match,
+        "quantized_reference_agreement": quantized_reference_agreement,
+        "first_quantized_reference_mismatch": first_quantized_mismatch,
         "artifact_paths": artifact_paths,
         "artifact_bytes": [Path(path).stat().st_size for path in artifact_paths],
     }

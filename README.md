@@ -205,6 +205,7 @@ runtime = compile_qwen2_static_cache(
     model,
     prompt_length=len(prompt_ids),
     max_new_tokens=64,
+    quantize=64,  # optional: weight-only int4, group size divides each reduction
 )
 tokens = runtime.greedy_generate(prompt_ids, max_new_tokens=64)
 print(tokens.tolist())
@@ -243,6 +244,8 @@ python examples/qwen_static_cache_benchmark.py \
   --codegen-matmul \
   --mlx-baseline \
   --output /tmp/qwen-aotolith-codegen.json
+python examples/qwen_static_cache_benchmark.py --quantize 64 \
+  --codegen-attention --output /tmp/qwen-aotolith-int4.json
 ```
 
 `--mlx-baseline` times `mlx_lm`'s own greedy decode on the same prompt in the same process, so the native number is measured on the machine running the benchmark instead of quoted from elsewhere. On this machine (M5 Pro, MLX 0.32) it reads **195.5-197.2 tokens/s** across runs.
@@ -313,6 +316,31 @@ The projection beats MLX's reduction at every size, so this is not an implementa
 The third is the controlled comparison inside one table above: the same warp-per-column kernel reaches 412 GB/s on a 272 MB matrix and 279 GB/s on a 17.4 MB one. Only the bytes differ.
 
 What all three show is that the rate a launch reaches depends on how many bytes it reads, not on how its grid is shaped. To run the whole step at 412 GB/s its 991 MB would have to arrive in launches of hundreds of megabytes, but every layer is cut into five strictly dependent projections — `qkv`, `o_proj`, paired gate/up, `down` — and the largest is 17.4 MB, because the nonlinearity between them is a real barrier. Pairing `gate` and `up` is exactly the move that exploits this, and it is why that one change measured 1.03x while removing 24 launches of 1 KB measured nothing. 4.17 ms per token is therefore the BF16 floor on this device: going meaningfully faster needs fewer bytes, which means quantized weights, not a better kernel.
+
+### Weight-only int4, and what it actually bought
+
+`compile_qwen2_static_cache(..., quantize=64)` packs every projection and the LM head — `qkv`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `lm_head` — and leaves the embeddings and the norms alone. The token embedding is read one row at a time, so 4 bits per element would buy nothing there and cost accuracy; a norm is one vector per layer.
+
+The format is stated once, in `aotolith/quantize.py`, because three pieces of code have to agree on it. A weight stays `[out, in]`, so one row of the packed matrix is one output unit. The reduction axis is cut into groups of `group_size` elements that share a scale, `max|w| / 7`, symmetric, round to nearest — the widest element lands exactly on `+7`, so negating a weight is exact. Eight nibbles go into each `int32` word, nibble 0 lowest, two's complement, so a word is the `uchar4` a kernel would load read as one integer. The scales sit beside the words in the compute dtype: a bf16 scale differs from an f32 one by three orders of magnitude less than one int4 step, and carrying f32 would force the kernel to hold a second dtype.
+
+What the compiler does with a packed weight depends on how many rows it multiplies. A single-row matmul — decode — *is* the streaming kernel: `fold_quantized_weights` rewrites `matmul(x, dequantize_i4(packed, scales))` into one `matmul` carrying `weight_group_size`, and the GEMV prologue loads words, sign-extends each nibble with two instructions (`(int)(word << 28) >> 28`), multiplies by `x` and by the group scale, and accumulates in float. No unpacked weight exists at any point. A wider matmul — prefill — keeps the unpack, because with 128 rows the weight stream is the cheap part of the multiply and int4 would only add decoding to a compute-bound pass; there the explicit `dequantize_i4` lowers to one streaming kernel in `codegen/quantize.py` rather than to eight elementwise MLX passes and a stack that writes several full-sized temporaries per layer.
+
+On Qwen2.5-0.5B-Instruct, 128 prompt tokens, 64 greedy decode tokens, `--codegen-attention`, on the M5 Pro:
+
+| | bf16 | int4 g64 | |
+| --- | ---: | ---: | ---: |
+| decode, synchronized each step | 4.13 ms/token | 3.56 ms/token | 1.16x |
+| weight bytes per token | 991 MB | 312 MB | 3.2x |
+| peak memory | 4.12 GiB | 1.90 GiB | 2.2x |
+| prefill, 128 tokens | 11.9 ms | 13.2 ms | 0.90x |
+
+The 1.16x is much less than the 3.2x in bytes, and the kernel's own rate says why: 312 MB in 3.56 ms is 88 GB/s, against the 240 GB/s the bf16 GEMV reached. The bf16 kernel reads a `vec<T, 4>` and does four multiply-adds per 8 bytes. The int4 kernel reads one word — 4 bytes — and does two shifts, a mask, a select and eight FMAs for the same eight weights, so it needs eight times the instruction rate to go three times faster. The rows decode at 88 GB/s because the SIMD pipes, not the memory controller, are what run out. That is the next thing to fix, and it is not a tiling problem.
+
+The async numbers are a separate finding: 193.7 tok/s for bf16 and 193.4 for int4, unchanged. Once each step drops to 3.56 ms of device time the host loop can no longer keep the queue full, so the launch rate is now the floor. Making the decode kernel faster on its own would show up here as nothing.
+
+Both rows of that table come from one back-to-back session, and that session read lower in absolute terms than the bf16 table above — 197-201 tok/s async where that table records 240, on the same build, with HEAD reproducing 152 tok/s synchronized too. So the absolute numbers here are only comparable to the row beside them; the ratio is the claim.
+
+Accuracy: int4 rounds each weight onto one of 15 values inside its group, so the logits move, and greedy decode is a chaotic readout of that movement. Against a float32 CPU forward on the *same* rounded weights, the runtime sits 0.51 off — 2.7% of the 18.5 logit scale — while torch's own bf16 forward on those weights sits 0.41, or 2.2%, away. Both are bf16 noise; neither is a decode error. Greedy then tracks the round-tripped checkpoint for 13 tokens and flips on a near-tie, matching 16 of 64 overall. So the CI gate does not use token equality on this model: `tests/test_quantized_qwen2.py` runs a 2-layer model where the check is exact — every decode token has to match the round-tripped reference — and `--quantize` reports both the bf16 reference and the round-tripped one so a run never hides which one it agrees with.
 
 Autotuning is not an escape either, and until now it could not even run on a model like this one. `--autotune` evaluated the MLX fallback for every operation in order to have a reference to compare against, but normalization, rotary, and attention only ever lower to generated kernels, so compiling a transformer raised `NotImplementedError` at the first standalone `rms_norm`. It now measures such an operation against itself, records the single benchmark, and notes in the selection reason that the kernel was the only valid candidate.
 
@@ -411,7 +439,7 @@ Tensor cores need Apple GPU family 9 or later, so both tensor-core paths are gat
 
 | Area | Coverage |
 |---|---|
-| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode, including prompt-length buckets with left padding; Qwen2.5-0.5B-Instruct validated |
+| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode, including prompt-length buckets with left padding and weight-only int4 streaming; Qwen2.5-0.5B-Instruct validated |
 | Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, `addbmm` (batch products summed into one matrix), `mv`/`addmv`, including supported batch broadcasting |
 | Linear algebra | `solve`, `solve_triangular`, `inv`, `det`, `slogdet`, `cholesky`, `cholesky_solve`, `cholesky_inverse`, `eigh`, `svd`, `qr`, `pinv`, `lu_factor` and `matrix_exp`, each lowered per selected output; `cdist` for every norm order |
 | Indexing | Embedding, `index_select`, advanced indexing, `gather`, `scatter`, `scatter_add`, `index_add`, `masked_scatter`, and the `scatter_reduce` reductions `sum`/`prod`/`amax`/`amin`/`mean` |

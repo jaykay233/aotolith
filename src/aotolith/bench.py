@@ -179,11 +179,43 @@ def _qwen2_prefill() -> tuple[Any, tuple[Any, ...]]:
     )
 
 
+def _packed_gemv() -> tuple[Any, tuple[Any, ...]]:
+    """A decode-shaped matmul against an int4 weight, on the streaming kernel.
+
+    This is the shape the fold exists for: one row of activations multiplied by
+    a packed weight, so the weight is never materialized. It gates both the
+    rewrite and the GEMV prologue, and the weights are real random values rather
+    than zeros so the driver cannot skip the read.
+    """
+
+    import torch
+
+    from .models.quantized import dequantize_i4
+    from .quantize import quantize_int4
+
+    group_size = 64
+    weight = torch.randn(2048, 2048)
+    packed, scales = quantize_int4(weight.numpy(), group_size)
+
+    class Packed(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("words", torch.from_numpy(packed))
+            self.register_buffer("scales", torch.from_numpy(scales))
+
+        def forward(self, x: Any) -> Any:
+            weight = dequantize_i4(self.words, self.scales, group_size)
+            return torch.matmul(x, weight.t())
+
+    return Packed().eval(), (torch.randn(1, 2048),)
+
+
 WORKLOADS: tuple[Workload, ...] = (
     Workload("linear_1024x1024", _linear, codegen_matmul=True),
     Workload("gated_mlp_1024_4096", _gated_mlp),
     Workload("rms_norm_32x4096", _rms_norm),
     Workload("attention_causal_128", _causal_attention, codegen_attention=True),
+    Workload("packed_gemv_2048", _packed_gemv),
     Workload("qwen2_prefill_128", _qwen2_prefill, optional=True),
 )
 

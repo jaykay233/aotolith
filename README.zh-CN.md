@@ -203,6 +203,7 @@ runtime = compile_qwen2_static_cache(
     model,
     prompt_length=len(prompt_ids),
     max_new_tokens=64,
+    quantize=64,  # 可选：权重 int4，group size 必须整除每条 reduction
 )
 tokens = runtime.greedy_generate(prompt_ids, max_new_tokens=64)
 print(tokens.tolist())
@@ -241,6 +242,8 @@ python examples/qwen_static_cache_benchmark.py \
   --codegen-matmul \
   --mlx-baseline \
   --output /tmp/qwen-aotolith-codegen.json
+python examples/qwen_static_cache_benchmark.py --quantize 64 \
+  --codegen-attention --output /tmp/qwen-aotolith-int4.json
 ```
 
 `--mlx-baseline` 会在同一个进程里用同一段 prompt 给 `mlx_lm` 自己的 greedy decode 计时，原生基线因此是在跑 benchmark 的这台机器上测出来的，而不是从别处引用。在这台机器上（M5 Pro，MLX 0.32）多次运行读到 **190.5-195.0 token/s**。
@@ -311,6 +314,31 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 第三个是上面同一个表里的受控对比：同一份 warp-per-column kernel，在 272 MB 矩阵上跑到 412 GB/s，在 17.4 MB 上只有 279。差别只有字节数。
 
 三者合起来说明：一次 launch 能达到的速率取决于它读多少字节，而不是它的网格怎么划分。要让整个 step 都跑在 412 GB/s，那 991 MB 必须以几百 MB 一次的 launch 到达，但每一层都被切成五个严格串行的投影 —— `qkv`、`o_proj`、成对 gate/up、`down` —— 而最大的只有 17.4 MB，因为中间的非线性是真屏障。把 `gate` 和 `up` 配对正是利用了这一点，这也是为什么那一次改动测到 1.03x，而删掉 24 次 1 KB 的 launch 什么也没测到。所以每个 token 4.17 ms 就是这台设备上的 BF16 地板：要明显更快只能少读字节，也就是量化权重，而不是写更好的 kernel。
+
+### 权重 int4，以及它到底买到了什么
+
+`compile_qwen2_static_cache(..., quantize=64)` 把每个投影和 LM head 都打包 —— `qkv`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`lm_head` —— 而嵌入和 norm 保持原精度。token embedding 是一次只读一行的查表，每个元素 4 bit 在这里既省不到带宽又要损失精度；norm 每层只有一个向量。
+
+格式只在一处定义，`aotolith/quantize.py`，因为有三份代码必须对它有同一个理解。权重仍然存成 `[out, in]`，所以打包矩阵的一行就是一个输出单元。reduction 轴按 `group_size` 切成共享一个 scale 的组，对称量化，scale 取 `max|w| / 7`，四舍五入 —— 组内绝对值最大的元素正好落在 `+7`，因此取负是精确的。每个 `int32` 字装 8 个 nibble，nibble 0 在最低位，两补码，于是这个字就是 kernel 要读的那个 `uchar4` 当成一个整数。scale 放在字旁边，用计算 dtype：bf16 的 scale 与 f32 的差别比一个 int4 步长小三个数量级，而带 f32 会逼 kernel 同时持两种精度。
+
+编译器怎么处理一个打包权重，取决于它乘多少行。单行 matmul —— decode —— *就是* 流式 kernel：`fold_quantized_weights` 把 `matmul(x, dequantize_i4(packed, scales))` 改写成带 `weight_group_size` 的单个 `matmul`，GEMV prologue 读字、用两条指令符号扩展每个 nibble（`(int)(word << 28) >> 28`）、乘 `x` 再乘组 scale、用 float 累加。整个过程中不存在解包后的权重。多行 matmul —— prefill —— 保留解包，因为 128 行时权重流只是乘法里便宜的那一半，int4 只会给算力受限的 pass 加解码工作；此时显式的 `dequantize_i4` 在 `codegen/quantize.py` 里 lower 成一个流式 kernel，而不是八个逐元素 MLX pass 加一次 stack、每层写出好几个全尺寸临时张量。
+
+Qwen2.5-0.5B-Instruct，128 个 prompt token，64 个 greedy decode token，`--codegen-attention`，M5 Pro：
+
+| | bf16 | int4 g64 | |
+| --- | ---: | ---: | ---: |
+| decode，每步同步 | 4.13 ms/token | 3.56 ms/token | 1.16x |
+| 每 token 权重字节 | 991 MB | 312 MB | 3.2x |
+| 峰值内存 | 4.12 GiB | 1.90 GiB | 2.2x |
+| prefill，128 token | 11.9 ms | 13.2 ms | 0.90x |
+
+1.16x 远小于字节数的 3.2x，kernel 自己的速率说明了原因：312 MB 用了 3.56 ms，也就是 88 GB/s，而 bf16 GEMV 跑到 240 GB/s。bf16 kernel 每 8 字节读一个 `vec<T, 4>`、做四次乘加。int4 kernel 每 4 字节读一个字，为同样 8 个权重做两次移位、一次掩码、一次选择、八次 FMA，要快三倍就需要八倍的指令吞吐。它停在 88 GB/s，是因为先耗尽的是 SIMD 管线而不是内存控制器。这是下一件要修的事，而且它不是 tiling 问题。
+
+异步那一列是另一个结论：bf16 193.7 token/s，int4 193.4，没动。当每步的设备时间降到 3.56 ms，host 循环已经喂不满队列，瓶颈变成了 launch 速率。单独把 decode kernel 做快，在这个数字上会显示为零。
+
+上表两行来自同一次背靠背测量，而那次会话的绝对值比前面的 bf16 表低 —— 异步 197-201 token/s，那张表记的是 240，同一份构建、HEAD 上同步口径也只读到 152 token/s。所以这里的绝对数字只能和同一行旁边的比，结论是那个比值。
+
+精度：int4 把每个权重四舍五入到组内 15 个取值之一，logits 因此会移动，而 greedy decode 是这个移动的混沌读数。以同一份取整后的权重跑 float32 CPU forward 作为基准，运行时偏离 0.51 —— 是 18.5 的 logit 尺度的 2.7% —— 而 torch 自己的 bf16 forward 偏离 0.41，即 2.2%。两者都是 bf16 噪声，都不是解码错误。greedy 于是能跟住取整后的 checkpoint 前 13 个 token，然后在一次接近平手的选择上翻转，64 个 token 里对上 16 个。所以 CI 不使用这个模型上的 token 相等：`tests/test_quantized_qwen2.py` 跑一个 2 层模型，那里检查是精确的 —— 每个 decode token 都必须与取整后的 reference 相同 —— 而 `--quantize` 会同时报告 bf16 reference 和取整后的 reference，任何一次运行都不会含糊它跟的是哪一个。
 
 自动调优也不是出路，而且在此之前它对这种模型连跑都跑不起来。`--autotune` 会给每个 op 都求一次 MLX fallback 当参考，但归一化、旋转和 attention 只降级到生成 kernel，所以编译一个 Transformer 会在第一个独立 `rms_norm` 上抛 `NotImplementedError`。现在它对这类 op 只测量自己，记录单条 benchmark，并在 selection reason 里说明这是唯一有效候选。
 
@@ -409,7 +437,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 
 | 类别 | 覆盖范围 |
 |---|---|
-| 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode，含按 prompt 长度的尺寸桶与左填充；已验证 Qwen2.5-0.5B-Instruct |
+| 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode，含按 prompt 长度的尺寸桶与左填充、权重 int4 流式；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting；`cholesky_solve`/`cholesky_inverse`、`cdist`（任意阶 p-范数）都是既有求解与归约的组合 |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`、`masked_scatter`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
 | Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、logsumexp、sum/mean/prod/amax/amin/nansum/nanmean/var/std/count_nonzero 归约、`all`/`any`、`vector_norm`、`F.normalize` 与 `F.cosine_similarity`、cumsum/cumprod、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |

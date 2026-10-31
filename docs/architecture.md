@@ -33,11 +33,12 @@ KV Cache 在编译器中的语义是图输入、图输出和 buffer layout contr
 ```text
 op_sets / shapes / ir.types / selection / _version      纯数据与词汇
 codegen.dtypes / codegen.msl / ir.op                    最小可编译单元：dtype 表、kernel 头
+quantize                                                int4 权重格式：位布局、打包、解包
 ir.graph / capture.tracer / legalize.targets            图、追踪、target 字面量
 ir.ops.* / target.*                                     逐族契约表、设备能力
 codegen.expr / reduction / pointwise / index            按族发射 MSL
 legalize.* / capture（组合点）                          FX → 核心 op
-codegen.norm → matmul → attention                       组合更复杂的 kernel
+codegen.norm → matmul → quantization → attention        组合更复杂的 kernel
 runtime.bounds / runtime.mlx_ops / runtime.plan         越界检查、MLX 回退、计划执行
 backends/apple.py                                       把上面三者拼成一个后端
 artifact.py / compiler.py                               图 → 产物、整条流水线
@@ -590,6 +591,21 @@ FP16/BF16 输入且 output 的行、列都能整除 `64` 时，kernel 改用 8 �
 kernel 在同一个循环里读 gate 行和 up 行（`in_1`、`in_2`），各自累加 4 个 float，最后写出 `silu(gate) * up`。两次乘加共用同一组已归一化的 `x0..x3`，所以第二个权重的带宽开销只是多读 8.72 MB，而 launch 从两次减到一次。gate 在 `silu` 前先 cast 回存储 dtype，得到的正是独立投影原本会写下的那个值，因此结果与未融合版本逐位一致。保留 FP32 累加精度反而会改变结果：在 24 token 的 greedy 运行中，第 4 个 token 就因为这点差异翻转了。
 
 该 epilogue 只由 transposed GEMV 实现。`fuse_gate_up_projection` 只在左侧操作数只有一行、权重物理布局为 `[out, in]`（`transpose_b=True`）、且两个投影的 weight shape/dtype 完全一致时才改写；taller 的操作数走 tiled kernel，两个投影保持独立，`silu_mul` 仍由原有的单向量 epilogue 处理。MLX fallback 用两次 `mx.matmul` 加一次逐元素表达式实现同一语义。
+
+### Packed int4 weights
+
+权重 int4 是唯一一条「字节数」而不是「kernel 质量」决定性能的路径，所以它的格式定义在 `aotolith/quantize.py` 一处，供三份代码共用：host 侧打包、MSL kernel 边流式读边解码、MLX fallback 解包。
+
+- 权重保持 `[out, in]`，打包矩阵的一行是一个输出单元；reduction 轴按 `group_size`（8 的倍数且整除 reduction）切组，每组一个 `max|w| / 7` 的对称 scale，四舍五入到 `[-8, 7]`，最大元素正好落在 `+7`，所以取负精确。每 8 个 nibble 装进一个 `int32`，nibble 0 在最低位，两补码 —— 这个字就是 kernel 想一次加载的 `uchar4`
+- scale 与计算 dtype 同精度。bf16 与 f32 的 scale 之差比一个 int4 步长小三个数量级，带 f32 只会逼 kernel 持有第二种精度
+- PyTorch 侧这个格式被写成单个自定义算子 `aotolith.dequantize_i4(packed, scales, group_size)`（`models/quantized.py`，用 `register_fake` 提供 shape 规则），`legalize/quantization.py` 只把它平移成 IR 里的同名算子，`passes/quantize.py` 的 `fold_quantized_weights` 才决定它的命运
+- 该 pass 排在 `fold_matmul_input_layouts` 之后、`fuse_rope` 之前：打包权重替换的是权重操作数本身，必须等操作数布局定稿，又必须早于任何把右操作数当矩阵读的匹配器。它只处理 `transpose_b=True` 且左侧只有一行的 `matmul`/`addmm`，把 `matmul(x, dequantize_i4(...))` 改写成带 `weight_group_size` 属性的单个 `matmul`（多操作数的 `addmm` 因此把 packed 和 scales 一起带进 epilogue，`fuse_residual_epilogue` 也相应透传 `inputs[1:]` 而不是假定只有两个操作数）
+- 折叠后的 GEMV 走 `_emit_quantized_gemv_matmul_source`：一个 warp 一列，每条 lane 每步读一个字，用 `(int)(word << 28) >> 28` 这类移位把 nibble 挪进符号位再算术右移完成符号扩展（两条指令，掩码加条件减法是四条），乘激活和组 scale 后进 float 累加，再用 `simd_sum` 归约。scale 在累加前乘，因为一个组的 scale 只作用于自己那段 reduction，提出去要求组边界必须落在 warp 边界上
+- 打包 matmul 不依赖 `codegen_matmul`：dense matmul 默认交给 MLX 是因为 MLX 的 kernel 更快，而 packed 权重一旦落到 MLX 就得先把稠密权重物化出来，正是量化要消掉的那份分配。所以只要 `_packed_matmul_supported` 认可 shape，就原生发射
+- 左侧超过一行时折叠被跳过（`M > 1` 时权重流是乘法里便宜的一半），显式 `dequantize_i4` 由 `codegen/quantize.py` 的 `QuantizationLowering` lower 成一个流式 kernel：一个字一个线程，解 8 个 nibble、乘组 scale、两次 `vec<T, 4>` 存储。相比 MLX fallback 的八个逐元素 pass 加一次 stack，它不产生中间全尺寸临时张量
+- 精度上 kernel 用 float 累加，`value`/`acc` 都是 float，只在写回时 cast。实测同一份取整后权重下，运行时相对 float32 CPU forward 的 logit 最大偏差 0.51，torch 自己的 bf16 forward 是 0.41，两者都是 bf16 噪声量级
+
+当前实测（Qwen2.5-0.5B，M5 Pro，bf16 与 int4 都开 `--codegen-attention`）：decode 4.13 → 3.56 ms/token（1.16x），峰值内存 4.12 → 1.90 GiB（2.2x），prefill 11.9 → 13.2 ms。kernel 只跑到 88 GB/s 而 bf16 GEMV 是 240 GB/s：每个 4 字节字要做两次移位、一次掩码、一次选择和八次 FMA，先耗尽的是 SIMD 管线而不是内存控制器。async 计时两边都是 193 token/s，说明每步 3.56 ms 时 host launch 速率已成新地板。
 
 ## 12. Metal attention codegen
 

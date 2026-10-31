@@ -32,6 +32,7 @@ import torch.nn.functional as F
 
 from ..compiler import CompiledModulePlan, compile_module
 from ..capture import capture_fx
+from .quantized import dequantize_i4, pack_weight
 
 # Probe points for the activation pre-flight check below. They span the range
 # where activations differ, including a negative input, where SiLU is not
@@ -141,6 +142,7 @@ class _Qwen2StaticBase(torch.nn.Module):
         model: torch.nn.Module,
         *,
         cache_capacity: int,
+        group_size: int | None = None,
     ) -> None:
         super().__init__()
         config = model.config
@@ -154,8 +156,8 @@ class _Qwen2StaticBase(torch.nn.Module):
         _validate_activation(model)
         _validate_no_sliding_attention(model)
 
-        self.model = model
         self.cache_capacity = cache_capacity
+        self.group_size = group_size
         self.hidden_size = int(config.hidden_size)
         self.num_layers = int(config.num_hidden_layers)
         self.num_heads = int(config.num_attention_heads)
@@ -178,6 +180,23 @@ class _Qwen2StaticBase(torch.nn.Module):
         )
         self.register_buffer("cosine_table", frequencies.cos(), persistent=False)
         self.register_buffer("sine_table", frequencies.sin(), persistent=False)
+        self._install(model)
+
+    # ------------------------------------------------------------------
+    # Where the tensors come from.
+    #
+    # Every forward path reads a weight through one of the hooks below rather
+    # than reaching into ``self.model``. That is what lets the quantized adapter
+    # replace a projection's operand with an unpacked 4-bit weight - and what
+    # lets it drop the float model entirely, so a compiled int4 plan holds no
+    # bf16 projection weights at all.
+    # ------------------------------------------------------------------
+
+    def _install(self, model: torch.nn.Module) -> None:
+        """Bind the module the dense adapter reads its weights from."""
+
+        self.model = model
+        self._activation = model.model.layers[0].mlp.act_fn
         # One projection per layer instead of three. Query, key and value share
         # the same normalized input, so a single matrix multiply over the packed
         # weights replaces three launches; the two key/value projections are far
@@ -209,8 +228,46 @@ class _Qwen2StaticBase(torch.nn.Module):
                 persistent=False,
             )
 
+    #: Where each named projection lives under a decoder layer.
+    _PROJECTION_OWNERS = {
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+
+    def _weight(self, name: str, layer_index: int) -> torch.Tensor:
+        """The right operand of one projection, as ``[out, in]``."""
+
+        if name == "qkv":
+            return self.get_buffer(f"qkv_weight_{layer_index}")
+        if name == "lm_head":
+            return self.model.lm_head.weight
+        owner = getattr(self.model.model.layers[layer_index], self._PROJECTION_OWNERS[name])
+        return getattr(owner, name).weight
+
+    def _bias(self, name: str, layer_index: int) -> torch.Tensor | None:
+        """The additive bias of one projection, or None for a bias-free one."""
+
+        if name == "qkv":
+            return self.get_buffer(f"qkv_bias_{layer_index}")
+        return None
+
+    def _normalization(self, name: str, layer_index: int) -> torch.Tensor:
+        """One RMS-norm scale: ``input``, ``post_attention`` or ``final``."""
+
+        if name == "final":
+            return self.model.model.norm.weight
+        layer = self.model.model.layers[layer_index]
+        if name == "input":
+            return layer.input_layernorm.weight
+        return layer.post_attention_layernorm.weight
+
+    def _embedding(self) -> torch.Tensor:
+        return self.model.model.embed_tokens.weight
+
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_ids, self.model.model.embed_tokens.weight)
+        return F.embedding(input_ids, self._embedding())
 
     def _project_qkv(
         self,
@@ -218,12 +275,13 @@ class _Qwen2StaticBase(torch.nn.Module):
         positions: torch.Tensor,
         layer_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        layer = self.model.model.layers[layer_index]
-        normalized = _rms_norm(hidden, layer.input_layernorm.weight, self.rms_norm_eps)
+        normalized = _rms_norm(
+            hidden, self._normalization("input", layer_index), self.rms_norm_eps
+        )
         projected = F.linear(
             normalized,
-            self.get_buffer(f"qkv_weight_{layer_index}"),
-            self.get_buffer(f"qkv_bias_{layer_index}"),
+            self._weight("qkv", layer_index),
+            self._bias("qkv", layer_index),
         )
         query, key, value = projected.split(
             (
@@ -274,7 +332,7 @@ class _Qwen2StaticBase(torch.nn.Module):
         self,
         hidden: torch.Tensor,
         attention_output: torch.Tensor,
-        layer: torch.nn.Module,
+        layer_index: int,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden.shape[:2]
         attention_output = attention_output.transpose(1, 2).reshape(
@@ -282,25 +340,37 @@ class _Qwen2StaticBase(torch.nn.Module):
         )
         hidden = hidden + F.linear(
             attention_output,
-            layer.self_attn.o_proj.weight,
-            None,
+            self._weight("o_proj", layer_index),
+            self._bias("o_proj", layer_index),
         )
         normalized = _rms_norm(
-            hidden, layer.post_attention_layernorm.weight, self.rms_norm_eps
+            hidden, self._normalization("post_attention", layer_index), self.rms_norm_eps
         )
-        gate = F.linear(normalized, layer.mlp.gate_proj.weight, None)
-        up = F.linear(normalized, layer.mlp.up_proj.weight, None)
+        gate = F.linear(
+            normalized,
+            self._weight("gate_proj", layer_index),
+            self._bias("gate_proj", layer_index),
+        )
+        up = F.linear(
+            normalized,
+            self._weight("up_proj", layer_index),
+            self._bias("up_proj", layer_index),
+        )
         # The layer's own activation, so the traced graph is the model's
         # computation for every activation the compiler can lower; the
         # projection epilogue fold below recognizes ``silu`` only.
-        down = F.linear(layer.mlp.act_fn(gate) * up, layer.mlp.down_proj.weight, None)
+        down = F.linear(
+            self._activation(gate) * up,
+            self._weight("down_proj", layer_index),
+            self._bias("down_proj", layer_index),
+        )
         return hidden + down
 
     def _logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = _rms_norm(hidden, self.model.model.norm.weight, self.rms_norm_eps)
+        hidden = _rms_norm(hidden, self._normalization("final", 0), self.rms_norm_eps)
         # The benchmark and serving path only need the next-token distribution.
         hidden = hidden[:, -1:, :]
-        return F.linear(hidden, self.model.lm_head.weight, None)
+        return F.linear(hidden, self._weight("lm_head", 0), self._bias("lm_head", 0))
 
 
 class Qwen2PrefillModule(_Qwen2StaticBase):
@@ -321,7 +391,7 @@ class Qwen2PrefillModule(_Qwen2StaticBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self._embed(input_ids)
         cache_values: list[torch.Tensor] = []
-        for layer_index, layer in enumerate(self.model.model.layers):
+        for layer_index in range(self.num_layers):
             query, key, value = self._project_qkv(hidden, positions, layer_index)
             attention_output = F.scaled_dot_product_attention(
                 query,
@@ -330,7 +400,7 @@ class Qwen2PrefillModule(_Qwen2StaticBase):
                 attn_mask=attention_mask,
                 enable_gqa=True,
             )
-            hidden = self._finish_layer(hidden, attention_output, layer)
+            hidden = self._finish_layer(hidden, attention_output, layer_index)
             cache_values.extend((key, value))
 
         cache = torch.stack(cache_values, dim=0).reshape(
@@ -356,7 +426,7 @@ class Qwen2DecodeModule(_Qwen2StaticBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self._embed(input_ids)
         next_cache_values: list[torch.Tensor] = []
-        for layer_index, layer in enumerate(self.model.model.layers):
+        for layer_index in range(self.num_layers):
             query, key, value = self._project_qkv(hidden, positions, layer_index)
             # One append moves key and value together: the cache already stores
             # both at the same slots, so a single copy replaces two.
@@ -379,7 +449,7 @@ class Qwen2DecodeModule(_Qwen2StaticBase):
                 attn_mask=attention_mask,
                 enable_gqa=True,
             )
-            hidden = self._finish_layer(hidden, attention_output, layer)
+            hidden = self._finish_layer(hidden, attention_output, layer_index)
             next_cache_values.append(next_key_value)
 
         next_cache = torch.stack(next_cache_values, dim=0).reshape(
@@ -391,6 +461,120 @@ class Qwen2DecodeModule(_Qwen2StaticBase):
             self.head_dim,
         )
         return self._logits(hidden), next_cache
+
+
+class _QuantizedProjections:
+    """Weight-only int4 projections for the static-cache adapters.
+
+    This is a mixin rather than a second adapter: the forward pass is identical,
+    and only three hooks change - where a projection's operand comes from, where
+    the norm scales come from, and the embedding. Everything the plan needs is
+    registered as a buffer here, so the compiled plan's state is the packed
+    weights and nothing else: the float model is *not* held, and no bf16
+    projection weight survives into the plan.
+
+    The weights are packed from the model at construction, which is the one
+    place a checkpoint is read; after that the model can be released.
+    """
+
+    group_size: int
+
+    #: The projections packed per decoder layer, plus the two whole-model ones.
+    _PACKED_PROJECTIONS = ("qkv", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+    def _install(self, model: torch.nn.Module) -> None:
+        if self.group_size is None:
+            raise ValueError("a quantized adapter requires a group size")
+        self._activation = model.model.layers[0].mlp.act_fn
+        dtype = next(model.parameters()).dtype
+
+        def register(name: str, tensor: torch.Tensor) -> None:
+            self.register_buffer(name, tensor.detach(), persistent=False)
+
+        def pack(name: str, weight: torch.Tensor) -> None:
+            packed, scales = pack_weight(weight, self.group_size)
+            self.register_buffer(f"{name}_packed", packed, persistent=False)
+            self.register_buffer(
+                f"{name}_scales", scales.to(dtype).contiguous(), persistent=False
+            )
+
+        register("embed_tokens_weight", model.model.embed_tokens.weight)
+        register("final_norm", model.model.norm.weight)
+        pack("lm_head_0", model.lm_head.weight)
+        for index, layer in enumerate(model.model.layers):
+            attention = layer.self_attn
+            pack(
+                f"qkv_{index}",
+                torch.cat(
+                    (
+                        attention.q_proj.weight,
+                        attention.k_proj.weight,
+                        attention.v_proj.weight,
+                    ),
+                    dim=0,
+                ),
+            )
+            register(
+                f"qkv_bias_{index}",
+                torch.cat(
+                    (
+                        attention.q_proj.bias,
+                        attention.k_proj.bias,
+                        attention.v_proj.bias,
+                    ),
+                    dim=0,
+                ),
+            )
+            register(f"input_norm_{index}", layer.input_layernorm.weight)
+            register(
+                f"post_attention_norm_{index}", layer.post_attention_layernorm.weight
+            )
+            for name in self._PACKED_PROJECTIONS[1:]:
+                owner = getattr(layer, self._PROJECTION_OWNERS[name])
+                pack(f"{name}_{index}", getattr(owner, name).weight)
+
+    def _weight(self, name: str, layer_index: int) -> torch.Tensor:
+        """The projection's weight, unpacked from the 4-bit words.
+
+        This is where the compiler's fold happens: every call here is one
+        ``dequantize_i4`` node feeding one matmul, and the pass rewrites the
+        pair so the kernel streams the words instead of this matrix.
+        """
+
+        packed = self.get_buffer(f"{name}_{layer_index}_packed")
+        scales = self.get_buffer(f"{name}_{layer_index}_scales")
+        return dequantize_i4(packed, scales, self.group_size)
+
+    def _bias(self, name: str, layer_index: int) -> torch.Tensor | None:
+        if name == "qkv":
+            return self.get_buffer(f"qkv_bias_{layer_index}")
+        return None
+
+    def _normalization(self, name: str, layer_index: int) -> torch.Tensor:
+        if name == "final":
+            return self.get_buffer("final_norm")
+        if name == "input":
+            return self.get_buffer(f"input_norm_{layer_index}")
+        return self.get_buffer(f"post_attention_norm_{layer_index}")
+
+    def _embedding(self) -> torch.Tensor:
+        return self.get_buffer("embed_tokens_weight")
+
+
+class Qwen2QuantizedPrefillModule(_QuantizedProjections, Qwen2PrefillModule):
+    """Int4 prefill: the dense prompt pass with packed projection weights."""
+
+
+class Qwen2QuantizedDecodeModule(_QuantizedProjections, Qwen2DecodeModule):
+    """Int4 decode: the dense token step with packed projection weights."""
+
+
+#: Which adapter classes a bucket compiles. The int4 pair is the same two
+#: modules with the projection hooks replaced, so the compile path is shared.
+_ADAPTER_TYPES = {
+    False: (Qwen2PrefillModule, Qwen2DecodeModule),
+    True: (Qwen2QuantizedPrefillModule, Qwen2QuantizedDecodeModule),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,6 +778,7 @@ def compile_qwen2_static_cache(
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
     autotune: bool = False,
+    quantize: int | None = None,
 ) -> Qwen2StaticCacheRuntime:
     """Compile a Qwen2/Qwen2.5 causal LM for greedy single-request generation.
 
@@ -610,6 +795,7 @@ def compile_qwen2_static_cache(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
         autotune=autotune,
+        quantize=quantize,
     )
 
 
@@ -621,6 +807,7 @@ def _compile_bucket(
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
     autotune: bool = False,
+    quantize: int | None = None,
 ) -> Qwen2StaticCacheRuntime:
     """Compile the prefill/decode plan pair for one fixed prompt length."""
 
@@ -637,8 +824,19 @@ def _compile_bucket(
             f"position embeddings ({model.config.max_position_embeddings})"
         )
 
-    prefill_module = Qwen2PrefillModule(model, cache_capacity=cache_capacity).eval()
-    decode_module = Qwen2DecodeModule(model, cache_capacity=cache_capacity).eval()
+    prefill_type, decode_type = _ADAPTER_TYPES[quantize is not None]
+    # A 4-bit weight is only worth its format if the kernel that reads it
+    # streams the words; without the streaming kernel the model unpacks on MLX
+    # and ends up slower than bf16. So asking for int4 turns the matmul codegen
+    # on rather than leaving a trap for the caller.
+    if quantize is not None:
+        codegen_matmul = True
+    prefill_module = prefill_type(
+        model, cache_capacity=cache_capacity, group_size=quantize
+    ).eval()
+    decode_module = decode_type(
+        model, cache_capacity=cache_capacity, group_size=quantize
+    ).eval()
     example_ids = torch.zeros((1, prompt_length), dtype=torch.int64)
     example_positions = torch.arange(prompt_length, dtype=torch.int64)[None, :]
     example_prefill_mask = torch.from_numpy(
@@ -838,6 +1036,7 @@ def compile_qwen2_bucketed(
     codegen_matmul: bool = False,
     codegen_attention: bool = False,
     autotune: bool = False,
+    quantize: int | None = None,
 ) -> Qwen2BucketedRuntime:
     """Compile one plan pair per prompt-length bucket.
 
@@ -864,6 +1063,7 @@ def compile_qwen2_bucketed(
             codegen_matmul=codegen_matmul,
             codegen_attention=codegen_attention,
             autotune=autotune,
+            quantize=quantize,
         )
         for width in widths
     ]
