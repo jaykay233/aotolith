@@ -53,6 +53,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _verify(args)
         if args.command == "run":
             return _run(args)
+        if args.command == "bench":
+            return _bench(args)
     except (ArtifactError, ImportError, OSError, TypeError, ValueError) as exc:
         print(f"{parser.prog}: error: {exc}", file=sys.stderr)
         return 1
@@ -158,7 +160,49 @@ def _build_parser() -> argparse.ArgumentParser:
         help=("tensor keyword input for the plan, in NAME=JSON form; may be repeated"),
     )
     run_parser.add_argument("--output", type=Path)
+    _add_bench_parser(subparsers)
     return parser
+
+
+def _add_bench_parser(subparsers: Any) -> None:
+    bench_parser = subparsers.add_parser(
+        "bench",
+        help="measure fixed workloads and check them against a baseline",
+    )
+    bench_parser.add_argument("--repeats", type=int, default=11)
+    bench_parser.add_argument("--warmups", type=int, default=3)
+    bench_parser.add_argument(
+        "--workload",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="measure only this workload; may be repeated",
+    )
+    bench_parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the report JSON to this path",
+    )
+    bench_parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="compare this run against a recorded report",
+    )
+    bench_parser.add_argument(
+        "--update-baseline",
+        type=Path,
+        metavar="PATH",
+        help="write this run as the baseline to compare future runs against",
+    )
+    bench_parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.15,
+        help=(
+            "fraction a timing may slow before it counts as a regression; "
+            "only applied when the baseline names the same device"
+        ),
+    )
 
 
 def _add_artifact_path(parser: argparse.ArgumentParser) -> None:
@@ -455,6 +499,47 @@ def _load_json_object(payload: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("expected a JSON object")
     return decoded
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    if path.parent != Path(""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def _bench(args: argparse.Namespace) -> int:
+    # Imported here so that ``aoto compile`` does not pay for the benchmark
+    # module's numpy and MLX reference setup.
+    from . import bench
+
+    selected = bench.WORKLOADS
+    if args.workload:
+        known = {workload.name: workload for workload in bench.WORKLOADS}
+        unknown = [name for name in args.workload if name not in known]
+        if unknown:
+            raise ValueError(
+                "unknown workload(s): "
+                + ", ".join(unknown)
+                + "; known: "
+                + ", ".join(known)
+            )
+        selected = tuple(known[name] for name in args.workload)
+
+    report = bench.run(warmups=args.warmups, repeats=args.repeats, workloads=selected)
+    print(bench.render_table(report))
+
+    if args.output is not None:
+        _write_json(args.output, report)
+    if args.update_baseline is not None:
+        _write_json(args.update_baseline, report)
+        print(f"baseline written to {args.update_baseline}")
+    if args.baseline is None:
+        return 0
+
+    baseline = json.loads(args.baseline.read_text())
+    comparison = bench.compare(report, baseline, tolerance=args.tolerance)
+    print(bench.summarize(comparison))
+    return 0 if comparison.ok else 1
 
 
 if __name__ == "__main__":

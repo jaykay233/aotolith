@@ -4,17 +4,25 @@ The compiler fixes every tensor shape at capture time. HuggingFace's default
 ``DynamicCache`` therefore cannot be passed through the graph boundary. This
 adapter exposes an explicit cache ABI:
 
-* prefill: ``input_ids`` + ``positions`` -> ``logits`` + compact cache
+* prefill: ``input_ids`` + ``positions`` + ``mask`` -> ``logits`` + compact cache
 * decode: ``token`` + ``position`` + ``mask`` + full cache -> ``logits`` + cache
 
 The host owns the greedy loop and the one-time left padding from prompt length
 to cache capacity. Scheduling, paged allocation, batching, and serving remain
 outside Aotolith.
+
+A fixed prompt length means one pair of plans. :func:`compile_qwen2_bucketed`
+compiles a pair per size bucket instead and left-pads a shorter prompt into the
+smallest bucket that fits, so the host picks a bucket per request rather than
+recompiling per prompt. Left padding is what keeps the cache layout: the decode
+masks select the trailing window. It also means prefill needs an explicit mask,
+because ``is_causal`` cannot tell a pad from a prompt token.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -105,6 +113,26 @@ def _apply_rotary(
     sine: torch.Tensor,
 ) -> torch.Tensor:
     return value * cosine + _rotate_half(value) * sine
+
+
+def prefill_mask(length: int, bucket: int) -> np.ndarray:
+    """Build the rank-4 boolean mask for a left-padded prompt.
+
+    Entry ``[query, key]`` is True when the key is a real token at or before
+    the query, which is "causal and not padding" in one comparison. ``length``
+    tokens are left-padded into a ``bucket``-wide plan, so the real tokens
+    occupy the last ``length`` slots and the first ``length`` rotary positions.
+    At ``length == bucket`` the result is the plain causal mask.
+    """
+
+    if bucket <= 0 or length <= 0 or length > bucket:
+        raise ValueError(
+            f"need 0 < length <= bucket, got length={length}, bucket={bucket}"
+        )
+    query = np.arange(bucket)[:, None]
+    key = np.arange(bucket)[None, :]
+    mask = (key <= query) & (key >= bucket - length)
+    return mask[None, None]
 
 
 class _Qwen2StaticBase(torch.nn.Module):
@@ -276,12 +304,20 @@ class _Qwen2StaticBase(torch.nn.Module):
 
 
 class Qwen2PrefillModule(_Qwen2StaticBase):
-    """Capture a fixed-length prompt and emit a compact per-layer KV cache."""
+    """Capture a fixed-length prompt and emit a compact per-layer KV cache.
+
+    The attention mask carries causality and padding in one tensor. A size
+    bucket compiles one prompt length and left-pads anything shorter into it,
+    so ``is_causal=True`` alone would let every real token attend to the pads
+    sitting to its left. At full length :func:`prefill_mask` reduces to exactly
+    the causal mask, so a single plan serves both cases.
+    """
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self._embed(input_ids)
         cache_values: list[torch.Tensor] = []
@@ -291,7 +327,7 @@ class Qwen2PrefillModule(_Qwen2StaticBase):
                 query,
                 key,
                 value,
-                is_causal=True,
+                attn_mask=attention_mask,
                 enable_gqa=True,
             )
             hidden = self._finish_layer(hidden, attention_output, layer)
@@ -370,6 +406,7 @@ class Qwen2StaticCacheRuntime:
     num_key_value_heads: int
     head_dim: int
     _decode_masks: mx.array
+    _prefill_mask: mx.array
 
     def prefill_ids(
         self,
@@ -381,7 +418,46 @@ class Qwen2StaticCacheRuntime:
                 f"expected prompt shape (1, {self.prompt_length}), got {ids.shape}"
             )
         positions = mx.arange(self.prompt_length, dtype=mx.int64)[None, :]
-        logits, cache = self.prefill(ids, positions)
+        logits, cache = self.prefill(ids, positions, self._prefill_mask)
+        return logits, cache
+
+    def prefill_padded(
+        self,
+        input_ids: mx.array | np.ndarray | list[int] | list[list[int]],
+    ) -> tuple[mx.array, mx.array]:
+        """Prefill a prompt no longer than the plan, left-padding the rest.
+
+        The pads only ever occupy cache slots that the decode masks exclude, so
+        the returned logits and the real part of the compact cache match a plan
+        compiled for the exact length. That is what lets one plan serve a whole
+        size bucket.
+        """
+
+        ids = _as_input_ids(input_ids)
+        if ids.shape[0] != 1:
+            raise ValueError(f"expected batch size 1, got {ids.shape[0]}")
+        length = int(ids.shape[1])
+        if length < 1 or length > self.prompt_length:
+            raise ValueError(
+                f"prompt length must be in [1, {self.prompt_length}], got {length}"
+            )
+        if length == self.prompt_length:
+            return self.prefill_ids(ids)
+        padding = self.prompt_length - length
+        # Pad tokens stay below every real token's rotary position and are
+        # masked out, so a zero id (and a zero position) is arbitrary but safe.
+        padded_ids = mx.concatenate(
+            (mx.zeros((1, padding), dtype=mx.int64), ids), axis=1
+        )
+        padded_positions = mx.concatenate(
+            (
+                mx.zeros((1, padding), dtype=mx.int64),
+                mx.arange(length, dtype=mx.int64)[None, :],
+            ),
+            axis=1,
+        )
+        mask = mx.array(prefill_mask(length, self.prompt_length))
+        logits, cache = self.prefill(padded_ids, padded_positions, mask)
         return logits, cache
 
     def pad_cache(self, compact_cache: mx.array) -> mx.array:
@@ -464,26 +540,7 @@ class Qwen2StaticCacheRuntime:
 
         logits, compact_cache = self.prefill_ids(input_ids)
         cache = self.pad_cache(compact_cache)
-        token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
-        if sync_each_step:
-            mx.eval(token, cache)
-        generated = [token.reshape(-1)]
-        valid_length = self.prompt_length
-        for _ in range(steps - 1):
-            valid_length += 1
-            # Every token here is an ``argmax`` over the logits, so it always
-            # indexes a real embedding row and the bounds check is redundant.
-            logits, cache = self.decode_token(
-                token, cache, valid_length, verify_token=False
-            )
-            token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
-            if sync_each_step:
-                mx.eval(token, cache)
-            generated.append(token.reshape(-1))
-        tokens = mx.stack(generated, axis=1)
-        if not sync_each_step:
-            mx.eval(tokens, cache)
-        return tokens
+        return _greedy_tokens(self, logits, cache, self.prompt_length, steps, sync_each_step)
 
     def save(self, prefix: str | Path) -> tuple[Path, Path]:
         path = Path(prefix)
@@ -491,6 +548,42 @@ class Qwen2StaticCacheRuntime:
             self.prefill.save(path.with_name(path.name + ".prefill.aoto")),
             self.decode.save(path.with_name(path.name + ".decode.aoto")),
         )
+
+
+def _greedy_tokens(
+    runtime: Qwen2StaticCacheRuntime,
+    logits: mx.array,
+    cache: mx.array,
+    valid_length: int,
+    steps: int,
+    sync_each_step: bool,
+) -> mx.array:
+    """Run the host-side greedy loop over one bucket.
+
+    ``valid_length`` is the real prompt length, not the bucket width: a
+    left-padded bucket prefill leaves the pads outside the window the decode
+    masks select, so the loop must start counting at the real length.
+    """
+
+    token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
+    if sync_each_step:
+        mx.eval(token, cache)
+    generated = [token.reshape(-1)]
+    for _ in range(steps - 1):
+        valid_length += 1
+        # Every token here is an ``argmax`` over the logits, so it always
+        # indexes a real embedding row and the bounds check is redundant.
+        logits, cache = runtime.decode_token(
+            token, cache, valid_length, verify_token=False
+        )
+        token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(mx.int64)
+        if sync_each_step:
+            mx.eval(token, cache)
+        generated.append(token.reshape(-1))
+    tokens = mx.stack(generated, axis=1)
+    if not sync_each_step:
+        mx.eval(tokens, cache)
+    return tokens
 
 
 def compile_qwen2_static_cache(
@@ -504,9 +597,32 @@ def compile_qwen2_static_cache(
 ) -> Qwen2StaticCacheRuntime:
     """Compile a Qwen2/Qwen2.5 causal LM for greedy single-request generation.
 
-    All shapes are static. The returned runtime releases the PyTorch module and
-    retains only Aotolith plans and model state.
+    All shapes are static, and one prompt length means one pair of plans. Use
+    :func:`compile_qwen2_bucketed` when the prompt length varies: it compiles a
+    plan per size bucket and serves every shorter prompt by left-padding into
+    the smallest bucket instead of recompiling.
     """
+
+    return _compile_bucket(
+        model,
+        prompt_length=prompt_length,
+        max_new_tokens=max_new_tokens,
+        codegen_matmul=codegen_matmul,
+        codegen_attention=codegen_attention,
+        autotune=autotune,
+    )
+
+
+def _compile_bucket(
+    model: torch.nn.Module,
+    *,
+    prompt_length: int,
+    max_new_tokens: int,
+    codegen_matmul: bool = False,
+    codegen_attention: bool = False,
+    autotune: bool = False,
+) -> Qwen2StaticCacheRuntime:
+    """Compile the prefill/decode plan pair for one fixed prompt length."""
 
     if prompt_length <= 0 or max_new_tokens < 0:
         raise ValueError(
@@ -525,9 +641,12 @@ def compile_qwen2_static_cache(
     decode_module = Qwen2DecodeModule(model, cache_capacity=cache_capacity).eval()
     example_ids = torch.zeros((1, prompt_length), dtype=torch.int64)
     example_positions = torch.arange(prompt_length, dtype=torch.int64)[None, :]
+    example_prefill_mask = torch.from_numpy(
+        prefill_mask(prompt_length, prompt_length)
+    )
     prefill = compile_module(
         prefill_module,
-        (example_ids, example_positions),
+        (example_ids, example_positions, example_prefill_mask),
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
         autotune=autotune,
@@ -569,11 +688,195 @@ def compile_qwen2_static_cache(
         num_key_value_heads=prefill_module.num_key_value_heads,
         head_dim=prefill_module.head_dim,
         _decode_masks=mx.array(masks),
+        _prefill_mask=mx.array(prefill_mask(prompt_length, prompt_length)),
     )
     # Do not leave the traced module (and a second reference to the state) in
     # the runtime through closures or exception frames.
     del prefill_module, decode_module
     return runtime
+
+
+def _share_plan_state(
+    plans: Sequence[CompiledModulePlan],
+) -> list[CompiledModulePlan]:
+    """Rebind identical state entries to one array across plans.
+
+    Every bucket traces the same module at a different sequence length, and
+    prefill and decode are traced separately, so a naive bucket list holds one
+    copy of the weights per plan. The weights are identical; only the rotary
+    tables depend on the cache capacity. Rebinding by ``(name, shape, dtype)``
+    leaves one copy of each weight for the whole bucket set.
+    """
+
+    if len(plans) < 2:
+        return list(plans)
+    canonical: dict[str, mx.array] = {}
+    for name, value in zip(plans[0].state_names, plans[0]._state_values):
+        canonical.setdefault(name, value)
+
+    shared: list[CompiledModulePlan] = [plans[0]]
+    for plan in plans[1:]:
+        values = list(plan._state_values)
+        changed = False
+        for index, name in enumerate(plan.state_names):
+            reference = canonical.get(name)
+            if reference is None:
+                continue
+            value = values[index]
+            if value.shape == reference.shape and value.dtype == reference.dtype:
+                canonical.setdefault(name, value)
+                if values[index] is not reference:
+                    values[index] = reference
+                    changed = True
+        shared.append(replace(plan, _state_values=tuple(values)) if changed else plan)
+    return shared
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen2BucketedRuntime:
+    """One compiled runtime per prompt-length bucket, dispatched by length.
+
+    A request is served by the smallest bucket that can hold it, left-padded
+    into that bucket's plan. Every prompt up to ``buckets[-1]`` therefore runs
+    on already-compiled plans, and the only per-request host work is one
+    padding copy and one mask build.
+    """
+
+    buckets: tuple[Qwen2StaticCacheRuntime, ...]
+    max_new_tokens: int
+
+    def __post_init__(self) -> None:
+        if not self.buckets:
+            raise ValueError("at least one bucket is required")
+        widths = tuple(bucket.prompt_length for bucket in self.buckets)
+        if list(widths) != sorted(set(widths)):
+            raise ValueError(
+                f"buckets must be strictly increasing, got {list(widths)}"
+            )
+        for bucket in self.buckets:
+            if bucket.max_new_tokens != self.max_new_tokens:
+                raise ValueError("every bucket must share one max_new_tokens")
+
+    @property
+    def prompt_lengths(self) -> tuple[int, ...]:
+        """The bucket widths, ascending."""
+
+        return tuple(bucket.prompt_length for bucket in self.buckets)
+
+    @property
+    def max_prompt_length(self) -> int:
+        return self.buckets[-1].prompt_length
+
+    def bucket_for(self, prompt_length: int) -> Qwen2StaticCacheRuntime:
+        """Return the smallest bucket that holds ``prompt_length`` tokens."""
+
+        for bucket in self.buckets:
+            if prompt_length <= bucket.prompt_length:
+                return bucket
+        raise ValueError(
+            f"prompt length {prompt_length} exceeds the largest bucket "
+            f"({self.max_prompt_length}); compile another bucket or truncate"
+        )
+
+    def prefill_ids(
+        self,
+        input_ids: mx.array | np.ndarray | list[int] | list[list[int]],
+    ) -> tuple[mx.array, mx.array]:
+        """Prefill on the matching bucket and return ``(logits, cache)``.
+
+        The cache is the full-capacity cache, already aligned so that the real
+        tokens occupy the window the decode masks select.
+        """
+
+        ids = _as_input_ids(input_ids)
+        if ids.shape[0] != 1:
+            raise ValueError(f"expected batch size 1, got {ids.shape[0]}")
+        bucket = self.bucket_for(int(ids.shape[1]))
+        logits, compact_cache = bucket.prefill_padded(ids)
+        return logits, bucket.pad_cache(compact_cache)
+
+    def greedy_generate(
+        self,
+        input_ids: mx.array | np.ndarray | list[int] | list[list[int]],
+        *,
+        max_new_tokens: int | None = None,
+        sync_each_step: bool = False,
+    ) -> mx.array:
+        steps = self.max_new_tokens if max_new_tokens is None else max_new_tokens
+        if steps < 0 or steps > self.max_new_tokens:
+            raise ValueError(
+                f"max_new_tokens must be in [0, {self.max_new_tokens}], got {steps}"
+            )
+        if steps == 0:
+            return mx.zeros((1, 0), dtype=mx.int64)
+
+        ids = _as_input_ids(input_ids)
+        if ids.shape[0] != 1:
+            raise ValueError(f"expected batch size 1, got {ids.shape[0]}")
+        prompt_length = int(ids.shape[1])
+        bucket = self.bucket_for(prompt_length)
+        logits, compact_cache = bucket.prefill_padded(ids)
+        cache = bucket.pad_cache(compact_cache)
+        return _greedy_tokens(bucket, logits, cache, prompt_length, steps, sync_each_step)
+
+    def save(self, prefix: str | Path) -> tuple[Path, ...]:
+        path = Path(prefix)
+        saved: list[Path] = []
+        for bucket in self.buckets:
+            width = bucket.prompt_length
+            saved.extend(
+                bucket.save(path.with_name(f"{path.name}.{width}"))
+            )
+        return tuple(saved)
+
+
+def compile_qwen2_bucketed(
+    model: torch.nn.Module,
+    *,
+    prompt_lengths: Sequence[int],
+    max_new_tokens: int,
+    codegen_matmul: bool = False,
+    codegen_attention: bool = False,
+    autotune: bool = False,
+) -> Qwen2BucketedRuntime:
+    """Compile one plan pair per prompt-length bucket.
+
+    Prompts shorter than a bucket are left-padded into it, so a serving loop
+    picks a bucket once per request instead of compiling per length. The bucket
+    widths are the only shape-varying knob: keep them on the boundaries the
+    workload actually clusters on, since a wider bucket costs more prefill
+    work for every prompt that lands in it.
+    """
+
+    widths = [int(width) for width in prompt_lengths]
+    if not widths:
+        raise ValueError("prompt_lengths must name at least one bucket")
+    if any(width <= 0 for width in widths):
+        raise ValueError(f"bucket widths must be positive, got {widths}")
+    if widths != sorted(set(widths)):
+        raise ValueError(f"bucket widths must be strictly increasing, got {widths}")
+
+    runtimes = [
+        _compile_bucket(
+            model,
+            prompt_length=width,
+            max_new_tokens=max_new_tokens,
+            codegen_matmul=codegen_matmul,
+            codegen_attention=codegen_attention,
+            autotune=autotune,
+        )
+        for width in widths
+    ]
+    # One copy of the weights for the whole bucket set. The plans never mutate
+    # their state, so sharing the arrays is safe.
+    shared = _share_plan_state(
+        [plan for runtime in runtimes for plan in (runtime.prefill, runtime.decode)]
+    )
+    buckets = tuple(
+        replace(runtime, prefill=shared[2 * index], decode=shared[2 * index + 1])
+        for index, runtime in enumerate(runtimes)
+    )
+    return Qwen2BucketedRuntime(buckets=buckets, max_new_tokens=max_new_tokens)
 
 
 def _as_input_ids(

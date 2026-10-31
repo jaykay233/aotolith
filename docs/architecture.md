@@ -669,6 +669,33 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 
 这个实现优先保证布局容易验证。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
 
+#### 尺寸桶
+
+`models/qwen2.py` 的 `compile_qwen2_bucketed` 让一次编译服务一组 prompt 长度。每个桶宽度编译一对 prefill/decode 计划，更短的 prompt 左填充进能装下它的最小桶，host 只付一次 padding 拷贝和一次 mask 构造。
+
+- 左填充而不是右填充：decode 的 mask 表按 `valid_length` 取 cache 尾部窗口，真实 token 必须留在尾部；右填充会把真实 K/V 放到前部，roll 一步就把它挤出窗口。
+- prefill 因此必须显式接收 mask。`is_causal=True` 只会屏蔽 query 之后的 key，看不见左侧的 pad，于是 `prefill_mask(length, bucket)` 把 causal 和 padding 合成一个 `[1, 1, bucket, bucket]` bool mask；`length == bucket` 时它退化成纯 causal，所以同一张计划覆盖等长和填充两种情况。decode 的 mask 表不变。
+- RoPE position 与 cache slot 解耦：真实 token 拿 `0..length-1`，pad 拿 0。slot 由左填充决定，position 由真实序号决定，两者本来就是两套坐标（非桶化路径里 cache 右对齐、position 从 0 开始，也是同样的解耦）。
+- 只有桶宽度改变 shape。`_share_plan_state` 按 `(name, shape, dtype)` 把各桶、以及 prefill/decode 之间的 state 数组重绑到同一份内存，运行时的权重因此只有一份；cos/sin 表随 capacity 变化而不共享。`save()` 仍是每个桶每张图一份 archive，每份各自带 state，所以共享只省运行时内存，不缩小产物体积。
+- 测试逐长度对照 PyTorch eager 的 logits，并对照「该长度单独编译」的 greedy token，覆盖 1/4/8/12/16 五个长度、桶边界和超长拒绝。
+
+## 13.5 性能回归门禁
+
+`aotolith/bench.py` 与 `aoto bench` 提供编译器自身的回归门禁。五个固定负载分别覆盖投影、gated MLP（`silu_mul_paired` epilogue 融合）、RMSNorm、causal attention 和 Qwen2 prefill 适配层；输入用固定 seed 的 torch 张量生成，不需要下载权重。
+
+门禁按可比性分成两半：
+
+| 指标 | 是否确定性 | 比对条件 |
+|---|---|---|
+| `input_ops`、`lowered_ops` | 是，与设备无关 | 任何设备上都精确比对，只允许下降 |
+| `kernels` | 否，取决于 GPU 能加载哪些原生 kernel | 仅当 baseline 记录同一 `device_name` |
+| `median_ms` | 否 | 同上，允许 `--tolerance` 比例的变慢 |
+| `ratio`、`compile_ms` | 否 | 只报告，不设阈值 |
+
+`ratio` 是负载中位数相对同进程内一次裸 MLX matmul 的比值，用来在跨机器阅读报告时抵消整体速度差异。`compile_ms` 只报告：首次编译会付 Metal kernel 编译和进程缓存，同一负载的顺序会显著改变这个数字。
+
+基线文件放在 `benchmarks/baselines/`，用 `aoto bench --update-baseline PATH` 重新记录。CI 的 `bench` job 用仓库内的 baseline 跑一次；macos runner 的虚拟 GPU 与基线设备不同，因此那里只比对 op 数，毫秒部分跳过并把 `perf-report.json` 作为 artifact 上传。
+
 ## 14. 编译产物、校验与加载
 
 `CompilationResult.save()`、`CompiledModulePlan.save()` 或 `save_compiled()` 写出 `.aoto` archive。当前 archive 使用 format version 5、ABI version 1.3，包含：
@@ -691,7 +718,7 @@ ABI 1.3 增加了 `entrypoint.kwargs`，记录被提升为图输入的 tensor �
 
 默认允许 artifact 在其他 Apple Silicon GPU 上加载，因为 Metal kernel 会从受校验的图和 MSL source 重新构建。`require_device_match=True` 会同时比较编译时和当前设备的 `device_name`、`architecture`，用于必须绑定特定 GPU 型号的场景。当前 target 只有 `apple-metal`。
 
-CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest，`verify` 完整重建并校验 artifact，`run` 加载 artifact 并写出 JSON 结果。Python API 与 CLI 使用同一个 loader。
+CLI 提供五个命令：`compile` 生成 artifact，`inspect` 读取 manifest，`verify` 完整重建并校验 artifact，`run` 加载 artifact 并写出 JSON 结果，`bench` 跑固定负载并与 baseline 比对。Python API 与 CLI 使用同一个 loader。
 
 ## 15. 已知边界
 
@@ -731,6 +758,7 @@ CLI 提供四个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - 复数不在范围内，因此 `torch.fft` 一族（`rfft`/`fft2` 等）虽然走的是 decomposition，最终仍停在 complex dtype 上；`grid_sample`（`aten.grid_sampler_2d`）是视觉模型里的专用算子，采集索引的语义和现有的 `gather` 不同，没有 lowering
 - 以值本身作结论的算子在捕获期被拒绝：`torch.equal`、`torch.allclose` 归约出来的结果没有形状，fake tracing 也给不出示例值，消息把比较放到编译产物之外
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
+- 尺寸桶只在 `compile_qwen2_bucketed` 里实现：桶宽度在编译期固定，超出最大桶的 prompt 直接报错，不做截断或二次编译。桶内填充到桶宽，所以一个 129 token 的 prompt 在 2048 桶里要按 2048 做完整 prefill；桶边界要按负载实际聚集的长度来定。推理运行时按请求动态挑桶、丢弃未用桶、跨桶迁移 cache 都不在编译器边界内
 - Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 走每层自己的 `mlp.act_fn`（因此 `silu`、两种 `gelu` 拼法以及其他 pointwise 激活都按模型本身的算式编译；`silu_mul` 的 matmul epilogue 折叠仍只识别 `silu`，`gelu` MLP 会多出一条独立的 pointwise kernel），构造时把该激活单独跑一遍捕获，无法 lower 的激活（例如带参数的 `PReLU`）在模型捕获之前就以点名该层的消息报错。sliding-window 层仍然被拒绝（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）：适配层的 mask 由自己构造，普通 causal mask 与窗口 mask 语义不同，而当前 transformers 版本自身的 sliding 路径在同一条 cache 上就会抛 `TypeError`，没有可对照的参考实现
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍

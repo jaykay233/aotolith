@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "device": {
+    "name": "Apple M5 Pro",
+    "architecture": "applegpu_g17s",
+    "memory_bytes": 25769803776
+  },
+  "measurement": {
+    "warmups": 3,
+    "repeats": 11
+  },
+  "reference_ms": 1.0555419139564037,
+  "workloads": {
+    "linear_1024x1024": {
+      "compile_ms": 307.08345770835876,
+      "median_ms": 1.2043328024446964,
+      "min_ms": 0.5371249280869961,
+      "max_ms": 1.3117501512169838,
+      "input_ops": 2,
+      "lowered_ops": 1,
+      "kernels": 1,
+      "ratio": 1.1409616108285001
+    },
+    "gated_mlp_1024_4096": {
+      "compile_ms": 6.003083195537329,
+      "median_ms": 0.5109580233693123,
+      "min_ms": 0.47508301213383675,
+      "max_ms": 0.5446672439575195,
+      "input_ops": 8,
+      "lowered_ops": 3,
+      "kernels": 0,
+      "ratio": 0.48407175178305234
+    },
+    "rms_norm_32x4096": {
+      "compile_ms": 3.245917148888111,
+      "median_ms": 0.16024988144636154,
+      "min_ms": 0.15199976041913033,
+      "max_ms": 0.20187534391880035,
+      "input_ops": 1,
+      "lowered_ops": 1,
+      "kernels": 1,
+      "ratio": 0.151817639193227
+    },
+    "attention_causal_128": {
+      "compile_ms": 1.965582836419344,
+      "median_ms": 0.2243751659989357,
+      "min_ms": 0.20195916295051575,
+      "max_ms": 0.25795912370085716,
+      "input_ops": 1,
+      "lowered_ops": 1,
+      "kernels": 1,
+      "ratio": 0.21256869389291053
+    },
+    "qwen2_prefill_128": {
+      "compile_ms": 41.978207882493734,
+      "median_ms": 1.6102921217679977,
+      "min_ms": 1.5219589695334435,
+      "max_ms": 1.6883336938917637,
+      "input_ops": 131,
+      "lowered_ops": 79,
+      "kernels": 10,
+      "ratio": 1.5255596205860438
+    }
+  },
+  "skipped": {}
+}

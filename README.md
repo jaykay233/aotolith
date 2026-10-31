@@ -212,6 +212,25 @@ print(tokens.tolist())
 
 The adapter fixes batch size, prompt length, and maximum generation length and implements greedy single-request generation only. The host owns the token loop; scheduling, batching, paged KV allocation, and sampling remain outside the compiler. `runtime.save("qwen")` writes separate prefill and decode `.aoto` files, each currently containing its own copy of the model state.
 
+#### Size buckets
+
+A fixed prompt length means a serving loop recompiles for every new one. `compile_qwen2_bucketed` compiles one plan pair per bucket width instead, and serves any shorter prompt by left-padding it into the smallest bucket that fits:
+
+```python
+from aotolith.models.qwen2 import compile_qwen2_bucketed
+
+runtime = compile_qwen2_bucketed(
+    model,
+    prompt_lengths=[128, 512, 2048],
+    max_new_tokens=64,
+)
+tokens = runtime.greedy_generate(prompt_ids)  # 128, 512, or 2048
+```
+
+Left padding is what keeps the decode layout: the decode masks select the trailing window of the cache, so the real tokens have to end there. `is_causal=True` cannot tell a pad from a prompt token, though, so the prefill graph takes an explicit rank-4 mask that carries causality and padding in one tensor. At the full bucket width that mask is exactly the causal mask, so one plan serves both the padded and the exact case.
+
+Only the bucket widths vary a shape. The weights are shared by identity across every bucket's plan, so a three-bucket runtime holds one copy of the model rather than three. `save(prefix)` still writes one archive per bucket plan (`prefix.128.prefill.aoto` and so on), and each archive carries its own copy of the state.
+
 Query, key, and value share one normalized input, so the adapter stores them as a single packed projection per layer and multiplies once. Splitting the result costs two view operations and removes two kernel launches: the 128-row key and value projections were far too small to fill the GPU, and each ran at under a fifth of the bandwidth the fused projection reaches.
 
 A gated MLP has no such packed weight, because `gate` and `up` are multiplied rather than concatenated. `fuse_gate_up_projection` supplies the missing half: it recognises `silu(gate) * up` where both operands trace back to a projection over the same activation, and replaces the pair with one multiply carrying a `silu_mul_paired` epilogue. The kernel streams the gate row and the up row of a decode token's weights in the same loop, and writes `silu(gate) * up` once, so the step reads the same 17.4 MB in one launch instead of two. It only fires for a single-row activation; a taller operand goes to the tiled multiply, which has no paired epilogue, and the projections stay separate. The gate is rounded to BF16 before `silu`, which is the value the separate projection would have written, so the fusion is bit-identical rather than merely close — a version that kept the extra precision in the FP32 accumulator flipped a greedy token on step four of a 24-token run.
@@ -335,6 +354,15 @@ Use repeated `--input '<json>'` arguments instead of `--input-file` when conveni
 
 A tensor keyword argument becomes a graph input, written here as `NAME=<json spec>`: `aoto compile ... --forward-kwarg position_ids='{"shape":[1,4],"dtype":"int64","data":[[0,1,2,3]]}'` and `aoto run ... --kwarg position_ids=...`. `aoto inspect` lists them under `entrypoint.kwargs`.
 
+`aoto bench` is the regression gate for the compiler itself. It measures a fixed set of shapes — a projection, a gated MLP, an RMSNorm, causal attention, and the Qwen2 prefill adapter — and can compare the result against a recorded baseline:
+
+```bash
+aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-report.json
+aoto bench --update-baseline benchmarks/baselines/apple-m5-pro.json
+```
+
+The gate has two halves. `input_ops` and `lowered_ops` are deterministic, so they are compared exactly on any machine and a pass that adds a copy or drops a fusion fails with no timing noise. Kernel counts and milliseconds depend on the GPU, so they are compared only when the baseline names the same device; otherwise the report still carries a `ratio` of each workload against one raw MLX matmul measured in the same process. CI runs the gate against the committed baseline, where the paravirtual runner compares the op counts and skips the millisecond half.
+
 Artifacts use format version 5 and ABI version 1.3. Each graph, kernel table, selection table, storage plan, and state tensor has a SHA-256 digest. Loading validates the ABI, target, graph, entrypoint layout, state shape/dtype, serialized kernels, rebuilt selections, and storage plan. Kernel objects are rebuilt from the validated graph and persisted selection, so the artifact does not need the original Python model and loading does not repeat autotuning.
 
 Strict GPU matching is optional. `--require-device-match` or `require_device_match=True` rejects an artifact compiled for another Apple GPU model; the default allows execution on another Apple Silicon device after rebuilding kernels.
@@ -381,7 +409,7 @@ Tensor cores need Apple GPU family 9 or later, so both tensor-core paths are gat
 
 | Area | Coverage |
 |---|---|
-| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode; Qwen2.5-0.5B-Instruct validated |
+| Models | Decoder-only Transformer forward pass; tiny Llama/Qwen-style models; Qwen2/Qwen2.5 single-request static KV-cache prefill/decode, including prompt-length buckets with left padding; Qwen2.5-0.5B-Instruct validated |
 | Matrix operations | `mm`, `bmm`, `addmm`, `baddbmm`, `addbmm` (batch products summed into one matrix), `mv`/`addmv`, including supported batch broadcasting |
 | Linear algebra | `solve`, `solve_triangular`, `inv`, `det`, `slogdet`, `cholesky`, `cholesky_solve`, `cholesky_inverse`, `eigh`, `svd`, `qr`, `pinv`, `lu_factor` and `matrix_exp`, each lowered per selected output; `cdist` for every norm order |
 | Indexing | Embedding, `index_select`, advanced indexing, `gather`, `scatter`, `scatter_add`, `index_add`, `masked_scatter`, and the `scatter_reduce` reductions `sum`/`prod`/`amax`/`amin`/`mean` |

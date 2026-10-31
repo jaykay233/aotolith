@@ -210,6 +210,25 @@ print(tokens.tolist())
 
 这个适配层固定 batch、prompt 长度和最大生成长度，只实现 greedy 单请求生成；host 侧负责 token 循环，scheduler、batching、分页 KV 和采样仍不包含在编译器中。`runtime.save("qwen")` 会保存 prefill 和 decode 两个 `.aoto`，每张图当前各自包含一份模型 state。
 
+#### 尺寸桶
+
+prompt 长度固定意味着服务循环每换一个长度就要重编译一次。`compile_qwen2_bucketed` 改为每个桶宽度编译一对计划，更短的 prompt 左填充进能装下它的最小桶：
+
+```python
+from aotolith.models.qwen2 import compile_qwen2_bucketed
+
+runtime = compile_qwen2_bucketed(
+    model,
+    prompt_lengths=[128, 512, 2048],
+    max_new_tokens=64,
+)
+tokens = runtime.greedy_generate(prompt_ids)  # 落到 128、512 或 2048
+```
+
+左填充是保持 decode 布局的前提：decode 的 mask 取 cache 的尾部窗口，真实 token 必须落在尾部。但 `is_causal=True` 分不清 pad 和 prompt token，所以 prefill 图额外接收一个 rank-4 mask，把 causal 和 padding 合成一个张量。桶宽正好等长时它就是纯粹的 causal mask，因此一张计划同时服务填充和等长两种情况。
+
+只有桶宽度会改变 shape。权重在各桶的计划之间按对象身份共享，所以三桶运行时只保留一份模型，而不是三份。`save(prefix)` 仍然是每个桶一份 archive（`prefix.128.prefill.aoto` 等），每份 archive 各自带一份 state。
+
 query、key、value 共享同一份归一化输入，因此适配层把三者按层存成一个打包后的投影并只做一次矩阵乘。拆分结果只需两个 view 操作，却省掉两次 kernel launch：128 行的 key/value 投影对 GPU 来说太小，带宽利用率不到融合后投影的五分之一。
 
 gated MLP 没有可以这样打包的权重，因为 `gate` 和 `up` 是相乘而不是拼接。`fuse_gate_up_projection` 补上了另一半：它识别 `silu(gate) * up`，且两个操作数都回溯到读取同一份激活的投影，然后把这对投影替换成一个带 `silu_mul_paired` epilogue 的矩阵乘。kernel 在同一个循环里流式读取 decode token 的 gate 行和 up 行，一次写出 `silu(gate) * up`，于是 step 读的还是同样的 17.4 MB，但 launch 从两次变成一次。它只在激活只有一行时生效；更高的操作数走 tiled 矩阵乘，那里没有成对 epilogue，两个投影保持独立。gate 在 `silu` 之前先舍入到 BF16，正是独立投影原本会写下的值，所以融合结果是逐位一致的，而不只是接近——保留 FP32 累加精度的版本在 24 token 的 greedy 运行里，第 4 个 token 就翻转了。
@@ -333,6 +352,15 @@ aoto run model.aoto --input-file inputs.json --output outputs.json
 
 tensor 关键字参数会变成图输入，写作 `NAME=<json spec>`：`aoto compile ... --forward-kwarg position_ids='{"shape":[1,4],"dtype":"int64","data":[[0,1,2,3]]}'`，运行时用 `aoto run ... --kwarg position_ids=...`。`aoto inspect` 会把它们列在 `entrypoint.kwargs` 下。
 
+`aoto bench` 是编译器自身的回归门禁：测量一组固定 shape（projection、gated MLP、RMSNorm、causal attention 和 Qwen2 prefill 适配层），并可与记录的 baseline 比对：
+
+```bash
+aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-report.json
+aoto bench --update-baseline benchmarks/baselines/apple-m5-pro.json
+```
+
+门禁分两半。`input_ops` 和 `lowered_ops` 是确定性的，任何机器上都精确比对，多做一次拷贝或少做一次融合都会立刻失败，且完全不受计时噪声影响。kernel 数量和毫秒数取决于 GPU，只在 baseline 记录的是同一设备时才比对；否则报告仍会给出每个负载相对同进程内一次裸 MLX matmul 的 `ratio`。CI 用仓库里的 baseline 跑这道门禁，那里的虚拟 GPU 比对 op 数，跳过毫秒部分。
+
 artifact 使用 format version 5 和 ABI version 1.3。两张图、kernel table、selection table、storage plan 和每个 state tensor 都有 SHA-256 digest。加载时会校验 ABI、target、图、入口布局、state shape/dtype、序列化 kernel、重新构建的 selection 和 storage plan。kernel 根据校验后的图和已保存的 selection 重建，因此 artifact 不需要原始 Python 模型，加载时也不会重新 autotune。
 
 是否要求 GPU 完全相同由调用方决定。`--require-device-match` 或 `require_device_match=True` 会拒绝为其他 Apple GPU 型号编译的 artifact；默认允许在其他 Apple Silicon 设备上重新构建 kernel 后执行。
@@ -379,7 +407,7 @@ tensor core 需要 Apple GPU family 9 及以上，所以两条 tensor-core 路�
 
 | 类别 | 覆盖范围 |
 |---|---|
-| 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode；已验证 Qwen2.5-0.5B-Instruct |
+| 模型 | decoder-only Transformer forward；tiny Llama/Qwen 风格模型；Qwen2/Qwen2.5 单请求静态 KV Cache prefill/decode，含按 prompt 长度的尺寸桶与左填充；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵计算 | `mm`、`bmm`、`addmm`、`baddbmm`，包括支持范围内的 batch broadcasting；`cholesky_solve`/`cholesky_inverse`、`cdist`（任意阶 p-范数）都是既有求解与归约的组合 |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter`、`scatter_add`、`index_add`、`masked_scatter`，以及 `scatter_reduce` 的 `sum`/`prod`/`amax`/`amin`/`mean` |
 | Transformer 计算 | scaled dot-product attention、分解后的 causal attention、softmax、log_softmax、logsumexp、sum/mean/prod/amax/amin/nansum/nanmean/var/std/count_nonzero 归约、`all`/`any`、`vector_norm`、`F.normalize` 与 `F.cosine_similarity`、cumsum/cumprod、LayerNorm（含 mean/rstd）、RMSNorm、SiLU、GELU、SwiGLU 和常见 pointwise 算子 |

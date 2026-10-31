@@ -7,7 +7,11 @@ import mlx.core as mx
 import pytest
 import torch
 
-from aotolith.models.qwen2 import compile_qwen2_static_cache
+from aotolith.models.qwen2 import (
+    compile_qwen2_bucketed,
+    compile_qwen2_static_cache,
+    prefill_mask,
+)
 
 
 def _reference_tokens(
@@ -407,3 +411,178 @@ def test_adapter_accepts_the_configurations_it_does_support() -> None:
         )
         mx.eval(tokens)
         assert tokens.shape == (1, 3), overrides
+
+
+def _bucketed_model(transformers: object, seed: int = 23):
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=40,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(seed)
+    return transformers.Qwen2ForCausalLM(config).eval()
+
+
+def _bucketed_runtime(model: torch.nn.Module, widths: list[int]):
+    return compile_qwen2_bucketed(
+        model,
+        prompt_lengths=widths,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+
+
+def test_prefill_mask_is_the_causal_mask_at_full_width() -> None:
+    """A full-width prompt needs no padding, so the mask is plain causality."""
+
+    import numpy as np
+
+    mask = prefill_mask(4, 4)
+    expected = np.tril(np.ones((4, 4), dtype=np.bool_))
+    assert mask.shape == (1, 1, 4, 4)
+    assert np.array_equal(mask[0, 0], expected)
+
+
+def test_prefill_mask_hides_the_left_padding() -> None:
+    """Every pad slot is excluded, and causality still holds for real tokens."""
+
+    mask = prefill_mask(2, 4)[0, 0]
+    # Two real tokens occupy the last two slots and keep positions 0 and 1.
+    assert mask.tolist() == [
+        [False, False, False, False],
+        [False, False, False, False],
+        [False, False, True, False],
+        [False, False, True, True],
+    ]
+    for query in range(4):
+        for key in range(4):
+            assert mask[query][key] == (key <= query and key >= 2)
+
+
+@pytest.mark.parametrize("length", [1, 4, 8, 12, 16])
+def test_bucketed_prefill_matches_pytorch_for_every_length_in_a_bucket(length) -> None:
+    """Padding must change nothing the model can see.
+
+    Each length is compared against the eager model on the real prompt, so a
+    bucket plan that let a pad token through would show up as a logit
+    difference even though its own exact-length plan would agree with it.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    model = _bucketed_model(transformers)
+    prompt = list(range(1, length + 1))
+    with torch.no_grad():
+        expected = model(
+            input_ids=torch.tensor([prompt], dtype=torch.int64),
+            use_cache=True,
+            logits_to_keep=1,
+        ).logits
+
+    runtime = _bucketed_runtime(model, [8, 16])
+    logits, cache = runtime.prefill_ids([prompt])
+    mx.eval(logits, cache)
+
+    width = runtime.bucket_for(length).prompt_length
+    assert width in (8, 16)
+    assert logits.shape == (1, 1, 64)
+    assert cache.shape == (2, 2, 1, 2, width + 8, 8)
+    assert mx.allclose(logits, mx.array(expected.numpy()), atol=1e-5, rtol=1e-5)
+
+
+def test_bucketed_runtime_picks_the_smallest_fitting_bucket() -> None:
+    transformers = pytest.importorskip("transformers")
+    runtime = _bucketed_runtime(_bucketed_model(transformers), [4, 8, 16])
+
+    assert runtime.prompt_lengths == (4, 8, 16)
+    assert runtime.max_prompt_length == 16
+    assert [runtime.bucket_for(length).prompt_length for length in (1, 4, 5, 8, 9, 16)] == [
+        4,
+        4,
+        8,
+        8,
+        16,
+        16,
+    ]
+
+
+def test_bucketed_runtime_rejects_a_prompt_longer_than_every_bucket() -> None:
+    transformers = pytest.importorskip("transformers")
+    runtime = _bucketed_runtime(_bucketed_model(transformers), [4, 8])
+
+    with pytest.raises(ValueError, match="exceeds the largest bucket"):
+        runtime.prefill_ids([[1] * 9])
+    with pytest.raises(ValueError, match="exceeds the largest bucket"):
+        runtime.greedy_generate([[1] * 9], max_new_tokens=2)
+
+
+def test_bucketed_runtime_rejects_unsorted_or_duplicate_widths() -> None:
+    transformers = pytest.importorskip("transformers")
+    model = _bucketed_model(transformers)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _bucketed_runtime(model, [8, 4])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _bucketed_runtime(model, [8, 8])
+    with pytest.raises(ValueError, match="at least one bucket"):
+        _bucketed_runtime(model, [])
+
+
+def test_bucketed_generate_matches_a_per_length_compile() -> None:
+    """The bucket must be invisible: same tokens as compiling that length alone."""
+
+    transformers = pytest.importorskip("transformers")
+    model = _bucketed_model(transformers)
+    runtime = _bucketed_runtime(model, [8, 16])
+
+    for length in (3, 8, 11, 16):
+        prompt = [list(range(1, length + 1))]
+        exact = compile_qwen2_static_cache(
+            model,
+            prompt_length=length,
+            max_new_tokens=8,
+            codegen_matmul=True,
+            codegen_attention=True,
+        )
+        expected = exact.greedy_generate(prompt, max_new_tokens=6, sync_each_step=True)
+        actual = runtime.greedy_generate(prompt, max_new_tokens=6, sync_each_step=True)
+        mx.eval(expected, actual)
+        assert actual.shape == (1, 6)
+        assert actual.tolist() == expected.tolist(), length
+
+
+def test_bucketed_runtime_keeps_one_copy_of_the_weights() -> None:
+    """Buckets and the prefill/decode split must not multiply the model state.
+
+    Every plan is traced from the same module, so the parameter arrays are
+    identical by construction; only the rotary tables follow the cache
+    capacity. Recomputation is not needed, and neither is a second copy.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    runtime = _bucketed_runtime(_bucketed_model(transformers), [8, 16])
+    narrow, wide = runtime.buckets
+
+    def values(plan):
+        return dict(zip(plan.state_names, plan._state_values))
+
+    first = values(narrow.prefill)
+    decode = values(narrow.decode)
+    # Prefill and decode are separate traces of the same weights.
+    assert first == {name: value for name, value in decode.items()}
+
+    for plan in (wide.prefill, wide.decode):
+        shared = values(plan)
+        for name, value in shared.items():
+            reference = first[name]
+            if value.shape != reference.shape:
+                # The rotary tables scale with the cache capacity.
+                assert name in {"cosine_table", "sine_table"}
+                continue
+            assert value is reference, name

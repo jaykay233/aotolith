@@ -55,3 +55,25 @@ jobs:
         run: python examples/tiny_llama_compile.py
       - name: Confirm the distribution builds
         run: python -m build
+
+  bench:
+    # A regression gate, not a scoreboard. The deterministic half compares the
+    # front-end and mid-end op counts against the recorded baseline, which holds
+    # on any machine. The timing and kernel-count half only fires on the
+    # baseline's own GPU, so this job compares counts here and leaves the
+    # millisecond gate to the machine the baseline came from.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Check the compiler against the recorded baseline
+        run: aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-report.json
+      - name: Upload the benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf-report.json
