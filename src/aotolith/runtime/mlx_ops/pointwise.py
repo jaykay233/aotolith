@@ -325,6 +325,24 @@ def _evaluate_pointwise_mlx(
         return mx.sin(arguments[0])
     if op.op == "cos":
         return mx.cos(arguments[0])
+    if op.op == "tan":
+        return mx.tan(arguments[0])
+    if op.op == "asin":
+        return mx.arcsin(arguments[0])
+    if op.op == "acos":
+        return mx.arccos(arguments[0])
+    if op.op == "atan":
+        return mx.arctan(arguments[0])
+    if op.op == "sinh":
+        return mx.sinh(arguments[0])
+    if op.op == "cosh":
+        return mx.cosh(arguments[0])
+    if op.op == "asinh":
+        return mx.arcsinh(arguments[0])
+    if op.op == "acosh":
+        return mx.arccosh(arguments[0])
+    if op.op == "atanh":
+        return mx.arctanh(arguments[0])
     if op.op == "floor":
         return mx.floor(arguments[0])
     if op.op == "ceil":

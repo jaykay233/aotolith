@@ -151,6 +151,18 @@ _SUPPORTED_OPS = {
     "aten.signbit.default": "signbit",
     "aten.sin.default": "sin",
     "aten.cos.default": "cos",
+    # The rest of the trigonometric and hyperbolic family. Torch treats these
+    # as core ATen primitives, so no decomposition rewrites them and the
+    # frontend has to lower them itself; Metal's standard library has all nine.
+    "aten.tan.default": "tan",
+    "aten.asin.default": "asin",
+    "aten.acos.default": "acos",
+    "aten.atan.default": "atan",
+    "aten.sinh.default": "sinh",
+    "aten.cosh.default": "cosh",
+    "aten.asinh.default": "asinh",
+    "aten.acosh.default": "acosh",
+    "aten.atanh.default": "atanh",
     "aten.floor.default": "floor",
     "aten.ceil.default": "ceil",
     "aten.round.default": "round",
@@ -291,6 +303,17 @@ _FLOAT_ONLY_POINTWISE_OPS = {
     "addcmul",
     "addcdiv",
     "nan_to_num",
+    # ATen promotes integer operands to float for these and computes in the
+    # default float dtype; Metal only has the floating-point overloads.
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "asinh",
+    "acosh",
+    "atanh",
 }
 
 

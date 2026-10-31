@@ -38,6 +38,8 @@ def _promoted_pointwise_dtype(
     op_name: str,
     dtypes: set[DType],
     output_dtype: DType,
+    *,
+    float_scalar: bool = False,
 ) -> DType | None:
     """Return the dtype PyTorch would apply operands of ``dtypes`` in."""
 
@@ -46,6 +48,12 @@ def _promoted_pointwise_dtype(
         return None
     if op_name == "div" and dtypes <= _INTEGRAL_DTYPES:
         # True division always produces a float, even for integer operands.
+        return output_dtype if output_dtype in _FLOATING_DTYPES else None
+    if float_scalar and dtypes <= _INTEGRAL_DTYPES:
+        # A Python float is a higher promotion category than an integer
+        # tensor, so ``int_tensor * 0.5`` is a float32 computation. The
+        # tensor's own dtype wins when the categories match, which is why
+        # ``half_tensor * 0.5`` stays half and needs no cast.
         return output_dtype if output_dtype in _FLOATING_DTYPES else None
     if op_name in _FLOAT_ONLY_POINTWISE_OPS and dtypes <= _INTEGRAL_DTYPES:
         # The kernel itself only takes floats, and PyTorch runs integer
@@ -70,11 +78,15 @@ def _promote_pointwise_operands(
     ops: list[Operation],
     output_dtype: DType,
     input_count: int,
+    *,
+    float_scalar: bool = False,
 ) -> tuple[str, ...]:
     """Insert casts so a pointwise op sees the operands PyTorch would."""
 
     dtypes = {values[input_id].type.dtype for input_id in inputs}
-    target = _promoted_pointwise_dtype(op_name, dtypes, output_dtype)
+    target = _promoted_pointwise_dtype(
+        op_name, dtypes, output_dtype, float_scalar=float_scalar
+    )
     if target is None:
         return inputs
     promoted: list[str] = []
@@ -840,6 +852,10 @@ def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
         )
     attrs = _operation_attrs(op_name, node.kwargs)
     attrs.update(scalar_attrs)
+    # A Python float operand is a promotion category of its own: it lifts an
+    # integer tensor to the default float dtype, which a table keyed only on the
+    # tensor dtypes cannot see.
+    float_scalar = isinstance(scalar_attrs.get("scalar"), float)
     if op_name == "where" and len(inputs) == 3:
         inputs = (inputs[0],) + _promote_pointwise_operands(
             "where",
@@ -857,6 +873,7 @@ def lower_supported(lowering: Lowering, node: Any, target: str) -> bool:
             lowering.ops,
             _node_type(node).dtype,
             len(lowering.input_ids),
+            float_scalar=float_scalar,
         )
     if op_name in _REDUCTION_OPS and "dims" not in attrs:
         input_type = lowering.values[inputs[0]].type

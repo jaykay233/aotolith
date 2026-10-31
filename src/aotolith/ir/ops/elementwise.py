@@ -54,6 +54,19 @@ def _check_cat(graph: Graph, op: Operation) -> None:
 
 
 CONTRACTS: dict[str, OpContract] = {
+    # ``erfinv`` is elementwise but deliberately not in ``POINTWISE_OPS``: that
+    # set means "emittable as an MSL expression", and this one stays an MLX
+    # call because PyTorch refines it with Newton steps against an accurate
+    # ``erf`` that Metal's standard library does not have. It still needs a
+    # contract, otherwise the backend's validation loop skips it by name and a
+    # malformed ``erfinv`` reaches the runtime unchecked.
+    "erfinv": OpContract(
+        arity=(1, 1),
+        rank=(0, 8),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        native=False,
+    ),
     "triu": OpContract(
         arity=(1, 1),
         rank=(2, 8),

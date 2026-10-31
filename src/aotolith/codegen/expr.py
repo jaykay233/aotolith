@@ -489,6 +489,24 @@ def _emit_pointwise_expression(
         return f"metal::sin({arguments[0]})"
     if op.op == "cos":
         return f"metal::cos({arguments[0]})"
+    if op.op == "tan":
+        return f"metal::tan({arguments[0]})"
+    if op.op == "asin":
+        return f"metal::asin({arguments[0]})"
+    if op.op == "acos":
+        return f"metal::acos({arguments[0]})"
+    if op.op == "atan":
+        return f"metal::atan({arguments[0]})"
+    if op.op == "sinh":
+        return f"metal::sinh({arguments[0]})"
+    if op.op == "cosh":
+        return f"metal::cosh({arguments[0]})"
+    if op.op == "asinh":
+        return f"metal::asinh({arguments[0]})"
+    if op.op == "acosh":
+        return f"metal::acosh({arguments[0]})"
+    if op.op == "atanh":
+        return f"metal::atanh({arguments[0]})"
     if op.op == "floor":
         return f"metal::floor({arguments[0]})"
     if op.op == "ceil":

@@ -156,13 +156,20 @@ def test_every_operator_the_backend_executes_has_a_contract() -> None:
     A new pointwise or layout operator reaches the runtime through the shared
     sets in ``passes``, so those names are where an operator could slip past
     verification. This test fails as soon as that happens.
+
+    The legalizer's own table is the second way in: ``_SUPPORTED_OPS`` names
+    the core op every ATen target becomes, and an operator that appears there
+    but not in the registry is skipped by the backend's
+    ``if op.op in OP_CONTRACTS`` guard - it still runs, just unvalidated.
+    ``erfinv`` sat in exactly that hole, so both sets are checked.
     """
 
     from aotolith.ir.ops import OP_CONTRACTS
+    from aotolith.legalize import targets
     from aotolith.passes import LAYOUT_OPS, POINTWISE_OPS
 
     registered = set(OP_CONTRACTS)
-    for group in (POINTWISE_OPS, LAYOUT_OPS):
+    for group in (POINTWISE_OPS, LAYOUT_OPS, set(targets._SUPPORTED_OPS.values())):
         missing = sorted(group - registered)
         assert not missing, f"no contract registered for {missing}"
 
