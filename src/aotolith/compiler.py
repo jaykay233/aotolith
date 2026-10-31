@@ -689,6 +689,27 @@ def _contains_tensor(value: Any) -> bool:
     return contains(value)
 
 
+def _module_output_leaves(value: Any, skip: Any) -> tuple[Any, ...] | None:
+    """Flatten a module output into its tensor leaves, in reading order.
+
+    Returns ``None`` when any leaf is not a tensor, so the caller can tell an
+    unflattenable structure from an empty one. ``skip`` is the tensor type,
+    which is passed in so the compiler does not import Torch to ask.
+    """
+
+    if isinstance(value, skip):
+        return (value,)
+    if isinstance(value, (tuple, list)):
+        leaves: list[Any] = []
+        for item in value:
+            found = _module_output_leaves(item, skip)
+            if found is None:
+                return None
+            leaves.extend(found)
+        return tuple(leaves)
+    return None
+
+
 def _select_module_output(output: Any, output_key: str | None) -> Any:
     try:
         import torch
@@ -717,11 +738,13 @@ def _select_module_output(output: Any, output_key: str | None) -> Any:
             selected = tuple(output)
 
     if isinstance(selected, (tuple, list)):
-        if not selected or not all(
-            isinstance(value, torch.Tensor) for value in selected
-        ):
+        leaves = _module_output_leaves(selected, torch.Tensor)
+        if leaves is None or not leaves:
             raise ValueError(
-                "module sequence outputs must be a non-empty tuple or list of tensors"
+                "module sequence outputs must be a non-empty tuple or list whose "
+                "leaves are all tensors; a plan returns the leaves flattened in "
+                "reading order, so a nested structure like nn.LSTM's "
+                "(output, (h, c)) is allowed but a non-tensor leaf is not"
             )
         return tuple(selected)
     if not isinstance(selected, torch.Tensor):

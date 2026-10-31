@@ -29,10 +29,24 @@ def _single_user(node: object) -> Any | None:
 
 
 def _output_ids(output: object, node_ids: dict[object, str]) -> tuple[str, ...]:
-    try:
-        return (_argument_ids(output, node_ids),)
-    except ValueError:
-        pass
-    if isinstance(output, (tuple, list)):
-        return tuple(_argument_ids(item, node_ids) for item in output)
-    raise ValueError(f"unsupported FX output: {output!r}")
+    """Resolve the graph output, flattening any nesting it carries.
+
+    A module that returns ``(output, (h, c))`` - ``nn.LSTM`` - traces to a
+    nested tuple of FX nodes. The plan returns a flat tuple of arrays in the
+    order those leaves appear, so a nested structure is walked in reading
+    order rather than refused.
+    """
+
+    ids: list[str] = []
+
+    def walk(argument: object) -> None:
+        if isinstance(argument, (tuple, list)):
+            for item in argument:
+                walk(item)
+            return
+        ids.append(_argument_ids(argument, node_ids))
+
+    walk(output)
+    if not ids:
+        raise ValueError(f"unsupported FX output: {output!r}")
+    return tuple(ids)

@@ -53,7 +53,7 @@ artifact.py / compiler.py                               图 → 产物、整条�
 
 模型级入口 `compile_module` 先用 `torch.func.functional_call` 把 `named_parameters()` 和 `named_buffers()` 作为显式参数传入 tracing function，再把 state 转为图中的私有输入。返回的 `CompiledModulePlan` 只保留 state 名称和 MLX 副本，不持有原始 module。当前按 parameter/buffer 全名绑定，`remove_duplicate=False`，因此共享 tensor 会作为多个状态项进入图；它们在运行期和 artifact 里共享同一份 buffer 和 payload，见第 15 节。
 
-HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。提升是递归的：list、tuple、mapping 里嵌套的 tensor 也会逐个成为图输入（`position_embeddings=(cos, sin)` 对应一个关键字、两个图输入，`past_key_values=[(k, v), ...]` 同理），调用方按 tracing 时的嵌套结构传回同一个值。同一个值里非 tensor 的叶子仍是 tracing 期常量，调用时传入不同的值会报错，而不是被静默忽略。其余关键字参数整体仍是 tracing 期常量。
+HuggingFace 模型输出默认选择 `.logits`，也可用 `output_key` 指定 mapping key 或对象属性。模块返回嵌套结构时（`nn.LSTM` 的 `(output, (h_n, c_n))`）不需要包装：tensor 叶子按阅读顺序进入图输出，plan 按同样顺序返回扁平 tuple。tensor-valued `example_kwargs` 会被提升为图输入：它们在 `example_inputs` 之后、state 之前进入图，调用时按名字传递（`plan(input_ids, position_ids=...)`），因此像 `position_ids` 这种调用方会变化的参数不会被固化成常量。提升是递归的：list、tuple、mapping 里嵌套的 tensor 也会逐个成为图输入（`position_embeddings=(cos, sin)` 对应一个关键字、两个图输入，`past_key_values=[(k, v), ...]` 同理），调用方按 tracing 时的嵌套结构传回同一个值。同一个值里非 tensor 的叶子仍是 tracing 期常量，调用时传入不同的值会报错，而不是被静默忽略。其余关键字参数整体仍是 tracing 期常量。
 
 两层随机 Llama 的当前回归结果是 220 个 FX 源算子降到 136 个 lowered op，logits 最大绝对误差约 `9e-08`；同一计划在删除原 PyTorch module 后仍可执行。
 

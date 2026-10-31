@@ -563,6 +563,35 @@ def test_compile_module_supports_multiple_tensor_outputs() -> None:
         )
 
 
+def test_compile_module_flattens_a_nested_output_in_reading_order() -> None:
+    # ``nn.LSTM`` returns ``(output, (h_n, c_n))``. The plan has no structure of
+    # its own, so the leaves come back flat in the order they are read; without
+    # this the LSTM failed at the frontend even though every operator in it
+    # lowers.
+    torch.manual_seed(13)
+    module = torch.nn.LSTM(8, 6, batch_first=True).eval()
+    value = torch.randn(2, 5, 8)
+    output, (hidden, cell) = module(value)
+    expected = (output, hidden, cell)
+
+    compiled = compile_module(module, (value,))
+    actual = compiled(_to_mlx(value))
+    mx.eval(*actual)
+
+    assert [tuple(int(dim) for dim in array.shape) for array in actual] == [
+        tuple(int(dim) for dim in tensor.shape) for tensor in expected
+    ]
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        # Five recurrent steps of f32 matmul on the GPU path, so compare with
+        # the tolerance those products need rather than bit for bit.
+        assert mx.allclose(
+            actual_value,
+            mx.array(expected_value.detach().numpy()),
+            atol=2e-3,
+            rtol=2e-3,
+        )
+
+
 class _MaskedScaleModule(torch.nn.Module):
     """Takes a tensor keyword input and a static keyword input.
 
