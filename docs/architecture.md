@@ -689,10 +689,14 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 |---|---|---|
 | `input_ops`、`lowered_ops` | 是，与设备无关 | 任何设备上都精确比对，只允许下降 |
 | `kernels` | 否，取决于 GPU 能加载哪些原生 kernel | 仅当 baseline 记录同一 `device_name` |
-| `median_ms` | 否 | 同上，允许 `--tolerance` 比例的变慢 |
-| `ratio`、`compile_ms` | 否 | 只报告，不设阈值 |
+| `min_ms` | 否 | 设备相同且两次报告都至少 3 次重复，允许 `--tolerance` 比例的变慢 |
+| `median_ms`、`ratio`、`compile_ms` | 否 | 只报告，不设阈值 |
 
 `ratio` 是负载中位数相对同进程内一次裸 MLX matmul 的比值，用来在跨机器阅读报告时抵消整体速度差异。`compile_ms` 只报告：首次编译会付 Metal kernel 编译和进程缓存，同一负载的顺序会显著改变这个数字。
+
+计时阈值比 `min_ms` 而不是 median。噪声只会往计时里加时间，不会减：同一台机上未改动的 0.35 ms 投影连跑三次，median 是 1.14、0.38、0.36 ms，最小值是 0.38、0.35、0.34。用 median 做门禁会把一次噪声报成 3 倍回归；用最小值只在真正抬高下限时才失败。
+
+`run()` 在开始计时前会把每个负载完整编译并执行一次，丢弃那次计时。进程里第一个计划要替它用到的所有 kernel 付 Metal 编译成本，这个成本即使经过 warmup 仍会漏进第一批样本：同一个投影在别的计划先跑过之后最小值是 0.34 ms，什么也没跑过时是 0.82 ms。少了这一遍，负载顺序就决定了第一个负载的读数。少于 3 次重复的报告没有可比的最小值，门禁会跳过计时部分并明确写在 note 里，op 数照旧比对。
 
 基线文件放在 `benchmarks/baselines/`，用 `aoto bench --update-baseline PATH` 重新记录。CI 的 `bench` job 用仓库内的 baseline 跑一次；macos runner 的虚拟 GPU 与基线设备不同，因此那里只比对 op 数，毫秒部分跳过并把 `perf-report.json` 作为 artifact 上传。
 

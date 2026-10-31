@@ -359,7 +359,9 @@ aoto bench --baseline benchmarks/baselines/apple-m5-pro.json --output perf-repor
 aoto bench --update-baseline benchmarks/baselines/apple-m5-pro.json
 ```
 
-门禁分两半。`input_ops` 和 `lowered_ops` 是确定性的，任何机器上都精确比对，多做一次拷贝或少做一次融合都会立刻失败，且完全不受计时噪声影响。kernel 数量和毫秒数取决于 GPU，只在 baseline 记录的是同一设备时才比对；否则报告仍会给出每个负载相对同进程内一次裸 MLX matmul 的 `ratio`。CI 用仓库里的 baseline 跑这道门禁，那里的虚拟 GPU 比对 op 数，跳过毫秒部分。
+门禁分两半。`input_ops` 和 `lowered_ops` 是确定性的，任何机器上都精确比对，多做一次拷贝或少做一次融合都会立刻失败，且完全不受计时噪声影响。kernel 数量和毫秒数取决于 GPU，只在 baseline 记录的是同一设备、且两次报告都至少有 3 次重复时才比对；否则报告仍会给出每个负载相对同进程内一次裸 MLX matmul 的 `ratio`。CI 用仓库里的 baseline 跑这道门禁，那里的虚拟 GPU 比对 op 数，跳过毫秒部分。
+
+让重跑可比的，是两处测量决定。第一，所有负载都先编译并执行一遍才开始计时：进程里第一个计划要替它用到的每个 kernel 付 Metal 编译成本，这个成本会穿过 warmup 漏进第一批样本，把第一个负载系统性抬高约一倍。第二，阈值比的是 `min_ms`，不是报告里的 median——负载只会加时间，不会减时间，同一个 0.35 ms 投影连跑三次的 median 是 1.14、0.38、0.36 ms，而最小值稳定在 0.38、0.35、0.34；真正的变慢会抬高这个下限。
 
 artifact 使用 format version 5 和 ABI version 1.3。两张图、kernel table、selection table、storage plan 和每个 state tensor 都有 SHA-256 digest。加载时会校验 ABI、target、图、入口布局、state shape/dtype、序列化 kernel、重新构建的 selection 和 storage plan。kernel 根据校验后的图和已保存的 selection 重建，因此 artifact 不需要原始 Python 模型，加载时也不会重新 autotune。
 

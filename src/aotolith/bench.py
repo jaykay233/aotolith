@@ -16,11 +16,11 @@ Two properties make the gate usable, and both matter:
   all. ``kernels`` counts the selected native kernels instead, which follows
   what the GPU can actually load, so it is gated only on the baseline's device.
 * **Timings are only comparable on the same GPU.** Absolute milliseconds are
-  recorded and gated, but only when the baseline names the same device. On a
-  different device the gate falls back to reporting ``ratio`` -- the workload's
-  median against one raw MLX matmul measured in the same process -- which
-  cancels most of the difference between machines without pretending to be
-  precise.
+  recorded and gated, but only when the baseline names the same device and both
+  reports have more than one sample. On a different device the gate falls back
+  to reporting ``ratio`` -- the workload's median against one raw MLX matmul
+  measured in the same process -- which cancels most of the difference between
+  machines without pretending to be precise.
 
 Nothing here needs network access or downloaded weights: every workload is a
 small torch module with seeded inputs, so the gate runs in the same environment
@@ -38,9 +38,14 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from .compiler import compile_module
+from .compiler import CompiledModulePlan, compile_module
 
 BENCH_SCHEMA = 1
+
+#: A median needs a few samples to mean anything. Comparing single-shot runs on
+#: a shared machine measured a 1.6x swing on an unchanged kernel, so reports
+#: below this count skip the timing half of the gate instead of failing it.
+MIN_TIMING_REPEATS = 3
 
 # One raw matmul dominates the reference measurement so that its own overhead
 # is negligible, and it is short enough to repeat twenty times in a second.
@@ -209,13 +214,8 @@ def _reference_ms(warmups: int, repeats: int) -> float:
     return statistics.median(samples)
 
 
-def measure(
-    workload: Workload,
-    *,
-    warmups: int,
-    repeats: int,
-) -> dict[str, Any]:
-    """Compile and time one workload."""
+def _compile(workload: Workload) -> tuple[CompiledModulePlan, tuple[Any, ...], float]:
+    """Compile one workload and return its plan, its MLX inputs, and the cost."""
 
     module, torch_inputs = workload.build()
     compile_start = time.perf_counter()
@@ -226,16 +226,32 @@ def measure(
         codegen_attention=workload.codegen_attention,
     )
     compile_ms = (time.perf_counter() - compile_start) * 1000.0
-
     inputs = tuple(mx.array(value.detach().numpy()) for value in torch_inputs)
-    for _ in range(warmups):
-        mx.eval(*compiled(*inputs))
+    return compiled, inputs, compile_ms
+
+
+def _timed(compiled: CompiledModulePlan, inputs: tuple[Any, ...], repeats: int) -> list[float]:
     samples: list[float] = []
     for _ in range(repeats):
         start = time.perf_counter()
         outputs = compiled(*inputs)
         mx.eval(*outputs)
         samples.append((time.perf_counter() - start) * 1000.0)
+    return samples
+
+
+def measure(
+    workload: Workload,
+    *,
+    warmups: int,
+    repeats: int,
+) -> dict[str, Any]:
+    """Compile and time one workload on its own."""
+
+    compiled, inputs, compile_ms = _compile(workload)
+    for _ in range(warmups):
+        mx.eval(*compiled(*inputs))
+    samples = _timed(compiled, inputs, repeats)
     return {
         "compile_ms": compile_ms,
         "median_ms": statistics.median(samples),
@@ -270,23 +286,50 @@ def run(
     The report is the unit the gate compares, so it holds the measurement
     settings alongside the numbers: a baseline recorded with one repeat is not
     a fair reference for a run with twenty.
+
+    Every workload is compiled and executed once before any timing starts. The
+    first plan a process runs pays for the Metal kernel compilation of every
+    kernel it uses, and that cost leaked into the first workload's samples even
+    through its warmups: the same 0.35 ms projection measured a 0.34 ms floor
+    when something else had run first and 0.82 ms when nothing had. Warmup runs
+    after the first plan are already fair, so this pass is what makes the
+    workload order irrelevant.
     """
 
     if warmups < 0 or repeats < 1:
         raise ValueError(
             f"need warmups >= 0 and repeats >= 1, got {warmups}/{repeats}"
         )
-    reference = _reference_ms(warmups, repeats)
-    measured: dict[str, Any] = {}
+    prepared: list[tuple[Workload, CompiledModulePlan, tuple[Any, ...], float]] = []
     skipped: dict[str, str] = {}
     for workload in workloads:
         try:
-            entry = measure(workload, warmups=warmups, repeats=repeats)
+            compiled, inputs, compile_ms = _compile(workload)
         except ImportError as exc:
             if not workload.optional:
                 raise
             skipped[workload.name] = str(exc)
             continue
+        prepared.append((workload, compiled, inputs, compile_ms))
+        # The discarded execution is the one that builds and caches the Metal
+        # kernels this plan uses.
+        mx.eval(*compiled(*inputs))
+
+    reference = _reference_ms(warmups, repeats)
+    measured: dict[str, Any] = {}
+    for workload, compiled, inputs, compile_ms in prepared:
+        for _ in range(warmups):
+            mx.eval(*compiled(*inputs))
+        samples = _timed(compiled, inputs, repeats)
+        entry = {
+            "compile_ms": compile_ms,
+            "median_ms": statistics.median(samples),
+            "min_ms": min(samples),
+            "max_ms": max(samples),
+            "input_ops": len(compiled.input_graph.ops),
+            "lowered_ops": len(compiled.lowered_graph.ops),
+            "kernels": len(compiled.plan.kernels),
+        }
         entry["ratio"] = entry["median_ms"] / reference
         measured[workload.name] = entry
     return {
@@ -342,6 +385,16 @@ def compare(
     same device, because kernel selection follows what the GPU can load and a
     millisecond is not portable; a tolerance is the fraction of slowdown that
     is allowed.
+
+    Timings are compared on ``min_ms`` rather than ``median_ms``: the report's
+    median is the number a reader wants, but for a gate the best sample is the
+    right statistic, because scheduling noise only ever adds time.
+
+    A timing comparison also needs more than one sample. A single-shot minimum
+    is that sample: on a shared runner two single-shot runs of an unchanged
+    kernel differed by 1.6x, which says nothing about the compiler. Reports with
+    fewer than :data:`MIN_TIMING_REPEATS` repeats therefore skip the timing
+    half and say so, while the op counts keep being checked.
     """
 
     if tolerance < 0:
@@ -356,12 +409,23 @@ def compare(
     regressions: list[Regression] = []
     current_device = (current.get("device") or {}).get("name")
     baseline_device = (baseline.get("device") or {}).get("name")
-    timings_compared = bool(current_device) and current_device == baseline_device
-    if not timings_compared:
+    device_matched = bool(current_device) and current_device == baseline_device
+    if not device_matched:
         notes.append(
             f"kernel counts and timings not compared: baseline device "
             f"{baseline_device!r} is not {current_device!r}; the ratio column is "
             f"still reported"
+        )
+    current_repeats = (current.get("measurement") or {}).get("repeats") or 0
+    baseline_repeats = (baseline.get("measurement") or {}).get("repeats") or 0
+    timings_compared = device_matched and min(current_repeats, baseline_repeats) >= (
+        MIN_TIMING_REPEATS
+    )
+    if device_matched and not timings_compared:
+        notes.append(
+            f"timings not compared: need at least {MIN_TIMING_REPEATS} repeats for "
+            f"a best-case estimate, got {current_repeats} now and "
+            f"{baseline_repeats} in the baseline"
         )
     # The front end and the mid end do not depend on the device, so these two
     # counts are the part of the gate that holds everywhere.
@@ -376,17 +440,22 @@ def compare(
             continue
         now = current_workloads[name]
         then = baseline_workloads[name]
-        metrics = deterministic + (device_dependent if timings_compared else ())
+        metrics = deterministic + (device_dependent if device_matched else ())
         for metric in metrics:
             if now[metric] > then[metric]:
                 regressions.append(
                     Regression(name, metric, then[metric], now[metric])
                 )
         if timings_compared:
-            allowed = then["median_ms"] * (1.0 + tolerance)
-            if now["median_ms"] > allowed:
+            # Compare the best sample, not the median. Noise only ever adds
+            # time, so it inflates the median and leaves the floor alone; three
+            # back-to-back runs of an unchanged kernel put the median of a
+            # 0.35 ms workload at 1.14, 0.38, and 0.36 ms while the minimum
+            # stayed at 0.40, 0.35, 0.34. A real regression raises the floor.
+            allowed = then["min_ms"] * (1.0 + tolerance)
+            if now["min_ms"] > allowed:
                 regressions.append(
-                    Regression(name, "median_ms", then["median_ms"], now["median_ms"])
+                    Regression(name, "min_ms", then["min_ms"], now["min_ms"])
                 )
     for name in sorted(set(baseline_workloads) - set(current_workloads)):
         notes.append(f"{name}: in the baseline but not measured now")
