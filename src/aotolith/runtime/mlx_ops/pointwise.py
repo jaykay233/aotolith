@@ -317,6 +317,8 @@ def _evaluate_pointwise_mlx(
         return mx.erfinv(value).astype(_MLX_DTYPES[output_type.dtype])
     if op.op == "lgamma":
         return _mlx_lgamma(arguments[0]).astype(_MLX_DTYPES[output_type.dtype])
+    if op.op == "digamma":
+        return _mlx_digamma(arguments[0]).astype(_MLX_DTYPES[output_type.dtype])
     if op.op == "i0":
         return _mlx_i0(arguments[0]).astype(_MLX_DTYPES[output_type.dtype])
     if op.op == "signbit":
@@ -449,6 +451,76 @@ def _mlx_lgamma(value: mx.array) -> mx.array:
         at_pole, float("inf"), mx.where(compute < 0.5, reflected, series(compute))
     )
     return mx.where(mx.isinf(compute), float("inf"), body)
+
+
+_PSI_10 = 2.25175258906672110764
+
+
+def _mlx_digamma(value: mx.array) -> mx.array:
+    """Digamma, mirroring the Metal helper ``tsc_digamma``."""
+
+    compute = (
+        value if value.dtype in (mx.float32, mx.float64) else value.astype(mx.float32)
+    )
+    pi = 3.14159265358979323846
+
+    def series(argument: mx.array) -> mx.array:
+        # Nine steps is the worst case: the walk starts at x = 1 and stops at 10.
+        accumulated = mx.zeros_like(argument)
+        current = argument
+        for _ in range(9):
+            active = current < 10.0
+            accumulated = accumulated - mx.where(active, 1.0 / current, 0.0)
+            current = mx.where(active, current + 1.0, current)
+        inverse_square = 1.0 / (current * current)
+        tail = inverse_square * (
+            8.33333333333333333333e-2
+            + inverse_square
+            * (
+                -2.10927960927960927961e-2
+                + inverse_square
+                * (
+                    7.57575757575757575758e-3
+                    + inverse_square
+                    * (
+                        -4.16666666666666666667e-3
+                        + inverse_square
+                        * (
+                            3.96825396825396825397e-3
+                            + inverse_square
+                            * (
+                                -8.33333333333333333333e-3
+                                + inverse_square * 8.33333333333333333333e-2
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        asymptotic = mx.log(current) - 0.5 / current - tail
+        return accumulated + mx.where(current == 10.0, _PSI_10, asymptotic)
+
+    # The same reduction the Metal helper does: subtract the nearest integer so
+    # the angle is in [-0.5, 0.5] (exact by Sterbenz' lemma), and use cos/sin
+    # instead of 1/tan so the error stays relative at both ends.
+    reduced = compute - mx.round(compute)
+    reflected = series(1.0 - compute) - pi * mx.cos(pi * reduced) / mx.sin(pi * reduced)
+    negative = compute < 0.0
+    # ATen reports NaN at the negative integers, where the reflection terms
+    # disagree. It is evaluated eagerly here and selected away, so the tan pole
+    # in an unused branch never reaches the output.
+    at_pole = negative & (compute == mx.trunc(compute))
+    body = mx.where(
+        negative, mx.where(at_pole, float("nan"), reflected), series(compute)
+    )
+    # At ±0 ATen returns the infinity whose sign is the opposite of the zero's,
+    # so +0 maps to -inf and -0 to +inf; the reciprocal is what tells the two
+    # zeros apart.
+    at_zero = compute == 0.0
+    signed_infinity = mx.where(1.0 / compute < 0.0, float("inf"), float("-inf"))
+    return mx.where(
+        at_zero, signed_infinity, mx.where(mx.isnan(compute), compute, body)
+    )
 
 
 def _mlx_i0(value: mx.array) -> mx.array:

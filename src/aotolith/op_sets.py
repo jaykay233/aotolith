@@ -93,6 +93,7 @@ POINTWISE_OPS = frozenset(
         "erf",
         "erfc",
         "lgamma",
+        "digamma",
         "i0",
         "sin",
         "cos",

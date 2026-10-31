@@ -144,6 +144,9 @@ _SUPPORTED_OPS = {
     # expressions; ``erfinv`` stays an MLX call because PyTorch refines it with
     # Newton steps against an accurate ``erf``, which MSL does not provide.
     "aten.lgamma.default": "lgamma",
+    # ``digamma`` has no MSL equivalent, so like ``lgamma`` it is a polynomial
+    # helper in ``_MSL_HEADER``; the MLX path mirrors it.
+    "aten.digamma.default": "digamma",
     "aten.i0.default": "i0",
     "aten.erfinv.default": "erfinv",
     # A bit test, so it is exact for both floats and integers: ``signbit`` is
@@ -294,6 +297,7 @@ _FLOAT_ONLY_POINTWISE_OPS = {
     "frac",
     "sinc",
     "lgamma",
+    "digamma",
     "i0",
     "erfinv",
     "hypot",

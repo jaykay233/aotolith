@@ -483,6 +483,8 @@ def _emit_pointwise_expression(
         return f"tsc_erf({arguments[0]})"
     if op.op == "lgamma":
         return f"tsc_lgamma({arguments[0]})"
+    if op.op == "digamma":
+        return f"tsc_digamma({arguments[0]})"
     if op.op == "i0":
         return f"tsc_i0({arguments[0]})"
     if op.op == "sin":

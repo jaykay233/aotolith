@@ -86,7 +86,9 @@ def test_the_family_fuses_like_any_other_pointwise_operator(call) -> None:
     compiled, actual = _run(call, value)
 
     assert [op.op for op in compiled.lowered_graph.ops] == ["fused_elementwise"]
-    assert bool(mx.allclose(actual, mx.array(call(value).numpy()), atol=2e-6, rtol=2e-6))
+    assert bool(
+        mx.allclose(actual, mx.array(call(value).numpy()), atol=2e-6, rtol=2e-6)
+    )
 
 
 @pytest.mark.parametrize("call", DOMAIN_FREE)

@@ -206,8 +206,60 @@ inline float tsc_lgamma(float value) {
     return tsc_lgamma_series(value);
 }
 
-inline float tsc_xlogy_f32(float value, float other) {
-    // ATen only short-circuits a zero left operand, and only when the right
+inline float tsc_digamma_series(float value) {
+    // ATen's calc_digamma: walk the argument up to 10 accumulating -1/x, then
+    // either use the precomputed PSI(10) or the asymptotic expansion. MSL
+    // forbids recursion, so the reflection branch calls this instead of
+    // calling tsc_digamma again.
+    float accumulated = 0.0f;
+    float x = value;
+    while (x < 10.0f) {
+        accumulated -= 1.0f / x;
+        x += 1.0f;
+    }
+    if (x == 10.0f) {
+        return accumulated + 2.25175258906672110764f;
+    }
+    float inverse_square = 1.0f / (x * x);
+    float series = inverse_square * (8.33333333333333333333E-2f
+        + inverse_square * (-2.10927960927960927961E-2f
+        + inverse_square * (7.57575757575757575758E-3f
+        + inverse_square * (-4.16666666666666666667E-3f
+        + inverse_square * (3.96825396825396825397E-3f
+        + inverse_square * (-8.33333333333333333333E-3f
+        + inverse_square * 8.33333333333333333333E-2f))))));
+    return accumulated + metal::log(x) - 0.5f / x - series;
+}
+
+inline float tsc_digamma(float value) {
+    const float pi = 3.14159265358979323846f;
+    if (metal::isnan(value)) {
+        return value;
+    }
+    if (value == 0.0f) {
+        // ATen returns the infinity whose sign is the opposite of the zero's,
+        // so +0 maps to -inf and -0 to +inf.
+        return metal::copysign(INFINITY, -value);
+    }
+    if (value < 0.0f) {
+        if (value == metal::trunc(value)) {
+            // The poles at the negative integers; ATen reports NaN there
+            // rather than an infinity, because the reflection terms disagree.
+            return NAN;
+        }
+        // Reflection: psi(x) = psi(1 - x) - pi * cot(pi x). The fractional part
+        // is reduced to [-0.5, 0.5] by subtracting the nearest integer, which
+        // is exact by Sterbenz' lemma; evaluating tan(pi * r) at a fractional
+        // part close to +-1 is not. cot is written as cos/sin rather than
+        // 1/tan so the error stays relative at both ends of the reduced range.
+        float reduced = value - metal::rint(value);
+        return tsc_digamma_series(1.0f - value)
+            - pi * metal::cos(pi * reduced) / metal::sin(pi * reduced);
+    }
+    return tsc_digamma_series(value);
+}
+
+inline float tsc_xlogy_f32(float value, float other) {    // ATen only short-circuits a zero left operand, and only when the right
     // operand is not NaN, so 0 * log(-1) is 0 while 0 * log(NaN) stays NaN.
     if (value == 0.0f && !metal::isnan(other)) {
         return 0.0f;
