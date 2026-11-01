@@ -177,7 +177,10 @@ def compile_graph(
     if target != "apple-metal":
         raise ValueError(f"unsupported target: {target}")
 
-    lowered = rewrite(graph)
+    # The norm fold moves work into the projection's kernel, so it has to know
+    # whether that projection will really be generated rather than lowered to
+    # MLX. It runs last, once nothing else can change the shape it folds into.
+    lowered = rewrite(graph, native_matmul=codegen_matmul)
     plan = AppleMetalBackend(
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,

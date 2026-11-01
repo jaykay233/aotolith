@@ -6,8 +6,12 @@ when the reduction really feeds that scale and nothing else.
 Absorbing the norm into a projection is a trade the backend has to be able to
 keep: the generated GEMV recomputes the RMS scale inside the kernel it already
 launches, while the MLX fallback re-derives the whole normalization once per
-projection. The matcher therefore only folds into a projection that carries a
-packed weight, which is the case the generated kernel always handles.
+projection. So the matcher folds in two cases only: a projection that carries a
+packed weight, which the generated kernel always handles, and a dense projection
+when the compiler was asked to generate its matrix multiplies and the shape is
+one this GEMV covers. On Qwen2.5-0.5B decode the second case is worth 2.4% of a
+step and 49 fewer operators, and leaving it out — folding regardless of who
+lowers the multiply — costs 27%.
 """
 
 from __future__ import annotations
@@ -17,8 +21,23 @@ from math import prod
 from ..graph import (
     _retarget_input,
 )
-from ...ir import Graph, Operation
+from ...ir import DType, Graph, Operation, TensorType
 from ...ir.ops.kernels import _matmul_weight_group_size
+
+
+def _fusable_by_generated_gemv(left_type: TensorType) -> bool:
+    """Return whether a generated kernel will really run this projection.
+
+    Absorbing the norm only pays when the projection it feeds is a generated
+    GEMV; the MLX fallback re-derives the normalization inside the op instead of
+    reusing one materialized row, which measured 1.28x slower on Qwen2.5-0.5B.
+    The dtype half of the backend's condition (``_supports_gemv_matmul``) is
+    what is left to check here: a single-row operand is already required above,
+    and the one case where that operand could still be transposed — a 1x1
+    multiply — is not a projection worth folding into.
+    """
+
+    return left_type.dtype in {DType.F16, DType.BF16, DType.F32}
 
 
 def _match_rms_norm_consumers(
@@ -27,6 +46,8 @@ def _match_rms_norm_consumers(
     norm: Operation,
     consumers: dict[str, list[int]],
     output_set: set[str],
+    *,
+    native_matmul: bool = False,
 ) -> tuple[dict[int, Operation], dict[int, Operation]] | None:
     """Return projection rewrites plus layout rewrites fed by one norm."""
 
@@ -95,13 +116,16 @@ def _match_rms_norm_consumers(
         if output_type.shape[:-2] != left_type.shape[:-2]:
             return None
         if _matmul_weight_group_size(projection) is None:
-            # Only a packed weight is guaranteed to run on the generated GEMV,
-            # and the prologue only pays there. A dense projection can fall back
-            # to MLX, which re-derives the normalization once per projection
-            # instead of reusing one materialized row; on Qwen2.5-0.5B that is
-            # 1.28x slower end to end than keeping the norm standalone, while
-            # the packed GEMV is 1.11x faster.
-            return None
+            # Only a packed weight is guaranteed to run on the generated GEMV.
+            # A dense projection can fall back to MLX, which re-derives the
+            # normalization once per projection instead of reusing one
+            # materialized row; on Qwen2.5-0.5B that is 1.28x slower end to end
+            # than keeping the norm standalone, while the packed GEMV is 1.11x
+            # faster. When the caller asked for generated matrix multiplies and
+            # the shape is one the GEMV covers, the same trade becomes a win on
+            # the dense path too.
+            if not native_matmul or not _fusable_by_generated_gemv(left_type):
+                return None
         attrs = dict(projection.attrs)
         attrs["rms_norm_eps"] = eps
         inputs = projection.inputs

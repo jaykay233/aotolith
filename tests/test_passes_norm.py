@@ -138,3 +138,93 @@ def test_the_fold_runs_on_the_graph_it_is_handed() -> None:
 
     assert len(folded.ops) < len(graph.ops)
     assert all(op.op != "cast" for op in folded.ops)
+
+
+def _decode_projection(hidden: int, width: int):
+    """A single-row projection over a normalized row: the decode shape."""
+
+    def call(value: torch.Tensor, weight: torch.Tensor, matrix: torch.Tensor):
+        row = _rms_norm_scale(value, weight)
+        return torch.matmul(row, matrix)
+
+    torch.manual_seed(0)
+    return call, (
+        torch.randn(1, hidden, dtype=torch.bfloat16),
+        torch.randn(hidden, dtype=torch.bfloat16),
+        torch.randn(hidden, width, dtype=torch.bfloat16),
+    )
+
+
+def test_the_norm_moves_into_a_projection_that_will_be_generated() -> None:
+    """A dense single-row projection keeps its own kernel when it is generated.
+
+    The GEMV already reads the normalized row once per output column, so
+    recomputing the scale there costs nothing and saves a launch. The pass has to
+    be told that the multiply will be generated, because the same rewrite is a
+    loss on the MLX fallback.
+    """
+
+    call, tensors = _decode_projection(128, 256)
+    graph = capture_fx(call, tensors)
+
+    default = rewrite(graph)
+    assert sum(op.op == "rms_norm" for op in default.ops) == 1
+    assert all(len(op.inputs) == 2 for op in default.ops if op.op == "matmul")
+
+    native = rewrite(graph, native_matmul=True)
+    assert not any(op.op == "rms_norm" for op in native.ops)
+    projections = [op for op in native.ops if op.op == "matmul"]
+    assert len(projections) == 1
+    # The norm weight rides in an extra input slot, which is what the GEMV
+    # prologue reads it from.
+    assert len(projections[0].inputs) == 3
+    assert projections[0].attrs["rms_norm_eps"] == EPS
+    assert len(native.ops) < len(default.ops)
+
+
+def test_the_fused_projection_matches_the_standalone_norm() -> None:
+    """Folding must not move a bit: the prologue does the same reduction."""
+
+    call, tensors = _decode_projection(128, 256)
+    graph = capture_fx(call, tensors)
+    inputs = [mx.array(tensor.float().numpy()).astype(mx.bfloat16) for tensor in tensors]
+
+    expected = compile_graph(graph).plan(*inputs)[0]
+    actual = compile_graph(graph, codegen_matmul=True).plan(*inputs)[0]
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected)
+    with torch.no_grad():
+        reference = call(*tensors)
+    assert (
+        float(
+            mx.abs(actual.astype(mx.float32) - mx.array(reference.float().numpy())).max()
+        )
+        < 1e-2
+    )
+
+
+def test_a_projection_the_gemv_cannot_take_keeps_its_norm() -> None:
+    """A taller projection is not the generated GEMV, so the fold must not fire.
+
+    The backend refuses a fused norm on more than one row, and the matcher has to
+    decline those shapes first rather than leave a fold the code generator would
+    reject.
+    """
+
+    def two_rows(value: torch.Tensor, weight: torch.Tensor, matrix: torch.Tensor):
+        row = _rms_norm_scale(value, weight)
+        return torch.matmul(row, matrix)
+
+    torch.manual_seed(0)
+    wide, weight, matrix = (
+        torch.randn(2, 32, dtype=torch.bfloat16),
+        torch.randn(32, dtype=torch.bfloat16),
+        torch.randn(32, 64, dtype=torch.bfloat16),
+    )
+    graph = capture_fx(two_rows, (wide, weight, matrix))
+
+    folded = rewrite(graph, native_matmul=True)
+
+    assert sum(op.op == "rms_norm" for op in folded.ops) == 1
+    assert len(folded.ops) == len(rewrite(graph).ops)

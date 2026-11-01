@@ -351,8 +351,8 @@ IR 定义在 `ir/`：`types.py` 放 `DType`/`TensorType`/`Value` 这组词汇，
 - `passes/graph.py` 放对图本身的问题：谁生产这个 value、谁消费它、某个 op 的输出 shape、怎么重建一段子图。所有 matcher 和所有 pass 都从这里取，避免各自实现一份导致行为不一致。
 - `passes/checks.py` 放最笨的谓词：attribute 是不是合法的整数、静态 shape 能不能 broadcast。它们不看图。
 - `passes/matchers/` 一族一个模块（`attention`、`rope`、`norm`、`matmul`、`view`），只判断「这段子图是不是我要的形状」，命中就返回匹配结果，否则返回 `None`，自己不写回图。
-- `layout.py`、`canonicalize.py`、`fusion.py`、`cse.py` 才是改写，每个 pass 一个函数，签名统一是 `Graph -> Graph`。
-- `driver.py` 拥有顺序。以前这些步骤是 `compile_graph` 里的一串赋值，顺序的理由写不出来也没法单独测；现在 `PIPELINE` 是一个带名字的元组，每一步旁边写着它为什么在这个位置，`tests/test_passes.py` 钉住这个序列。`compiler.py` 只调用 `rewrite(graph)`。
+- `layout.py`、`canonicalize.py`、`fusion.py`、`cse.py` 才是改写，每个 pass 一个函数，签名统一是 `Graph -> Graph`；唯一的例外是 `fuse_rms_norm_epilogue`，它多接一个 `native_matmul`，因为它把计算从被删掉的 kernel 搬进保留的 kernel 里，这个交易只在投影真会被生成时成立。
+- `driver.py` 拥有顺序。以前这些步骤是 `compile_graph` 里的一串赋值，顺序的理由写不出来也没法单独测；现在 `PIPELINE` 是一个带名字的元组，每一步旁边写着它为什么在这个位置，`tests/test_passes.py` 钉住这个序列。`compiler.py` 只调用 `rewrite(graph, native_matmul=codegen_matmul)`。
 
 每一步为什么排在这个位置，写在 `passes/driver.py` 的 `PIPELINE` 里那一步的注释上；下面几节讲的是各步的匹配条件，以及它最终生成什么。
 
@@ -370,7 +370,7 @@ Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention
 
 `fuse_norm_scale` 补的是前端折叠留下的一半。`F.rms_norm(input, normalized_shape, weight)` 在 `make_fx` 里不是单个 ATen target：前端的 pattern folding 只吃掉 `pow -> mean -> add -> rsqrt -> mul` 这一段，weight 的乘法留在图里，形状是 `cast(up) -> rms_norm(无 weight) -> cast(up weight) -> mul -> cast(narrow)`。这在语义上是同一次归一化，但图里是五个 op、四个全宽临时张量。pass 以那个无 weight 的 `rms_norm` 为锚点向后匹配，要求：命中一个无 weight、无 bias 的 `rms_norm`，它的唯一消费者是那个 `mul`，`mul` 的另一个操作数来自一次 `cast`，而该 `cast` 的输入形状等于 `normalized_shape`；行的 upcast 和 weight 的 upcast 都只在没有其他读者时才被删掉，这一点由 consumer 表证明而不是假定。改写本身逐位精确：输入行和 weight 都已经是收窄后的 dtype，融合 kernel 在 fp32 里做乘积并只舍入一次，与原来的五 op 链算的是同一串舍入；前提不满足时 pass 直接不生效。`tests/test_passes_norm.py` 断言的是与未折叠图的逐位相等。它排在 `fold_quantized_weights` 之后、`fuse_rope` 之前：必须晚于量化折叠（这样 weight 已是最终操作数），又必须早于任何把归一化吸收进投影 prologue 的 matcher，否则那段五 op 序列会被当成普通 pointwise 链。
 
-同一个 pass 还收紧了一处匹配条件。`_match_rms_norm_consumers` 会把归一化折进读它的投影的 prologue，让 GEMV 在加载输入行时顺便缩放。对打包权重这是免费的——prologue 本来就是生成的 Metal；但稠密投影退回 MLX，它会为每个读者重新推导一遍归一化，比算一次更慢。现在只有投影带 `weight_group_size` 时才吸收，稠密图保持一个独立的 `rms_norm`。
+同一个 pass 还收紧了一处匹配条件。`_match_rms_norm_consumers` 会把归一化折进读它的投影的 prologue，让 GEMV 在加载输入行时顺便缩放。对打包权重这是免费的——prologue 本来就是生成的 Metal；但稠密投影退回 MLX，它会为每个读者重新推导一遍归一化，比算一次更慢。所以吸收的前提是这笔交易能兑现：投影带 `weight_group_size` 时一定成立，稠密投影则要看 `rewrite(graph, native_matmul=...)`——`compile_graph` 用 `codegen_matmul` 填这个参数，只有编译器真会为这个单行投影生成 GEMV 时才折，f16/bf16/f32 之外的 dtype 和多余的行数一律保持独立 `rms_norm`，因为生成路径会直接拒绝带融合权重的形状。这把稠密 decode 图从 683 个 op 降到 634 个，异步 227.8 升到 233.0 tok/s；不问后端如何 lower 就折的话，同一个模型读出 189.6 降到 138.8。
 
 `fuse_kv_cache_update` 折掉的是 decode 的 KV-cache 滚动链。前端把它写成每层一组：从分层 cache 里切出该层、切掉最旧一个 slot 得到窗口、把这一步的 key 和从投影行读出的 value 用 `unsqueeze -> cat` 拼成 pair、`cat` 到窗口上、再 `slice -> squeeze` 拆成两半喂给 attention；value 那一路还要额外付出 `slice -> reshape -> transpose` 三个只改布局的 view。每层 11 个 op 加 3 个 value view，折成 1 个算子后每层净少 13 个，24 层一共 312 个，是 decode step 里最大的一块通用算子。pass 以那个 key 轴上的 `cat` 为锚点正向检查：窗口必须是 *同一个* pair 的前缀切片且端到端正好差一个 slot，pair 必须由层切片（可以藏在 `squeeze/reshape` 后面）从 6 维分层 cache 里取出，两半必须由 `slice(half, half+1)` 加一次 `squeeze` 解出、形状与算子输出一致，value 必须来自 projection 行的 `value_start` 处，且链上要删掉的每个 value 都不能被链外的 consumer 读到。命中的整条链换成一个 `kv_cache_append`：输入是整份 cache、这一步的 key 和打包的投影行，输出是新的 pair 和两个窗口。因为匹配依赖前端原始的 view 写法，它必须排在 `simplify_layouts` 之前。`tests/test_passes_cache.py` 覆盖四种不命中情形（窗口多切一个 slot、value 不是投影来的、pair 还有别的读者或本身就是输出）、改写前后的逐位一致、kernel 与 MLX fallback 的一致，以及多输出算子不会把 plan 退回解释执行；`tests/test_qwen2_static_cache.py` 断言 24 层 decode 的 lowering 少于 700 个 op。
 

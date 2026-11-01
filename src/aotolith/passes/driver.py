@@ -69,9 +69,18 @@ PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
 )
 
 
-def rewrite(graph: Graph) -> Graph:
-    """Run the whole pipeline over ``graph``."""
+def rewrite(graph: Graph, *, native_matmul: bool = False) -> Graph:
+    """Run the whole pipeline over ``graph``.
+
+    ``native_matmul`` reports whether the backend will generate the matrix
+    multiply kernels. Only ``fuse_rms_norm_epilogue`` needs it, and only because
+    it moves work from a kernel it removes into a kernel it keeps: that is a
+    saving on a generated GEMV and a loss on the MLX fallback.
+    """
 
     for _, step in PIPELINE:
-        graph = step(graph)
+        if step is fuse_rms_norm_epilogue:
+            graph = step(graph, native_matmul=native_matmul)
+        else:
+            graph = step(graph)
     return graph

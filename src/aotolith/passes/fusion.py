@@ -462,13 +462,20 @@ def fuse_activation_epilogue(graph: Graph) -> Graph:
     return _replace_graph(graph, tuple(rewritten), graph.outputs)
 
 
-def fuse_rms_norm_epilogue(graph: Graph) -> Graph:
+def fuse_rms_norm_epilogue(
+    graph: Graph, *, native_matmul: bool = False
+) -> Graph:
     """Fold ``rms_norm(x) @ w`` into the projection's GEMV prologue.
 
     A single-token projection already streams the whole weight matrix and
     reads the normalized activation once per output column, so recomputing the
     RMS scale inside that kernel costs one extra pass over a cache-resident
     vector and removes a launch, a barrier, and a memory round trip.
+
+    ``native_matmul`` says whether the backend will generate the multiplies. The
+    fold is a saving only on a generated GEMV; where the multiply falls back to
+    MLX the normalization has to be derived inside the projection, which is
+    slower than leaving it standalone.
     """
 
     graph.validate()
@@ -480,7 +487,14 @@ def fuse_rms_norm_epilogue(graph: Graph) -> Graph:
     for norm_index, norm in enumerate(graph.ops):
         if norm.op != "rms_norm":
             continue
-        plan = _match_rms_norm_consumers(graph, norm_index, norm, consumers, output_set)
+        plan = _match_rms_norm_consumers(
+            graph,
+            norm_index,
+            norm,
+            consumers,
+            output_set,
+            native_matmul=native_matmul,
+        )
         if plan is None:
             continue
         projection_rewrites, layout_rewrites = plan
