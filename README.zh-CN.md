@@ -126,9 +126,20 @@ Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16
 | `--codegen-matmul` | 11 800 token/s | **231.7 token/s** | **1.21x** |
 | `--codegen-matmul --codegen-attention` | 12 400 token/s | 232.3 token/s | 1.20x |
 
-64 个 token 与 PyTorch BF16 参考实现逐位一致，开不开原生 kernel 都是如此，`mlx_lm` 产出的也是同一批 token。原生路径离 PyTorch 的 logits 也比 fallback 更近（平均 0.043 对 0.081），所以打开 codegen 是吞吐决策，不是精度决策。
+64 个 token 与 PyTorch BF16 参考实现逐位一致，开不开原生 kernel 都是如此，`mlx_lm` 产出的也是同一批 token。
 
-复现：`examples/qwen_static_cache_benchmark.py --codegen-matmul --mlx-baseline`。
+token 一致不等于数字一致，而且这个差距取决于 prefill 看到多少 token —— `examples/qwen_logit_distance.py` 就是测它：
+
+| prompt token 数 | fallback 平均 | fallback 最大 | codegen 平均 | codegen 最大 |
+| --- | --- | --- | --- | --- |
+| 7 | 0.1056 | 0.6875 | 0.0290 | 0.1875 |
+| 8 | 0.0783 | 0.5469 | 0.0451 | 0.2500 |
+| 16 | 0.0312 | 0.2031 | 0.0310 | 0.1953 |
+| 128 | 0.0596 | 0.4219 | 0.0566 | 0.4219 |
+
+顺着列往下读：fallback 的平均距离在 7 token 和 16 token 之间差 3.4 倍，所以单独一个数字描述的是 prompt，不是模型。这张表能说明的是：在这些长度上 codegen 从不比 fallback 更远离 PyTorch —— 7 token 时近 3.6 倍，16 token 时持平（0.0312 对 0.0310）—— 到 128 token 的 prefill 时两者相差在 5% 以内。打开 codegen 是吞吐决策，不是精度决策。
+
+token 用 `examples/qwen_static_cache_benchmark.py --codegen-matmul --mlx-baseline` 复现，距离用 `examples/qwen_logit_distance.py`。
 
 ## 一步是怎么编出来的
 

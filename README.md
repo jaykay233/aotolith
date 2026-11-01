@@ -151,12 +151,28 @@ M5 Pro. `mlx_lm` measured 195.5-197.2 tok/s in the same process:
 | `--codegen-matmul --codegen-attention` | 12 400 tok/s | 232.3 tok/s | 1.20x |
 
 All 64 tokens match the PyTorch BF16 reference exactly, with or without native
-kernels, and `mlx_lm` produces those same tokens. The native path is also closer
-to PyTorch's logits than the fallback (mean 0.043 vs 0.081), so enabling code
-generation is a throughput decision, not an accuracy one.
+kernels, and `mlx_lm` produces those same tokens.
 
-Reproduce with `examples/qwen_static_cache_benchmark.py --codegen-matmul
---mlx-baseline`.
+Agreeing on tokens is not agreeing on numbers, and the gap depends on how many
+tokens the prefill sees — `examples/qwen_logit_distance.py` measures it:
+
+| prompt tokens | fallback mean | fallback max | codegen mean | codegen max |
+| --- | --- | --- | --- | --- |
+| 7 | 0.1056 | 0.6875 | 0.0290 | 0.1875 |
+| 8 | 0.0783 | 0.5469 | 0.0451 | 0.2500 |
+| 16 | 0.0312 | 0.2031 | 0.0310 | 0.1953 |
+| 128 | 0.0596 | 0.4219 | 0.0566 | 0.4219 |
+
+Read down a column: the fallback's mean distance moves by 3.4x between a 7- and a
+16-token prompt, so a single figure describes the prompt as much as the model.
+What the table does say is that code generation is never further from PyTorch at
+these lengths — 3.6x closer at 7 tokens, level at 16 (0.0312 against 0.0310) — and that
+by a 128-token prefill the two paths are within 5%. Enabling code generation is a
+throughput decision, not an accuracy one.
+
+Reproduce the tokens with `examples/qwen_static_cache_benchmark.py
+--codegen-matmul --mlx-baseline`, and the distances with
+`examples/qwen_logit_distance.py`.
 
 ## How a step is compiled
 

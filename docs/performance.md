@@ -103,13 +103,34 @@ shapes is smaller than this machine's run-to-run spread.)
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without
 native kernels, and `mlx_lm` produces those same 64 tokens, so the comparison
-above also compares two implementations that agree on the answer. Agreeing on
-tokens is not the same as agreeing on numbers, and the two paths are not equally
-close to the reference: on the same model's 24-layer forward, the native kernels
-land a mean 0.043 / max 0.38 from PyTorch's logits, the MLX fallback a mean
-0.081 / max 1.5. Enabling code generation therefore moves the arithmetic toward
-PyTorch rather than away from it, which makes it a throughput decision and not an
-accuracy one.
+above also compares two implementations that agree on the answer.
+
+Agreeing on tokens is not the same as agreeing on numbers.
+`examples/qwen_logit_distance.py` measures each path's last-token logits against
+PyTorch, and the gap turns out to depend on how many tokens the prefill sees:
+
+| prompt tokens | fallback mean | fallback max | codegen mean | codegen max |
+| --- | --- | --- | --- | --- |
+| 7 | 0.1056 | 0.6875 | 0.0290 | 0.1875 |
+| 8 | 0.0783 | 0.5469 | 0.0451 | 0.2500 |
+| 16 | 0.0312 | 0.2031 | 0.0310 | 0.1953 |
+| 128 | 0.0596 | 0.4219 | 0.0566 | 0.4219 |
+
+Read down a column rather than across a row: the fallback's mean distance moves
+by 3.4x between a 7-token and a 16-token prompt, so any single figure here
+describes the prompt as much as the model. What the table supports is narrower
+than "the native path is closer" - code generation is never further from PyTorch
+at these lengths, is 3.6x closer at 7 tokens, is level with it at 16 (0.0312 against 0.0310), and
+is within 5% by a 128-token prefill. A run that carried on for 32 decode steps
+put them within 6% of each other in the other order (fallback 0.061 mean, codegen
+0.064), so the ordering is not stable enough to support a claim either way. The
+honest summary is that code generation does not cost accuracy, not that it buys
+much of one - and either way it is a throughput decision, not an accuracy one.
+
+Earlier revisions of this section quoted a mean 0.043 / max 0.38 against 0.081 /
+1.5 from one 7-token measurement, without saying that the prompt was 7 tokens.
+Neither pair reproduces at this commit, and the second overstated the gap by 2x
+while presenting a prompt-length artifact as a property of the model.
 
 ## What the MLX fallback costs in accuracy
 

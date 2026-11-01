@@ -81,10 +81,13 @@ def test_every_example_the_docs_or_ci_run_actually_exists() -> None:
     sources.extend(sorted((root / "docs").glob("*.md")))
     sources.extend(sorted((root / ".github" / "workflows").glob("*.yml")))
 
+    # The path alone counts, not just `python examples/...`: a doc that points at
+    # an example in a sentence rather than in a shell line is still promising the
+    # file exists, and the first version of this test let those through.
     referenced: set[str] = set()
     for source in sources:
         for match in re.finditer(
-            r"python\s+(examples/[\w./-]+\.py)", source.read_text(encoding="utf-8")
+            r"(examples/[\w./-]+\.py)", source.read_text(encoding="utf-8")
         ):
             referenced.add(match.group(1))
 

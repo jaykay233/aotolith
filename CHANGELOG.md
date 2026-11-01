@@ -9,6 +9,26 @@ The policy that decides what counts as a breaking change lives in
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/qwen_logit_distance.py`**, which measures each execution path's
+  last-token logits against PyTorch for several prompt lengths. It exists because
+  the figure it replaces was a single measurement quoted as if it described the
+  model: the MLX fallback's mean distance moves by 3.4x between a 7-token and a
+  16-token prompt, so the prompt length has to be part of the claim.
+
+### Fixed
+
+- **The README and `docs/performance.md` quoted 0.043 / 0.38 against 0.081 /
+  1.5** for how far the native and fallback paths land from PyTorch's logits.
+  Neither pair reproduces at 0.68.0, and the commit that added them recorded a
+  7-token prompt in its message that never reached the prose. Two claims were
+  wrong, not just the numbers: the fallback's distance is not a property of the
+  model (it depends on the prompt length by 3.4x), and "the native path is
+  closer" overstates a gap that is 5% at a 128-token prefill and reverses across
+  32 decode steps. Both languages now carry the measured table and the narrower
+  conclusion that code generation does not cost accuracy.
+
 ## [0.68.0] - 2026-11-01
 
 A gate that scales past one machine. The performance baseline was a single file
