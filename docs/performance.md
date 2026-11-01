@@ -301,7 +301,7 @@ elementwise MLX passes and a stack that writes several full-sized temporaries pe
 layer.
 
 The step time tracks the launch count more than the bytes — [the next section](#cutting-245-operators-out-of-a-decode-step)
-takes the count from 1239 to 994 and measures what that bought. What it leaves is
+takes 245 operators out of the step and measures what that bought. What it leaves is
 a decode step whose launches are each worth about 14 µs of fixed cost: isolating
 one launch of this kernel gives `t ≈ 14 µs + bytes / 373 GB/s`, so a 2.3 MB
 gate/up launch takes 20.8 µs at 110 GB/s while the 72 MB LM head takes 288 µs at
@@ -332,9 +332,9 @@ selection reason that the kernel was the only valid candidate.
 
 ## Cutting 245 operators out of a decode step
 
-A decode step of this model was 1239 operations — 147 casts, 338 reshapes,
-168 slices, 49 multiplies, 49 normalizations — and the GPU work in it took
-2.5 ms of a 5.7 ms step. The rest was the gap between launches, about 4.6 µs
+A decode step of this model traces to 1909 operations — 147 casts, 339
+reshapes, 265 slices, 169 multiplies, 49 normalizations — and the GPU work in it
+took 2.5 ms of a 5.7 ms step. The rest was the gap between launches, about 4.6 µs
 each, across 24 layers of roughly ten strictly dependent launches: a chain that
 deep cannot be hidden by a host thread that queues each step in microseconds,
 because the GPU sits idle between commands. Cutting that count turned out to be
@@ -351,8 +351,19 @@ four full-width temporaries.
 
 `fuse_norm_scale` matches the sequence and emits one `rms_norm` carrying the
 weight. That is 245 operators gone from the step, the 49 multiplies among them
-and the rest casts and layout work that only existed to feed them: 1239 ops to
-994, and 1191 to 995 on the bf16 model. The fold needs no tolerance because it is
+and the rest casts and layout work that only existed to feed them. The split is
+worth stating because the two halves are removed by different passes: 196 go
+where the fold runs, and the remaining 49 are the multiplies that
+`fuse_rms_norm_epilogue` can only reach once the norm is no longer standing in
+front of them. Measured end to end, dropping `fuse_norm_scale` from the pipeline
+costs 245 ops on both variants — 1909 ops to 634 (lowered to 683) on bf16, and
+2030 to 682 on int4. `examples/qwen_op_counts.py` prints the table, including
+each pass's own delta and its net contribution, and it is the reason the numbers
+in this section are stable: the per-pass figures hold as long as the pass does,
+while the absolute counts move with the transformers version that traced the
+graph. An earlier revision of this paragraph quoted 1239 ops to 994 and 1191 to
+995; the nets below are unchanged from that measurement, and only the endpoints
+moved. The fold needs no tolerance because it is
 bit-identical: both the row and the weight arrive in the dtype the product is
 narrowed back to, and the fused kernel forms the product in fp32 and rounds once,
 which is exactly what the five-op chain did. The pass checks that precondition and
@@ -365,11 +376,18 @@ on — so every pair below shares the machine's thermal and load state:
 
 | | bf16 | int4 g64 |
 | --- | ---: | ---: |
-| graph ops per decode step | 1191 → 995 | 1239 → 994 |
+| graph ops the fold removes | 245 | 245 |
 | decode, synchronized each step | 155.4 → 167.2 tok/s (6.44 → 5.98 ms) | 179.0 → 228.3 tok/s (5.59 → 4.38 ms) |
 | decode, asynchronous | 199.2 → 232.2 tok/s (5.02 → 4.31 ms) | 195.3 → 272.8 tok/s (5.12 → 3.67 ms) |
 | prefill, 128 tokens | 11 208 → 12 298 tok/s | 9 494 → 10 375 tok/s |
 | peak memory | 4.26 GiB, unchanged | 1.99 → 1.89 GiB |
+
+> The op-count rows quote what the fold removes, not the absolute step size. The
+> traced base has grown since these timings were taken — the step traces to 1909
+> ops on bf16 and 2030 on int4 today, because the view operators the frontend
+> records follow the installed transformers version — while each fold's net is
+> unchanged at 245. `examples/qwen_op_counts.py` prints both columns.
+
 
 The before/after pairs are what the ratios rest on, and they are 1.08x and 1.17x
 for bf16, 1.28x and 1.40x for int4, and 1.09-1.10x on prefill, for 245 fewer
@@ -405,7 +423,7 @@ rows, concatenates them onto the window, then slices the pair apart again and
 squeezes both halves because attention wants them separate. That is eleven
 operators per layer, plus the three views — slice, reshape, transpose — that read
 the value back out of the projection row it was just computed in. Across 24 layers
-it was 312 of the step's 995 operators, a third of the graph, for a statement that
+it was 312 of the 946 operators the step carried without it, a third of the graph, for a statement that
 fits in one line: slide the window down a slot, write the new key and value into
 the freed slot, hand back the window and its two halves.
 
@@ -442,7 +460,7 @@ session — on the 0.5B model, bf16 and int4:
 
 | | bf16 | int4 g64 |
 | --- | ---: | ---: |
-| graph ops per decode step | 995 → 683 | 994 → 682 |
+| graph ops the fold removes | 312 | 312 |
 | decode, synchronized each step | 147.9 → 154.6 tok/s (6.76 → 6.47 ms) | 228.2 → 251.5 tok/s (4.38 → 3.98 ms) |
 | decode, asynchronous | 178.8 → 188.5 tok/s (5.59 → 5.30 ms) | 277.2 → 308.7 tok/s (3.61 → 3.24 ms) |
 | greedy tokens | unchanged, all 64 | unchanged, all 64 |

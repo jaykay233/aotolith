@@ -118,7 +118,7 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 编译器怎么处理一个打包权重，取决于它乘多少行。单行 matmul —— decode —— *就是* 流式 kernel：`fold_quantized_weights` 把 `matmul(x, dequantize_i4(packed, scales))` 改写成带 `weight_group_size` 的单个 `matmul`，GEMV prologue 读字、用两条指令符号扩展每个 nibble（`(int)(word << 28) >> 28`）、乘 `x` 再乘组 scale、用 float 累加。整个过程中不存在解包后的权重。多行 matmul —— prefill —— 保留解包，因为 128 行时权重流只是乘法里便宜的那一半，int4 只会给算力受限的 pass 加解码工作；此时显式的 `dequantize_i4` 在 `codegen/quantize.py` 里 lower 成一个流式 kernel，而不是八个逐元素 MLX pass 加一次 stack、每层写出好几个全尺寸临时张量。
 
-step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#从-decode-step-里砍掉-245-个-op)把 launch 数从 1239 压到 994，并测出这一项买到了什么。它留下的是一个「每次 launch 约 14 µs 固定成本」的 decode step：把这种 kernel 的单次 launch 隔离出来，得到 `t ≈ 14 µs + 字节 / 373 GB/s`，于是 2.3 MB 的 gate/up launch 花 20.8 µs（110 GB/s），72 MB 的 LM head 花 288 µs（252 GB/s）。threadgroup 尺寸只改几个百分点，更省的 nibble 解码连噪声都没超过，所以下一步是把一次 launch 用来验证多个 token，而不是把单行 kernel 做快。四个测量点见[架构文档](architecture.md#小-launch-的地板是固定的-14-µs不是带宽)。
+step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#从-decode-step-里砍掉-245-个-op)砍掉 245 个 op，并测出这一项买到了什么。它留下的是一个「每次 launch 约 14 µs 固定成本」的 decode step：把这种 kernel 的单次 launch 隔离出来，得到 `t ≈ 14 µs + 字节 / 373 GB/s`，于是 2.3 MB 的 gate/up launch 花 20.8 µs（110 GB/s），72 MB 的 LM head 花 288 µs（252 GB/s）。threadgroup 尺寸只改几个百分点，更省的 nibble 解码连噪声都没超过，所以下一步是把一次 launch 用来验证多个 token，而不是把单行 kernel 做快。四个测量点见[架构文档](architecture.md#小-launch-的地板是固定的-14-µs不是带宽)。
 
 精度：int4 把每个权重四舍五入到组内 15 个取值之一，logits 因此会移动，而 greedy decode 是这个移动的混沌读数。以同一份取整后的权重跑 float32 CPU forward 作为基准，运行时偏离 0.51 —— 是 18.5 的 logit 尺度的 2.7% —— 而 torch 自己的 bf16 forward 偏离 0.41，即 2.2%。两者都是 bf16 噪声，都不是解码错误。greedy 于是能跟住取整后的 checkpoint 前 13 个 token，然后在一次接近平手的选择上翻转，64 个 token 里对上 16 个。所以 CI 不使用这个模型上的 token 相等：`tests/test_quantized_qwen2.py` 跑一个 2 层模型，那里检查是精确的 —— 每个 decode token 都必须与取整后的 reference 相同 —— 而 `--quantize` 会同时报告 bf16 reference 和取整后的 reference，任何一次运行都不会含糊它跟的是哪一个。
 
@@ -126,21 +126,24 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 ## 从 decode step 里砍掉 245 个 op
 
-这个模型的 decode step 原来是 1239 个 op —— 147 个 cast、338 个 reshape、168 个 slice、49 个 multiply、49 个归一化 —— 而其中真正的 GPU 工作只占 5.7 ms 里的 2.5 ms。其余都是 launch 之间的间隙，平均每次约 4.6 µs，摊在 24 层、每层约十次严格串行的 launch 上：这样一条依赖链，靠一个微秒级提交的 host 线程是盖不住的，GPU 在命令之间空转。把 launch 数压下来比把任何一个 kernel 做快都更值。
+这个模型的 decode step trace 出来是 1909 个 op —— 147 个 cast、339 个 reshape、265 个 slice、169 个 multiply、49 个归一化 —— 而其中真正的 GPU 工作只占 5.7 ms 里的 2.5 ms。其余都是 launch 之间的间隙，平均每次约 4.6 µs，摊在 24 层、每层约十次严格串行的 launch 上：这样一条依赖链，靠一个微秒级提交的 host 线程是盖不住的，GPU 在命令之间空转。把 launch 数压下来比把任何一个 kernel 做快都更值。
 
 最大的一笔来自 PyTorch 写 RMSNorm 的方式。展开写它是 `(x.to(f32).pow(2).mean().rsqrt() * x.to(f32) * weight.to(f32)).to(x.dtype)`，前端忠实记录了五个 op：一次加宽 cast、一次不带 weight 的归一化、为 weight 的第二次加宽 cast、一次 multiply、一次收窄 cast。编译器早就有带 weight 的 `rms_norm`（它降级到同一个 Metal kernel），但没有任何规则把这种五 op 写法匹配上去，于是图里 49 个归一化各自变成五次 launch 和四个全宽临时张量。
 
-`fuse_norm_scale` 匹配这个序列，最后发出一个带 weight 的 `rms_norm`。每 token 因此从图里少掉 245 个 op——49 个被折叠的 multiply 在内，其余是只为喂它而存在的 cast 和 layout 工作——量化图上 1239 降到 994，bf16 图上 1191 降到 995。这个折叠不需要容差，因为它是逐位一致的：输入行和 weight 都以收窄后的 dtype 到达，融合 kernel 用 fp32 做乘积并只舍入一次，正是原来五 op 链做的事。pass 检查这个前提，不满足时不生效——真要一个独立 fp32 行的图保留它——`tests/test_passes_norm.py` 断言的是与未折叠图的逐位相等，而不是容差。
+`fuse_norm_scale` 匹配这个序列，最后发出一个带 weight 的 `rms_norm`。每 token 因此从图里少掉 245 个 op——49 个被折叠的 multiply 在内，其余是只为喂它而存在的 cast 和 layout 工作。这 245 个由两个 pass 分摊，值得说清楚：196 个在折叠自己发生的位置消失，剩下 49 个是 `fuse_rms_norm_epilogue` 只有在归一化不再挡在乘法前面之后才够得着的 multiply。端到端量下来，把 `fuse_norm_scale` 从管线里去掉，两个变体都是 245 个 op——bf16 从 1909 到 634（lowering 后 683），int4 从 2030 到 682。这个折叠不需要容差，因为它是逐位一致的：输入行和 weight 都以收窄后的 dtype 到达，融合 kernel 用 fp32 做乘积并只舍入一次，正是原来五 op 链做的事。pass 检查这个前提，不满足时不生效——真要一个独立 fp32 行的图保留它——`tests/test_passes_norm.py` 断言的是与未折叠图的逐位相等，而不是容差。
 
 在同一个交替会话里只对这一个 pass 做消融 —— 关、开、关、开 —— 所以每一对数字共享同一份机器热状态与负载：
 
 | | bf16 | int4 g64 |
 | --- | ---: | ---: |
-| 每步图 op 数 | 1191 → 995 | 1239 → 994 |
+| 这一折净减的图 op 数 | 245 | 245 |
 | decode（每步同步） | 155.4 → 167.2 token/s（6.44 → 5.98 ms） | 179.0 → 228.3 token/s（5.59 → 4.38 ms） |
 | decode（异步） | 199.2 → 232.2 token/s（5.02 → 4.31 ms） | 195.3 → 272.8 token/s（5.12 → 3.67 ms） |
 | prefill，128 token | 11 208 → 12 298 token/s | 9 494 → 10 375 token/s |
 | 峰值内存 | 4.26 GiB，不变 | 1.99 → 1.89 GiB |
+
+注：op 数这一行引用的是「这一折去掉了多少」，不是 step 的绝对规模。这些计时测完之后，被 trace 出来的基座变大了 —— 今天 bf16 是 1909 个 op、int4 是 2030 个 —— 因为前端记录的 view 算子数量跟着装上的 transformers 版本走；而每一折的净值没变，仍是 245。两列都能用 `examples/qwen_op_counts.py` 打出来。
+
 
 结论落在前后配对值上：bf16 是 1.08x 和 1.17x，int4 是 1.28x 和 1.40x，prefill 是 1.09-1.10x，代价是每 token 少 245 个 op，没有任何 kernel 改动。折叠之后异步仍然领先同步 —— 4.31 ms 对 5.98 ms —— 说明 host 循环还盖在队列后面，这次折叠并没有把 launch 地板推到台前。每个 op 平摊的成本折叠前是 4.51 µs、折叠后是 4.41 µs：这就是这条发现的形状——这个 step 的耗时等于 op 数乘以一个常数，而常数没有随数量变。
 
@@ -148,7 +151,7 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 ## 把 KV-cache 滚动链收成一个算子
 
-decode 每步要往一个固定容量的窗口里写每层的一个 key 和一个 value，而 torch 能表达这件事的写法都比这件事本身长。adapter 把该层 pair 最旧的那个 slot 切掉、把这一步的两行 stack 起来、cat 到窗口上，再把 pair 切开、squeeze 成两半，因为 attention 要分开读。每层十一个 op，再加上把 value 从刚算出的投影行里读回来所需的三个 view —— slice、reshape、transpose。24 层加起来是 312 个 op，占这个 step 995 个 op 的三分之一，而它们说的其实是一句话：窗口往前挪一格，把新的 key 和 value 写进腾出来的那一格，然后把窗口和它的两半交出来。
+decode 每步要往一个固定容量的窗口里写每层的一个 key 和一个 value，而 torch 能表达这件事的写法都比这件事本身长。adapter 把该层 pair 最旧的那个 slot 切掉、把这一步的两行 stack 起来、cat 到窗口上，再把 pair 切开、squeeze 成两半，因为 attention 要分开读。每层十一个 op，再加上把 value 从刚算出的投影行里读回来所需的三个 view —— slice、reshape、transpose。24 层加起来是 312 个 op，占它生效前那个 step 946 个 op 的三分之一，而它们说的其实是一句话：窗口往前挪一格，把新的 key 和 value 写进腾出来的那一格，然后把窗口和它的两半交出来。
 
 `kv_cache_append` 就是这一句话。它吃整个分层 cache、这一步的 key，和打包的投影行，吐出新的 pair 和两个窗口。它的约定写在 `ir/ops/kernels.py` 里，语义就在那：cache 是 `[layers, 2, batch, heads, slots, dim]`，pair 在轴 1 上，`layer` 说明这一步拥有它的哪一层，`value_start` 说明 value 那一半从投影行的哪个位置开始 —— 算子直接在那里读，所以它的形状副本从不需要存在。重写在 `passes/cache.py` 的 `fuse_kv_cache_update`，它刻意很窄：concat 必须把 pair 造得比一个窗口正好长一个 slot，而这个窗口必须是 *同一个* pair 的前缀切片；两个半边必须由一个 slice 和一个 squeeze 解出、形状与算子输出完全一致；重写要删掉的任何值都不能被链外的算子读到。窗口少切两个 slot、value 不是投影来的、pair 还有第三个读者 —— 每一种都保持通用写法。它在流水线里排第一个，因为后面的 pass 会很高兴地把这些必须被看见的 view 整理掉。
 
@@ -158,7 +161,7 @@ decode 每步要往一个固定容量的窗口里写每层的一个 key 和一�
 
 | | bf16 | int4 g64 |
 | --- | ---: | ---: |
-| 每步图 op 数 | 995 → 683 | 994 → 682 |
+| 这一折净减的图 op 数 | 312 | 312 |
 | decode（每步同步） | 147.9 → 154.6 token/s（6.76 → 6.47 ms） | 228.2 → 251.5 token/s（4.38 → 3.98 ms） |
 | decode（异步） | 178.8 → 188.5 token/s（5.59 → 5.30 ms） | 277.2 → 308.7 token/s（3.61 → 3.24 ms） |
 | greedy token | 不变，64 个全同 | 不变，64 个全同 |

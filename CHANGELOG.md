@@ -11,6 +11,12 @@ The policy that decides what counts as a breaking change lives in
 
 ### Added
 
+- **`examples/qwen_op_counts.py`**, which prints the decode step's op count as
+  traced, each pass's delta where it runs, and each named pass's net
+  contribution. It separates the two halves of a figure the docs mixed together:
+  a per-pass number is stable while the pass is, and an absolute count follows
+  the transformers version that traced the graph.
+
 - **`examples/qwen_logit_distance.py`**, which measures each execution path's
   last-token logits against PyTorch for several prompt lengths. It exists because
   the figure it replaces was a single measurement quoted as if it described the
@@ -18,6 +24,17 @@ The policy that decides what counts as a breaking change lives in
   16-token prompt, so the prompt length has to be part of the claim.
 
 ### Fixed
+
+- **The op-count endpoints in `docs/performance.md` (1239 to 994, 1191 to 995)
+  no longer matched the graph the frontend traces**, which is 1909 ops on bf16
+  and 2030 on int4 at this commit. The per-pass figures the section is actually
+  arguing from are unchanged and now reproducible: `fuse_norm_scale` is worth a
+  net 245 ops and `fuse_kv_cache_update` a net 312, measured by dropping each
+  from `PIPELINE` and diffing. The section now quotes those nets, explains the
+  245 as 196 at the fold's position plus 49 multiply operators that
+  `fuse_rms_norm_epilogue` can only reach once the norm stops standing in front
+  of them, and states the current endpoints next to the note that the
+  transformers version moves them.
 
 - **The README and `docs/performance.md` quoted 0.043 / 0.38 against 0.081 /
   1.5** for how far the native and fallback paths land from PyTorch's logits.
