@@ -26,26 +26,30 @@ Qwen2 的每一次测量都用同一段 prompt、同一精度、同样的 `128 +
 
 | 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm`（异步） |
 | --- | --- | --- | --- | --- |
-| 仅 MLX fallback | 9 650 token/s | 154.7 token/s | 185.9 token/s | 0.77x |
-| `--codegen-matmul` | 10 872 token/s | 182.4 token/s | **239.1 token/s** | **1.00x** |
-| `--codegen-matmul --codegen-attention` | 12 379 token/s | 184.9 token/s | 239.0 token/s | 0.99x |
-| `mlx_lm` 本身 | — | 198.0 token/s | 242.1 token/s | — |
+| 仅 MLX fallback | 9 616 token/s | 198.4 token/s | 230.5 token/s | 0.96x |
+| `--codegen-matmul` | 11 466 token/s | 211.7 token/s | **240.9 token/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 11 153 token/s | 211.9 token/s | 239.8 token/s | 1.00x |
+| `mlx_lm` 本身 | 11 280 token/s | 195.9 token/s | 238.8 token/s | — |
 
-（同一个会话里 5 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致，且都在 decoder 默认的 `memory="latency"` 策略下运行。这台机器的运行间波动大到一个小时前后同一份代码量到 204 和 239 token/s，所以有意义的是比值，不是绝对值——每一行都对着旁边那行 `mlx_lm` 读。
+（整张表跑三轮取中位数，每轮本身是 5 次重复的中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致，且都在 decoder 默认的 `memory="latency"` 策略下运行。这台机器的运行间波动大到一个小时内同一份代码量到 205 和 243 token/s，所以有意义的是比值，不是绝对值——每一行都对着同一进程里那行 `mlx_lm` 读。
 
-`相对 mlx_lm` 这一列是异步对异步。这是一次更正：本表早先把这个仓库的异步 decode 拿去比一个每步都用 `mx.eval` 加 `.item()` 等待的基线，而那种等待本身就值大约 15%，由此得出 1.21x。按服务循环的写法计时，`mlx_lm` 是 242.1 token/s，所以 codegen 抹平的是 fallback 路径那 23% 的差距，到达的是持平而不是领先。同步那一列从另一面说的是同一件事：0.93x——到那里 kernel 的选择已经不再决定结果，每步的 host 开销开始决定。
+只要某个 commit 改动了每步成本，这张表就要重测。上一版表格早于「把展开后的 decode body 交给 `mx.compile` 重放」那一次改动，而那次改动动的恰好就是同步列读的东西：它当时记的是 182.4 token/s，现在 211.7，16% 的误差被当作 0.93x 发布了出去。表里的一个数字是一次带日期的测量，不是代码的属性。）
 
-`--codegen-attention` 那行在 decode 上与上一行落在噪声内，prefill 这里甚至略高——attention kernel 在 prefill 形状上更慢的 tile 比这台机器的运行间波动还小。）
+`相对 mlx_lm` 这一列是异步对异步。这是一次更正：本表早先把这个仓库的异步 decode 拿去比一个每步都用 `mx.eval` 加 `.item()` 等待的基线，而那种等待本身就值大约 15%，由此得出 1.21x。按服务循环的写法计时，`mlx_lm` 是 238.8 token/s，所以 codegen 抹平的是 fallback 路径那 4% 的差距，到达的是持平而不是领先。异步这一列本来也表现不出更多东西：两边每一步都在流式读同一份 991 MB 权重，都被钉在同一个内存天花板上，kernel 的选择只决定谁先撞到它。看得见每步 host 开销的是同步那一列，而编译过的 plan 在那里领先是真实且可复现的：四个独立会话都是 1.04-1.06x。prefill 是带宽天花板够不着的另一个地方：fallback 未编译的图在这个 prompt 长度上落后 `mlx_lm` 15%，生成的 matmul 把它变成持平。
 
-prompt 长度对 prefill 的影响远大于对 decode 的影响。在同一个进程里交错计时、两边都测、每格取 5 次的中位数：
+`--codegen-attention` 那行在 decode 上与上一行落在噪声内。它的 prefill 比 `--codegen-matmul` 那行低 9%，而这一列在这台机器上的运行间波动也是这个量级，所以诚实的读法是：attention kernel 在这里既没帮上忙也没拖后腿——一个每层只搬 0.1 MB 的单 query attention step 本来就该这样。
+
+prompt 长度对 prefill 的影响远大于对 decode 的影响。四个独立会话，每行的每格取三次的中位数，两边在同一个进程里计时。比值按跨会话的区间给，因为这些会话之间绝对值能差到 18%，而比值只动 0.02-0.06：
 
 | prompt token 数 | prefill：本仓库 / `mlx_lm` | decode 同步 | decode 异步 |
 | --- | --- | --- | --- |
-| 32 | 3 392 / 5 661 token/s（0.60x） | 181.2 / 198.2（0.91x） | 226.8 / 241.2（0.94x） |
-| 128 | 12 029 / 11 122 token/s（1.08x） | 176.2 / 196.3（0.90x） | 230.7 / 241.4（0.96x） |
-| 178 | 14 702 / 13 341 token/s（1.10x） | 174.3 / 196.2（0.89x） | 228.1 / 241.4（0.94x） |
+| 32 | 0.61-0.68x | 0.94-1.09x | 0.86-1.01x |
+| 128 | 1.02-1.08x | 1.04-1.06x | 0.96-1.00x |
+| 178 | 1.09-1.14x | 1.03-1.05x | 0.96-0.98x |
 
-32 token 的 prefill 短到让每次 launch 的地板价主导：算术只有约 0.02 ms，却摊在几百次 4-14 µs 的 launch 上，所以成本就是那个次数，而 `mlx_lm` 的图更短。到 128 token，算术开始值得这些 launch，本仓库领先 8-10%。decode 在三个长度上两边都是平的，这正是带宽受限的一步该有的样子，同时它一直落后 4-10%。`examples/compare_mlx_lm.py` 会打出整张网格。
+32 token 那行 decode 区间宽，是**一个格子**造成的，不是跨会话的分散。`compare_mlx_lm.py` 最先测这一行，而且就在 plan 编译完之后，四个会话里有一次读到 0.94x 和 0.86x，而同一会话的 128 和 178 两行是 1.06x 和 0.97x——是开跑时的瞬态，不是这个形状的属性。另外三个会话在同一个格子上是同步 1.05-1.09x、异步 0.999-1.006x。这些格子按实测报出，而不是把不一致的那个会话删掉；32 token 的 decode 请读作「与 `mlx_lm` 持平，其中一次开机偏冷」，prefill 那一列才是结论，它在四个会话里都稳定。
+
+32 token 的 prefill 短到让每次 launch 的地板价主导：算术只有约 0.02 ms，却摊在几百次 4-14 µs 的 launch 上，所以成本就是那个次数，而 `mlx_lm` 的图更短。到 128 token，算术开始值得这些 launch，本仓库领先 2-14%。decode 在三个长度上两边都是平的，这正是带宽受限的一步该有的样子：两边都异步时编译过的 plan 与 `mlx_lm` 持平，两边都逐步等待时它持平到领先 9%。`examples/compare_mlx_lm.py` 会打出整张网格。
 
 token 一致不等于数字一致。`examples/qwen_logit_distance.py` 把两条路径的最后一个 token logits 分别与 PyTorch 对比，而这个差距取决于 prefill 看到多少 token：
 
@@ -143,19 +147,21 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 它比 4 bit 慢，但准得多，而它只是"稍微慢一点"的原因，和当初做 4 bit 值得的原因是同一个：decode step 仍然受 host 限制。Qwen2.5-0.5B 上一步的拆分是
 
-| | host | kernel 占比 | wall |
+| | host | kernel 占比 | wall（当前） |
 | --- | --- | --- | --- |
-| bf16 | 5.18 ms | — | 5.04 ms |
-| int4 g64 | 2.50 ms | 0.53 ms | 3.03 ms |
-| int8 g64 | 2.92 ms | 0.57 ms | 3.49 ms |
+| bf16 | 5.18 ms | — | 4.15 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 2.68 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 3.05 ms |
 
-也就是说权重流量翻倍只让 kernel 自己那部分动了 0.04 ms，剩下的都落在循环体上 —— 同样的 reduction 现在要走两倍的字。与量化到同一宽度、同样循环形状的 `mlx_lm` 对比，同 prompt 64 步：
+host 和 kernel 两列是在 decode body 交给 `mx.compile` 重放之前测的，那次改动降低了每步 host 开销——所以 wall 一列不再等于两者之和。wall 是下面那些速率反推出的值；host/kernel 的拆分请当作"这一步受 host 限制"的原因来读，而不是今天这 2.68 ms 的账。
+
+权重流量翻倍只让 kernel 自己那部分动了 0.04 ms，剩下的都落在循环体上 —— 同样的 reduction 现在要走两倍的字。与量化到同一宽度、同样循环形状的 `mlx_lm` 对比，同 prompt 64 步：
 
 | 权重 | 本仓库 | `mlx_lm`（同位宽） | 比值 |
 | --- | --- | --- | --- |
-| bf16 | 200.6 token/s | 208.7 token/s | 0.96x |
-| int4，group 64 | 373.1 token/s | 328.7 token/s | 1.13x |
-| int8，group 64 | 328.6 token/s | 301.3 token/s | 1.09x |
+| bf16 | 240.9 token/s | 238.8 token/s | 1.01x |
+| int4，group 64 | 373.4 token/s | 329.2 token/s | 1.13x |
+| int8，group 64 | 327.4 token/s | 300.5 token/s | 1.09x |
 
 如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环，这两行会变成 1.35x 和 1.19x，因为 `generate()` 每 token 多做一次文本处理。那正是本文档早先在 bf16 上抓到、并已纠正的同一个循环形状错误，也是 `--mlx-baseline` 要把基线也量化、两种形状都测的原因。
 

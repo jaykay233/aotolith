@@ -219,6 +219,24 @@ def _mlx_lm_decode_rate(
         mx.eval(model.parameters())
     ids = mx.array([prompt])
 
+    def prefill_once() -> float:
+        """Time the prompt pass the way ``_prefill_once`` times this project's.
+
+        It runs after the decode measurements on purpose: interleaving it
+        would change the sequence the documented decode figures came from,
+        and a baseline is only useful if it is timed the same way twice.
+        """
+
+        prompt_cache = mlx_cache.make_prompt_cache(model)
+        start = time.perf_counter()
+        logits = model(ids, cache=prompt_cache)
+        token = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+        # Evaluating the token forces the prompt pass; the synchronize drains
+        # the cache writes that hang off it but are not its dependencies.
+        mx.eval(token)
+        mx.synchronize()
+        return time.perf_counter() - start
+
     def once(sync_each_step: bool) -> tuple[float, list[int]]:
         prompt_cache = mlx_cache.make_prompt_cache(model)
         logits = model(ids, cache=prompt_cache)
@@ -255,10 +273,19 @@ def _mlx_lm_decode_rate(
     for _ in range(repeats):
         elapsed, tokens = once(False)
         async_latencies.append(elapsed)
+    for _ in range(warmups):
+        prefill_once()
+    prefill_latencies: list[float] = []
+    for _ in range(repeats):
+        prefill_latencies.append(prefill_once())
     return {
         "backend": "mlx_lm",
         "quantize_group_size": group_size,
         "quantize_bits": bits if group_size is not None else None,
+        "prefill": {
+            "latency_ms": _summary([value * 1000 for value in prefill_latencies]),
+            "tokens_per_s": _rate_summary(prefill_latencies, len(prompt)),
+        },
         "decode_sync_each_step": {
             "latency_ms": _summary([value * 1000 for value in sync_latencies]),
             "tokens_per_s": _rate_summary(sync_latencies, decode_tokens - 1),
@@ -475,7 +502,9 @@ def main() -> None:
         "model_path": model_path,
         "model_dtype": "bfloat16",
         "weight_quantization": (
-            None if args.quantize is None else f"int4-group{args.quantize}"
+            None
+            if args.quantize is None
+            else f"int{args.quantize_bits}-group{args.quantize}"
         ),
         "device": str(mx.default_device()),
         "load_s": load_seconds,

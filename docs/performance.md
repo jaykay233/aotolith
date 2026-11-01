@@ -90,47 +90,73 @@ nothing else to fall back to.
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 9 650 tok/s | 154.7 tok/s | 185.9 tok/s | 0.77x |
-| `--codegen-matmul` | 10 872 tok/s | 182.4 tok/s | **239.1 tok/s** | **1.00x** |
-| `--codegen-matmul --codegen-attention` | 12 379 tok/s | 184.9 tok/s | 239.0 tok/s | 0.99x |
-| `mlx_lm` itself | — | 198.0 tok/s | 242.1 tok/s | — |
+| MLX fallback only | 9 616 tok/s | 198.4 tok/s | 230.5 tok/s | 0.96x |
+| `--codegen-matmul` | 11 466 tok/s | 211.7 tok/s | **240.9 tok/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 11 153 tok/s | 211.9 tok/s | 239.8 tok/s | 1.00x |
+| `mlx_lm` itself | 11 280 tok/s | 195.9 tok/s | 238.8 tok/s | — |
 
-(Median of 5 repeats in one session, the same 64 generated tokens as the
-PyTorch reference in every row, and each run under the decoder's default
-`memory="latency"` policy. Run-to-run spread on this machine is wide enough —
-the same code measured 204 and 239 tok/s in two sessions an hour apart — that
-the ratios matter and the absolute numbers do not; read each row against the
-`mlx_lm` row measured beside it.
+(Median of three runs of the whole table, each run a median of five repeats, the
+same 64 generated tokens as the PyTorch reference in every row, and each run
+under the decoder's default `memory="latency"` policy. Run-to-run spread on this
+machine is wide enough — the same code measured 205 and 243 tok/s in two sessions
+a few minutes apart — that the ratios matter and the absolute numbers do not;
+read each row against the `mlx_lm` row measured in the same process.
+
+The table is re-measured whenever a commit changes per-step cost. The revision
+before this one predated replaying the unrolled decode body through `mx.compile`,
+and that commit moves exactly what the sync column reads: it reported 182.4 tok/s
+there against 211.7 now, a 16% error that had been published as 0.93x. A figure
+in a table is a measurement with a date, not a property of the code.)
 
 The `vs mlx_lm` column compares asynchronous against asynchronous. That is a
 correction: earlier revisions put this repository's asynchronous decode against a
 baseline that waited for every step with `mx.eval` and `.item()`, which is worth
-about 15% on its own, and reported 1.21x from it. `mlx_lm` does 242.1 tok/s when
-its loop is timed the way a serving loop runs, so code generation closes the 23%
+about 15% on its own, and reported 1.21x from it. `mlx_lm` does 238.8 tok/s when
+its loop is timed the way a serving loop runs, so code generation closes the 4%
 gap that the fallback path has and arrives at parity rather than at a lead. The
-sync column says the same thing from the other side: 0.93x, which is where the
-kernel choice stops mattering and per-step host overhead starts to.)
+asynchronous column cannot show more than that: both sides stream the same 991 MB
+of weights per step, so both are pinned to the same memory ceiling and the
+kernel choice only decides who reaches it. The sync column is where per-step host
+cost is visible, and there the compiled plan's advantage is real and repeatable:
+1.04-1.06x across four independent sessions. Prefill is the other place a
+bandwidth ceiling does not reach: the fallback's uncompiled graph runs 15% behind
+`mlx_lm` at this prompt length and the generated matmul turns that into parity.)
 
-The `--codegen-attention` row is within noise of the one above it on decode, and
-its prefill reads a little higher here rather than lower — the attention kernel's
-slower tile on prefill shapes is smaller than this machine's run-to-run spread.
+The `--codegen-attention` row is within noise of the one above it on decode. Its
+prefill reads 9% lower than the `--codegen-matmul` row, on a column whose
+run-to-run spread on this machine is of the same size, so the honest reading is
+that the attention kernel neither helps nor hurts here — which is what a
+single-query attention step that moves 0.1 MB per layer should look like.
 
-Prompt length moves prefill more than it moves decode. Timed interleaved in one
-process, both sides, median of five passes per cell:
+Prompt length moves prefill more than it moves decode. Four independent sessions,
+each row a median of three passes per cell, timed in one process on both sides.
+The ratios are quoted as a range across sessions because the absolute rates move
+by up to 18% between them while the ratio moves by 0.02-0.06:
 
 | prompt tokens | prefill: this / `mlx_lm` | decode sync | decode async |
 | --- | --- | --- | --- |
-| 32 | 3 392 / 5 661 tok/s (0.60x) | 181.2 / 198.2 (0.91x) | 226.8 / 241.2 (0.94x) |
-| 128 | 12 029 / 11 122 tok/s (1.08x) | 176.2 / 196.3 (0.90x) | 230.7 / 241.4 (0.96x) |
-| 178 | 14 702 / 13 341 tok/s (1.10x) | 174.3 / 196.2 (0.89x) | 228.1 / 241.4 (0.94x) |
+| 32 | 0.61-0.68x | 0.94-1.09x | 0.86-1.01x |
+| 128 | 1.02-1.08x | 1.04-1.06x | 0.96-1.00x |
+| 178 | 1.09-1.14x | 1.03-1.05x | 0.96-0.98x |
+
+The wide decode ranges at 32 tokens are one cell, not a spread across sessions.
+`compare_mlx_lm.py` measures that row first, immediately after compiling the
+plan, and in one of four sessions it read 0.94x and 0.86x while the 128 and 178
+rows of the same session were 1.06x and 0.97x — a transient at the start of the
+run, not a property of the shape. The other three sessions put the same cell at
+1.05-1.09x sync and 0.999-1.006x async. The cells are reported as measured
+rather than dropping the session that disagrees; treat the 32-token decode row
+as "level with `mlx_lm`, one run started cold" and the prefill column as the
+finding, which is stable across all four.
 
 A 32-token prefill is short enough that the per-operation launch floor dominates:
 the arithmetic is ~0.02 ms spread over a few hundred launches at 4-14 µs each, so
 the count is the cost and `mlx_lm` runs a shorter graph. By 128 tokens the
-arithmetic pays for the launches and this repository leads by 8-10%. Decode is
+arithmetic pays for the launches and this repository leads by 2-14%. Decode is
 flat across the three lengths on both sides, which is what a bandwidth-bound step
-should look like, and it stays 4-10% behind. `examples/compare_mlx_lm.py` prints
-the grid.
+should look like: the compiled plan is level with `mlx_lm` when both are
+asynchronous and level-to-9% ahead when both wait for every step.
+`examples/compare_mlx_lm.py` prints the grid.
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without
 native kernels, and `mlx_lm` produces those same 64 tokens, so the comparison
@@ -364,22 +390,28 @@ It is slower than four bits and much more accurate, and the reason it is only
 mildly slower is the same reason four bits was worth doing: a decode step is
 host-bound. On Qwen2.5-0.5B the step time splits as
 
-| | host | kernel share | wall |
+| | host | kernel share | wall, current |
 | --- | --- | --- | --- |
-| bf16 | 5.18 ms | — | 5.04 ms |
-| int4 g64 | 2.50 ms | 0.53 ms | 3.03 ms |
-| int8 g64 | 2.92 ms | 0.57 ms | 3.49 ms |
+| bf16 | 5.18 ms | — | 4.15 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 2.68 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 3.05 ms |
 
-so doubling the weight traffic moved the kernel's own share by 0.04 ms while the
+The host and kernel columns were measured before the decode body was handed to
+`mx.compile`, and that change lowered per-step host cost — which is why the wall
+column no longer equals their sum. The wall column is what the rates below
+imply; read the split as the reason the step is host-bound rather than as an
+accounting of today's 2.68 ms.
+
+Doubling the weight traffic moved the kernel's own share by 0.04 ms while the
 loop body, which now walks twice the words for the same reduction, accounts for
 the rest. Against `mlx_lm` quantized to the same width and timed in the same loop
 shape, 64 decode steps at the same prompt:
 
 | weights | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- |
-| bf16 | 200.6 tok/s | 208.7 tok/s | 0.96x |
-| int4, group 64 | 373.1 tok/s | 328.7 tok/s | 1.13x |
-| int8, group 64 | 328.6 tok/s | 301.3 tok/s | 1.09x |
+| bf16 | 240.9 tok/s | 238.8 tok/s | 1.01x |
+| int4, group 64 | 373.4 tok/s | 329.2 tok/s | 1.13x |
+| int8, group 64 | 327.4 tok/s | 300.5 tok/s | 1.09x |
 
 Timing `mlx_lm.generate()` rather than its raw decode loop would turn those into
 1.35x and 1.19x, because `generate()` adds per-token text bookkeeping the loop

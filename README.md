@@ -146,20 +146,27 @@ M5 Pro. `mlx_lm` was timed in the same process, under the same loop shape:
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 9 650 tok/s | 154.7 tok/s | 185.9 tok/s | 0.77x |
-| `--codegen-matmul` | 10 872 tok/s | 182.4 tok/s | **239.1 tok/s** | **1.00x** |
-| `--codegen-matmul --codegen-attention` | 12 379 tok/s | 184.9 tok/s | 239.0 tok/s | 0.99x |
-| `mlx_lm` itself | — | 198.0 tok/s | 242.1 tok/s | — |
+| MLX fallback only | 9 616 tok/s | 198.4 tok/s | 230.5 tok/s | 0.96x |
+| `--codegen-matmul` | 11 466 tok/s | 211.7 tok/s | **240.9 tok/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 11 153 tok/s | 211.9 tok/s | 239.8 tok/s | 1.00x |
+| `mlx_lm` itself | 11 280 tok/s | 195.9 tok/s | 238.8 tok/s | — |
 
 The point of code generation is the *second* step, not the first: the fallback
-path is 23% behind `mlx_lm` and turning on the matmul kernel closes that. It does
-not open a lead. An earlier revision of this table read 1.21x, and that came from
-timing the two sides differently — this repository's decode path submits each step
-with `mx.async_eval` while the `mlx_lm` baseline waited for every step, and a
-device round trip per token costs about 15%. Timed like for like across three
-prompt lengths, decode lands at 0.89-0.96x of `mlx_lm` and prefill at 0.60x on a
-32-token prompt, 1.08-1.10x from 128 up. `examples/compare_mlx_lm.py` prints that
-grid.
+path is 4% behind `mlx_lm` and turning on the matmul kernel closes that. It does
+not open a lead on asynchronous decode, where both sides are reading the same
+991 MB of weights per step and neither can go faster than the memory they share.
+What code generation buys is visible in the two columns a bandwidth ceiling does
+not hide: prefill, where the fallback's uncompiled graph runs 15% behind and the
+generated matmul turns that into parity, and the synchronous column, where the
+compiled plan's lower per-step host cost is worth 8%. An earlier revision of this
+table read 0.77x and 1.21x in different places, and both came from timing the
+sides differently — one against a baseline that waited for every step, one against
+a published figure instead of a measured one. Reading the same pair across three
+prompt lengths, decode lands at 0.96-1.01x of `mlx_lm` and prefill at 0.61-0.68x
+on a 32-token prompt, 1.02-1.14x from 128 up. `examples/compare_mlx_lm.py` prints
+that grid; the decode range there is wider at 32 tokens because that row is
+measured first, right after the plan compiles, and one of four sessions started
+cold. The prefill column is the stable one.
 
 All 64 tokens match the PyTorch BF16 reference exactly, with or without native
 kernels, and `mlx_lm` produces those same tokens.
@@ -195,9 +202,9 @@ format, not the compiler. On the same prompt and the same 64 steps:
 
 | weights | bytes per step | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- | --- |
-| BF16 | 991 MB | 200.6 tok/s | 208.7 tok/s | 0.96x |
-| int4, group 64 | 250 MB | **373.1 tok/s** | 328.7 tok/s | **1.13x** |
-| int8, group 64 | 495 MB | 328.6 tok/s | 301.3 tok/s | 1.09x |
+| BF16 | 991 MB | 240.9 tok/s | 238.8 tok/s | 1.01x |
+| int4, group 64 | 250 MB | **373.4 tok/s** | 329.2 tok/s | **1.13x** |
+| int8, group 64 | 495 MB | 327.4 tok/s | 300.5 tok/s | 1.09x |
 
 Four bits is the wider margin, and the reason is bandwidth: at bf16 a step reads
 991 MB and both engines are saturated, so there is nothing left to win. At four
@@ -209,7 +216,7 @@ smaller gain.
 
 Three measurements of the same pair, alternating which runs first: 1.135x,
 1.125x and 1.138x at four bits; 1.090x, 1.091x and 1.099x at eight. BF16 has read
-0.96x and 1.00x here and 0.89-0.96x across prompt lengths, so it is parity and
+0.96x and 1.01x here and 0.99-1.01x across prompt lengths, so it is parity and
 not a lead — the lead comes from dropping the width.
 
 > [!NOTE]

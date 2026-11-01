@@ -122,12 +122,12 @@ Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16
 
 | 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm`（异步） |
 | --- | --- | --- | --- | --- |
-| 仅 MLX fallback | 9 650 token/s | 154.7 token/s | 185.9 token/s | 0.77x |
-| `--codegen-matmul` | 10 872 token/s | 182.4 token/s | **239.1 token/s** | **1.00x** |
-| `--codegen-matmul --codegen-attention` | 12 379 token/s | 184.9 token/s | 239.0 token/s | 0.99x |
-| `mlx_lm` 本身 | — | 198.0 token/s | 242.1 token/s | — |
+| 仅 MLX fallback | 9 616 token/s | 198.4 token/s | 230.5 token/s | 0.96x |
+| `--codegen-matmul` | 11 466 token/s | 211.7 token/s | **240.9 token/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 11 153 token/s | 211.9 token/s | 239.8 token/s | 1.00x |
+| `mlx_lm` 本身 | 11 280 token/s | 195.9 token/s | 238.8 token/s | — |
 
-codegen 的意义在**第二次**跨步，而不是第一次：全走 fallback 时比 `mlx_lm` 落后 23%，打开 matmul kernel 把这个差距抹平。它并不带来领先。本表早先写的是 1.21x，那个数字来自两边计时方式不同——本仓库的 decode 路径每步用 `mx.async_eval` 提交，而 `mlx_lm` 基线每步都等，每 token 一次设备往返值大约 15%。按同口径跨三个 prompt 长度测，decode 落在 `mlx_lm` 的 0.89-0.96x，prefill 在 32 token 上是 0.60x、128 token 起是 1.08-1.10x。`examples/compare_mlx_lm.py` 会打出这张网格。
+codegen 的意义在**第二次**跨步，而不是第一次：全走 fallback 时比 `mlx_lm` 落后 4%，打开 matmul kernel 把这个差距抹平。它在异步 decode 上并不带来领先——两边每一步读的是同一份 991 MB 权重，谁也不可能快过它们共享的那条内存。codegen 买到的东西写在带宽上限盖不住的那两列里：prefill 上 fallback 的未编译图落后 15%，生成的 matmul 把它变成持平；同步那一列里编译过的 plan 每步 host 开销更低，值 8%。本表早先在两个地方分别写过 0.77x 和 1.21x，两者都来自两边计时方式不同——一次是拿异步比一个每步都等的基线，一次是拿实测比一个引用来的数字。按同口径跨三个 prompt 长度测，decode 落在 `mlx_lm` 的 0.96-1.01x，prefill 在 32 token 上是 0.61-0.68x、128 token 起是 1.02-1.14x。`examples/compare_mlx_lm.py` 会打出这张网格；32 token 那行 decode 区间更宽，是因为它最先被测、就在 plan 编译完之后，而四个会话里有一次是冷开跑。prefill 那一列才是稳定的。
 
 token 用 `examples/qwen_static_cache_benchmark.py --codegen-matmul --mlx-baseline` 复现，距离用 `examples/qwen_logit_distance.py`。
 
@@ -152,13 +152,13 @@ token 一致不等于数字一致，而且这个差距取决于 prefill 看到�
 
 | 权重 | 每步字节数 | 本仓库 | `mlx_lm`（同位宽） | 比值 |
 | --- | --- | --- | --- | --- |
-| BF16 | 991 MB | 200.6 token/s | 208.7 token/s | 0.96x |
-| int4，group 64 | 250 MB | **373.1 token/s** | 328.7 token/s | **1.13x** |
-| int8，group 64 | 495 MB | 328.6 token/s | 301.3 token/s | 1.09x |
+| BF16 | 991 MB | 240.9 token/s | 238.8 token/s | 1.01x |
+| int4，group 64 | 250 MB | **373.4 token/s** | 329.2 token/s | **1.13x** |
+| int8，group 64 | 495 MB | 327.4 token/s | 300.5 token/s | 1.09x |
 
 4 bit 的差距更大，原因在带宽：bf16 一步要读 991 MB，两边都被压满，没有可赢的空间。4 bit 一步只读 250 MB、约 2.7 ms，算下来不到 100 GB/s——远低于这台机器能流的速率——所以一步又变成由每步开销决定，而这正是编译好的 plan 胜过"每层注意力 + 每个投影各一个节点"的地方。8 bit 夹在中间：495 MB 还剩一些余量，所以收益小一些。
 
-同一对配置测三次、交替谁先跑：4 bit 是 1.135x、1.125x、1.138x；8 bit 是 1.090x、1.091x、1.099x。BF16 在这里读到 0.96x 和 1.00x，跨 prompt 长度是 0.89-0.96x，所以它是持平而不是领先——领先来自把位宽降下来。
+同一对配置测三次、交替谁先跑：4 bit 是 1.135x、1.125x、1.138x；8 bit 是 1.090x、1.091x、1.099x。BF16 在这里读到 1.01x，跨 prompt 长度是 0.99-1.01x，所以它是持平而不是领先——领先来自把位宽降下来。
 
 > [!NOTE]
 > 如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环来计时，量化后的比值会变成 1.35x 和 1.19x，因为 `generate()` 每 token 多做了一次文本处理。这正是本 README 早先在 bf16 上犯过、并已纠正的同一个错误，也是这里的 helper 要把基线也量化、两种循环形状都测并分开报的原因。可信的是表里那个数字。

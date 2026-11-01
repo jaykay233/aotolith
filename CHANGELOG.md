@@ -28,14 +28,14 @@ The policy that decides what counts as a breaking change lives in
 
   | weights | aotolith | `mlx_lm` | ratio |
   | --- | --- | --- | --- |
-  | bf16 | 200.6 tok/s | 208.7 tok/s | 0.96x |
-  | int4, group 64 | 373.1 tok/s | 328.7 tok/s | 1.13x |
-  | int8, group 64 | 328.6 tok/s | 301.3 tok/s | 1.09x |
+  | bf16 | 240.9 tok/s | 238.8 tok/s | 1.01x |
+  | int4, group 64 | 373.4 tok/s | 329.2 tok/s | 1.13x |
+  | int8, group 64 | 327.4 tok/s | 300.5 tok/s | 1.09x |
 
-  Eight bits is slower than four because a decode step is still host-bound
-  (2.92 ms of host against a decode at 3.49 ms), so the extra 250 MB of weight
-  traffic is nearly free - the kernel's own share moved from 0.53 to 0.57 ms -
-  while the loop body reads twice the words. What it buys is precision:
+  Eight bits is slower than four because a decode step is still host-bound, so
+  the extra 250 MB of weight traffic is nearly free: the kernel's own share moved
+  from 0.53 to 0.57 ms while the loop body, which walks twice the words for the
+  same reduction, accounts for the rest. What it buys is precision:
   quantizing the same weights leaves 0.63% mean relative error against 11.5% at
   four bits, and an eight-bit plan reproduced the bf16 checkpoint's greedy
   choices for all 64 steps of a benchmark prompt.
@@ -95,11 +95,14 @@ The policy that decides what counts as a breaking change lives in
   shapes.** This repository's decode path submits each step with `mx.async_eval`;
   the baseline helper in `examples/qwen_static_cache_benchmark.py` used
   `mx.eval` and `.item()` on every step, and a device round trip per token is
-  worth about 15%. Timed like for like, `mlx_lm` does 242.1 tok/s against this
-  repository's 239.1, so code generation closes the fallback path's 23% gap and
-  arrives at parity rather than at a lead. `--mlx-baseline` now times both modes
-  on both sides and returns them under `decode_sync_each_step` and
-  `decode_async`, so the comparison cannot drift apart again.
+  worth about 15%. Timed like for like on the code as it stood then, `mlx_lm`
+  did 242.1 tok/s against this repository's 239.1, so code generation closed the
+  fallback path's 23% gap and arrived at parity rather than at a lead.
+  `--mlx-baseline` now times both modes on both sides and returns them under
+  `decode_sync_each_step` and `decode_async`, so the comparison cannot drift
+  apart again. The 23% describes the fallback path before `mx.compile` replay;
+  with it the same gap is 4%, which the entry above records as 0.965x to
+  1.015x.
 
 - **The decoder runtimes lost about 20% of their decode rate between 0.62.0 and
   0.68.0**, and the docs hid it: the README still said 1.21x over `mlx_lm` while
