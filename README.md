@@ -185,6 +185,52 @@ Reproduce the tokens with `examples/qwen_static_cache_benchmark.py
 --codegen-matmul --mlx-baseline`, and the distances with
 `examples/qwen_logit_distance.py`.
 
+### Quantized weights
+
+`quantize=<group size>` packs every projection and `quantize_bits=` picks the
+width, four or eight bits. The comparison only means something if the baseline
+is quantized to the same width and timed in the same loop shape, which is what
+`--mlx-baseline` now does — an int4 plan against a bf16 `mlx_lm` measures the
+format, not the compiler. On the same prompt and the same 64 steps:
+
+| weights | bytes per step | this repository | `mlx_lm`, same width | ratio |
+| --- | --- | --- | --- | --- |
+| BF16 | 991 MB | 200.6 tok/s | 208.7 tok/s | 0.96x |
+| int4, group 64 | 250 MB | **373.1 tok/s** | 328.7 tok/s | **1.13x** |
+| int8, group 64 | 495 MB | 328.6 tok/s | 301.3 tok/s | 1.09x |
+
+Four bits is the wider margin, and the reason is bandwidth: at bf16 a step reads
+991 MB and both engines are saturated, so there is nothing left to win. At four
+bits it reads 250 MB in about 2.7 ms — under 100 GB/s, well short of what the
+machine can stream — so the step is deciding on per-step overhead again, and that
+is where a compiled plan beats one node per attention layer and per projection.
+Eight bits sits between the two: 495 MB still leaves some headroom, hence the
+smaller gain.
+
+Three measurements of the same pair, alternating which runs first: 1.135x,
+1.125x and 1.138x at four bits; 1.090x, 1.091x and 1.099x at eight. BF16 has read
+0.96x and 1.00x here and 0.89-0.96x across prompt lengths, so it is parity and
+not a lead — the lead comes from dropping the width.
+
+> [!NOTE]
+> Timing `mlx_lm.generate()` instead of its raw decode loop makes the quantized
+> ratios look like 1.35x and 1.19x, because `generate()` does per-token text
+> bookkeeping the loop does not. That is the same mistake an earlier revision of
+> this README made at bf16, and it is why the helper here quantizes the baseline,
+> times both loop shapes and reports them separately. The honest number is the
+> one in the table.
+
+The cost is accuracy, and it is the usual trade. Mean relative error against the
+source weights is 11.5% at four bits and 0.63% at eight. An eight-bit plan
+reproduced the BF16 checkpoint's greedy choices for all 64 steps of the benchmark
+prompt; a four-bit plan tracks it for 13 and then flips on a near-tie. So four
+bits is the throughput setting and eight is the one for when a change in wording
+is not acceptable, at about 12% of the four-bit rate.
+
+`docs/performance.md` splits a step into host and kernel time for each width, and
+`examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8
+--mlx-baseline` reproduces the middle column.
+
 ## How a step is compiled
 
 ```text

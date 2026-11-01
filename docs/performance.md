@@ -372,13 +372,20 @@ host-bound. On Qwen2.5-0.5B the step time splits as
 
 so doubling the weight traffic moved the kernel's own share by 0.04 ms while the
 loop body, which now walks twice the words for the same reduction, accounts for
-the rest. Timed interleaved against `mlx_lm` at the same prompt, 64 decode steps:
+the rest. Against `mlx_lm` quantized to the same width and timed in the same loop
+shape, 64 decode steps at the same prompt:
 
-| weights | this repository | `mlx_lm` | ratio |
+| weights | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- |
-| bf16 | 232.8 tok/s | 226.6 tok/s | 1.027x |
-| int4, group 64 | 394.8 tok/s | 292.9 tok/s | 1.348x |
-| int8, group 64 | 348.6 tok/s | 291.4 tok/s | 1.196x |
+| bf16 | 200.6 tok/s | 208.7 tok/s | 0.96x |
+| int4, group 64 | 373.1 tok/s | 328.7 tok/s | 1.13x |
+| int8, group 64 | 328.6 tok/s | 301.3 tok/s | 1.09x |
+
+Timing `mlx_lm.generate()` rather than its raw decode loop would turn those into
+1.35x and 1.19x, because `generate()` adds per-token text bookkeeping the loop
+does not. That is the same loop-shape mistake an earlier revision of this
+document caught at bf16, and the reason `--mlx-baseline` quantizes the baseline
+and times both shapes rather than quoting whichever looks best.
 
 Mean relative error after quantizing the same weights is 0.63% at eight bits
 against 11.5% at four, and an eight-bit plan reproduced the bf16 checkpoint's

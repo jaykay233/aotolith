@@ -137,6 +137,32 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 精度：int4 把每个权重四舍五入到组内 15 个取值之一，logits 因此会移动，而 greedy decode 是这个移动的混沌读数。以同一份取整后的权重跑 float32 CPU forward 作为基准，运行时偏离 0.51 —— 是 18.5 的 logit 尺度的 2.7% —— 而 torch 自己的 bf16 forward 偏离 0.41，即 2.2%。两者都是 bf16 噪声，都不是解码错误。greedy 于是能跟住取整后的 checkpoint 前 13 个 token，然后在一次接近平手的选择上翻转，64 个 token 里对上 16 个。所以 CI 不使用这个模型上的 token 相等：`tests/test_quantized_qwen2.py` 跑一个 2 层模型，那里检查是精确的 —— 每个 decode token 都必须与取整后的 reference 相同 —— 而 `--quantize` 会同时报告 bf16 reference 和取整后的 reference，任何一次运行都不会含糊它跟的是哪一个。
 
+### 八位
+
+`quantize_bits=8` 选择更宽的格式，它只改一个 `int32` 字里装几个码：四个字节而不是八个 nibble，scale 取 127 档而不是 7 档。其余全部共用 —— 折叠、流式 kernel、分组。
+
+它比 4 bit 慢，但准得多，而它只是"稍微慢一点"的原因，和当初做 4 bit 值得的原因是同一个：decode step 仍然受 host 限制。Qwen2.5-0.5B 上一步的拆分是
+
+| | host | kernel 占比 | wall |
+| --- | --- | --- | --- |
+| bf16 | 5.18 ms | — | 5.04 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 3.03 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 3.49 ms |
+
+也就是说权重流量翻倍只让 kernel 自己那部分动了 0.04 ms，剩下的都落在循环体上 —— 同样的 reduction 现在要走两倍的字。与量化到同一宽度、同样循环形状的 `mlx_lm` 对比，同 prompt 64 步：
+
+| 权重 | 本仓库 | `mlx_lm`（同位宽） | 比值 |
+| --- | --- | --- | --- |
+| bf16 | 200.6 token/s | 208.7 token/s | 0.96x |
+| int4，group 64 | 373.1 token/s | 328.7 token/s | 1.13x |
+| int8，group 64 | 328.6 token/s | 301.3 token/s | 1.09x |
+
+如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环，这两行会变成 1.35x 和 1.19x，因为 `generate()` 每 token 多做一次文本处理。那正是本文档早先在 bf16 上抓到、并已纠正的同一个循环形状错误，也是 `--mlx-baseline` 要把基线也量化、两种形状都测的原因。
+
+对同一份权重取整后的平均相对误差，8 bit 是 0.63%，4 bit 是 11.5%，而 8 bit 的 plan 在上面那个基准 prompt 的全部 64 步里都复现了 bf16 checkpoint 的 greedy 选择 —— 这比 4 bit 那条注释能给出的说法更强。
+
+有一个对比需要说明。基准里取整后的 reference 在 4 bit 下与运行时读到的字逐字节相同，因为组内绝对值最大的权重正好落在顶码，scale 因此重算不变。8 bit 下这一点在 float32 往返里成立，但经过 bf16 写回就不成立了：int8 的步长比 bf16 的尾数还细，所以解包后的值存成 bf16 再打包时，约 1% 的码会四舍五入到邻格。在基准 prompt 上，这一个码的差异正好落在一个 top-1 与 top-2 logit 完全相等的 token 上，reference 走了另一支。所以 `--quantize-bits 8` 报告的是"一致度"，而不是要求相等。
+
 自动调优也不是出路，而且在此之前它对这种模型连跑都跑不起来。`--autotune` 会给每个 op 都求一次 MLX fallback 当参考，但归一化、旋转和 attention 只降级到生成 kernel，所以编译一个 Transformer 会在第一个独立 `rms_norm` 上抛 `NotImplementedError`。现在它对这类 op 只测量自己，记录单条 benchmark，并在 selection reason 里说明这是唯一有效候选。
 
 ## 从 decode step 里砍掉 245 个 op

@@ -23,14 +23,14 @@ The policy that decides what counts as a breaking change lives in
 
   Selected with `quantize_bits=8` next to the existing `quantize=<group size>`,
   which keeps every existing call meaning four bits. Measured on
-  Qwen2.5-0.5B-Instruct, 128-token prompt, 64 decode steps, timed interleaved
-  against `mlx_lm` on the same machine and prompt:
+  Qwen2.5-0.5B-Instruct, 128-token prompt, 64 decode steps, against `mlx_lm`
+  quantized to the same width and timed in the same loop shape:
 
   | weights | aotolith | `mlx_lm` | ratio |
   | --- | --- | --- | --- |
-  | bf16 | 232.8 tok/s | 226.6 tok/s | 1.027x |
-  | int4, group 64 | 394.8 tok/s | 292.9 tok/s | 1.348x |
-  | int8, group 64 | 348.6 tok/s | 291.4 tok/s | 1.196x |
+  | bf16 | 200.6 tok/s | 208.7 tok/s | 0.96x |
+  | int4, group 64 | 373.1 tok/s | 328.7 tok/s | 1.13x |
+  | int8, group 64 | 328.6 tok/s | 301.3 tok/s | 1.09x |
 
   Eight bits is slower than four because a decode step is still host-bound
   (2.92 ms of host against a decode at 3.49 ms), so the extra 250 MB of weight
@@ -39,6 +39,11 @@ The policy that decides what counts as a breaking change lives in
   quantizing the same weights leaves 0.63% mean relative error against 11.5% at
   four bits, and an eight-bit plan reproduced the bf16 checkpoint's greedy
   choices for all 64 steps of a benchmark prompt.
+
+  `--mlx-baseline` now quantizes the baseline to the same width. Timing
+  `mlx_lm.generate()` instead of its raw decode loop would report 1.35x and
+  1.19x, which is the loop-shape error an earlier release already corrected at
+  bf16; the table above is the like-for-like comparison.
 
   The four-bit path is unchanged: same packed layout, same kernel names, same
   tokens, and `weight_bits` defaults to 4 so a graph folded by an older release

@@ -191,12 +191,18 @@ def _mlx_lm_decode_rate(
     *,
     warmups: int,
     repeats: int,
+    group_size: int | None = None,
+    bits: int = 4,
 ) -> dict[str, object] | None:
     """Time mlx_lm's own greedy decode on the same prompt for comparison.
 
     The native baseline is the number this project is measured against, so it
     has to be produced on the machine running the benchmark rather than quoted
     from elsewhere. ``mlx_lm`` is optional: without it the key is omitted.
+
+    ``group_size`` quantizes the baseline to the same width being measured,
+    which is the only comparison that means anything once the weights differ:
+    an int4 plan against a bf16 baseline measures the format, not the compiler.
     """
 
     try:
@@ -206,6 +212,11 @@ def _mlx_lm_decode_rate(
         return None
 
     model, _ = load(model_path)
+    if group_size is not None:
+        import mlx.nn as nn
+
+        nn.quantize(model, group_size=group_size, bits=bits)
+        mx.eval(model.parameters())
     ids = mx.array([prompt])
 
     def once(sync_each_step: bool) -> tuple[float, list[int]]:
@@ -246,6 +257,8 @@ def _mlx_lm_decode_rate(
         async_latencies.append(elapsed)
     return {
         "backend": "mlx_lm",
+        "quantize_group_size": group_size,
+        "quantize_bits": bits if group_size is not None else None,
         "decode_sync_each_step": {
             "latency_ms": _summary([value * 1000 for value in sync_latencies]),
             "tokens_per_s": _rate_summary(sync_latencies, decode_tokens - 1),
@@ -294,7 +307,11 @@ def main() -> None:
     parser.add_argument(
         "--mlx-baseline",
         action="store_true",
-        help="also time mlx_lm's greedy decode on the same prompt",
+        help=(
+            "also time mlx_lm's greedy decode on the same prompt, quantized to "
+            "the same width as --quantize/--quantize-bits so the two sides "
+            "differ in compiler rather than in format"
+        ),
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--artifact-prefix", type=Path)
@@ -528,6 +545,8 @@ def main() -> None:
             model_path,
             prompt,
             args.decode_tokens,
+            group_size=args.quantize,
+            bits=args.quantize_bits,
             warmups=args.warmups,
             repeats=args.repeats,
         )

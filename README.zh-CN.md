@@ -129,6 +129,8 @@ Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16
 
 codegen 的意义在**第二次**跨步，而不是第一次：全走 fallback 时比 `mlx_lm` 落后 23%，打开 matmul kernel 把这个差距抹平。它并不带来领先。本表早先写的是 1.21x，那个数字来自两边计时方式不同——本仓库的 decode 路径每步用 `mx.async_eval` 提交，而 `mlx_lm` 基线每步都等，每 token 一次设备往返值大约 15%。按同口径跨三个 prompt 长度测，decode 落在 `mlx_lm` 的 0.89-0.96x，prefill 在 32 token 上是 0.60x、128 token 起是 1.08-1.10x。`examples/compare_mlx_lm.py` 会打出这张网格。
 
+token 用 `examples/qwen_static_cache_benchmark.py --codegen-matmul --mlx-baseline` 复现，距离用 `examples/qwen_logit_distance.py`。
+
 64 个 token 与 PyTorch BF16 参考实现逐位一致，开不开原生 kernel 都是如此，`mlx_lm` 产出的也是同一批 token。
 
 token 一致不等于数字一致，而且这个差距取决于 prefill 看到多少 token —— `examples/qwen_logit_distance.py` 就是测它：
@@ -142,7 +144,28 @@ token 一致不等于数字一致，而且这个差距取决于 prefill 看到�
 
 顺着列往下读：fallback 的平均距离在 7 token 和 16 token 之间差 3.4 倍，所以单独一个数字描述的是 prompt，不是模型。这张表能说明的是：在这些长度上 codegen 从不比 fallback 更远离 PyTorch —— 7 token 时近 3.6 倍，16 token 时持平（0.0312 对 0.0310）—— 到 128 token 的 prefill 时两者相差在 5% 以内。打开 codegen 是吞吐决策，不是精度决策。
 
-token 用 `examples/qwen_static_cache_benchmark.py --codegen-matmul --mlx-baseline` 复现，距离用 `examples/qwen_logit_distance.py`。
+### 量化权重
+
+`quantize=<group size>` 打包每个投影，`quantize_bits=` 选位宽（4 或 8 bit）。这个对比只有在一件事成立时才有意义：基线也要量化到**同样的位宽**，并且用**同样的循环形状**计时——这正是 `--mlx-baseline` 现在做的事。用 int4 的 plan 去比 bf16 的 `mlx_lm`，量到的是格式差异，不是编译器差异。
+
+同一个 prompt、同样 64 步：
+
+| 权重 | 每步字节数 | 本仓库 | `mlx_lm`（同位宽） | 比值 |
+| --- | --- | --- | --- | --- |
+| BF16 | 991 MB | 200.6 token/s | 208.7 token/s | 0.96x |
+| int4，group 64 | 250 MB | **373.1 token/s** | 328.7 token/s | **1.13x** |
+| int8，group 64 | 495 MB | 328.6 token/s | 301.3 token/s | 1.09x |
+
+4 bit 的差距更大，原因在带宽：bf16 一步要读 991 MB，两边都被压满，没有可赢的空间。4 bit 一步只读 250 MB、约 2.7 ms，算下来不到 100 GB/s——远低于这台机器能流的速率——所以一步又变成由每步开销决定，而这正是编译好的 plan 胜过"每层注意力 + 每个投影各一个节点"的地方。8 bit 夹在中间：495 MB 还剩一些余量，所以收益小一些。
+
+同一对配置测三次、交替谁先跑：4 bit 是 1.135x、1.125x、1.138x；8 bit 是 1.090x、1.091x、1.099x。BF16 在这里读到 0.96x 和 1.00x，跨 prompt 长度是 0.89-0.96x，所以它是持平而不是领先——领先来自把位宽降下来。
+
+> [!NOTE]
+> 如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环来计时，量化后的比值会变成 1.35x 和 1.19x，因为 `generate()` 每 token 多做了一次文本处理。这正是本 README 早先在 bf16 上犯过、并已纠正的同一个错误，也是这里的 helper 要把基线也量化、两种循环形状都测并分开报的原因。可信的是表里那个数字。
+
+代价是精度，和所有量化一样。对原始权重平均相对误差是 4 bit 的 11.5% 和 8 bit 的 0.63%。8 bit 的 plan 在基准 prompt 的全部 64 步上都复现了 BF16 checkpoint 的 greedy 选择；4 bit 的 plan 跟了 13 步，然后在一个近似平局上翻掉。所以 4 bit 是吞吐档，而当你不能接受措辞变化时用 8 bit，代价大约是 4 bit 速率的 12%。
+
+一步在每种位宽下 host 与 kernel 的时间拆分在 `docs/performance.md`，中间那一列可以用 `examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8 --mlx-baseline` 复现。
 
 ## 一步是怎么编出来的
 
