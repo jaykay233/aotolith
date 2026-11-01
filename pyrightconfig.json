@@ -1,0 +1,18 @@
+{
+  "include": [
+    "src/aotolith/__init__.py",
+    "src/aotolith/errors.py",
+    "src/aotolith/_log.py",
+    "src/aotolith/artifact.py",
+    "src/aotolith/buckets.py",
+    "src/aotolith/cli.py",
+    "src/aotolith/compiler.py",
+    "src/aotolith/runtime/plan.py"
+  ],
+  "exclude": ["**/.venv*", "**/__pycache__", "build", "dist"],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Darwin",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": "none"
+}

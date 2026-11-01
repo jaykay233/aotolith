@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 from contextvars import ContextVar
-from math import prod
-from ..ir import TensorType
-from ..codegen.expr import _DTYPE_ITEMSIZE
+from ..errors import IndexBoundsError
 
 _PENDING_INDEX_CHECKS: ContextVar[list[tuple[mx.array, int, bool]] | None] = ContextVar(
     "aotolith_pending_index_checks", default=None
@@ -67,7 +65,32 @@ def _flush_index_checks(pending: list[tuple[mx.array, int, bool]]) -> None:
     if violation is None:
         return
     if bool(violation.item()):
-        raise IndexError("index out of range in self")
+        # Name the axis and the value. The eager message ("index out of range
+        # in self") is what PyTorch says, and a caller comparing against eager
+        # output wants the same class, not the same words - so the class stays
+        # IndexError and the message says what the caller needs to fix.
+        for indices, upper_bound, allow_negative in pending:
+            if indices.size == 0:
+                continue
+            low = -upper_bound if allow_negative else 0
+            bad = mx.logical_or(indices < low, indices >= upper_bound)
+            if bool(mx.any(bad).item()):
+                # Only on the failure path, so the extra sync costs nothing on
+                # the calls that pass.
+                flat_bad = bad.reshape((-1,))
+                position = int(mx.argmax(flat_bad).item())
+                offending = int(indices.reshape((-1,))[position].item())
+                raise IndexBoundsError(
+                    f"index out of range: {offending} is outside the valid "
+                    f"range [{low}, {upper_bound - 1}] for a dimension of "
+                    f"size {upper_bound}",
+                    hint=(
+                        "the plan checks gather, index and embedding operands on "
+                        "every call; pass verify_index_bounds=False when the "
+                        "indices are known good (an argmax result, for example)"
+                    ),
+                )
+        raise IndexBoundsError("index out of range")
 
 
 def _check_take_indices(indices: mx.array, upper_bound: int) -> None:
@@ -87,8 +110,3 @@ def _check_advanced_index_indices(indices: mx.array, upper_bound: int) -> None:
     if _defer_index_check(indices, upper_bound, allow_negative=True):
         return
     _flush_index_checks([(indices, upper_bound, True)])
-
-
-def _tensor_nbytes(tensor_type: TensorType) -> int:
-    itemsize = _DTYPE_ITEMSIZE[tensor_type.dtype]
-    return prod(tensor_type.shape) * itemsize

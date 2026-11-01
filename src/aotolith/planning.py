@@ -3,16 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import prod
 
-from .ir import DType, Graph, TensorType
+from .ir import Graph, TensorType
+from .ir.types import DTYPE_ITEMSIZE
 
-_DTYPE_BYTES = {
-    DType.F16: 2,
-    DType.BF16: 2,
-    DType.F32: 4,
-    DType.BOOL: 1,
-    DType.I32: 4,
-    DType.I64: 8,
-}
+__all__ = [
+    "BufferSlot",
+    "StoragePlan",
+    "ValueLifetime",
+    "plan_storage",
+    "tensor_nbytes",
+]
+
+
+def tensor_nbytes(tensor_type: TensorType) -> int:
+    """Bytes one tensor of this type occupies.
+
+    One implementation for the whole package: the storage plan sizes slots with
+    it, the runtime bounds the buffers it writes, and the memory accounting
+    reports it, so a dtype that is added to the table cannot be sized three
+    different ways.
+    """
+
+    return prod(tensor_type.shape) * DTYPE_ITEMSIZE[tensor_type.dtype]
+
 _BUFFER_ALIGNMENT = 16
 
 
@@ -77,7 +90,7 @@ def plan_storage(graph: Graph) -> StoragePlan:
             tensor_type=graph.value(value_id).type,
             start=producers.get(value_id, -1),
             end=max(last_use[value_id], producers.get(value_id, -1)) + 1,
-            size_bytes=_tensor_size_bytes(graph.value(value_id).type),
+            size_bytes=tensor_nbytes(graph.value(value_id).type),
             is_input=value_id in input_set,
             is_output=value_id in output_set,
         )
@@ -140,10 +153,6 @@ def plan_storage(graph: Graph) -> StoragePlan:
         peak_live_bytes=_peak_live_bytes(lifetimes),
         arena_size_bytes=_align_up(offset, _BUFFER_ALIGNMENT),
     )
-
-
-def _tensor_size_bytes(tensor_type: TensorType) -> int:
-    return prod(tensor_type.shape) * _DTYPE_BYTES[tensor_type.dtype]
 
 
 def _intervals_overlap(left: ValueLifetime, right: ValueLifetime) -> bool:

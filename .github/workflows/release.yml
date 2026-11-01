@@ -25,11 +25,13 @@ jobs:
           python-version: "3.12"
       - name: Check the tag against the version
         if: startsWith(github.ref, 'refs/tags/')
+        # The version is single-sourced in `src/aotolith/_version.py` and
+        # `hatch` reads it from there, so that is what a tag has to match.
         run: |
-          version=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          version=$(python -c "import pathlib,re; print(re.search(r'\"([^\"]+)\"', pathlib.Path('src/aotolith/_version.py').read_text()).group(1))")
           tag=${GITHUB_REF_NAME#v}
           if [ "$version" != "$tag" ]; then
-            echo "pyproject.toml says $version, tag says $tag" >&2
+            echo "_version.py says $version, tag says $tag" >&2
             exit 1
           fi
       - run: pip install build twine

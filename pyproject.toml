@@ -4,7 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aotolith"
-version = "0.62.0"
+# One source of truth. The version used to be written here and in
+# `src/aotolith/_version.py`, which is two places to forget; `hatch` reads the
+# module so `importlib.metadata.version("aotolith")` and
+# `aotolith.__version__` cannot disagree.
+dynamic = ["version"]
 description = "An Apple Metal-first compiler for Transformer models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,7 +42,11 @@ dependencies = [
   # does not depend on it outside its own dev extra, so a plain
   # `pip install aotolith` needs this stated here.
   "numpy>=1.26",
-  "mlx>=0.32,<0.33",
+  # MLX ships wheels for macOS arm64 only. Declaring the same condition as a
+  # marker keeps a Linux or Intel install from failing at resolution time with
+  # "No matching distribution found for mlx", which says nothing about the real
+  # requirement; `aotolith/__init__.py` then explains it at import.
+  "mlx>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.urls]
@@ -46,7 +54,7 @@ Homepage = "https://github.com/jaykay233/aotolith"
 Repository = "https://github.com/jaykay233/aotolith"
 Issues = "https://github.com/jaykay233/aotolith/issues"
 Documentation = "https://github.com/jaykay233/aotolith/tree/main/docs"
-Changelog = "https://github.com/jaykay233/aotolith/commits/main"
+Changelog = "https://github.com/jaykay233/aotolith/blob/main/CHANGELOG.md"
 
 [project.scripts]
 aoto = "aotolith.cli:main"
@@ -54,10 +62,21 @@ aoto = "aotolith.cli:main"
 [project.optional-dependencies]
 fx = ["torch>=2.7"]
 hf = ["torch>=2.7", "transformers>=4.57,<5"]
-dev = ["build>=1.2", "pytest>=8", "torch>=2.7", "transformers>=4.57,<5", "ruff>=0.17,<0.18"]
+dev = [
+  "build>=1.2",
+  "coverage>=7.6",
+  "pyright>=1.1.400",
+  "pytest>=8",
+  "torch>=2.7",
+  "transformers>=4.57,<5",
+  "ruff>=0.17,<0.18",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aotolith"]
+
+[tool.hatch.version]
+path = "src/aotolith/_version.py"
 
 [tool.hatch.build.targets.sdist]
 # A source distribution should be enough to run the suite and the examples:
@@ -79,6 +98,24 @@ include = [
 addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# Line coverage over the package, measured from the source tree so a test that
+# imports an installed copy cannot hide an uncovered module.
+source = ["src/aotolith"]
+
+[tool.coverage.report]
+# A ratchet, not an aspiration: the suite sits at ~85%, so the gate is set
+# just under it. Raising this number is how coverage improves - a change that
+# drops it fails CI instead of quietly becoming the new normal.
+fail_under = 84
+show_missing = true
+skip_covered = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]
 
 [tool.ruff]
 # `.venv-mlx-only` is a second environment used to check the MLX-only install
