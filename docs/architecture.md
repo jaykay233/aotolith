@@ -709,7 +709,9 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - RoPE position 通过 `F.embedding` 从静态 cos/sin 表选行。这个操作已经能被现有 embedding lowering 执行，不需要新增 cache 专用算子。
 - 测试覆盖 `B=1` 和左侧 padding 的 `B=2`，第二个请求的有效 prompt 更短。连续三步 decode 会逐请求对照完整序列 forward 的 logits 和贪心 token，验证 padding、mask、position 和 cache 更新没有改变模型语义。
 
-`kv_cache_append` 的 lowering 在 `codegen/kv_cache.py`。对每个 `(half, batch, head)`，一个 head 的 slots 是连续的一段，所以「丢最旧一格、追加一格」就是这段往后挪一行再读：除末格是向量拷贝，末格从 key 张量或投影行里按 `value_start` 取，value 因此不需要先 materialize 成 `[B, H, 1, D]`。每线程搬四个元素（bf16 窗口八个字节），唯一的分支只判最后一行；`head_dim`、`value_start` 或投影行宽不是四的倍数时退回 MLX。两个窗口不是第二次拷贝，而是刚写好的 pair 上的 view。算子是三元组输出，`runtime/plan.py` 的展开式 runner 因此学会了 `v_0, v_1, v_2 = thunk(...)` 的绑定，多输出 kernel 不会被踢回解释执行。代价是它仍然整窗拷贝一遍（每层不到 100 KB），所以字节数没变，收益全在消失掉的 launch 上；真正免掉这次拷贝要按 slot 计数器寻址、让 attention 直接读环形窗口，那属于 attention kernel 的布局决定，尚未做。
+`kv_cache_append` 的 lowering 在 `codegen/kv_cache.py`。对每个 `(half, batch, head)`，一个 head 的 slots 是连续的一段，所以「丢最旧一格、追加一格」就是这段往后挪一行再读：除末格是向量拷贝，末格从 key 张量或投影行里按 `value_start` 取，value 因此不需要先 materialize 成 `[B, H, 1, D]`。每线程搬四个元素（bf16 窗口八个字节），唯一的分支只判最后一行；`head_dim`、`value_start` 或投影行宽不是四的倍数时退回 MLX。两个窗口不是第二次拷贝，而是刚写好的 pair 上的 view。算子是三元组输出，`runtime/plan.py` 的展开式 runner 因此学会了 `v_0, v_1, v_2 = thunk(...)` 的绑定，多输出 kernel 不会被踢回解释执行。代价是它仍然整窗拷贝一遍（每层不到 100 KB），所以字节数没变，收益全在消失掉的 launch 上。
+
+「按 slot 计数器寻址、让 attention 直接读环形窗口」这条路测过之后没有走。把发出的 kernel 改成只写末行 —— 窗口完全不拷，因此结果不对，但 launch 数、grid 和访存形状都与环形版本相同 —— 异步读数是 183.2 tok/s，真 kernel 是 188.3（各两轮：186.4-190.2 与 182.9-183.4）。90 KB 的窗口拷贝对着每步 991 MB 的权重流，本来就被队列吸收，环形化真正会删掉的是一次 barrier 而不是带宽；要做也该在 attention kernel 里做。
 
 这个实现优先保证布局容易验证。每一步都会复制并重排完整固定容量 cache，attention 也读取包括 padding 在内的整个 capacity；block table、slot mapping、paged attention、prefix sharing 和 cache eviction 属于外部推理运行时，不在编译器边界内。
 
