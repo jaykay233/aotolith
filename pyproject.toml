@@ -8,9 +8,36 @@ version = "0.62.0"
 description = "An Apple Metal-first compiler for Transformer models."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "jaykay233" }]
+keywords = [
+  "compiler",
+  "metal",
+  "apple-silicon",
+  "transformer",
+  "inference",
+  "mlx",
+  "pytorch",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: MacOS X",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Compilers",
+  "Typing :: Typed",
+]
 dependencies = [
+  # `quantize.py` and the Qwen2 adapter use numpy at import time, and `mlx`
+  # does not depend on it outside its own dev extra, so a plain
+  # `pip install aotolith` needs this stated here.
+  "numpy>=1.26",
   "mlx>=0.32,<0.33",
 ]
 
@@ -18,6 +45,8 @@ dependencies = [
 Homepage = "https://github.com/jaykay233/aotolith"
 Repository = "https://github.com/jaykay233/aotolith"
 Issues = "https://github.com/jaykay233/aotolith/issues"
+Documentation = "https://github.com/jaykay233/aotolith/tree/main/docs"
+Changelog = "https://github.com/jaykay233/aotolith/commits/main"
 
 [project.scripts]
 aoto = "aotolith.cli:main"
@@ -29,6 +58,22 @@ dev = ["build>=1.2", "pytest>=8", "torch>=2.7", "transformers>=4.57,<5", "ruff>=
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aotolith"]
+
+[tool.hatch.build.targets.sdist]
+# A source distribution should be enough to run the suite and the examples:
+# the READMEs are what the PyPI page renders, docs/ is where they link, and
+# benchmarks/ holds the baseline `aoto bench` compares against.
+include = [
+  "/src",
+  "/tests",
+  "/examples",
+  "/docs",
+  "/benchmarks",
+  "/README.md",
+  "/README.zh-CN.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"

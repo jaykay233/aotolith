@@ -38,6 +38,12 @@ print(compiled.plan.selections)     # native kernel or MLX, and why
 ## Install
 
 ```bash
+pip install aotolith            # released builds
+```
+
+Or from source, which is also how the test suite is run:
+
+```bash
 git clone https://github.com/jaykay233/aotolith.git
 cd aotolith
 python3 -m venv .venv && source .venv/bin/activate
@@ -231,10 +237,24 @@ tests/         IR, lowering, numerical parity, generation, planner
 examples/      runnable models, kernels, and static KV-cache benchmarks
 ```
 
+## Roadmap
+
+- **Symbolic shapes and limited control flow**, without weakening the strict
+  verifier the static path relies on.
+- **Shape-aware backend policy**, replacing per-op autotune with a selection that
+  accounts for the whole graph, and a reproducible benchmark report.
+- **Wider native coverage**: split-K for matmul, tile search for attention, and
+  generated kernels for the families still on MLX.
+- **More models**: adapters beyond Qwen2, starting with the Llama family, and
+  long-context variants that need RoPE scaling.
+- **Other backends**, once the core ABI has settled.
+
 ## Contributing
 
-Issues and pull requests are welcome. A change to lowering behaviour needs a
-stated motivation, a reproducible test, and numerical parity against PyTorch.
+Issues and pull requests are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) covers
+what a change needs, how to add an operator, and how a release is published. A
+change to lowering behaviour needs a stated motivation, a reproducible test, and
+numerical parity against PyTorch.
 
 ## License
 

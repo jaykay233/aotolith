@@ -39,6 +39,12 @@ print(compiled.plan.selections)     # 原生 kernel 还是 MLX，以及原因
 ## 安装
 
 ```bash
+pip install aotolith            # 已发布的版本
+```
+
+或者从源码安装（跑测试也要用这种方式）：
+
+```bash
 git clone https://github.com/jaykay233/aotolith.git
 cd aotolith
 python3 -m venv .venv && source .venv/bin/activate
@@ -191,9 +197,17 @@ tests/         IR、lowering、数值对齐、生成、planner
 examples/      可运行的模型、kernel 和静态 KV Cache 示例
 ```
 
+## Roadmap
+
+- **符号 shape 与有限控制流**，同时不削弱静态路径依赖的严格 verifier。
+- **shape-aware backend policy**：把逐 op autotune 换成看整张图的选择，以及可复现的 benchmark report。
+- **更宽的原生覆盖**：matmul 的 split-K、attention 的 tile 搜索，以及给仍在 MLX 上的算子族做生成 kernel。
+- **更多模型**：Qwen2 之外的适配层，从 Llama 系列开始，以及需要 RoPE scaling 的长上下文变体。
+- **其他后端**，等核心 ABI 稳定之后。
+
 ## 参与贡献
 
-欢迎提交 issue 和 pull request。修改 lowering 行为时，请附上明确的动机、可复现测试和数值对齐结果。
+欢迎提交 issue 和 pull request；[CONTRIBUTING.md](CONTRIBUTING.md)（英文）说明了一次改动需要什么、怎么加一个算子、以及发布流程。修改 lowering 行为时，请附上明确的动机、可复现测试和数值对齐结果。
 
 ## License
 

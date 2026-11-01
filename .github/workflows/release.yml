@@ -1,0 +1,70 @@
+name: Release
+
+# Publishing is driven by a tag, and the tag has to match the version in
+# pyproject.toml. `workflow_dispatch` exists so a release can be retried after
+# PyPI rejected an upload, without deleting and re-pushing the tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # The wheel is pure Python, but `python -m build` also runs the sdist's own
+    # build step, and the package imports mlx at import time only, not build
+    # time. Building on Linux keeps the artifact independent of a runner image.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the tag against the version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$version" != "$tag" ]; then
+            echo "pyproject.toml says $version, tag says $tag" >&2
+            exit 1
+          fi
+      - run: pip install build twine
+      - run: python -m build
+      - name: Check the metadata and the long description
+        # `twine check` is what PyPI's own validator would say about README
+        # rendering; a broken badge or an unclosed fence fails here rather than
+        # after the upload.
+        run: twine check --strict dist/*
+      - name: Confirm the wheel carries py.typed
+        run: |
+          python -c "
+          import glob, zipfile
+          wheel = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert 'aotolith/py.typed' in names, names
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aotolith
+    permissions:
+      # Trusted publishing: PyPI verifies this workflow's identity through OIDC,
+      # so the repository holds no API token at all.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

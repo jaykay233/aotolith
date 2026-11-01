@@ -55,6 +55,16 @@ jobs:
         run: python examples/tiny_llama_compile.py
       - name: Confirm the distribution builds
         run: python -m build
+      - name: Install the wheel as a user would
+        # The editable install above has the `dev` extra, so it can mask a
+        # dependency the package never declared — which is exactly how `numpy`
+        # went missing from a plain `pip install aotolith` while the suite
+        # stayed green. Install the built wheel into a bare venv and import it.
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/pip install dist/*.whl
+          /tmp/wheel-check/bin/python -c "import aotolith, aotolith.models.qwen2"
+          /tmp/wheel-check/bin/aoto --help > /dev/null
 
   bench:
     # A regression gate, not a scoreboard. The deterministic half compares the
