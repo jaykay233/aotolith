@@ -4,11 +4,16 @@
 
 **面向 Apple Silicon 的 Transformer 编译器。** 把 PyTorch 模型捕获成 FX 图，经过 typed SSA IR 下沉，最后跑在编译器自己生成的 Metal kernel 上；MLX 既是 fallback，也是数值基准。
 
+[![PyPI](https://img.shields.io/pypi/v/aotolith?logo=pypi&logoColor=white)](https://pypi.org/project/aotolith/)
 [![CI](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml/badge.svg)](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-000000?logo=apple&logoColor=white)](#环境要求)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#已知限制)
+
+```bash
+pip install aotolith
+```
 
 大多数 Transformer 编译器以 CUDA 为前提。这个项目保留一套后端无关的 IR，并把整条路走到 Metal：图捕获、合法化、布局折叠、融合、CSE、张量生命周期、kernel 选择、代码生成，以及一个能在全新进程里重新加载的版本化产物。
 
@@ -39,10 +44,10 @@ print(compiled.plan.selections)     # 原生 kernel 还是 MLX，以及原因
 ## 安装
 
 ```bash
-pip install aotolith            # 已发布的版本
+pip install aotolith
 ```
 
-或者从源码安装（跑测试也要用这种方式）：
+从源码安装（跑测试也要用这种方式）：
 
 ```bash
 git clone https://github.com/jaykay233/aotolith.git

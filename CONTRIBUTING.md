@@ -99,13 +99,38 @@ Publishing is driven by a tag, and `.github/workflows/release.yml` checks that t
 tag matches `[project].version` before it uploads.
 
 1. Bump `version` in `pyproject.toml`.
-2. Commit, then tag: `git tag v0.63.0 && git push origin v0.63.0`.
+2. Commit, then tag: `git tag -a v0.63.0 -m "aotolith 0.63.0" && git push origin v0.63.0`.
 3. The workflow builds the sdist and wheel, runs `twine check --strict`, asserts
    the wheel carries `py.typed`, and publishes with PyPI trusted publishing.
 
-One-time setup, done on PyPI rather than in this repository: add a trusted
-publisher for project `aotolith` with workflow `release.yml`, environment
-`pypi`. No API token is stored anywhere.
+One-time setup, done in two web consoles rather than in this repository:
+
+**PyPI** — at <https://pypi.org/manage/account/publishing/> add a *pending*
+publisher (the project does not exist yet, so it lives under the account sidebar).
+The five fields must match this repository exactly:
+
+| Field | Value |
+| --- | --- |
+| PyPI Project Name | `aotolith` |
+| Owner | `jaykay233` — the **GitHub** owner, not the PyPI login |
+| Repository name | `aotolith` |
+| Workflow name | `release.yml` — the bare file name |
+| Environment name | `pypi` |
+
+A pending publisher does not reserve the name until its first successful upload.
+
+**GitHub** — the `pypi` environment needs two deployment branch policies, `tag:
+v*` **and** `branch: main`. Both, because the workflow also has a
+`workflow_dispatch` trigger for retrying a rejected upload: that run's ref is
+`main`, and with only the tag policy the publish job would be blocked by the
+protection rule exactly when it is needed. No secret or token is stored anywhere;
+the workflow authenticates with OIDC.
+
+Two failures worth recognising: `invalid-publisher` means one of the five PyPI
+fields disagrees with the repository (usually `Workflow name` with a path prefix,
+or the PyPI login typed into `Owner`); a "file already exists" rejection means the
+version was published before, and PyPI does not allow replacing a file, so the
+fix is a new version number rather than a retry.
 
 ## Reporting a bug
 

@@ -6,11 +6,16 @@ English | [简体中文](README.zh-CN.md)
 as an FX graph, lower it through a typed SSA IR, and run it on Metal kernels the
 compiler generates itself, with MLX as the fallback and the numerical reference.
 
+[![PyPI](https://img.shields.io/pypi/v/aotolith?logo=pypi&logoColor=white)](https://pypi.org/project/aotolith/)
 [![CI](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml/badge.svg)](https://github.com/jaykay233/aotolith/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-000000?logo=apple&logoColor=white)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#limitations)
+
+```bash
+pip install aotolith
+```
 
 Most Transformer compilers assume CUDA. This one keeps a backend-independent IR
 and takes the whole path to Metal: graph capture, legalization, layout folding,
@@ -38,10 +43,10 @@ print(compiled.plan.selections)     # native kernel or MLX, and why
 ## Install
 
 ```bash
-pip install aotolith            # released builds
+pip install aotolith
 ```
 
-Or from source, which is also how the test suite is run:
+From source, which is also how the test suite is run:
 
 ```bash
 git clone https://github.com/jaykay233/aotolith.git
