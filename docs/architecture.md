@@ -41,12 +41,54 @@ legalize.* / capture（组合点）                          FX → 核心 op
 codegen.norm → matmul → quantization → attention        组合更复杂的 kernel
 runtime.bounds / runtime.mlx_ops / runtime.plan         越界检查、MLX 回退、计划执行
 backends/apple.py                                       把上面三者拼成一个后端
+backends/reference.py                                   不发射任何东西的后端：全部走 MLX
 artifact.py / compiler.py                               图 → 产物、整条流水线
+buckets.py                                              一组计划按 shape 派发
+models/decoder.py                                       两个模型族共用的静态 Cache 引擎
+cli.py / models/qwen2.py / models/llama.py              入口与按族固定的前端
 ```
 
 唯一的例外是包自己的 `__init__.py` 可以再导出同包的子模块，这正是 `ir/__init__.py`、`codegen/__init__.py` 的做法。
 
-分层检查抓到的都是真实的反向依赖，不是纸面上的：`target` 为了回答「这条 GPU 能不能编译 tensor-core kernel」而要编译一段 kernel，于是 kernel 头和 dtype 表被下移到第 1 层，成为 `target` 也能读的最小单元；`artifact.py` 与 `compiler.py` 曾经排在被它们序列化的 backend 之下，现在排在它之上；`passes` 曾经是单文件、层号很低，拆成包之后按 `graph`/`matchers`/单个 pass/`driver` 排成一段阶梯。
+分层检查抓到的都是真实的反向依赖，不是纸面上的：`target` 为了回答「这条 GPU 能不能编译 tensor-core kernel」而要编译一段 kernel，于是 kernel 头和 dtype 表被下移到第 1 层，成为 `target` 也能读的最小单元；`artifact.py` 与 `compiler.py` 曾经排在被它们序列化的 backend 之下，现在排在它之上；`passes` 曾经是单文件、层号很低，拆成包之后按 `graph`/`matchers`/单个 pass/`driver` 排成一段阶梯。`models/decoder.py` 要调 `buckets.share_plan_state`，所以它站在 `buckets.py` 之上，三个前端再站在它之上——这条顺序是第二个模型族落地时才暴露出来的。
+
+## 0.6 后端是一个接口，不是一句描述
+
+`compiler.compile_graph` 收一个 `target`，把它换成一个 `Backend`：
+
+```python
+class Backend(Protocol):
+    name: str
+    def compile(self, graph: Graph, *, tune_inputs: Any = None) -> CompiledPlan: ...
+```
+
+目前有两个实现：
+
+| target | 生产什么 | 靠什么运行 |
+|---|---|---|
+| `apple-metal` | 逐 op 发射 MSL，逐节点选 kernel，其余回退 MLX | Metal，加载时从 MSL 重建 kernel |
+| `mlx-reference` | 什么都不发射，每个节点都标 `mlx` | MLX 解释器 |
+
+参考后端存在的意义不是「多一个后端」，而是把这条缝变成可测的：编译器、产物格式和运行时不问计划是谁产的，所以一份 `mlx-reference` 产物走的是与 Metal 产物完全相同的保存、校验、加载路径。它也让计划在没有 Metal 的 host 上能被编出来并被结构性地验证——图里有没有少一个 op、mask 有没有漏、cache 写的是不是同一份。
+
+它不是位精确的 oracle，理由值得写清：MLX 在 Apple GPU 上不用 IEEE float32 求 batched `matmul`，M5 + MLX 0.32 上同一个乘积相对 float32 参考差约 1e-3，单行路径才是精确的。生成的 kernel 用 float32 累加，反而是两条路里更紧的那条。所以两个 target 之间比结构、shape、dtype、cache 内容和 token 决策，精度去和 kernel 比。
+
+`target` 被写进产物 manifest 并在加载时比对；带自行生成 kernel 的图编给参考后端是合法的（那些 kernel 只是不会被选中），而 `autotune=True` 会被明确拒绝——没有东西可测的时候接受这个参数，等于让调用方以为测量发生过。
+
+## 0.7 模型族是一个校验过的名字
+
+静态 Cache 适配层写在 `models/decoder.py`，它对着 HuggingFace decoder 共享的那棵模块树：`model.model.layers`、`self_attn.{q,k,v,o}_proj`、`mlp.{gate,up,down}_proj`、两个 per-layer norm、`model.norm`、`lm_head`，以及从 `rope_theta` 建出来的 rotary 表。一个「族」不是类继承，而是一个被验证过与这棵树吻合的 `model_type` 集合：
+
+```python
+FAMILIES = (
+    DecoderFamily("qwen2", ("qwen2",), "Qwen2/Qwen2.5"),
+    DecoderFamily("llama", ("llama",), "Llama"),
+)
+```
+
+真正不同的东西从模型上读：attention 投影带不带 bias、head_dim、RoPE 底数。`models/qwen2.py` 与 `models/llama.py` 是薄前端：固定族名、导出自己的公开名字、拒绝另一个族的 checkpoint。这个拒绝不是形式主义——两棵树看起来一样，但 Qwen2 的 q/k/v 带 bias、Llama 不带，按错的族编出来的打包投影会少一个加法项或者多一个不存在的加法项，而 logits 只会在小数位上慢慢歪。`family_for(model, require=...)` 把这件事变成编译期的一个 `UnsupportedModelError`（AOTO-1004）。
+
+族目前只影响三处：`_attention_qkv_bias` 是否折叠 bias epilogue、`num_key_value_heads` 与 `num_attention_heads` 的关系（相等即标准 MHA，整除即 GQA），以及 rotary 表从哪个底数生成。其余全部共享——cache 布局、`prefill_mask`、int4 打包、`greedy_generate`。
 
 ## 1. FX 捕获
 
@@ -722,29 +764,65 @@ backend 用进程内 LRU cache 复用 `mx.fast.metal_kernel` 对象，key 由 ke
 - 左填充而不是右填充：decode 的 mask 表按 `valid_length` 取 cache 尾部窗口，真实 token 必须留在尾部；右填充会把真实 K/V 放到前部，roll 一步就把它挤出窗口。
 - prefill 因此必须显式接收 mask。`is_causal=True` 只会屏蔽 query 之后的 key，看不见左侧的 pad，于是 `prefill_mask(length, bucket)` 把 causal 和 padding 合成一个 `[1, 1, bucket, bucket]` bool mask；`length == bucket` 时它退化成纯 causal，所以同一张计划覆盖等长和填充两种情况。decode 的 mask 表不变。
 - RoPE position 与 cache slot 解耦：真实 token 拿 `0..length-1`，pad 拿 0。slot 由左填充决定，position 由真实序号决定，两者本来就是两套坐标（非桶化路径里 cache 右对齐、position 从 0 开始，也是同样的解耦）。
-- 只有桶宽度改变 shape。`_share_plan_state` 按 `(name, shape, dtype)` 把各桶、以及 prefill/decode 之间的 state 数组重绑到同一份内存，运行时的权重因此只有一份；cos/sin 表随 capacity 变化而不共享。`save()` 仍是每个桶每张图一份 archive，每份各自带 state，所以共享只省运行时内存，不缩小产物体积。
+- 只有桶宽度改变 shape。`buckets.share_plan_state` 按 `(name, shape, dtype)` 把各桶、以及 prefill/decode 之间的 state 数组重绑到同一份内存，运行时的权重因此只有一份；cos/sin 表随 capacity 变化而不共享。`save()` 仍是每个桶每张图一份 archive，每份各自带 state，所以共享只省运行时内存，不缩小产物体积。
 - 测试逐长度对照 PyTorch eager 的 logits，并对照「该长度单独编译」的 greedy token，覆盖 1/4/8/12/16 五个长度、桶边界和超长拒绝。
 
-## 13.5 性能回归门禁
+## 13.5 通用尺寸桶：`buckets.py`
 
-`aotolith/bench.py` 与 `aoto bench` 提供编译器自身的回归门禁。固定负载覆盖投影、gated MLP（`silu_mul_paired` epilogue 融合）、RMSNorm、causal attention、量化 GEMV 流式 kernel、Qwen2 prefill 适配层和 Qwen2 decode 适配层；输入用固定 seed 的 torch 张量生成，不需要下载权重。decode 那一项就是 `kv_cache_append` 的闸门：一旦 `fuse_kv_cache_update` 不再命中，`input_ops` 和 `lowered_ops` 会立刻跳起来，不需要任何计时。
+IR 的每一维都是常量，storage plan、峰值上界和 kernel 选择才是可回答的。symbolic extent 会把这三个答案全部推到运行时，内存契约重新变成希望。`buckets.py` 因此从另一侧兜住变化：`compile_bucketed` 沿一根轴为每个宽度编一份计划，`BucketedPlans` 把任意不超过最大桶的请求派给能装下它的最小桶。
+
+- **请求维度靠 shape 认出来**：追踪时同一轴上宽度等于追踪宽度的输入，以及宽度等于追踪宽度的张量关键字参数，都属于请求；同轴上宽度不同的输入（表、权重）保持不动。每个桶按宽度重建这些输入，所以宽度 4 的计划期待的就是宽度 4 的关键字。
+- **填充是平铺**：`mx.take(x, arange(width) % n, axis)` 重复请求自己的切片，而不是填常量——常量会让填充区上的 `var`/`softmax` 变成 NaN，重复既有切片则保持有限。填充出的切片在派发后从输出切掉。
+- **契约是「变宽不改变原有行」**：batch 轴天然满足；序列轴不满足（causal 块里 pad 会被 attends 到），所以 `pad`/`unpad` 钩子把这份语义交还给调用方，编译器只管派发。默认平铺是有意的保守选择：一个猜错的填充语义比没有填充更糟。
+- **权重一份**：`share_plan_state` 按 `(name, shape, dtype)` 重绑，桶集的一份权重就是一份模型；随宽度变化的 state（旋转变换表一类）保持各自一份。
+- **内存先算再跑**：`footprint()` 把共享字节、最宽桶的 planned peak、最宽桶的 `peak_bound_bytes` 分开报，`check_memory_budget()` 用它们做准入，越界抛 `MemoryBudgetError`（AOTO-2004）而不是等分配失败。
+- **产物**：`save()` 写每桶一份 archive 加一份 `*.buckets.json` 索引，索引记 `planned_peak_bytes` 作为指纹——它是 shape 的函数，因此换了产物的集合会被 `load_bucketed` 以 `ArtifactCompatibilityError` 拒绝，而不是把某个宽度派给按别的宽度编出来的计划。自定义钩子是宿主代码，带钩子的集合拒绝保存。
+- **可观测**：每次派发在 DEBUG 记下桶宽、请求宽与填充比例，`stats` 累计各桶命中次数与浪费的 token 数——前者决定桶边界怎么调，后者是这么调的代价。
+- **不保证逐位一致**：后端自己的 matmul 在同一行、不同 tile 形状下就差 6.8e-3，桶集合的差异被限制在这个噪声内，`tests/test_buckets.py` 断言的是这个噪声本身。
+
+## 13.6 性能回归门禁
+
+`aotolith/bench.py` 与 `aoto bench` 提供编译器自身的回归门禁。固定负载覆盖投影、尺寸桶派发（96 行请求交给 128 的桶，走完整的平铺与裁剪路径）、gated MLP（`silu_mul_paired` epilogue 融合）、RMSNorm、causal attention、量化 GEMV 流式 kernel、Qwen2 prefill 适配层和 Qwen2 decode 适配层；输入用固定 seed 的 torch 张量生成，不需要下载权重。decode 那一项就是 `kv_cache_append` 的闸门：一旦 `fuse_kv_cache_update` 不再命中，`input_ops` 和 `lowered_ops` 会立刻跳起来，不需要任何计时。
+
+尺寸桶那一项的数按桶求和：任何一桶多出一个 kernel 或一个 op 都是回归，和单张计划里多出来一样，所以门禁看的是整套桶的总数；内存数字取最宽那一桶，因为准入决策要清掉的就是它。
 
 门禁按可比性分成两半：
 
 | 指标 | 是否确定性 | 比对条件 |
 |---|---|---|
 | `input_ops`、`lowered_ops` | 是，与设备无关 | 任何设备上都精确比对，只允许下降 |
+| `planned_peak_bytes`、`peak_bound_bytes` | 是，由 shape 决定 | 任何设备上都精确比对，只允许下降 |
 | `kernels` | 否，取决于 GPU 能加载哪些原生 kernel | 仅当 baseline 记录同一 `device_name` |
-| `min_ms` | 否 | 设备相同且两次报告都至少 3 次重复，允许 `--tolerance` 比例的变慢 |
-| `median_ms`、`ratio`、`compile_ms` | 否 | 只报告，不设阈值 |
+| `min_ratio` | 否 | 设备相同且两次报告都至少 3 次重复，允许 `--tolerance`（默认 0.25）比例的变慢 |
+| `min_ms`、`median_ms`、`compile_ms`、`first_call_ms` | 否 | 毫秒变慢但比值没变的运行只写 note；`first_call_ms`/`compile_ms` 是一次性测量，只挡 3 倍以上的回归 |
 
-`ratio` 是负载中位数相对同进程内一次裸 MLX matmul 的比值，用来在跨机器阅读报告时抵消整体速度差异。`compile_ms` 只报告：首次编译会付 Metal kernel 编译和进程缓存，同一负载的顺序会显著改变这个数字。
+`ratio` 是负载中位数相对同一次测量里一次裸 MLX matmul 的比值，`min_ratio` 是最好一次采样相对同一时刻 matmul 地板的比值，两者都用来在跨机器阅读报告时抵消整体速度差异。参考 matmul 是**交错**采样的：每个 workload 的每次采样之前都先测一次参考 matmul，两边共用同一个时钟、同一段热状态、同一条 GPU 队列。早期版本整份报告只除以开头那一次，在一个速度会漂的机器上把「投影变慢 60%」报成回归，而代码一行未改；把参考测成一批放在负载之后也好不了——那一次实测把 `attention_causal_128` 的 `min_ratio` 从 0.177 推到 0.237，纯属两次测量之间时钟频率的偏移。`compile_ms` 只挡宽阈值：首次编译会付 Metal kernel 编译和进程缓存，同一负载的顺序会显著改变这个数字。
 
-计时阈值比 `min_ms` 而不是 median。噪声只会往计时里加时间，不会减：同一台机上未改动的 0.35 ms 投影连跑三次，median 是 1.14、0.38、0.36 ms，最小值是 0.38、0.35、0.34。用 median 做门禁会把一次噪声报成 3 倍回归；用最小值只在真正抬高下限时才失败。
+计时阈值比 `min_ratio`，既不是 `min_ms` 也不是 median。噪声只会往计时里加时间，不会减：同一台机上未改动的 0.35 ms 投影连跑三次，median 是 1.14、0.38、0.36 ms，最小值是 0.38、0.35、0.34。用 median 做门禁会把一次噪声报成 3 倍回归；用最小值只在真正抬高下限时才失败。而最小值本身在机器负载变化时也会动 —— 同一个投影的地板测出过 0.344 和 0.431 ms，而同时刻的参考 matmul 从 0.89 变成 1.56 ms —— 所以最后比的是两者相除之后的数。`--rounds N` 把计时部分重复 N 轮并保留全部采样，基线用 `--rounds 3` 记录，CI 用同一参数比较。
 
 `run()` 在开始计时前会把每个负载完整编译并执行一次，丢弃那次计时。进程里第一个计划要替它用到的所有 kernel 付 Metal 编译成本，这个成本即使经过 warmup 仍会漏进第一批样本：同一个投影在别的计划先跑过之后最小值是 0.34 ms，什么也没跑过时是 0.82 ms。少了这一遍，负载顺序就决定了第一个负载的读数。少于 3 次重复的报告没有可比的最小值，门禁会跳过计时部分并明确写在 note 里，op 数照旧比对。
 
-基线文件放在 `benchmarks/baselines/`，用 `aoto bench --update-baseline PATH` 重新记录。CI 的 `bench` job 用仓库内的 baseline 跑一次；macos runner 的虚拟 GPU 与基线设备不同，因此那里只比对 op 数，毫秒部分跳过并把 `perf-report.json` 作为 artifact 上传。
+## 13.7 多芯片基线矩阵
+
+一台机器记一份基线，所以 `benchmarks/baselines/` 是**一个目录**而不是一个文件，文件名就是芯片的身份：`device_slug("Apple M5 Pro")` 是 `apple-m5-pro`，一个芯片一份 `apple-m5-pro.json`。记录的机器越多，矩阵越全，而每一份文件只在自己那块芯片上打开计时那一半门禁。
+
+选哪份文件由 `resolve_baseline()` 决定，规则短到能背下来：
+
+| `--baseline` 给的是 | 行为 |
+|---|---|
+| 文件 | 照用。显式路径是显式决定；`compare()` 仍会按 `device.name` 自行决定要不要比毫秒 |
+| 目录，且本机有对应文件 | 用本机那份，计时与 kernel 数全比 |
+| 目录，但本机没有对应文件 | 用目录里排序第一份，只比与设备无关的指标，并打一条 note 说明用了谁的文件、为什么跳过毫秒 |
+| 目录，但同名文件记录的是别的芯片 | 信文件不信名字：按「没有本机文件」处理并打 note。复制一份基线再改名，正是会让 M4 的毫秒被 M5 的数字卡住的那种错误 |
+| 空目录 | 报 `BaselineError`（`AOTO-6001`）。门禁指向空目录却「通过」，是门禁唯一不能有的失效方式 |
+
+「没有本机文件」不是妥协，是矩阵的设计：`input_ops`、`lowered_ops`、`planned_peak_bytes`、`peak_bound_bytes` 由图形状决定，与 GPU 无关，所以一台从没人记录过的 M4 照样能用 M5 的文件卡住每一条流水线回归；它不比的是毫秒，而 `compare()` 本来就会用一条 note 点名两边的设备说明这件事。
+
+目录里的文件是提交进仓库、可以手工编辑的，因此 `aoto bench --check-baselines DIR` 校验那些只能被手改坏的东西：schema 版本、文件名与它所记录的 `device.name` 是否一致（不一致的文件加载器永远不会选中）、同一块芯片是否出现两次、有没有记 `repeats`（没有就没法比最小值）。校验不需要 GPU，也不需要匹配的硬件，所以 CI 在任何 macOS runner 上都能跑。
+
+记录用 `aoto bench --update-baseline DIR`：给目录时文件按本机芯片命名，落在那份芯片的位置上，而不是覆盖别人。若同名文件记录的其实是另一块芯片，写入被拒绝（`AOTO-6001`）——覆盖掉就是把那块芯片的数字删了。
+
+CI 的 `bench` job 先 `--check-baselines`，再用 `--rounds 3` 和整个目录跑一次门禁；macos runner 的虚拟 GPU 在矩阵里没有文件，于是走回退分支、只比 op 数与计划内存，并把 `perf-report.json` 作为 artifact 上传。`real-device-gate` job 跑在带 `m-series` 标签的自托管 runner 上，由仓库变量 `AOTOLITH_SELF_HOSTED_RUNNER=true` 打开；工作流一行不用改，因为查找是按设备做的——一旦有人在那台机器上记录过，同一个 job 就自动拿到严格的计时门禁，没记录过也仍是「比了能比的，并说明为什么没比其余」的通过。
 
 ## 14. 编译产物、校验与加载
 
@@ -766,7 +844,9 @@ ABI 1.3 增加了 `entrypoint.kwargs`，记录被提升为图输入的 tensor �
 
 加载时使用 `autotune=False` 和 `selection_overrides`。这样可以验证序列化 selection 仍与当前 backend 的可重建 plan 一致，同时不重新执行 benchmark。校验内容包括 kernel artifact、selection key、storage plan、state shape/dtype 和 graph inputs/outputs；任一不匹配都会抛出 `ArtifactCompatibilityError`。
 
-默认允许 artifact 在其他 Apple Silicon GPU 上加载，因为 Metal kernel 会从受校验的图和 MSL source 重新构建。`require_device_match=True` 会同时比较编译时和当前设备的 `device_name`、`architecture`，用于必须绑定特定 GPU 型号的场景。当前 target 只有 `apple-metal`。
+默认允许 artifact 在其他 Apple Silicon GPU 上加载，因为 Metal kernel 会从受校验的图和 MSL source 重新构建。`require_device_match=True` 会同时比较编译时和当前设备的 `device_name`、`architecture`，用于必须绑定特定 GPU 型号的场景。
+
+manifest 里的 `target` 记录计划是哪个后端产的，加载时比对：`apple-metal` 的产物要在有 Apple GPU 的机器上加载（kernel 从 MSL 重建），`mlx-reference` 的产物只需要 MLX，因此两者之间不能互换。这不是设备绑定，是 provider 绑定——`mlx-reference` 产物故意不依赖设备，加载它从不检查设备。
 
 CLI 提供五个命令：`compile` 生成 artifact，`inspect` 读取 manifest，`verify` 完整重建并校验 artifact，`run` 加载 artifact 并写出 JSON 结果，`bench` 跑固定负载并与 baseline 比对。Python API 与 CLI 使用同一个 loader。
 
@@ -808,7 +888,7 @@ CLI 提供五个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 - 复数不在范围内，因此 `torch.fft` 一族（`rfft`/`fft2` 等）虽然走的是 decomposition，最终仍停在 complex dtype 上；`grid_sample`（`aten.grid_sampler_2d`）是视觉模型里的专用算子，采集索引的语义和现有的 `gather` 不同，没有 lowering
 - 以值本身作结论的算子在捕获期被拒绝：`torch.equal`、`torch.allclose` 归约出来的结果没有形状，fake tracing 也给不出示例值，消息把比较放到编译产物之外
 - 静态 KV Cache 只有固定 batch、固定容量 prefill/decode 示例：每步复制整段 cache，attention 读取 padded capacity；有效长度只能通过 static-shape mask 和 position 表达。分页 cache、prefix sharing、请求动态进出 batch、采样 API 和 serving 属于外部推理运行时，不是本项目的待实现功能
-- 尺寸桶只在 `compile_qwen2_bucketed` 里实现：桶宽度在编译期固定，超出最大桶的 prompt 直接报错，不做截断或二次编译。桶内填充到桶宽，所以一个 129 token 的 prompt 在 2048 桶里要按 2048 做完整 prefill；桶边界要按负载实际聚集的长度来定。推理运行时按请求动态挑桶、丢弃未用桶、跨桶迁移 cache 都不在编译器边界内
+- 尺寸桶是静态 shape 的答案，不是符号 shape：`compile_bucketed` 对任意 module 沿一根轴按给定宽度各编一份计划，桶宽度在编译期固定，超出最大桶的请求抛 `BucketRangeError`（AOTO-2005），不做截断也不在请求里二次编译。桶内平铺填充到桶宽，所以一个 129 token 的 prompt 在 2048 桶里要按 2048 做完整 prefill；桶边界要按负载实际聚集的长度来定。跨桶派发不保证逐位一致（后端自己的 matmul 在同一行不同 tile 形状下就差到 6.8e-3），且只在「变宽不改变原有行」的轴上默认可用，序列轴需要调用方自己的 `pad`/`unpad`。推理运行时按请求挑桶之后的事——丢弃未用桶、跨桶迁移 cache、动态调桶——都不在编译器边界内
 - Qwen2 静态 cache 适配层在构造时校验它所依赖的语义：MLP 走每层自己的 `mlp.act_fn`（因此 `silu`、两种 `gelu` 拼法以及其他 pointwise 激活都按模型本身的算式编译；`silu_mul` 的 matmul epilogue 折叠仍只识别 `silu`，`gelu` MLP 会多出一条独立的 pointwise kernel），构造时把该激活单独跑一遍捕获，无法 lower 的激活（例如带参数的 `PReLU`）在模型捕获之前就以点名该层的消息报错。sliding-window 层仍然被拒绝（读 `model.model.has_sliding_layers`，旧版本回退到 `config.layer_types`）：适配层的 mask 由自己构造，普通 causal mask 与窗口 mask 语义不同，而当前 transformers 版本自身的 sliding 路径在同一条 cache 上就会抛 `TypeError`，没有可对照的参考实现
 - layout 优化已覆盖恒等、逆变换、矩阵乘输入转置、`flip/roll` 相消和可证明的单消费者 batch `expand` 折叠；跨 reshape 以及其他非 matmul 边界的一般布局传播尚未实现
 - attention 只支持相同 dtype 的 rank-3/4 Q/K/V，以及同 dtype additive mask 或 bool mask；rank-4 支持 GQA/MQA，但 Q head 数必须是 K/V head 数的整数倍
@@ -823,7 +903,7 @@ CLI 提供五个命令：`compile` 生成 artifact，`inspect` 读取 manifest�
 
 模型前端、静态内存复用、kernel selection、autotune 和 artifact 加载链已经打通。后续工作集中在 ABI 完整性和编译器质量：
 
-1. 增加符号 shape 和有限控制流，同时保留静态 shape 路径的严格 verifier。
+1. 增加符号 shape 和有限控制流，同时保留静态 shape 路径的严格 verifier。当前用尺寸桶覆盖请求尺寸的变化（见 13.5），符号 extent 的收益在别的方向：值相关的形状、真正的动态 batch 拼接，以及避免桶边界的填充浪费。
 2. 把 op 级 autotune 扩展成 shape-aware backend policy，生成可复现的 benchmark report。
 3. 改进原生 matmul、attention 的 tile 和流水，扩大真实模型、dtype、算子与 Apple GPU 覆盖。
 4. 在核心 ABI 稳定后增加其他 backend；当前不为跨厂商兼容性做推测性抽象。

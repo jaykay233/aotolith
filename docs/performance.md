@@ -24,17 +24,67 @@ between sessions, so rows are comparable to each other and not to a session
 recorded weeks earlier.
 
 `aoto bench` is the regression gate, and it compares two different kinds of
-number differently. `input_ops` and `lowered_ops` are deterministic, so they are
-compared exactly on any machine and a pass that adds a copy or drops a fusion
-fails with no timing noise. Kernel counts and milliseconds depend on the GPU, so
-they are compared only when the baseline names the same device and both reports
-have at least three repeats. The threshold compares `min_ms` rather than the
-median: contention only ever adds time, so three runs of an unchanged 0.35 ms
-projection gave medians of 1.14, 0.38 and 0.36 ms while the minimums stayed at
-0.38, 0.35 and 0.34, and a real slowdown raises the floor. Every workload is also
-compiled and executed once before timing starts, because the first plan a process
-runs pays for the Metal kernel compilation of all its kernels — that
-systematically doubled the first workload's numbers even through its warmups.
+number differently. `input_ops`, `lowered_ops`, `planned_peak_bytes` and
+`peak_bound_bytes` are deterministic, so they are compared exactly on any
+machine and a pass that adds a copy or drops a fusion fails with no timing noise.
+Kernel counts and milliseconds depend on the GPU, so they are compared only when
+the baseline names the same device and both reports have at least three repeats.
+The threshold compares `min_ratio`, not `min_ms` or the median: contention only
+ever adds time, so the best sample is the right statistic, and dividing it by a
+reference matmul measured at the same moment is what removes the machine from
+the number. Two runs of unchanged code here gave the same 0.34 ms projection
+floors of 0.344 and 0.431 ms while the reference matmul moved from 0.89 to
+1.56 ms; in ratio terms both were 0.39x. A run that is slower in milliseconds
+but not in ratio is printed as a note instead of failing the gate. The default
+tolerance is 25%, above the 15% swing two best-of-33 floors of an unchanged
+kernel showed on this machine — and only the timing half of the gate has a
+tolerance at all.
+
+The reference matmul is sampled between a workload's samples, not around them.
+One round timed the same 0.2 ms attention kernel at 0.203 ms and then the
+reference at 1.15 ms, while the next round timed that kernel at 0.203 ms and the
+reference at 0.78 ms; dividing the first pair gave a floor of 0.177 that no later
+run could reproduce, so the gate failed on unchanged code with a 1.4x "regression"
+that was entirely the reference's clock. Interleaving puts the numerator and the
+denominator in the same window - same clock, same thermal state, same queue - at
+the cost of one matmul per sample. Four consecutive runs then put the same
+workload at 0.2425-0.2543 instead of 0.177-0.244.
+
+Every workload is also compiled and executed once before timing starts, because
+the first plan a process runs pays for the Metal kernel compilation of all its
+kernels — that systematically doubled the first workload's numbers even through
+its warmups. `--rounds N` repeats the timed half and keeps every sample; a
+baseline recorded with `--rounds 3` has a floor from three times as many
+samples, and CI compares against it with the same flag.
+
+Baselines are a matrix, not a file: `benchmarks/baselines/<chip>.json`, one per
+chip, and `--baseline benchmarks/baselines` resolves to the file for the machine
+running. That is what makes the millisecond half scale past one Mac — a second
+machine adds its own file instead of overwriting the first. A chip nobody has
+recorded on still gets the deterministic half, taken from another chip's file,
+with a note naming both devices; it is not a silent pass. So the op-count and
+planned-peak gate is enforced on every Mac, and the timing gate is enforced
+wherever somebody has recorded — which is the honest statement of coverage, and
+the reason `--check-baselines` exists to keep the committed files trustworthy.
+
+The fixed set covers one workload per mechanism that could regress on its own:
+a dense projection, a bucket dispatch (96 rows into a 128 bucket, so the tile,
+the trim and per-bucket lowering all execute), a gated MLP with the
+`silu_mul_paired` epilogue, `RMSNorm`, causal attention, the int4 streaming
+GEMV, and one prefill and one decode through each model family's adapter. The
+two adapter pairs are what make a family a gated object rather than a claim: a
+Llama decode that loses the bias-free projection fold, or grows an extra op
+where Qwen2 does not have one, shows up as a count change in the deterministic
+half of the gate.
+
+The reference backend has a workload of its own. `reference_linear_1024x1024` is
+the same projection as `linear_1024x1024` with `target="mlx-reference"`, so its
+`kernels` count is zero by construction and the gate on it is the interpreter
+path: the numbers it must not change are `input_ops`, `lowered_ops`, the storage
+plan's two figures, and the millisecond floor of walking the graph through MLX.
+It is the cheapest way to notice that an op lost its fallback, since the Metal
+plan would simply not select the missing kernel while the reference plan has
+nothing else to fall back to.
 
 ## Qwen2.5-0.5B, 128 prompt tokens and 64 generated
 
@@ -60,6 +110,27 @@ land a mean 0.043 / max 0.38 from PyTorch's logits, the MLX fallback a mean
 0.081 / max 1.5. Enabling code generation therefore moves the arithmetic toward
 PyTorch rather than away from it, which makes it a throughput decision and not an
 accuracy one.
+
+## What the MLX fallback costs in accuracy
+
+A plan's float32 arithmetic is only as precise as the kernel that runs it, and
+the two paths do not have the same precision. With `codegen_matmul` and
+`codegen_attention` on, a two-layer Llama's last-token logits land `1.043e-07`
+from PyTorch — fp32 round-off. With both off, the same graph runs on MLX's own
+kernels and the drift is `1.3e-3`; turning on one at a time splits the blame
+(`4.2e-4` for matmul alone, `8.5e-4` for attention alone).
+
+The cause is the fallback, not the lowering: MLX's own float32 matmul is `8e-4`
+relative to a float64 reference on this GPU, and that figure stays flat from
+K=32 to K=2048. Accumulation error would grow with K, so this is a
+reduced-precision matmul — TF32-shaped — rather than a summation that drifts.
+
+Two consequences worth knowing. The fallback is a correctness-safe path: greedy
+continuations match PyTorch exactly, because `1e-3` relative does not reorder
+argmax on logits that differ by more than that. It is not a bit-accurate path,
+so a test that pins logits to `1e-6` has to compile the kernels rather than
+compare the interpreter against fp32 torch. `examples/tiny_llama_compile.py`
+is the executable version of this paragraph.
 
 ## Where a decode step goes
 
@@ -376,3 +447,89 @@ each, 186.4-190.2 and 182.9-183.4. There is nothing there to win: the copy is
 queue, and what the rewrite would actually remove is a barrier rather than
 bandwidth. The copy stays, and the ring belongs to an attention kernel that reads
 the window as a permutation it does not care about.
+
+## What a bucket boundary costs
+
+A bucket set serves a request the compiler never saw, and the price is the rows
+between the request's width and the bucket's. That price is not one number,
+because it depends on whether the launch is reading its weight or its
+activations. Measured on the M5 Pro with a `1024 x 1024` projection, the same
+plan compiled directly at the request's width as the reference, minimum of 15
+calls over 7 rounds:
+
+| rows | bucket | rows wasted | direct | through the set | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 | 96 | 0% | 0.159–0.281 ms | 0.151–0.275 ms | 0.95–1.03x |
+| 96 | 128 | 33% | 0.159–0.281 ms | 0.157–0.244 ms | 0.87–1.06x |
+| 4096 | 8192 | 100% | 0.572–0.588 ms | 1.241–1.251 ms | 2.16–2.18x |
+
+The first row is the dispatch itself: picking a bucket, checking the width and
+running the plan lands inside the run-to-run noise of calling the plan directly,
+because a request that fits a bucket exactly needs no padding and no slice. The
+second row is the case a bucket set is designed for: 96 rows served by the 128
+bucket is 33% more rows, and the launch does not get 33% slower, because it is
+reading a 4 MB weight matrix either way and 32 extra rows of a `1024`-wide
+activation are cheap next to that. The third row is the case it is not designed
+for: past a few thousand rows the projection is activation-bound, so the padded
+rows cost their share and a little more.
+
+The rule that follows is the one the Qwen2 buckets already use. Put the
+boundaries where the traffic clusters, and keep the widest bucket close to the
+largest width the host will admit, because every row between a request and its
+bucket is computed and discarded. `plans.stats.snapshot()` reports both halves of
+that trade: which bucket served each request, and how many rows were padded away.
+
+## Peak memory, and what releases it
+
+The plan's storage layout has always known which value dies at which operation.
+Until this release the runner could not act on it: the unrolled body was one
+lazy graph, so every intermediate stayed referenced until the caller evaluated
+the outputs, and MLX's evaluator allocated an output for every node in that
+graph before releasing the ones it was done with. The peak was therefore the sum
+of the intermediates, not the largest live set.
+
+Measured on a chain of eight concatenations of a 64 x 1024 fp32 input, where the
+storage plan's live set peaks at 134.2 MB and the intermediates add up to
+200.8 MB:
+
+| policy | peak | synchronizations |
+| --- | ---: | ---: |
+| `latency` | 200.8 MB | 0 |
+| `balanced` | 134.5 MB | 4 |
+| `minimal` | 134.5 MB | 9 |
+
+The mechanism has to be a synchronization and not just a `del`. Deleting the
+Python name frees nothing on its own — the node is still in the graph — and
+`mx.async_eval` does not free it either, because the buffer is allocated when the
+command is encoded: the same chain measured 200.8 MB through `mx.async_eval` and
+134.5 MB through `mx.eval`. So the runner evaluates the values that are still
+live at a release point and then deletes the names that died there, which is what
+makes the storage plan's releases real rather than advisory.
+
+That is also why the policy is a choice: a synchronization on a decode step whose
+whole graph is 0.6 ms is expensive. A `minimal` runner on `qwen2_decode_128`
+measured 5.3 ms against 0.6 ms — nine times the work, for a plan whose transient
+is 0.4 MB. The `balanced` threshold (`max(8 MiB, transient/8)`) exists to make
+the policy free where memory is not the problem: every workload in `aoto bench`
+holds less than 8 MiB of transient, so `balanced` emits no synchronization at all
+and measures the same as `latency` to within noise. The cost only appears on
+graphs that hold tens of megabytes of intermediates, which is where it buys
+something.
+
+Two costs were paid for that guarantee. The first is one cache-sized comparison
+per decode step: `decode_mask` builds the window instead of indexing a
+`capacity x capacity` boolean table. The table was 16 MiB at a 4096-token
+capacity and would have been 1 GiB at 32k, to save a few microseconds. The
+second is the single-bucket entry point sharing its weights with the decode plan;
+`compile_qwen2_bucketed` had always shared them across buckets, but
+`compile_qwen2_static_cache` traced prefill and decode separately and kept two
+copies of the checkpoint. `memory_footprint()` reports both, and
+`check_memory_budget()` compares a budget against one decode step, which holds
+two caches because a step allocates the cache it returns before the one it was
+given is dropped.
+
+`aoto bench` now records all of it per workload: `planned_peak_bytes` and
+`peak_bound_bytes` (deterministic, gated exactly on any machine),
+`peak_extra_bytes` (measured, gated with the timing tolerance on the baseline's
+own device), `first_call_ms` and `compile_ms` (gated with a factor of two, since
+the shader compiler moved 1.5x between runs of unchanged code).

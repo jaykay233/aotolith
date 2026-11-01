@@ -101,6 +101,21 @@ tokens = runtime.greedy_generate(prompt_ids, max_new_tokens=64)
 
 适配层固定 batch、prompt 长度和最大生成长度，只实现 greedy 单请求生成。`compile_qwen2_bucketed` 改为每个 prompt 长度桶编译一对计划，更短的 prompt 左填充进能装下它的最小桶。
 
+同一套静态 Cache 运行时也覆盖第二个模型族。`aotolith.models.llama` 导出 `compile_llama_static_cache` 与 `compile_llama_bucketed`，与 Qwen2 的入口只在编译期坚持什么上不同：
+
+```python
+from aotolith.models.llama import compile_llama_static_cache
+
+runtime = compile_llama_static_cache(
+    model, prompt_length=128, max_new_tokens=64, quantize=64
+)
+tokens = runtime.greedy_generate(prompt_ids)
+```
+
+两个族在三件事上不一致、其余全部一致：Llama 的 q/k/v/o 投影没有 bias，所以打包投影 kernel 少一段 epilogue 折叠；`num_key_value_heads` 既可以整除 `num_attention_heads`，也可以等于它；RoPE 底数是配置项 `rope_theta` 而不是常量。`check_llama_model` 与 `check_qwen2_model` 会拒绝另一个族，而不是悄悄编出一张按别的 checkpoint 排布的投影图。
+
+两个后端共用同一个入口。`target="mlx-reference"` 把同一张图编成一份完全没有 kernel 的计划——每个节点都由 MLX 解释器执行——于是没有 Metal 的 host 也能编出并校验计划，同一张 lowering 后的图也获得一次独立执行，用来对照 shape、dtype、cache 内容和 token 决策。
+
 ## 实测结果
 
 Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16，batch 1，M5 Pro。`mlx_lm` 在同一进程里读到 190.5-195.0 token/s：
@@ -127,7 +142,9 @@ PyTorch FX / nn.Module
 
 第一次调用会把 plan 编成一个函数，函数体是每个 op 一行赋值，kernel 调用点作为常量绑定。kernel 本身一点没变，变的是围绕它们的记账：在这个模型上它把 decode 一步的 host 成本从 6.2 ms 降到 0.98 ms。
 
-作为更小的端到端检查，一个两层的 HuggingFace Llama 从 220 个 FX op 编到 136 个 lowering 后的 op，logits 与 PyTorch 参考相差 `8.941e-08`，并且在原 module 被释放之后 plan 仍然可执行。
+作为更小的端到端检查，`examples/tiny_llama_compile.py` 编译一个两层的 HuggingFace Llama：捕获的 131 个 op 在 prefill 里降到 79（decode 从 151 降到 62），在 matmul 与 attention 都开着 codegen 时 logits 与 PyTorch 参考相差 `1.043e-07`——float32 舍入量级，不是累积漂移——并且在原 module 被释放之后 plan 仍然可执行。
+
+最后这一点值得说清楚。关掉 codegen，同一张图跑在 MLX 自己的 kernel 上，漂移变成 `1.3e-3`：MLX 在这块 GPU 上的 float32 matmul 相对 float64 参考是 `8e-4` 量级，而且不随 K 增长，这是「降精度 matmul」的形状，不是累积误差。所以回退路径在正确性上是安全的，但不是逐位精确的，而这个差异属于 runtime，不属于编译器。
 
 ## 原生 Metal Code Generation
 
@@ -145,7 +162,7 @@ compiled = aoto.compile_callable(fn, inputs, codegen_matmul=True, codegen_attent
 
 | 类别 | 覆盖范围 |
 | --- | --- |
-| 模型 | decoder-only Transformer forward；Qwen2/Qwen2.5 静态 KV Cache prefill/decode，含尺寸桶与权重 int4；已验证 Qwen2.5-0.5B-Instruct |
+| 模型 | decoder-only Transformer forward；Qwen2/Qwen2.5 与 Llama 静态 KV Cache prefill/decode，含尺寸桶与权重 int4；已验证 Qwen2.5-0.5B-Instruct |
 | 矩阵 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`mv`/`addmv`，含 batch broadcasting |
 | 线性代数 | `solve`、`inv`、`det`、`cholesky` 一族、`eigh`、`svd`、`qr`、`pinv`、`lu_factor`、`matrix_exp`、`cdist` |
 | 索引 | embedding、`index_select`、advanced indexing、`gather`、`scatter*`、`index_add`、`masked_scatter` |
@@ -153,6 +170,7 @@ compiled = aoto.compile_callable(fn, inputs, codegen_matmul=True, codegen_attent
 | 空间 | `conv1d/2d/3d`（stride/padding/dilation/groups）、pooling 一族、`interpolate`、BatchNorm/GroupNorm/InstanceNorm |
 | 排序与选择 | `argmax`、`argmin`、带 `dim` 的 `max`/`min`、`median`、`sort`、`kthvalue`、`topk` |
 | 布局 | view、transpose/permute、slice、split/chunk/unbind、squeeze、expand、`repeat`/`tile`、cat/stack、padding、flip/roll、cast、`arange` |
+| target | `apple-metal`（生成的 Metal kernel，其余回退 MLX）与 `mlx-reference`（不生成 kernel，只走 MLX 解释器） |
 | 数据类型 | 支持范围内的 FP16、BF16、FP32、bool、I32、I64 |
 
 算子覆盖范围小于 PyTorch。不支持的 target 会在捕获或构造 IR 时失败，不会静默绕过编译计划。每个算子族实际怎么执行，见 [docs/operators.md](docs/operators.md)；逐 pass 的实现细节见 [docs/architecture.md](docs/architecture.md)。
@@ -160,16 +178,20 @@ compiled = aoto.compile_callable(fn, inputs, codegen_matmul=True, codegen_attent
 ## 已知限制
 
 - shape 和 dtype 在编译期固定，不支持动态 shape、符号维度和控制流。
-- artifact ABI 只接受 `apple-metal` target。
+- 产物在 manifest 里写明 target，只在对应后端可用的地方加载：`apple-metal` 需要 Apple GPU（kernel 由 MSL 重建），`mlx-reference` 只需要 MLX。目前没有 CUDA 或 CPU target。
 - 训练和 autograd 不在范围内。
-- 不包含 scheduler、continuous batching、抢占、分页 KV Cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch 和服务 API。
+- 不包含 scheduler、continuous batching、抢占、分页 KV Cache、prefix cache、采样策略、PD 分离、EP/MoE dispatch 和服务 API。这些是嵌入方的职责，[docs/host-runtime.md](docs/host-runtime.md) 记录了 host 可以依赖什么。
 - 部分算子族走 MLX 而不是生成 kernel，`mx.linalg` 的分解跑在 MLX 的 CPU stream 上。原因与确切边界按算子族记录在 [docs/operators.md](docs/operators.md)。
 
 ## 文档
 
 - [docs/usage.md](docs/usage.md)：tensor 关键字参数、尺寸桶、`aoto` 命令、产物版本。
+- [docs/errors.zh-CN.md](docs/errors.zh-CN.md)：全部错误码、含义、调用方该做什么，以及包会写什么日志（[English](docs/errors.md)）。
+- [docs/compatibility.zh-CN.md](docs/compatibility.zh-CN.md)：版本之间承诺什么、什么算破坏性变更、弃用怎么走（[English](docs/compatibility.md)）。
+- [CHANGELOG.md](CHANGELOG.md)：每个版本改了什么。
 - [docs/operators.md](docs/operators.md)：每个算子族的执行方式，以及哪些拼写与 PyTorch 不同、为什么。
 - [docs/performance.zh-CN.md](docs/performance.zh-CN.md)：decode step 的时间花在哪、每次重写买到了什么、哪些想法测过之后被放弃。
+- [docs/host-runtime.md](docs/host-runtime.md)：编译器与服务引擎的分界线，以及嵌入方可以依赖什么。
 - [docs/architecture.md](docs/architecture.md)：IR、pass 与代码生成，比 README 更细。
 
 ## 测试
@@ -182,7 +204,7 @@ python examples/tiny_llama_compile.py
 
 CI 在每次 push 上跑的就是这些：`ruff` 跑在 Linux 上；Apple Silicon 的 macOS runner 上做 `dev` extra 的可编辑安装、跑测试和 Llama 示例、再跑 `python -m build`。托管 runner 的 GPU 是半虚拟化的，装不上 tensor-core kernel，所以那里的 `compile` 会回退到 simdgroup 路径，相关测试自行跳过——绿灯只覆盖 simdgroup 路径。
 
-`aoto bench` 是编译器自身的回归门禁：测量固定 shape，确定性 op 数精确比对，计时与记录的 GPU baseline 比对。更多示例在 `examples/`。
+`aoto bench` 是编译器自身的回归门禁：测量固定 shape，确定性 op 数精确比对，计时、峰值内存与冷启动与记录的 GPU baseline 比对。更多示例在 `examples/`。
 
 ## 仓库结构
 
@@ -197,7 +219,8 @@ src/aotolith/
   passes/      图重写：matcher、layout、fusion、CSE，以及执行顺序
   planning.py  算子合法性与存储计划
   selection.py 原生 kernel 与 MLX fallback 之间的选择
-  backends/    Apple Metal backend
+  backends/    Apple Metal backend 与 MLX reference backend
+  models/      decoder 静态 Cache 适配层：族注册表、Qwen2、Llama
 tests/         IR、lowering、数值对齐、生成、planner
 examples/      可运行的模型、kernel 和静态 KV Cache 示例
 ```
@@ -206,9 +229,11 @@ examples/      可运行的模型、kernel 和静态 KV Cache 示例
 
 - **符号 shape 与有限控制流**，同时不削弱静态路径依赖的严格 verifier。
 - **shape-aware backend policy**：把逐 op autotune 换成看整张图的选择，以及可复现的 benchmark report。
+- **多行 decode**：一张计划一次吃进并验证多个 token，这是投机解码需要的东西。`m` 仍然是编译期常量，所以它落在既有契约里，而不是引入一个新的动态维度。
+- **端到端命令**：`aoto generate` 接受 prompt，直接打印或流式输出 token，带停止条件和一种采样，让 `pip install` 之后不写循环也能跑模型。调度和 serving 仍归嵌入编译器的引擎；见 [docs/host-runtime.md](docs/host-runtime.md)。
 - **更宽的原生覆盖**：matmul 的 split-K、attention 的 tile 搜索，以及给仍在 MLX 上的算子族做生成 kernel。
-- **更多模型**：Qwen2 之外的适配层，从 Llama 系列开始，以及需要 RoPE scaling 的长上下文变体。
-- **其他后端**，等核心 ABI 稳定之后。
+- **更多模型族**：decoder 适配层已经按族组织，下一个族是一份配置读取加它自己的怪癖——Mistral 的 sliding window、Qwen3 的 head 排布——而不是再写一遍适配层。长上下文变体需要 RoPE scaling，而当前的 position 表假设的是朴素形式。
+- **第三个后端**，跑在别的设备上，那才能证明 `mlx-reference` 这条缝是通用的、而不是 MLX 形状的。ABI 已经带上 target，缺的是一个不说 MLX 的 provider。
 
 ## 参与贡献
 

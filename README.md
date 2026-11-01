@@ -106,6 +106,39 @@ implements greedy single-request generation only. `compile_qwen2_bucketed`
 compiles one plan pair per prompt-length bucket and left-pads a shorter prompt
 into the smallest one that fits.
 
+The same static-cache runtime covers a second family. `aotolith.models.llama`
+exports `compile_llama_static_cache` and `compile_llama_bucketed`, which differ
+from the Qwen2 entry points only in what they insist on at compile time —
+
+```python
+from aotolith.models.llama import compile_llama_static_cache
+
+runtime = compile_llama_static_cache(
+    model, prompt_length=128, max_new_tokens=64, quantize=64
+)
+tokens = runtime.greedy_generate(prompt_ids)
+```
+
+— because the two families disagree about three things and agree about
+everything else: Llama's q/k/v/o projections carry no bias, so the packed
+projection kernel has no epilogue fold to apply; `num_key_value_heads` can equal
+`num_attention_heads` as well as divide it; and the RoPE base is a config value
+(`rope_theta`) rather than a constant. `check_llama_model` and
+`check_qwen2_model` refuse the other family instead of silently compiling a
+graph whose projections are shaped for a different checkpoint.
+
+Both backends are reachable from one entry point. `target="mlx-reference"`
+compiles the same graph with no kernels at all — every node runs on the MLX
+interpreter — which is how a plan can be built and verified on a host that has
+no Metal, and how the same lowered graph gets a second, independent execution to
+compare shapes, dtypes, cache contents and token decisions against.
+
+The same idea is available for any module: `compile_bucketed(model,
+example_inputs, axis=0, sizes=(1, 4, 8))` compiles one plan per width and
+dispatches a request to the smallest bucket that holds it, sharing one copy of
+the weights across the set and accounting for the worst bucket's memory before a
+request runs.
+
 ## Results
 
 Qwen2.5-0.5B-Instruct, 128 prompt tokens, 64 greedy tokens, BF16, batch 1, on an
@@ -140,9 +173,18 @@ operation, with kernel call sites bound as constants. Nothing about the kernels
 changes, only the bookkeeping around them: on this model it took the host cost of
 a decode step from 6.2 ms to 0.98 ms.
 
-As a smaller end-to-end check, a two-layer HuggingFace Llama compiles from 220 FX
-operations to 136 lowered ones, its logits land `8.941e-08` from the PyTorch
-reference, and the plan still executes after the original module is released.
+As a smaller end-to-end check, `examples/tiny_llama_compile.py` compiles a
+two-layer HuggingFace Llama: 131 captured operations become 79 in prefill (151
+to 62 in decode), its logits land `1.043e-07` from the PyTorch reference with
+both matmul and attention codegen on — float32 round-off, not accumulated drift
+— and the plan still executes after the original module is released.
+
+The last two words matter. With codegen off, the same graph runs on MLX's own
+kernels, and the drift becomes `1.3e-3`: MLX's float32 matmul on this GPU is
+about `8e-4` relative to a float64 reference, flat in K, which is the shape of a
+reduced-precision matmul rather than an accumulation error. So the fallback is a
+correctness-safe path and not a bit-accurate one, and the difference is the
+runtime's, not the compiler's.
 
 ## Native Metal code generation
 
@@ -168,7 +210,7 @@ compiled = aoto.compile_callable(fn, inputs, codegen_matmul=True, codegen_attent
 
 | Area | Coverage |
 | --- | --- |
-| Models | Decoder-only Transformer forward; Qwen2/Qwen2.5 static KV-cache prefill/decode with buckets and weight-only int4; Qwen2.5-0.5B-Instruct validated |
+| Models | Decoder-only Transformer forward; Qwen2/Qwen2.5 and Llama static KV-cache prefill/decode with buckets and weight-only int4; Qwen2.5-0.5B-Instruct validated |
 | Matrix | `mm`, `bmm`, `addmm`, `baddbmm`, `addbmm`, `mv`/`addmv`, with batch broadcasting |
 | Linear algebra | `solve`, `inv`, `det`, `cholesky` and friends, `eigh`, `svd`, `qr`, `pinv`, `lu_factor`, `matrix_exp`, `cdist` |
 | Indexing | Embedding, `index_select`, advanced indexing, `gather`, `scatter*`, `index_add`, `masked_scatter` |
@@ -176,6 +218,7 @@ compiled = aoto.compile_callable(fn, inputs, codegen_matmul=True, codegen_attent
 | Spatial | `conv1d/2d/3d` with stride/padding/dilation/groups, the pooling family, `interpolate`, BatchNorm/GroupNorm/InstanceNorm |
 | Selection | `argmax`, `argmin`, `max`/`min` with `dim`, `median`, `sort`, `kthvalue`, `topk` |
 | Layout | Views, transpose/permute, slice, split/chunk/unbind, squeeze, expand, `repeat`/`tile`, cat/stack, padding, flip/roll, casts, `arange` |
+| Targets | `apple-metal` (generated Metal kernels with MLX fallback) and `mlx-reference` (no kernels, MLX interpreter only) |
 | Dtypes | FP16, BF16, FP32, bool, I32, I64 where the operation supports them |
 
 Coverage is intentionally narrower than PyTorch. Unsupported targets fail during
@@ -186,24 +229,36 @@ each family executes — generated Metal, MLX, or a composition — is in
 
 ## Limitations
 
-- Shapes and dtypes are fixed at compile time. No dynamic shapes, symbolic
-  dimensions, or control flow.
-- The artifact ABI accepts only the `apple-metal` target.
+- Shapes and dtypes are fixed at compile time. No symbolic dimensions or control
+  flow. A request whose width varies is covered by compiling a set of widths
+  (`compile_bucketed`, `aoto compile --bucket-sizes`), which serves any width up
+  to the largest bucket; the cost is the rows between a request and its bucket.
+- An artifact names its target and loads only where that target is available: `apple-metal` artifacts need an Apple GPU (they rebuild their kernels from MSL), `mlx-reference` artifacts need MLX and nothing else. There is no CUDA or CPU target yet.
 - Training and autograd are out of scope.
 - No scheduler, continuous batching, preemption, paged KV cache, prefix cache,
   sampling policies, PD disaggregation, EP/MoE dispatch, or serving APIs.
+  [docs/host-runtime.md](docs/host-runtime.md) records what an embedding host can
+  rely on instead of each of them.
 - Several operator families run on MLX rather than in generated kernels, and
   `mx.linalg` factorizations run on MLX's CPU stream. The reasons and the exact
   boundaries are recorded per family in [docs/operators.md](docs/operators.md).
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md) — tensor keyword arguments, prompt-length
-  buckets, the `aoto` command, and artifact versioning.
+- [docs/usage.md](docs/usage.md) — tensor keyword arguments, shape buckets, the
+  `aoto` command, and artifact versioning.
+- [docs/errors.md](docs/errors.md) — every error code, what it means, what a
+  caller should do, and what the package logs ([Chinese](docs/errors.zh-CN.md)).
+- [docs/compatibility.md](docs/compatibility.md) — what is promised between
+  releases, what counts as breaking, and how a deprecation works
+  ([Chinese](docs/compatibility.zh-CN.md)).
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 - [docs/operators.md](docs/operators.md) — how each operator family executes and
   where a spelling deliberately differs from PyTorch.
 - [docs/performance.md](docs/performance.md) — where a decode step's time goes,
   what each rewrite bought, and which ideas were measured and dropped.
+- [docs/host-runtime.md](docs/host-runtime.md) — the boundary between the
+  compiler and a serving engine, and what an embedding host may rely on.
 - [docs/architecture.md](docs/architecture.md) — IR, passes, and code generation,
   in more depth than the README (Chinese).
 
@@ -221,8 +276,8 @@ Hosted runners expose a paravirtual GPU that cannot load tensor-core kernels, so
 `compile` falls back to simdgroup kernels there and those tests skip themselves.
 
 `aoto bench` is the compiler's own regression gate: it measures fixed shapes and
-compares deterministic op counts exactly and timings against a recorded GPU
-baseline. More examples live in `examples/`.
+compares deterministic op counts exactly, and timings, peak memory and cold start
+against a recorded GPU baseline. More examples live in `examples/`.
 
 ## Layout
 
@@ -237,7 +292,8 @@ src/aotolith/
   passes/      rewrites: matchers, layout, fusion, CSE, and their order
   planning.py  operation legality and the storage plan
   selection.py native kernel vs MLX fallback
-  backends/    the Apple Metal backend
+  backends/    the Apple Metal backend and the MLX reference backend
+  models/      decoder static-cache adapters: family registry, Qwen2, Llama
 tests/         IR, lowering, numerical parity, generation, planner
 examples/      runnable models, kernels, and static KV-cache benchmarks
 ```
@@ -245,14 +301,28 @@ examples/      runnable models, kernels, and static KV-cache benchmarks
 ## Roadmap
 
 - **Symbolic shapes and limited control flow**, without weakening the strict
-  verifier the static path relies on.
+  verifier the static path relies on. Request widths already come from compiled
+  buckets; what is left is extent that depends on values, and the padding a
+  bucket boundary costs.
 - **Shape-aware backend policy**, replacing per-op autotune with a selection that
   accounts for the whole graph, and a reproducible benchmark report.
+- **Multi-row decode**: one plan that consumes and verifies several tokens per
+  launch, which is what speculative decoding needs. `m` stays a compile-time
+  constant, so it fits the existing contract instead of adding a dynamic
+  dimension.
+- **An end-to-end command**: `aoto generate` takes a prompt and prints or streams
+  tokens, with a stop condition and one sampler, so a pip install can run a model
+  without writing a loop. Scheduling and serving stay with the engine that embeds
+  the compiler; see [docs/host-runtime.md](docs/host-runtime.md).
 - **Wider native coverage**: split-K for matmul, tile search for attention, and
   generated kernels for the families still on MLX.
-- **More models**: adapters beyond Qwen2, starting with the Llama family, and
-  long-context variants that need RoPE scaling.
-- **Other backends**, once the core ABI has settled.
+- **More model families**: the decoder adapter takes a family, so the next one
+  is a config reader plus its quirks — Mistral's sliding window, Qwen3's head
+  layout — rather than a second adapter. Long-context variants need RoPE
+  scaling, which the position table currently assumes is plain.
+- **A third backend** on a different device, which is what would prove the
+  `mlx-reference` seam is general rather than MLX-shaped. The ABI already
+  carries the target; what is missing is a provider that does not speak MLX.
 
 ## Contributing
 
