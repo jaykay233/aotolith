@@ -24,8 +24,9 @@ from ...codegen.matmul import (
     _matmul_epilogue_kind,
     _matmul_paired_weight_position,
 )
-from ...ir.ops.kernels import _matmul_weight_group_size
+from ...ir.ops.kernels import _matmul_weight_bits, _matmul_weight_group_size
 from ...quantize import mx_dequantize_int4 as _mx_dequantize_int4
+from ...quantize import mx_dequantize_int8 as _mx_dequantize_int8
 from ..bounds import (
     _check_advanced_index_indices,
     _check_take_indices,
@@ -527,9 +528,12 @@ def _evaluate_mlx_op(
         return _mlx_resize(graph, op, env)
     if op.op in _MLX_LAYOUT_OPS:
         return _evaluate_layout_mlx(graph, op, env[op.inputs[0]])
-    if op.op == "dequantize_i4":
+    if op.op in ("dequantize_i4", "dequantize_i8"):
         packed, scales = (env[value_id] for value_id in op.inputs)
-        return _mx_dequantize_int4(packed, scales, int(op.attrs["group_size"]))
+        unpack = (
+            _mx_dequantize_int4 if op.op == "dequantize_i4" else _mx_dequantize_int8
+        )
+        return unpack(packed, scales, int(op.attrs["group_size"]))
     if op.op == "matmul":
         left, right = (env[value_id] for value_id in op.inputs[:2])
         left = _apply_mlx_matmul_norm(op, env, left)
@@ -540,7 +544,11 @@ def _evaluate_mlx_op(
             # The folded form: the right operand is a packed weight, and the
             # logical right operand of the matmul is that weight transposed.
             scales = env[op.inputs[2]]
-            weight = _mx_dequantize_int4(right, scales, group_size)
+            unpack = (
+                _mx_dequantize_int8 if _matmul_weight_bits(op) == 8
+                else _mx_dequantize_int4
+            )
+            weight = unpack(right, scales, group_size)
             product = mx.matmul(left, mx.swapaxes(weight, -1, -2))
             return _apply_mlx_matmul_epilogue(op, env, product)
         if op.attrs.get("transpose_b", False):
@@ -563,7 +571,11 @@ def _evaluate_mlx_op(
         beta = float(op.attrs.get("beta", 1.0))
         group_size = _matmul_weight_group_size(op)
         if group_size is not None:
-            weight = _mx_dequantize_int4(right, env[op.inputs[3]], group_size)
+            unpack = (
+                _mx_dequantize_int8 if _matmul_weight_bits(op) == 8
+                else _mx_dequantize_int4
+            )
+            weight = unpack(right, env[op.inputs[3]], group_size)
             product = mx.matmul(left, mx.swapaxes(weight, -1, -2))
             return _apply_mlx_matmul_epilogue(op, env, beta * bias + alpha * product)
         if op.attrs.get("transpose_b", False):

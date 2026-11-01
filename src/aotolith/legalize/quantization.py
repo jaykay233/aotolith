@@ -1,13 +1,14 @@
-"""Lowering for the weight-only int4 unpack.
+"""Lowering for the weight-only unpacks, at four and eight bits.
 
-There is only one operator here, and it exists for a reason worth stating: the
+There are two operators here, one per width, and each exists for a reason worth
+stating: the
 unpack is *not* expressible as a handful of ATen calls the legalizer already
 knows, because the packing is a bit layout rather than an arithmetic one. A
 shift-and-mask chain would lower to eight elementwise regions, and every one of
 them would have to be fused back together before the result was a weight again.
 
-So the frontend calls ``aotolith.dequantize_i4`` as one custom operator, and it
-arrives here as one node. What the graph then holds is a single
+So the frontend calls ``aotolith.dequantize_i4`` or ``aotolith.dequantize_i8`` as
+one custom operator, and it arrives here as one node. What the graph then holds is a single
 ``dequantize_i4`` whose result is the weight matrix, which is exactly what the
 folding pass needs to find: it looks for a matmul reading one, and replaces both
 with a matmul that streams the packed words directly. A graph that keeps the
@@ -23,12 +24,13 @@ from .fx import _node_type
 from .refs import _argument_ids
 from .state import Handler, Lowering
 
-#: The custom operator the quantized frontend emits. It is a PyTorch
-#: ``library`` op rather than an ATen one, so the target carries our namespace.
+#: The custom operators the quantized frontend emits. They are PyTorch
+#: ``library`` ops rather than ATen ones, so the targets carry our namespace.
 DEQUANTIZE_I4_TARGET = "aotolith.dequantize_i4.default"
+DEQUANTIZE_I8_TARGET = "aotolith.dequantize_i8.default"
 
 
-def _lower_dequantize_i4(lowering: Lowering, node: Any, target: str) -> bool:
+def _lower_dequantize(lowering: Lowering, node: Any, target: str, op_name: str) -> bool:
     args = getattr(node, "args", ())
     if len(args) != 3:
         raise ValueError(f"{target} expects three arguments, got {len(args)}")
@@ -42,7 +44,7 @@ def _lower_dequantize_i4(lowering: Lowering, node: Any, target: str) -> bool:
     lowering.bind(
         node,
         lowering.emit(
-            "dequantize_i4",
+            op_name,
             inputs,
             {"group_size": group_size},
             _node_type(node),
@@ -51,6 +53,15 @@ def _lower_dequantize_i4(lowering: Lowering, node: Any, target: str) -> bool:
     return True
 
 
+def _lower_dequantize_i4(lowering: Lowering, node: Any, target: str) -> bool:
+    return _lower_dequantize(lowering, node, target, "dequantize_i4")
+
+
+def _lower_dequantize_i8(lowering: Lowering, node: Any, target: str) -> bool:
+    return _lower_dequantize(lowering, node, target, "dequantize_i8")
+
+
 HANDLERS: dict[str, tuple[Handler, ...]] = {
     DEQUANTIZE_I4_TARGET: (_lower_dequantize_i4,),
+    DEQUANTIZE_I8_TARGET: (_lower_dequantize_i8,),
 }

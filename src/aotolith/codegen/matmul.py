@@ -28,7 +28,7 @@ from .msl import KernelArtifact, _MPP_HEADER
 from .norm import _emit_thread_rms_norm_prologue, _emit_warp_rms_norm_prologue
 from ..target import apple as target
 from ..target.apple import _select_mpp_gemm_config, _supports_mpp_matmul
-from ..ir.ops.kernels import _matmul_weight_group_size
+from ..ir.ops.kernels import _matmul_weight_bits, _matmul_weight_group_size
 
 _MATMUL_MICROTILE = (4, 4)
 
@@ -63,6 +63,11 @@ _MATMUL_GEMV_THREADS_WIDE = 128
 #: Four-bit weights come eight to an int32 word, which is the load width the
 #: packed GEMV walks the reduction in.
 _QUANTIZED_NIBBLES = 8
+
+#: Eight-bit weights come four to a word. Twice the traffic of four bits for
+#: the same reduction, and the decode is cheaper: a byte needs two instructions
+#: to sign-extend where a nibble needs three.
+_QUANTIZED_BYTES = 4
 
 
 def _gemv_threads(columns: int, transpose_right: bool) -> int:
@@ -452,6 +457,22 @@ def _emit_transposed_gemv_matmul_source(
     return "\n".join(f"        {line}" for line in lines)
 
 
+def _quantized_codes_per_word(bits: int) -> int:
+    """How many codes one int32 word carries at this width.
+
+    Four bits packs eight nibbles into a word and eight bits packs four bytes,
+    which is the only thing the two kernels disagree about: both walk the
+    reduction in whole words so a word is one load and the decode keeps the
+    loads vectorizable.
+    """
+
+    if bits == 4:
+        return _QUANTIZED_NIBBLES
+    if bits == 8:
+        return _QUANTIZED_BYTES
+    raise ValueError(f"quantization width must be 4 or 8 bits, got {bits!r}")
+
+
 def _packed_matmul_supported(graph: Graph, op: Operation) -> bool:
     """Whether a folded packed-weight matmul has a native kernel.
 
@@ -465,6 +486,7 @@ def _packed_matmul_supported(graph: Graph, op: Operation) -> bool:
     group_size = _matmul_weight_group_size(op)
     if group_size is None:
         return False
+    bits = _matmul_weight_bits(op) or 4
     right_position = 2 if op.op == "addmm" else 1
     if len(op.inputs) <= right_position + 1:
         return False
@@ -477,7 +499,8 @@ def _packed_matmul_supported(graph: Graph, op: Operation) -> bool:
     if len(packed_type.shape) < 2 or len(left_type.shape) < 2:
         return False
     columns, words = packed_type.shape[-2:]
-    reduction = words * _QUANTIZED_NIBBLES
+    codes_per_word = _quantized_codes_per_word(bits)
+    reduction = words * codes_per_word
     if left_type.shape[-1] != reduction:
         return False
     return _supports_quantized_gemv_matmul(
@@ -486,6 +509,7 @@ def _packed_matmul_supported(graph: Graph, op: Operation) -> bool:
         reduction,
         group_size,
         output_type.dtype,
+        codes_per_word,
     )
 
 
@@ -495,20 +519,21 @@ def _supports_quantized_gemv_matmul(
     reduction: int,
     group_size: int,
     dtype: DType,
+    codes_per_word: int = _QUANTIZED_NIBBLES,
 ) -> bool:
-    """Return whether a packed 4-bit weight can use the streaming GEMV.
+    """Return whether a packed weight can use the streaming GEMV.
 
     The kernel walks the reduction in whole packed words, so the extent has to
-    be a multiple of eight, and it reads one scale per word group, so the group
-    size has to be too. Those are the only structural conditions; the rest is
-    the same one-row shape the dense GEMV needs.
+    be a multiple of the codes one word holds, and it reads one scale per word
+    group, so the group size has to be too. Those are the only structural
+    conditions; the rest is the same one-row shape the dense GEMV needs.
     """
 
     return (
         rows == 1
         and dtype in {DType.F16, DType.BF16, DType.F32}
-        and reduction % _QUANTIZED_NIBBLES == 0
-        and group_size % _QUANTIZED_NIBBLES == 0
+        and reduction % codes_per_word == 0
+        and group_size % codes_per_word == 0
         and reduction % group_size == 0
         and columns > 0
     )
@@ -655,6 +680,146 @@ def _emit_quantized_gemv_matmul_source(
             f"{indent}}}",
             f"{indent}float total = simd_sum(((acc0 + acc1) + (acc2 + acc3)) + "
             "((acc4 + acc5) + (acc6 + acc7)));",
+            f"{indent}if (lane == 0u) {{",
+            f"{indent}    out[{output_linear}] = (T)({value});",
+            f"{indent}}}",
+        ]
+    )
+    if not exact_columns:
+        lines.append("}")
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _emit_quantized_gemv_int8_source(
+    op: Operation,
+    graph: Graph,
+    reduction: int,
+    columns: int,
+    group_size: int,
+    batch_count: int,
+    left_batch_offset: str,
+    weight_batch_offset: str,
+    scales_batch_offset: str,
+) -> str:
+    """Emit a GEMV over a packed eight-bit weight, one warp per output column.
+
+    The same skeleton as the four-bit kernel with the decode replaced: a word
+    carries four weights instead of eight, so one step consumes exactly one
+    ``vec<T, 4>`` of activations. That makes the body tidier than the four-bit
+    one, which needs two activation vectors per word and keeps eight
+    accumulators to hide the dependency.
+
+    Four accumulators are enough here because the loop body already streams a
+    whole vector per lane per step, so the limiting factor is the weight load
+    rather than the accumulate latency.
+    """
+
+    threads = _gemv_threads(columns, True)
+    warps = threads // 32
+    exact_columns = columns % warps == 0
+    output_batch_offset = f"batch * {columns}u + " if batch_count > 1 else ""
+    output_linear = f"{output_batch_offset}column"
+    if op.op == "addmm":
+        left_position = 1
+        weight_position = 2
+        bias_position: int | None = 0
+        alpha = float(op.attrs.get("alpha", 1.0))
+        beta = float(op.attrs.get("beta", 1.0))
+    else:
+        left_position = 0
+        weight_position = 1
+        bias_position = None
+        alpha = 1.0
+        beta = 1.0
+    scales_position = _matmul_quantized_scales_position(op, weight_position)
+    assert scales_position is not None
+    output_shape = graph.value(op.outputs[0]).type.shape
+
+    value = "total"
+    if bias_position is not None:
+        bias_type = graph.value(op.inputs[bias_position]).type
+        bias_offset = _offset_expression(bias_type.shape, output_shape, output_linear)
+        value = f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
+    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+
+    words = reduction // _QUANTIZED_BYTES
+    words_per_group = group_size // _QUANTIZED_BYTES
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint lane = tid % 32u;",
+        "uint warp = tid / 32u;",
+        "uint threadgroup_index = threadgroup_position_in_grid.x;",
+    ]
+    if batch_count > 1:
+        lines.append("uint batch = threadgroup_position_in_grid.y;")
+    lines.extend(
+        [
+            f"uint column = threadgroup_index * {warps}u + warp;",
+            f"const device int* weight_row = in_{weight_position} + "
+            f"{weight_batch_offset}column * {words}u;",
+            f"const device T* scale_row = in_{scales_position} + "
+            f"{scales_batch_offset}column * {words // words_per_group}u;",
+        ]
+    )
+    norm_slot = _matmul_norm_position(op)
+    if norm_slot is not None:
+        lines.extend(
+            _emit_warp_rms_norm_prologue(
+                op, norm_slot, left_position, reduction, left_batch_offset
+            )
+        )
+    if not exact_columns:
+        lines.append(f"if (column < {columns}u) {{")
+    indent = "    " if not exact_columns else ""
+    lines.extend(f"{indent}float acc{offset} = 0.0f;" for offset in range(4))
+    lines.extend(
+        [
+            f"{indent}for (uint index = lane; index < {words}u; index += 32u) {{",
+            f"{indent}    uint word = (uint)weight_row[index];",
+            f"{indent}    uint base = index * {_QUANTIZED_BYTES}u;",
+            f"{indent}    float scale = float(scale_row[index / {words_per_group}u]);",
+        ]
+    )
+    if norm_slot is None:
+        lines.extend(
+            [
+                f"{indent}    const device vec<T, 4>* activations = "
+                "reinterpret_cast<const device vec<T, 4>*>("
+                f"in_{left_position} + {left_batch_offset}base);",
+                f"{indent}    vec<T, 4> x = activations[0];",
+            ]
+        )
+        for offset in range(4):
+            lines.append(f"{indent}    float x{offset} = float(x[{offset}]);")
+    else:
+        lines.extend(
+            [
+                f"{indent}    vec<T, 4> norm_values = norm_source[index];",
+                f"{indent}    vec<T, 4> weight_values = norm_weight_values[index];",
+            ]
+        )
+        for offset in range(4):
+            lines.append(
+                f"{indent}    float x{offset} = float((T)(norm_scale * "
+                f"float(norm_values[{offset}]) * "
+                f"float(weight_values[{offset}])));"
+            )
+    for offset in range(4):
+        lines.extend(
+            [
+                # Shift the byte into the sign position and let the arithmetic
+                # shift bring it back down, which sign-extends in two
+                # instructions; masking and subtracting would be three.
+                f"{indent}    int code{offset} = (int)(word << "
+                f"{24 - 8 * offset}u) >> 24;",
+                f"{indent}    acc{offset} = fma(float(code{offset}), "
+                f"x{offset} * scale, acc{offset});",
+            ]
+        )
+    lines.extend(
+        [
+            f"{indent}}}",
+            f"{indent}float total = simd_sum(((acc0 + acc1) + (acc2 + acc3)));",
             f"{indent}if (lane == 0u) {{",
             f"{indent}    out[{output_linear}] = (T)({value});",
             f"{indent}}}",
@@ -1739,16 +1904,21 @@ class MatmulLowering:
         *,
         right_position: int,
     ) -> tuple[KernelArtifact, Any]:
-        """Emit the streaming GEMV over a packed 4-bit weight.
+        """Emit the streaming GEMV over a packed weight.
 
         Only the one-row shape is lowered natively. A wider left operand would
         have to reuse each decoded weight over several rows, which is a tiled
         kernel rather than this one, and the codegen declines so the MLX
         fallback unpacks and runs - correct, and only paid for by prefill.
+
+        Four and eight bits share every part of this except the source emitter,
+        because they differ only in how many codes one word carries.
         """
 
         group_size = _matmul_weight_group_size(op)
         assert group_size is not None
+        bits = _matmul_weight_bits(op) or 4
+        codes_per_word = _quantized_codes_per_word(bits)
         scales_position = _matmul_quantized_scales_position(op, right_position)
         assert scales_position is not None
         left_position = 1 if op.op == "addmm" else 0
@@ -1761,7 +1931,7 @@ class MatmulLowering:
             raise NotImplementedError("packed matmul weights must be rank >= 2")
         columns, words = packed_type.shape[-2:]
         rows = left_type.shape[-2] if len(left_type.shape) >= 2 else 0
-        reduction = words * _QUANTIZED_NIBBLES
+        reduction = words * codes_per_word
         if left_type.shape[-1] != reduction:
             raise ValueError(
                 f"packed weight reduction {reduction} does not match the left "
@@ -1773,11 +1943,11 @@ class MatmulLowering:
                 f"{columns} columns in groups of {group_size}"
             )
         if not _supports_quantized_gemv_matmul(
-            rows, columns, reduction, group_size, output_type.dtype
+            rows, columns, reduction, group_size, output_type.dtype, codes_per_word
         ):
             raise NotImplementedError(
-                "the packed 4-bit matmul is only lowered natively for a single "
-                f"row with a reduction in whole words, got {rows} rows and "
+                f"the packed {bits}-bit matmul is only lowered natively for a "
+                f"single row with a reduction in whole words, got {rows} rows and "
                 f"{reduction} x {columns} in groups of {group_size}"
             )
         batch_shape = _matmul_batch_shape(
@@ -1811,7 +1981,12 @@ class MatmulLowering:
             scales_type.shape[:-2], batch_shape, columns * (reduction // group_size)
         )
 
-        source = _emit_quantized_gemv_matmul_source(
+        emitter = (
+            _emit_quantized_gemv_matmul_source
+            if bits == 4
+            else _emit_quantized_gemv_int8_source
+        )
+        source = emitter(
             op,
             graph,
             reduction,
@@ -1826,7 +2001,7 @@ class MatmulLowering:
         warps = threads // 32
         batch_suffix = f"_batch{batch_count}" if batch_count > 1 else ""
         name = (
-            f"metal_{op.op}_gemv_int4_g{group_size}_{threads}"
+            f"metal_{op.op}_gemv_int{bits}_g{group_size}_{threads}"
             f"{batch_suffix}_{index}"
         )
         kernel = msl._metal_kernel(

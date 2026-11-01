@@ -353,6 +353,49 @@ exact — every decode token has to match the round-tripped reference — and
 `--quantize` reports both the bf16 reference and the round-tripped one so a run
 never hides which one it agrees with.
 
+### Eight bits
+
+`quantize_bits=8` selects the wider format, which changes only how many codes a
+word holds: four bytes instead of eight nibbles, with the scale taken over 127
+levels instead of 7. Everything else — the fold, the streaming kernel, the
+grouping — is the same code.
+
+It is slower than four bits and much more accurate, and the reason it is only
+mildly slower is the same reason four bits was worth doing: a decode step is
+host-bound. On Qwen2.5-0.5B the step time splits as
+
+| | host | kernel share | wall |
+| --- | --- | --- | --- |
+| bf16 | 5.18 ms | — | 5.04 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 3.03 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 3.49 ms |
+
+so doubling the weight traffic moved the kernel's own share by 0.04 ms while the
+loop body, which now walks twice the words for the same reduction, accounts for
+the rest. Timed interleaved against `mlx_lm` at the same prompt, 64 decode steps:
+
+| weights | this repository | `mlx_lm` | ratio |
+| --- | --- | --- | --- |
+| bf16 | 232.8 tok/s | 226.6 tok/s | 1.027x |
+| int4, group 64 | 394.8 tok/s | 292.9 tok/s | 1.348x |
+| int8, group 64 | 348.6 tok/s | 291.4 tok/s | 1.196x |
+
+Mean relative error after quantizing the same weights is 0.63% at eight bits
+against 11.5% at four, and an eight-bit plan reproduced the bf16 checkpoint's
+greedy choices for all 64 steps of that benchmark prompt — which is a stronger
+statement than the four-bit note above can make.
+
+One comparison needs a caveat. The benchmark's round-tripped reference is
+byte-identical to the runtime's words at four bits, because the widest weight in
+a group lands exactly on the top code and the scale therefore recomputes
+unchanged. At eight bits that survives a float32 round trip but not a bf16 write
+back: the int8 step is finer than a bf16 mantissa, so about 1% of codes round to
+the neighbour when the dequantized value is stored and packed again. On the
+benchmark prompt that one-code difference lands on a token whose top two logits
+are exactly equal, and the reference takes the other branch. `--quantize-bits 8`
+therefore reports agreement rather than requiring it.
+
+
 Autotuning is not an escape either, and until now it could not even run on a
 model like this one. `--autotune` evaluated the MLX fallback for every operation
 in order to have a reference to compare against, but normalization, rotary, and

@@ -453,13 +453,18 @@ def _check_attention(graph: Graph, op: Operation) -> None:
             )
 
 
-def _check_dequantize_i4(graph: Graph, op: Operation) -> None:
-    """The three facts a 4-bit unpack relies on, checked together.
+def _check_packed_unpack(
+    graph: Graph, op: Operation, packed_width: int, name: str
+) -> None:
+    """The three facts a packed unpack relies on, checked together.
 
     The packed operand is a row of int32 words, the scales carry one value per
-    group along the same row, and the result is the row expanded eightfold. Each
-    of those is a relation *between* operands, which is why none of them fits the
-    shape and dtype fields.
+    group along the same row, and the result is the row expanded by the codes
+    one word holds. Each of those is a relation *between* operands, which is why
+    none of them fits the shape and dtype fields.
+
+    Four and eight bits differ only in ``packed_width``, so they are one check
+    with one parameter rather than two near-copies that could drift apart.
     """
 
     packed_type = graph.value(op.inputs[0]).type
@@ -467,43 +472,50 @@ def _check_dequantize_i4(graph: Graph, op: Operation) -> None:
     output_type = graph.value(op.outputs[0]).type
     if packed_type.dtype is not DType.I32:
         raise ValueError(
-            f"dequantize_i4 packed weights must be int32 words, got {packed_type.dtype}"
+            f"{name} packed weights must be int32 words, got {packed_type.dtype}"
         )
     if len(packed_type.shape) != 2:
         raise ValueError(
-            f"dequantize_i4 packed weights must be [out, in/8], got {packed_type.shape}"
+            f"{name} packed weights must be "
+            f"[out, in/{packed_width}], got {packed_type.shape}"
         )
     if len(scales_type.shape) != 2:
         raise ValueError(
-            f"dequantize_i4 scales must be [out, in/group_size], got {scales_type.shape}"
+            f"{name} scales must be [out, in/group_size], got {scales_type.shape}"
         )
     group_size = op.attrs["group_size"]
     assert isinstance(group_size, int)
     rows, words = packed_type.shape
     if scales_type.shape[0] != rows:
         raise ValueError(
-            f"dequantize_i4 scales has {scales_type.shape[0]} rows but the packed "
+            f"{name} scales has {scales_type.shape[0]} rows but the packed "
             f"weights have {rows}"
         )
-    inner = words * 8
+    inner = words * packed_width
     if inner % group_size != 0 or scales_type.shape[1] != inner // group_size:
         raise ValueError(
-            f"dequantize_i4 scales shape {scales_type.shape} does not cover "
+            f"{name} scales shape {scales_type.shape} does not cover "
             f"{inner} weights in groups of {group_size}"
         )
     if scales_type.dtype != output_type.dtype:
         raise ValueError(
-            f"dequantize_i4 output dtype {output_type.dtype} must match the scales' "
+            f"{name} output dtype {output_type.dtype} must match the scales' "
             f"{scales_type.dtype}"
         )
     if output_type.shape != (rows, inner):
-        raise ValueError(
-            f"dequantize_i4 output shape {output_type.shape} != {(rows, inner)}"
-        )
+        raise ValueError(f"{name} output shape {output_type.shape} != {(rows, inner)}")
+
+
+def _check_dequantize_i4(graph: Graph, op: Operation) -> None:
+    _check_packed_unpack(graph, op, 8, "dequantize_i4")
+
+
+def _check_dequantize_i8(graph: Graph, op: Operation) -> None:
+    _check_packed_unpack(graph, op, 4, "dequantize_i8")
 
 
 def _matmul_weight_group_size(op: Operation) -> int | None:
-    """Return the int4 group size when the right operand is a packed weight.
+    """Return the group size when the right operand is a packed weight.
 
     A folded quantized matmul keeps the same operator and the same names: the
     weight operand is the packed word tensor, the slot right after it holds the
@@ -525,6 +537,22 @@ def _matmul_weight_group_size(op: Operation) -> int | None:
     return value
 
 
+def _matmul_weight_bits(op: Operation) -> int | None:
+    """Return the packed width of a folded weight, or ``None`` if it is dense.
+
+    ``weight_bits`` defaults to four because that is the only width the first
+    releases emitted, so a graph saved before eight bits existed keeps folding
+    into the kernel it always used instead of being read with a wider decode.
+    """
+
+    if _matmul_weight_group_size(op) is None:
+        return None
+    value = op.attrs.get("weight_bits", 4)
+    if value not in (4, 8):
+        raise ValueError(f"{op.op}.weight_bits must be 4 or 8, got {value!r}")
+    return int(value)
+
+
 CONTRACTS: dict[str, OpContract] = {
     # Their compilers check the operands against the kernel they emit, so the
     # table only pins the arity and the number of results.
@@ -544,6 +572,14 @@ CONTRACTS: dict[str, OpContract] = {
         shape=ShapeRule.FREE,
         attrs=(AttrSpec("group_size", AttrKind.INT),),
         extra=_check_dequantize_i4,
+    ),
+    # The eight-bit twin. Same shape, same folding, four codes per word.
+    "dequantize_i8": OpContract(
+        arity=(2, 2),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        attrs=(AttrSpec("group_size", AttrKind.INT),),
+        extra=_check_dequantize_i8,
     ),
     # A fused region may also hold no graph inputs at all: a chain that starts
     # from a constant producer (``x.zero_()`` fused into its consumer) is that

@@ -23,9 +23,9 @@ import torch
 from aotolith import compile_callable
 from aotolith.backends.apple import AppleMetalBackend
 from aotolith.capture import capture_fx
-from aotolith.models.quantized import dequantize_i4, pack_weight
+from aotolith.models.quantized import dequantize_i4, dequantize_i8, pack_weight
 from aotolith.passes import rewrite
-from aotolith.quantize import dequantize_int4, quantize_int4
+from aotolith.quantize import dequantize_int4, dequantize_int8, quantize_int4, quantize_int8
 
 
 GROUP = 32
@@ -232,3 +232,125 @@ def test_a_residual_folds_into_one_packed_addmm() -> None:
     mx.eval(actual)
     scale = float(np.abs(expected).max())
     assert float(np.abs(np.asarray(actual) - expected).max()) <= 3e-2 * scale
+
+
+# --- eight bits ---------------------------------------------------------------
+
+
+def _case_int8(rows: int, inner: int, batch: int, seed: int):
+    rng = np.random.default_rng(seed)
+    weight = rng.standard_normal((rows, inner)).astype(np.float32)
+    activation = rng.standard_normal((batch, inner)).astype(np.float32)
+    packed, scales = quantize_int8(weight, GROUP)
+    return weight, activation, packed, scales
+
+
+def _compile_int8(rows: int, inner: int, batch: int, seed: int):
+    _, activation, packed, scales = _case_int8(rows, inner, batch, seed)
+
+    def call(activation, packed, scales):
+        return torch.matmul(activation, dequantize_i8(packed, scales, GROUP).t())
+
+    compiled = compile_callable(
+        call,
+        (
+            torch.from_numpy(activation),
+            torch.from_numpy(packed),
+            torch.from_numpy(scales),
+        ),
+    )
+    actual = compiled.plan(mx.array(activation), mx.array(packed), mx.array(scales))
+    mx.eval(actual)
+    expected = torch.matmul(
+        torch.from_numpy(activation),
+        dequantize_i8(torch.from_numpy(packed), torch.from_numpy(scales), GROUP).t(),
+    ).numpy()
+    return np.asarray(actual), expected
+
+
+@pytest.mark.parametrize("rows,inner", [(64, 128), (32, 256), (128, 64)])
+def test_int8_decode_matmul_matches_torch(rows: int, inner: int) -> None:
+    actual, expected = _compile_int8(rows, inner, 1, seed=rows + inner)
+    scale = float(np.abs(expected).max()) or 1.0
+    # Eight bits leaves almost no residual, so the tolerance is the float
+    # accumulation order rather than a quantization term.
+    assert float(np.abs(actual - expected).max()) <= 1e-2 * scale
+
+
+@pytest.mark.parametrize("batch", [2, 4, 7])
+def test_int8_prefill_matmul_matches_torch(batch: int) -> None:
+    actual, expected = _compile_int8(48, 128, batch, seed=batch)
+    scale = float(np.abs(expected).max()) or 1.0
+    assert float(np.abs(actual - expected).max()) <= 1e-2 * scale
+
+
+def test_int8_single_row_matmul_keeps_no_unpacked_weight() -> None:
+    packed = torch.from_numpy(_case_int8(64, 128, 1, seed=3)[2])
+    scales = torch.from_numpy(_case_int8(64, 128, 1, seed=3)[3])
+
+    def call(x, packed, scales):
+        return torch.matmul(x, dequantize_i8(packed, scales, GROUP).t())
+
+    graph = rewrite(capture_fx(call, (torch.zeros(1, 128), packed, scales)))
+    assert [op.op for op in graph.ops if op.op == "dequantize_i8"] == []
+
+
+def test_int8_a_wide_matmul_keeps_the_unpack() -> None:
+    packed = torch.from_numpy(_case_int8(64, 128, 4, seed=3)[2])
+    scales = torch.from_numpy(_case_int8(64, 128, 4, seed=3)[3])
+
+    def call(x, packed, scales):
+        return torch.matmul(x, dequantize_i8(packed, scales, GROUP).t())
+
+    graph = rewrite(capture_fx(call, (torch.zeros(4, 128), packed, scales)))
+    assert [op.op for op in graph.ops].count("dequantize_i8") == 1
+
+
+def test_int8_fold_records_the_width_on_the_matmul() -> None:
+    # The kernel is chosen from the width later, on the other side of the
+    # pipeline, so the fold has to carry it.
+    packed = torch.from_numpy(_case_int8(16, 64, 1, seed=5)[2])
+    scales = torch.from_numpy(_case_int8(16, 64, 1, seed=5)[3])
+
+    def call(x, packed, scales):
+        return torch.matmul(x, dequantize_i8(packed, scales, GROUP).t())
+
+    graph = rewrite(capture_fx(call, (torch.zeros(1, 64), packed, scales)))
+    matmuls = [op for op in graph.ops if op.op == "matmul"]
+    assert len(matmuls) == 1
+    assert matmuls[0].attrs["weight_bits"] == 8
+    assert matmuls[0].attrs["weight_group_size"] == GROUP
+
+
+def test_int8_unpacked_fallback_agrees_with_the_native_kernel() -> None:
+    _, activation, packed, scales = _case_int8(32, 64, 1, seed=11)
+    reference = dequantize_int8(packed, scales, GROUP).T
+    expected = np.matmul(activation, reference)
+    actual = _compile_int8(32, 64, 1, seed=11)[0]
+    assert np.allclose(actual, expected, atol=1e-4 * (np.abs(expected).max() + 1e-6))
+
+
+def test_int8_emits_the_eight_bit_gemv() -> None:
+    from aotolith.backends.apple import AppleMetalBackend
+
+    _, activation, packed, scales = _case_int8(64, 128, 1, seed=17)
+
+    def call(x, packed, scales):
+        return torch.matmul(x, dequantize_i8(packed, scales, GROUP).t())
+
+    graph = rewrite(
+        capture_fx(
+            call,
+            (
+                torch.from_numpy(activation),
+                torch.from_numpy(packed),
+                torch.from_numpy(scales),
+            ),
+        )
+    )
+    candidates = AppleMetalBackend()._lower_candidates(graph)
+    names = set()
+    for value in candidates.values():
+        items = [value] if not isinstance(value, (list, tuple)) else value
+        names.update(item.artifact.name for item in items)
+    assert any("gemv_int8" in name for name in names), names

@@ -166,8 +166,16 @@ runtime = compile_llama_static_cache(
 tokens = runtime.greedy_generate(prompt_ids)
 ```
 
+`quantize=` is the **group size** that shares a scale, and the width is a
+separate knob: `quantize_bits=4` (the default) packs eight nibbles to a word and
+`quantize_bits=8` packs four bytes. Both fold into the same streaming kernel, so
+asking for eight bits is a precision choice rather than a different code path —
+it costs about 12% of the decode rate over four bits and leaves roughly a
+hundredth of the rounding error. Leaving `quantize=None` compiles the bf16
+plans, and `quantize_bits` is refused in that case rather than ignored.
+
 Everything after the checks is shared: the same cache layout, the same
-`prefill_mask`, the same int4 packing, the same `greedy_generate`. That is why
+`prefill_mask`, the same weight packing, the same `greedy_generate`. That is why
 the refusal matters — `check_qwen2_model` and `check_llama_model` raise on the
 other family's checkpoint (`UnsupportedModelError`, AOTO-2006) instead of
 compiling a projection that is shaped for a different one. The family is read

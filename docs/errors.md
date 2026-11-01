@@ -37,7 +37,7 @@ followed by `hint: …` — which is exactly what the `aoto` command prints.
 | `AOTO-2001` | `PlanInputError` | the call does not match the plan's signature | fix the call: input count and shapes come from `plan.graph.inputs` |
 | `AOTO-2002` | `IndexBoundsError` | an index that would read outside the tensor it indexes | fix the indices, or pass `verify_index_bounds=False` when they are known good |
 | `AOTO-2003` | `PlanDTypeError` | an argument whose dtype the plan does not accept | cast the argument, or recompile with that dtype |
-| `AOTO-2004` | `MemoryBudgetError` | a configuration whose memory does not fit the budget it was given | shorten the sequence, compile with `quantize=4`, or raise the budget |
+| `AOTO-2004` | `MemoryBudgetError` | a configuration whose memory does not fit the budget it was given | shorten the sequence, compile with a smaller `quantize=<group size>`, or raise the budget |
 | `AOTO-2005` | `BucketRangeError` | a request wider than the widest compiled bucket | compile a wider bucket, or split the request; nothing is recompiled at run time |
 | `AOTO-3001` | `DeviceError` | the plan is valid, this machine cannot run it | run on a supported Apple GPU, outside a sandbox that hides Metal |
 | `AOTO-4001` | `ArtifactError` | a damaged or structurally invalid artifact | recompile, or restore the file |

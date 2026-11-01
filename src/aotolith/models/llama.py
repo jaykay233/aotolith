@@ -78,6 +78,7 @@ def compile_llama_static_cache(
     codegen_attention: bool = False,
     autotune: bool = False,
     quantize: int | None = None,
+    quantize_bits: int = 4,
     target: str = "apple-metal",
     memory: str = "latency",
 ) -> DecoderStaticCacheRuntime:
@@ -92,6 +93,7 @@ def compile_llama_static_cache(
         codegen_attention=codegen_attention,
         autotune=autotune,
         quantize=quantize,
+        quantize_bits=quantize_bits,
         family=FAMILY,
         target=target,
         memory=memory,
@@ -107,6 +109,7 @@ def compile_llama_bucketed(
     codegen_attention: bool = False,
     autotune: bool = False,
     quantize: int | None = None,
+    quantize_bits: int = 4,
     target: str = "apple-metal",
 ) -> DecoderBucketedRuntime:
     """Compile one Llama plan pair per prompt-length bucket."""
@@ -120,6 +123,7 @@ def compile_llama_bucketed(
         codegen_attention=codegen_attention,
         autotune=autotune,
         quantize=quantize,
+        quantize_bits=quantize_bits,
         family=FAMILY,
         target=target,
     )

@@ -25,7 +25,12 @@ import pytest
 import torch
 
 from aotolith.models.qwen2 import compile_qwen2_static_cache
-from aotolith.quantize import dequantize_int4, quantize_int4
+from aotolith.quantize import (
+    dequantize_int4,
+    dequantize_int8,
+    quantize_int4,
+    quantize_int8,
+)
 
 GROUP = 8
 PROMPT = [1, 2, 3, 4]
@@ -213,4 +218,95 @@ def test_quantizing_requires_a_group_size_that_divides_the_reduction() -> None:
             prompt_length=len(PROMPT),
             max_new_tokens=8,
             quantize=48,
+        )
+
+
+def _round_tripped_int8(model: torch.nn.Module) -> torch.nn.Module:
+    """Replace every projection weight with its own eight-bit round trip."""
+
+    model = _clone(model)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            for name in _PROJECTIONS:
+                linear = getattr(layer.self_attn, name, None) or getattr(
+                    layer.mlp, name
+                )
+                packed, scales = quantize_int8(linear.weight.numpy(), GROUP)
+                restored = dequantize_int8(packed, scales, GROUP)
+                linear.weight.copy_(torch.from_numpy(restored).to(linear.weight.dtype))
+    return model
+
+
+def test_int8_decode_matches_the_round_tripped_checkpoint() -> None:
+    # Same contract as the four-bit case: the runtime has to reproduce the
+    # decisions a checkpoint that arrived already quantized would make, token
+    # for token, because it consumes the same codes.
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(23)
+    model = transformers.Qwen2ForCausalLM(_config(transformers)).eval()
+    expected = _reference_tokens(_round_tripped_int8(model))
+
+    runtime = compile_qwen2_static_cache(
+        model,
+        prompt_length=len(PROMPT),
+        max_new_tokens=8,
+        codegen_attention=True,
+        quantize=GROUP,
+        quantize_bits=8,
+    )
+    tokens = runtime.greedy_generate(PROMPT, max_new_tokens=STEPS, sync_each_step=True)
+    mx.eval(tokens)
+    assert tokens.shape == (1, STEPS)
+    assert tokens.tolist() == [expected]
+
+
+def test_int8_packs_each_weight_into_half_a_word() -> None:
+    """The fold must leave an eight-bit operand, not the four-bit one.
+
+    A wrong width would otherwise show up only as slightly-off numbers, so the
+    check is structural: every int32 packed input is twice as wide at eight bits
+    as at four, because a word holds four codes instead of eight.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(31)
+    model = transformers.Qwen2ForCausalLM(_config(transformers)).eval()
+    shapes = {}
+    for bits in (4, 8):
+        runtime = compile_qwen2_static_cache(
+            model,
+            prompt_length=len(PROMPT),
+            max_new_tokens=8,
+            codegen_attention=True,
+            quantize=GROUP,
+            quantize_bits=bits,
+        )
+        graph = runtime.decode.plan.graph
+        shapes[bits] = sorted(
+            graph.value(value).type.shape
+            for value in graph.inputs
+            if graph.value(value).type.dtype.value == "int32"
+        )
+        tokens = runtime.greedy_generate(
+            PROMPT, max_new_tokens=STEPS, sync_each_step=True
+        )
+        mx.eval(tokens)
+        assert tokens.shape == (1, STEPS)
+    four, eight = shapes[4], shapes[8]
+    assert len(four) == len(eight) and four
+    for coarse, fine in zip(four, eight):
+        assert fine == (coarse[0], coarse[1] * 2)
+
+
+def test_a_width_without_quantization_is_refused() -> None:
+    from aotolith.errors import CompilationError
+
+    transformers = pytest.importorskip("transformers")
+    model = transformers.Qwen2ForCausalLM(_config(transformers)).eval()
+    with pytest.raises(CompilationError):
+        compile_qwen2_static_cache(
+            model,
+            prompt_length=len(PROMPT),
+            max_new_tokens=8,
+            quantize_bits=8,
         )

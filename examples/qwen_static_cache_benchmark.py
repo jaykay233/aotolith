@@ -100,18 +100,31 @@ def _reference_tokens(
     return generated
 
 
-def _round_trip_weights(model: torch.nn.Module, group_size: int) -> None:
-    """Replace each projection weight by its own int4 round trip, in place.
+def _round_trip_weights(model: torch.nn.Module, group_size: int, bits: int = 4) -> None:
+    """Replace each projection weight by its own round trip, in place.
 
     The runtime packs these same tensors, and quantizing a value that is already
-    on the int4 grid returns the same words - the group's widest element rounds
-    to +-7, so the scale recomputes unchanged. So the words the runtime streams
+    on the grid returns the same words - the group's widest element rounds to
+    the top code, so the scale recomputes unchanged.
+
+    At four bits that survives the write-back, so the words the runtime streams
     are byte-identical to the ones this reference consumed, which is the only
-    way to tell a decode bug from a rounding difference. The embedding stays
-    untouched because the runtime leaves it in bf16 too.
+    way to tell a decode bug from a rounding difference. At eight bits it does
+    not: the int8 step is finer than a bf16 mantissa can hold, so about 1% of
+    the codes round to the neighbour when the dequantized value is stored in
+    bf16 and packed again. The two then differ by one code out of 256, and a
+    token that sits on an exact logit tie can go either way - so for eight bits
+    the token check is a close-agreement signal, not an equality requirement.
+
+    The embedding stays untouched because the runtime leaves it in bf16 too.
     """
 
-    from aotolith.quantize import dequantize_int4, quantize_int4
+    if bits == 8:
+        from aotolith.quantize import dequantize_int8 as dequantize_any
+        from aotolith.quantize import quantize_int8 as quantize_any
+    else:
+        from aotolith.quantize import dequantize_int4 as dequantize_any
+        from aotolith.quantize import quantize_int4 as quantize_any
 
     targets = [model.lm_head]
     for layer in model.model.layers:
@@ -122,8 +135,8 @@ def _round_trip_weights(model: torch.nn.Module, group_size: int) -> None:
     with torch.no_grad():
         for module in targets:
             weight = module.weight
-            packed, scales = quantize_int4(weight.float().cpu().numpy(), group_size)
-            restored = dequantize_int4(packed, scales, group_size)
+            packed, scales = quantize_any(weight.float().cpu().numpy(), group_size)
+            restored = dequantize_any(packed, scales, group_size)
             weight.copy_(torch.from_numpy(restored).to(weight.dtype))
 
 
@@ -265,9 +278,17 @@ def main() -> None:
         default=None,
         metavar="GROUP",
         help=(
-            "weight-only int4 with this group size (for example 64); the "
+            "weight-only quantization with this group size (for example 64); the "
             "streaming kernel is selected whether or not --codegen-matmul is on"
         ),
+    )
+    parser.add_argument(
+        "--quantize-bits",
+        type=int,
+        default=4,
+        choices=(4, 8),
+        metavar="BITS",
+        help="codes per weight: 4 packs eight to a word, 8 packs four (default 4)",
     )
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument(
@@ -304,7 +325,7 @@ def main() -> None:
     # reference is what a checkpoint that arrived already quantized would say.
     quantized_reference_tokens: list[int] | None = None
     if args.quantize is not None:
-        _round_trip_weights(model, args.quantize)
+        _round_trip_weights(model, args.quantize, args.quantize_bits)
         quantized_reference_tokens = _reference_tokens(
             model,
             prompt,
@@ -320,6 +341,7 @@ def main() -> None:
         codegen_attention=args.codegen_attention,
         autotune=args.autotune,
         quantize=args.quantize,
+        quantize_bits=args.quantize_bits,
     )
     compile_seconds = time.perf_counter() - compile_start
 
@@ -487,6 +509,8 @@ def main() -> None:
         "generated_tokens_sha256": hashlib.sha256(
             np.asarray(generated, dtype=np.int32).tobytes()
         ).hexdigest(),
+        "quantize_group_size": args.quantize,
+        "quantize_bits": args.quantize_bits if args.quantize is not None else None,
         "reference_tokens": reference_tokens,
         "reference_tokens_match": (
             None if reference_tokens is None else generated == reference_tokens

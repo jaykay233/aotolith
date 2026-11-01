@@ -1,25 +1,34 @@
-"""Weight-only int4: the packed layout, the quantizer, and the unpack.
+"""Weight-only quantization: the packed layouts, the quantizers, the unpacks.
 
-A 4-bit weight is only worth carrying if the *format* is stated once, because
-three different pieces of code have to agree on it: the host code that packs a
-checkpoint, the MSL kernel that reads the words while streaming them, and the
-MLX fallback that unpacks them when no native kernel applies. So the layout is
-defined here, in one place, in terms of bit positions:
+Two widths are supported, 4 and 8 bits, and they differ only in how many codes
+one 32-bit word holds: eight nibbles, or four bytes. Everything else - the
+group scales, the symmetric rounding, the ``[out, in]`` orientation - is the
+same, so the two share the document below and the constants that describe it.
+
+A quantized weight is only worth carrying if the *format* is stated once,
+because three different pieces of code have to agree on it: the host code that
+packs a checkpoint, the MSL kernel that reads the words while streaming them,
+and the MLX fallback that unpacks them when no native kernel applies. So the
+layouts are defined here, in one place, in terms of bit positions:
 
 * A weight matrix is stored the way a ``Linear`` stores it: ``[out, in]``, so
   one *row* of the packed tensor is one output unit's weights.
 * The reduction axis is cut into groups of ``group_size`` elements. A group
-  shares one scale, which is what keeps 4 bits usable: the width of a group
-  follows the local range of the weights instead of the global one.
-* Quantization is symmetric and scaled by ``max|w| / 7``, so the largest
-  magnitude in a group lands exactly on ``+7`` (and ``-7``), and the value
-  ``-8`` is representable but never produced. Rounding to nearest.
-* Nibbles are packed eight to an ``int32`` word. Word ``j`` holds weights
-  ``8j .. 8j+7`` and weight ``8j + k`` sits in nibble ``k`` - nibble 0 in the
-  low four bits. That is little-endian byte order, so a word is exactly the
-  ``uchar4`` a kernel would load, read as one integer.
-* Values are two's complement: a nibble in ``8..15`` is a negative weight in
-  ``-8..-1``.
+  shares one scale, which is what keeps the narrower widths usable: the width
+  of a group follows the local range of the weights instead of the global one.
+* Quantization is symmetric and scaled by ``max|w| / magnitude``, where the
+  magnitude is ``7`` for four bits and ``127`` for eight, so the largest
+  magnitude in a group lands exactly on ``+magnitude`` (and ``-magnitude``).
+  The most negative code is representable but never produced. Rounding to
+  nearest.
+* Codes are packed little-endian into an ``int32`` word: eight nibbles for four
+  bits, four bytes for eight. Word ``j`` holds codes ``8j .. 8j+7`` (four bits)
+  or ``4j .. 4j+3`` (eight), code ``k`` inside the word sits at shift
+  ``4k`` or ``8k``. That makes a word exactly the ``uchar4`` a kernel loads
+  and reads as one integer.
+* Values are two's complement: a code at the top of its range is negative - a
+  nibble in ``8..15`` is a weight in ``-8..-1``, a byte in ``128..255`` one in
+  ``-128..-1``.
 
 The scales live beside the words, ``[out, in / group_size]``, in the model's
 compute dtype rather than float32: the 4-bit rounding error is three orders of
@@ -43,22 +52,36 @@ INT4_MAGNITUDE = 7
 #: Nibbles per packed word.
 NIBBLES_PER_WORD = 8
 
+#: The same three facts for eight bits. A group of int8 weights needs no
+#: unusual rounding to survive: 127 levels either side of zero is wider than
+#: most weights use, so at a group size that suits four bits the error is
+#: below the bf16 step and eight bits is effectively lossless.
+INT8_MIN = -128
+INT8_MAX = 127
+INT8_MAGNITUDE = 127
 
-def check_group_size(group_size: int, inner: int) -> int:
+#: Bytes per packed word. The two widths exist so that one word is one load.
+BYTES_PER_WORD = 4
+
+
+def check_group_size(group_size: int, inner: int, packed_width: int = NIBBLES_PER_WORD) -> int:
     """Validate one group size against a reduction length.
 
     A group has to divide the reduction (a partial group would need a scale
     that covers it and a kernel branch that reads it), and it has to be a
-    multiple of the eight weights one packed word spans (otherwise a group
-    boundary falls inside a word and the kernel cannot pick a scale from the
-    word index alone).
+    multiple of the codes one packed word spans (otherwise a group boundary
+    falls inside a word and the kernel cannot pick a scale from the word index
+    alone).
+
+    ``packed_width`` is the codes per word: eight for four bits, four for
+    eight. It defaults to eight so every existing caller keeps its meaning.
     """
 
     if group_size <= 0:
         raise ValueError(f"quantization group size must be positive, got {group_size}")
-    if group_size % NIBBLES_PER_WORD != 0:
+    if group_size % packed_width != 0:
         raise ValueError(
-            f"quantization group size must be a multiple of {NIBBLES_PER_WORD}, "
+            f"quantization group size must be a multiple of {packed_width}, "
             f"got {group_size}"
         )
     if inner % group_size != 0:
@@ -67,6 +90,46 @@ def check_group_size(group_size: int, inner: int) -> int:
             f"length {inner}"
         )
     return group_size
+
+
+def _quantize_codes(
+    weight: np.ndarray,
+    group_size: int,
+    packed_width: int,
+    lowest: int,
+    magnitude: int,
+    shift: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The quantizer both widths share: group scales, round, pack.
+
+    ``packed_width`` codes fit one word and each takes ``shift`` bits, so four
+    bits packs eight to a word and eight bits packs four. The two paths differ
+    in nothing else, which is why they are one function and not two.
+    """
+
+    matrix = np.asarray(weight, dtype=np.float32)
+    if matrix.ndim != 2:
+        raise ValueError(
+            f"quantization expects a 2-D weight, got {matrix.shape}"
+        )
+    rows, inner = matrix.shape
+    check_group_size(group_size, inner, packed_width)
+    groups = inner // group_size
+
+    blocks = matrix.reshape(rows, groups, group_size)
+    widest = np.abs(blocks).max(axis=-1)
+    # An all-zero group would divide by zero. Giving it unit scale keeps the
+    # arithmetic finite and still rounds every weight in it to zero.
+    scale = np.where(widest > 0.0, widest, 1.0) / magnitude
+    codes = np.clip(np.rint(blocks / scale[:, :, None]), lowest, magnitude)
+    codes = codes.astype(np.int32).reshape(rows, inner)
+
+    packed = np.zeros((rows, inner // packed_width), dtype=np.int32)
+    mask = (1 << shift) - 1
+    for position in range(packed_width):
+        field = (codes[:, position::packed_width] & mask).astype(np.int32)
+        packed |= field << (shift * position)
+    return packed, scale.astype(np.float32)
 
 
 def quantize_int4(
@@ -79,26 +142,34 @@ def quantize_int4(
     ``scales`` is ``float32 [out, in / group_size]``.
     """
 
-    matrix = np.asarray(weight, dtype=np.float32)
-    if matrix.ndim != 2:
-        raise ValueError(f"quantize_int4 expects a 2-D weight, got {matrix.shape}")
-    rows, inner = matrix.shape
-    check_group_size(group_size, inner)
-    groups = inner // group_size
+    return _quantize_codes(
+        weight,
+        group_size,
+        NIBBLES_PER_WORD,
+        INT4_MIN,
+        INT4_MAGNITUDE,
+        4,
+    )
 
-    blocks = matrix.reshape(rows, groups, group_size)
-    widest = np.abs(blocks).max(axis=-1)
-    # An all-zero group would divide by zero. Giving it unit scale keeps the
-    # arithmetic finite and still rounds every weight in it to zero.
-    scale = np.where(widest > 0.0, widest, 1.0) / INT4_MAGNITUDE
-    codes = np.clip(np.rint(blocks / scale[:, :, None]), INT4_MIN, INT4_MAX)
-    codes = codes.astype(np.int32).reshape(rows, inner)
 
-    packed = np.zeros((rows, inner // NIBBLES_PER_WORD), dtype=np.int32)
-    for nibble in range(NIBBLES_PER_WORD):
-        field = (codes[:, nibble::NIBBLES_PER_WORD] & 0xF).astype(np.int32)
-        packed |= field << (4 * nibble)
-    return packed, scale.astype(np.float32)
+def quantize_int8(
+    weight: np.ndarray,
+    group_size: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize a ``[out, in]`` weight to eight bits.
+
+    Returns ``(packed, scales)`` where ``packed`` is ``int32 [out, in / 4]`` and
+    ``scales`` is ``float32 [out, in / group_size]``.
+    """
+
+    return _quantize_codes(
+        weight,
+        group_size,
+        BYTES_PER_WORD,
+        INT8_MIN,
+        INT8_MAGNITUDE,
+        8,
+    )
 
 
 def unpack_codes(packed: np.ndarray) -> np.ndarray:
@@ -112,6 +183,20 @@ def unpack_codes(packed: np.ndarray) -> np.ndarray:
     for nibble in range(NIBBLES_PER_WORD):
         field = ((words >> (4 * nibble)) & 0xF).astype(np.int8)
         codes[:, nibble::NIBBLES_PER_WORD] = np.where(field >= 8, field - 16, field)
+    return codes
+
+
+def unpack_codes_int8(packed: np.ndarray) -> np.ndarray:
+    """Expand packed words back into signed 8-bit codes, ``[out, in]``."""
+
+    words = np.asarray(packed, dtype=np.int64)
+    rows, word_count = words.shape
+    codes = np.empty((rows, word_count * BYTES_PER_WORD), dtype=np.int8)
+    for byte in range(BYTES_PER_WORD):
+        field = ((words >> (8 * byte)) & 0xFF).astype(np.int8)
+        # ``astype(np.int8)`` already wrapped the unsigned byte into two's
+        # complement, so the sign is correct without a second correction.
+        codes[:, byte::BYTES_PER_WORD] = field
     return codes
 
 
@@ -145,5 +230,39 @@ def mx_dequantize_int4(
     for nibble in range(NIBBLES_PER_WORD):
         field = (words >> (4 * nibble)) & 0xF
         fields.append(mx.where(field >= 8, field - 16, field).astype(scales.dtype))
+    codes = mx.stack(fields, axis=-1).reshape(packed.shape[0], -1)
+    return codes * mx.repeat(scales, group_size, axis=-1)
+
+
+def dequantize_int8(
+    packed: np.ndarray,
+    scales: np.ndarray,
+    group_size: int,
+) -> np.ndarray:
+    """The float32 weights an eight-bit packed pair stands for."""
+
+    codes = unpack_codes_int8(packed)
+    return codes.astype(np.float32) * np.repeat(
+        np.asarray(scales, dtype=np.float32), group_size, axis=-1
+    )
+
+
+def mx_dequantize_int8(
+    packed: mx.array,
+    scales: mx.array,
+    group_size: int,
+) -> mx.array:
+    """The MLX unpack for eight-bit words, in the scales' dtype.
+
+    The byte is moved into the sign position and shifted back down with an
+    arithmetic shift, which is the same two-instruction sign extension the
+    kernel uses; masking and subtracting would be a third.
+    """
+
+    words = packed.astype(mx.int32)
+    fields = []
+    for byte in range(BYTES_PER_WORD):
+        field = (words >> (8 * byte)) & 0xFF
+        fields.append(mx.where(field >= 128, field - 256, field).astype(scales.dtype))
     codes = mx.stack(fields, axis=-1).reshape(packed.shape[0], -1)
     return codes * mx.repeat(scales, group_size, axis=-1)

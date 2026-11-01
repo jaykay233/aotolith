@@ -1,16 +1,17 @@
 """Fold a quantized weight into the matrix multiply that reads it.
 
-A quantized projection reaches the IR as two operators: ``dequantize_i4`` turns
-the packed words and group scales into a weight matrix, and the ``matmul`` right
-after it consumes that matrix. Run as written, the unpack materializes the whole
-weight - which is exactly the traffic the 4-bit format existed to avoid, and
-worse than leaving the model in bf16.
+A quantized projection reaches the IR as two operators: ``dequantize_i4`` or
+``dequantize_i8`` turns the packed words and group scales into a weight matrix,
+and the ``matmul`` right after it consumes that matrix. Run as written, the
+unpack materializes the whole weight - which is exactly the traffic the packed
+format existed to avoid, and worse than leaving the model in bf16.
 
 So this pass proves the unpack has one consumer and that the consumer is a
 matmul that wants the weight transposed (the shape ``Linear`` stores), then
 rewrites the pair into a single matmul whose weight operand is the *packed*
 tensor. The scales ride along in the slot right after it. Nothing is
-materialized, and the kernel that reads the result streams 4 bits per weight.
+materialized, and the kernel that reads the result streams four or eight bits
+per weight, which the fold records as ``weight_bits``.
 
 The rewrite is deliberately narrow: a weight with a second consumer stays an
 explicit unpack, because folding would then have to produce the matrix anyway.
@@ -24,6 +25,10 @@ from .graph import _consumers, _producers, _replace_graph
 
 #: Where each matmul spelling keeps its operands.
 _RIGHT_POSITION = {"matmul": 1, "addmm": 2}
+
+#: The unpacks this pass folds. Both widths fold the same way; only the width
+#: attribute the matmul carries afterwards differs.
+_UNPACK_OPS = {"dequantize_i4": 4, "dequantize_i8": 8}
 
 
 def _quantized_weight_positions(op: Operation) -> tuple[int, int] | None:
@@ -69,7 +74,7 @@ def fold_quantized_weights(graph: Graph) -> Graph:
         if unpack_index is None:
             continue
         unpack = graph.ops[unpack_index]
-        if unpack.op != "dequantize_i4":
+        if unpack.op not in _UNPACK_OPS:
             continue
         if consumers.get(unpacked) != [index]:
             # Another reader needs the matrix itself, so folding here would
@@ -83,6 +88,11 @@ def fold_quantized_weights(graph: Graph) -> Graph:
         attrs = dict(op.attrs)
         del attrs["transpose_b"]
         attrs["weight_group_size"] = int(unpack.attrs["group_size"])
+        # The width rides on the matmul because that is the operator the kernel
+        # is emitted for; the unpack it came from is gone by the time the
+        # backend looks. Four is the default, so writing it is only a
+        # convenience for eight-bit weights and a no-op for four.
+        attrs["weight_bits"] = _UNPACK_OPS[unpack.op]
         inputs = (
             op.inputs[:right_position]
             + (packed_id, scales_id)

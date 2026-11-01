@@ -278,8 +278,12 @@ class AppleMetalBackend(
                 )
             elif op.op == "arange":
                 compiled = self._compile_arange(graph, op, index)
-            elif op.op == "dequantize_i4":
-                compiled = self._compile_dequantize_i4(graph, op, index)
+            elif op.op in ("dequantize_i4", "dequantize_i8"):
+                compiled = (
+                    self._compile_dequantize_i4(graph, op, index)
+                    if op.op == "dequantize_i4"
+                    else self._compile_dequantize_i8(graph, op, index)
+                )
             elif (
                 op.op in _CONSTANT_POINTWISE_OPS
                 and graph.value(op.outputs[0]).type.dtype in _INTEGRAL_DTYPES

@@ -33,7 +33,7 @@ except errors.CompilationError:
 | `AOTO-2001` | `PlanInputError` | 调用的参数与 plan 签名不匹配 | 按 `plan.graph.inputs` 修调用：个数与 shape |
 | `AOTO-2002` | `IndexBoundsError` | index 会读到自己索引的张量之外 | 修 index，或确认无误后传 `verify_index_bounds=False` |
 | `AOTO-2003` | `PlanDTypeError` | 某个参数 dtype 不被 plan 接受 | cast 这个参数，或用那个 dtype 重编 |
-| `AOTO-2004` | `MemoryBudgetError` | 这组配置的内存放不进给定的预算 | 缩短序列、用 `quantize=4` 编，或提高预算 |
+| `AOTO-2004` | `MemoryBudgetError` | 这组配置的内存放不进给定的预算 | 缩短序列、用更小的 `quantize=<group size>` 编，或提高预算 |
 | `AOTO-2005` | `BucketRangeError` | 请求比最宽的桶还长 | 编译更宽的桶，或拆分请求；运行期不会重编译 |
 | `AOTO-3001` | `DeviceError` | plan 有效，但这台机器跑不了 | 换受支持的 Apple GPU，或离开屏蔽 Metal 的沙箱 |
 | `AOTO-4001` | `ArtifactError` | 产物损坏或结构不合法 | 重新编译，或恢复文件 |

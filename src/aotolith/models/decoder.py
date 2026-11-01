@@ -54,7 +54,7 @@ from ..errors import (
 from ..ir import TensorType
 from ..planning import tensor_nbytes
 from ..runtime.plan import MEMORY_POLICIES
-from .quantized import dequantize_i4, pack_weight
+from .quantized import dequantize_i4, dequantize_i8, pack_weight, pack_weight_int8
 
 # Probe points for the activation pre-flight check below. They span the range
 # where activations differ, including a negative input, where SiLU is not
@@ -289,6 +289,7 @@ class _DecoderBase(torch.nn.Module):
         *,
         cache_capacity: int,
         group_size: int | None = None,
+        weight_bits: int = 4,
         require: str | None = None,
     ) -> None:
         super().__init__()
@@ -308,6 +309,7 @@ class _DecoderBase(torch.nn.Module):
 
         self.cache_capacity = cache_capacity
         self.group_size = group_size
+        self.weight_bits = weight_bits
         self.hidden_size = int(config.hidden_size)
         self.num_layers = int(config.num_hidden_layers)
         self.num_heads = int(config.num_attention_heads)
@@ -614,7 +616,7 @@ class DecoderDecodeModule(_DecoderBase):
 
 
 class _QuantizedProjections:
-    """Weight-only int4 projections for the static-cache adapters.
+    """Weight-only packed projections for the static-cache adapters.
 
     This is a mixin rather than a second adapter: the forward pass is identical,
     and only three hooks change - where a projection's operand comes from, where
@@ -632,6 +634,9 @@ class _QuantizedProjections:
     #: The projections packed per decoder layer, plus the two whole-model ones.
     _PACKED_PROJECTIONS = ("qkv", "o_proj", "gate_proj", "up_proj", "down_proj")
 
+    #: The packed width this adapter installs: four or eight bits.
+    weight_bits: int = 4
+
     def _install(self, model: torch.nn.Module) -> None:
         if self.group_size is None:
             raise IRValidationError(  # pragma: no cover - set by the factory
@@ -643,8 +648,10 @@ class _QuantizedProjections:
         def register(name: str, tensor: torch.Tensor) -> None:
             self.register_buffer(name, tensor.detach(), persistent=False)
 
+        packer = pack_weight if self.weight_bits == 4 else pack_weight_int8
+
         def pack(name: str, weight: torch.Tensor) -> None:
-            packed, scales = pack_weight(weight, self.group_size)
+            packed, scales = packer(weight, self.group_size)
             self.register_buffer(f"{name}_packed", packed, persistent=False)
             self.register_buffer(
                 f"{name}_scales", scales.to(dtype).contiguous(), persistent=False
@@ -680,7 +687,7 @@ class _QuantizedProjections:
                     # The quantized plan holds only the q/k/v bias; any other one
                     # would be dropped, and the output would quietly drift.
                     raise UnsupportedModelError(
-                        f"int4 compilation cannot pack the {name} bias of the "
+                        f"packed compilation cannot pack the {name} bias of the "
                         f"{self.family.label} adapter",
                         hint=(
                             "the quantized plan holds only the packed q/k/v "
@@ -691,16 +698,18 @@ class _QuantizedProjections:
                 pack(f"{name}_{index}", projection.weight)
 
     def _weight(self, name: str, layer_index: int) -> torch.Tensor:
-        """The projection's weight, unpacked from the 4-bit words.
+        """The projection's weight, unpacked from the packed words.
 
         This is where the compiler's fold happens: every call here is one
-        ``dequantize_i4`` node feeding one matmul, and the pass rewrites the
-        pair so the kernel streams the words instead of this matrix.
+        ``dequantize_i4`` or ``dequantize_i8`` node feeding one matmul, and the
+        pass rewrites the pair so the kernel streams the words instead of this
+        matrix.
         """
 
         packed = self.get_buffer(f"{name}_{layer_index}_packed")
         scales = self.get_buffer(f"{name}_{layer_index}_scales")
-        return dequantize_i4(packed, scales, self.group_size)
+        unpack = dequantize_i4 if self.weight_bits == 4 else dequantize_i8
+        return unpack(packed, scales, self.group_size)
 
     def _bias(self, name: str, layer_index: int) -> torch.Tensor | None:
         if name == "qkv":
@@ -721,11 +730,11 @@ class _QuantizedProjections:
 
 
 class QuantizedDecoderPrefillModule(_QuantizedProjections, DecoderPrefillModule):
-    """Int4 prefill: the dense prompt pass with packed projection weights."""
+    """Packed prefill: the dense prompt pass with quantized projection weights."""
 
 
 class QuantizedDecoderDecodeModule(_QuantizedProjections, DecoderDecodeModule):
-    """Int4 decode: the dense token step with packed projection weights."""
+    """Packed decode: the dense token step with quantized projection weights."""
 
 
 #: Which adapter classes a bucket compiles. The int4 pair is the same two
@@ -1087,6 +1096,7 @@ def compile_decoder_static_cache(
     codegen_attention: bool = False,
     autotune: bool = False,
     quantize: int | None = None,
+    quantize_bits: int = 4,
     family: str | None = None,
     target: str = "apple-metal",
     memory: str = "latency",
@@ -1128,6 +1138,7 @@ def compile_decoder_static_cache(
         codegen_attention=codegen_attention,
         autotune=autotune,
         quantize=quantize,
+        quantize_bits=quantize_bits,
         family=family,
         target=target,
         memory=memory,
@@ -1143,6 +1154,7 @@ def _compile_bucket(
     codegen_attention: bool = False,
     autotune: bool = False,
     quantize: int | None = None,
+    quantize_bits: int = 4,
     family: str | None = None,
     target: str = "apple-metal",
     memory: str = "latency",
@@ -1191,11 +1203,20 @@ def _compile_bucket(
     # for codegen there would be rejected by the backend.
     if quantize is not None and target == "apple-metal":
         codegen_matmul = True
+    _check_quantize_bits(quantize, quantize_bits)
     prefill_module = prefill_type(
-        model, cache_capacity=cache_capacity, group_size=quantize, require=family
+        model,
+        cache_capacity=cache_capacity,
+        group_size=quantize,
+        weight_bits=quantize_bits,
+        require=family,
     ).eval()
     decode_module = decode_type(
-        model, cache_capacity=cache_capacity, group_size=quantize, require=family
+        model,
+        cache_capacity=cache_capacity,
+        group_size=quantize,
+        weight_bits=quantize_bits,
+        require=family,
     ).eval()
     example_ids = torch.zeros((1, prompt_length), dtype=torch.int64)
     example_positions = torch.arange(prompt_length, dtype=torch.int64)[None, :]
@@ -1382,6 +1403,27 @@ class DecoderBucketedRuntime:
         return tuple(saved)
 
 
+def _check_quantize_bits(quantize: int | None, quantize_bits: int) -> None:
+    """Reject a width the packed path has no kernel for, before packing.
+
+    ``quantize`` is the group size, and ``quantize_bits`` the width, because the
+    two are independent knobs: eight bits wants a group the four-bit default
+    also satisfies, but a caller asking for, say, 12 bits should hear about it
+    here rather than from a kernel that decodes the wrong number of codes.
+    """
+
+    if quantize_bits not in (4, 8):
+        raise CompilationError(
+            f"quantize_bits must be 4 or 8, got {quantize_bits!r}",
+            hint="four bits packs eight codes a word, eight bits packs four",
+        )
+    if quantize is None and quantize_bits != 4:
+        raise CompilationError(
+            "quantize_bits is only meaningful with quantize=<group size>",
+            hint="pass quantize=64 (or another group size) to pack eight-bit weights",
+        )
+
+
 def compile_decoder_bucketed(
     model: torch.nn.Module,
     *,
@@ -1391,6 +1433,7 @@ def compile_decoder_bucketed(
     codegen_attention: bool = False,
     autotune: bool = False,
     quantize: int | None = None,
+    quantize_bits: int = 4,
     family: str | None = None,
     target: str = "apple-metal",
 ) -> DecoderBucketedRuntime:
@@ -1429,6 +1472,7 @@ def compile_decoder_bucketed(
             codegen_attention=codegen_attention,
             autotune=autotune,
             quantize=quantize,
+            quantize_bits=quantize_bits,
             family=family,
             target=target,
         )

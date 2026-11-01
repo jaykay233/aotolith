@@ -9,6 +9,45 @@ The policy that decides what counts as a breaking change lives in
 
 ## [Unreleased]
 
+### Added
+
+- **Weight-only eight-bit quantization, alongside the existing four bits.**
+  Both widths are the same format with one parameter changed: a group of
+  `group_size` weights shares a scale, quantization is symmetric and rounds to
+  the nearest code scaled by `max|w| / magnitude` (7 for four bits, 127 for
+  eight), and codes pack little-endian into `int32` words - eight nibbles to a
+  word at four bits, four bytes at eight, so one word stays one load. The packed
+  GEMV, the streaming unpack and the folding pass are shared; only the decode
+  differs, and at eight bits it is cheaper per code because a byte sign-extends
+  in two instructions where a nibble needs three.
+
+  Selected with `quantize_bits=8` next to the existing `quantize=<group size>`,
+  which keeps every existing call meaning four bits. Measured on
+  Qwen2.5-0.5B-Instruct, 128-token prompt, 64 decode steps, timed interleaved
+  against `mlx_lm` on the same machine and prompt:
+
+  | weights | aotolith | `mlx_lm` | ratio |
+  | --- | --- | --- | --- |
+  | bf16 | 232.8 tok/s | 226.6 tok/s | 1.027x |
+  | int4, group 64 | 394.8 tok/s | 292.9 tok/s | 1.348x |
+  | int8, group 64 | 348.6 tok/s | 291.4 tok/s | 1.196x |
+
+  Eight bits is slower than four because a decode step is still host-bound
+  (2.92 ms of host against a decode at 3.49 ms), so the extra 250 MB of weight
+  traffic is nearly free - the kernel's own share moved from 0.53 to 0.57 ms -
+  while the loop body reads twice the words. What it buys is precision:
+  quantizing the same weights leaves 0.63% mean relative error against 11.5% at
+  four bits, and an eight-bit plan reproduced the bf16 checkpoint's greedy
+  choices for all 64 steps of a benchmark prompt.
+
+  The four-bit path is unchanged: same packed layout, same kernel names, same
+  tokens, and `weight_bits` defaults to 4 so a graph folded by an older release
+  still lowers to the kernel it always used.
+
+- **`--quantize-bits {4,8}`** on `examples/qwen_static_cache_benchmark.py`, and
+  `quantize_group_size` / `quantize_bits` in its JSON, so a result says which
+  width produced it.
+
 ### Changed
 
 - **The unrolled runner is now handed to `mx.compile` for the policies that do

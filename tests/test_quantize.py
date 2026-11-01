@@ -26,9 +26,13 @@ import torch
 from aotolith.quantize import (
     check_group_size,
     dequantize_int4,
+    dequantize_int8,
     mx_dequantize_int4,
+    mx_dequantize_int8,
     quantize_int4,
+    quantize_int8,
     unpack_codes,
+    unpack_codes_int8,
 )
 
 
@@ -161,3 +165,102 @@ def test_pack_weight_keeps_a_bfloat16_weights_dtype() -> None:
     # only be rounded back down.
     assert scales.dtype == torch.bfloat16
     assert packed.dtype == torch.int32
+
+
+# --- eight bits ---------------------------------------------------------------
+
+
+def test_int8_packs_four_codes_to_a_word() -> None:
+    weight = _weight(8, 32)
+    packed, _ = quantize_int8(weight, 32)
+    assert packed.dtype == np.int32
+    assert packed.shape == (8, 8)
+    # Eight bits is one byte per weight, so a word covers four of them: exactly
+    # twice the packed size of the four-bit form and a quarter of the source.
+    assert packed.nbytes * 4 == weight.nbytes
+
+
+def test_int8_unpack_round_trips_the_codes_exactly() -> None:
+    weight = _weight(16, 64, seed=1)
+    packed, _ = quantize_int8(weight, 64)
+    codes = unpack_codes_int8(packed)
+    assert codes.shape == weight.shape
+    assert codes.dtype == np.int8
+    assert int(codes.min()) >= -128
+    assert int(codes.max()) <= 127
+    np.testing.assert_array_equal(codes, unpack_codes_int8(packed))
+
+
+def test_bytes_are_ordered_low_to_high_across_a_word() -> None:
+    # Four distinct codes, including both extremes, so a reversed byte order or
+    # an unsigned decode shows up as a permutation or a large positive value.
+    codes = np.array([[-128, -1, 0, 127]], dtype=np.int8)
+    word = 0
+    for position, code in enumerate(codes[0]):
+        word |= (int(code) & 0xFF) << (8 * position)
+    packed = np.array([[word - (1 << 32) if word >= 1 << 31 else word]], dtype=np.int32)
+    np.testing.assert_array_equal(unpack_codes_int8(packed), codes)
+
+
+def test_int8_error_is_far_below_four_bits() -> None:
+    # The whole point of the second width: 127 levels either side of zero leave
+    # a residual about 127/7 times smaller than the four-bit one on the same
+    # weights, because both round to nearest within a step of scale/2.
+    weight = _weight(32, 128, seed=4)
+    coarse = dequantize_int4(*quantize_int4(weight, 32), 32)
+    fine = dequantize_int8(*quantize_int8(weight, 32), 32)
+    coarse_error = float(np.abs(coarse - weight).max())
+    fine_error = float(np.abs(fine - weight).max())
+    assert fine_error < coarse_error / 15
+
+
+def test_int8_scale_is_the_group_magnitude_over_127() -> None:
+    weight = _weight(2, 64, seed=3)
+    weight[0, :32] *= 7.0
+    _, scales = quantize_int8(weight, 32)
+    assert scales.shape == (2, 2)
+    np.testing.assert_allclose(scales[0, 0], np.abs(weight[0, :32]).max() / 127.0)
+    np.testing.assert_allclose(scales[0, 1], np.abs(weight[0, 32:]).max() / 127.0)
+
+
+def test_int8_dequantize_matches_the_pack_then_scale_product() -> None:
+    weight = _weight(4, 32, seed=2)
+    packed, scales = quantize_int8(weight, 16)
+    actual = dequantize_int8(packed, scales, 16)
+    expected = unpack_codes_int8(packed).astype(np.float32) * np.repeat(
+        scales, 16, axis=1
+    )
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+
+def test_mx_dequantize_int8_matches_the_reference() -> None:
+    weight = _weight(6, 32, seed=5)
+    packed, scales = quantize_int8(weight, 8)
+    actual = mx_dequantize_int8(mx.array(packed), mx.array(scales), 8)
+    mx.eval(actual)
+    np.testing.assert_allclose(
+        np.asarray(actual), dequantize_int8(packed, scales, 8), atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("group_size", [0, -4, 2, 6])
+def test_int8_rejects_group_sizes_that_do_not_cover_whole_words(
+    group_size: int,
+) -> None:
+    with pytest.raises(ValueError):
+        check_group_size(group_size, 32, 4)
+
+
+def test_torch_reference_agrees_with_the_numpy_int8_pack() -> None:
+    from aotolith.models.quantized import dequantize_i8, pack_weight_int8
+
+    weight = torch.from_numpy(_weight(4, 32, seed=6))
+    packed, scales = pack_weight_int8(weight, 16)
+    assert packed.dtype == torch.int32
+    assert packed.shape == (4, 8)
+    restored = dequantize_i8(packed, scales, 16)
+    np.testing.assert_allclose(
+        restored.numpy(),
+        dequantize_int8(packed.numpy(), scales.numpy(), 16),
+        atol=1e-6,
+    )
