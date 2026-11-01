@@ -33,6 +33,10 @@ LAYERS: dict[str, int] = {
     "ir.types": 0,
     "selection": 0,
     "_version": 0,
+    # The error contract and the logger: no intra-package imports at all, so
+    # every layer above may use them without learning about any other layer.
+    "errors": 0,
+    "_log": 0,
     # The int4 weight format: bit layout, packing, unpacking. NumPy and MLX
     # only, and every consumer - the packer, the kernel, the fallback - has to
     # read the same definition, so it sits as low as the primitives it is
@@ -133,10 +137,18 @@ LAYERS: dict[str, int] = {
     "artifact": 11,
     # Sequencing the whole pipeline.
     "compiler": 11,
-    # Entry points.
-    "cli": 12,
+    # A set of plans, dispatched by shape: it composes the pipeline, so it sits
+    # above the compiler and below the callers that offer the set to a user.
+    "buckets": 12,
+    # The decoder adapter: one shared graph for every supported family, built
+    # on the bucket set and the compiler.
+    "models.decoder": 13,
+    # Entry points. The family modules pin a family and are otherwise aliases,
+    # so they sit above the shared adapter and level with the CLI.
+    "cli": 14,
     "models.quantized": 11,
-    "models.qwen2": 12,
+    "models.qwen2": 14,
+    "models.llama": 14,
 }
 
 MODULE_PATHS = {
@@ -158,6 +170,8 @@ MODULE_PATHS = {
     "ir.ops.table": "ir/ops/table.py",
     "selection": "selection.py",
     "_version": "_version.py",
+    "errors": "errors.py",
+    "_log": "_log.py",
     "planning": "planning.py",
     "quantize": "quantize.py",
     "passes": "passes/__init__.py",
@@ -219,9 +233,12 @@ MODULE_PATHS = {
     "backends.apple": "backends/apple.py",
     "artifact": "artifact.py",
     "compiler": "compiler.py",
+    "buckets": "buckets.py",
     "cli": "cli.py",
     "models.quantized": "models/quantized.py",
+    "models.decoder": "models/decoder.py",
     "models.qwen2": "models/qwen2.py",
+    "models.llama": "models/llama.py",
 }
 
 

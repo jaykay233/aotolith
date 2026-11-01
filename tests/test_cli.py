@@ -211,3 +211,158 @@ def test_cli_rejects_a_keyword_input_without_a_plan_slot(tmp_path: Path) -> None
     )
     assert result.returncode != 0
     assert "unexpected keyword inputs: mask" in result.stderr
+
+
+def test_cli_reports_a_missing_artifact_with_its_code(tmp_path: Path) -> None:
+    """A failure a user is meant to read carries the code they can quote.
+
+    The traceback used to escape `main`, because `ArtifactError` is a
+    `RuntimeError` and the handler only caught the builtins. That is a
+    regression this asserts against, not just the formatting.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-m", "aotolith", "inspect", str(tmp_path / "gone.aoto")],
+        cwd=_ROOT,
+        env=_cli_environment(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "[AOTO-4001]" in result.stderr
+    assert "not found" in result.stderr
+
+
+def test_cli_reports_an_incompatible_artifact_with_its_code(tmp_path: Path) -> None:
+    artifact = tmp_path / "tiny.aoto"
+    _run_cli(
+        "compile",
+        "--module",
+        "cli_fixture:TinyCliModule",
+        "--input",
+        json.dumps(_input_spec()),
+        "--output",
+        str(artifact),
+    )
+    damaged = tmp_path / "damaged.aoto"
+    damaged.write_bytes(b"not a zip file")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "aotolith", "inspect", str(damaged)],
+        cwd=_ROOT,
+        env=_cli_environment(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "[AOTO-4001]" in result.stderr
+
+
+def test_cli_compiles_a_bucket_set_and_runs_it_by_shape(tmp_path: Path) -> None:
+    """The bucket index is the artifact: a request of any width up to the
+    largest bucket is dispatched without the caller naming one.
+    """
+
+    index = tmp_path / "buckets" / "tiny.buckets.json"
+    index.parent.mkdir()
+    spec = {"shape": [1, 3], "dtype": "float32", "data": [[1.0, 2.0, -1.0]]}
+
+    compiled = _run_cli(
+        "compile",
+        "--module",
+        "cli_fixture:TinyCliModule",
+        "--input",
+        json.dumps(spec),
+        "--output",
+        str(tmp_path / "buckets" / "tiny.aoto"),
+        "--bucket-sizes",
+        "1,2,4",
+    )
+    summary = json.loads(compiled.stdout)
+    assert summary["widths"] == [1, 2, 4]
+    assert summary["pad"] == "tile"
+    assert [entry["width"] for entry in summary["per_bucket"]] == [1, 2, 4]
+    assert index.exists()
+
+    inspected = json.loads(_run_cli("inspect", str(index)).stdout)
+    assert inspected["entrypoint"] == "bucketed"
+    assert inspected["buckets"] == 3
+
+    verified = json.loads(_run_cli("verify", str(index)).stdout)
+    assert verified["verified"] is True
+
+    # A width no bucket was compiled for: served by the smallest one that fits.
+    request = {
+        "shape": [3, 3],
+        "dtype": "float32",
+        "data": [[1.0, 2.0, -1.0], [0.5, -1.0, 3.0], [2.0, 0.0, 1.0]],
+    }
+    outputs = json.loads(
+        _run_cli("run", str(index), "--input", json.dumps(request)).stdout
+    )
+    assert outputs[0]["shape"] == [3, 2]
+    expected = TinyCliModule()(torch.tensor(request["data"]))
+    assert outputs[0]["data"] == expected.reshape(-1).tolist()
+
+
+def test_cli_refuses_a_bucketed_request_wider_than_every_bucket(
+    tmp_path: Path,
+) -> None:
+    index = tmp_path / "tiny.buckets.json"
+    _run_cli(
+        "compile",
+        "--module",
+        "cli_fixture:TinyCliModule",
+        "--input",
+        json.dumps({"shape": [1, 3], "dtype": "float32", "data": [[1.0, 2.0, -1.0]]}),
+        "--output",
+        str(tmp_path / "tiny.aoto"),
+        "--bucket-sizes",
+        "1,2",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aotolith",
+            "run",
+            str(index),
+            "--input",
+            json.dumps({"shape": [3, 3], "dtype": "float32", "data": [[0.0] * 3] * 3}),
+        ],
+        cwd=_ROOT,
+        env=_cli_environment(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "[AOTO-2005]" in result.stderr
+    assert "exceeds the largest bucket" in result.stderr
+
+
+def test_cli_refuses_bucket_sizes_it_cannot_use(tmp_path: Path) -> None:
+    for sizes, message in (("4,1", "strictly increasing"), ("1,,4", "empty entry")):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aotolith",
+                "compile",
+                "--module",
+                "cli_fixture:TinyCliModule",
+                "--input",
+                json.dumps({"shape": [1, 3], "dtype": "float32", "data": [[1.0, 2.0, -1.0]]}),
+                "--output",
+                str(tmp_path / "tiny.aoto"),
+                "--bucket-sizes",
+                sizes,
+            ],
+            cwd=_ROOT,
+            env=_cli_environment(),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1, sizes
+        assert message in result.stderr, (sizes, result.stderr)

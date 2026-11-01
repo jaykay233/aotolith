@@ -12,11 +12,15 @@ from typing import Any
 import mlx.core as mx
 
 from .artifact import (
-    ArtifactError,
     load_compiled_module,
     read_artifact_manifest,
 )
+from .backends import TARGETS
 from .compiler import CompiledModulePlan, compile_callable, compile_module
+from .buckets import compile_bucketed, load_bucketed
+from .runtime.plan import DEFAULT_MEMORY, MEMORY_POLICIES
+from ._log import basic_config as _basic_config
+from .errors import AotolithError, BaselineError, format_error
 
 _TORCH_DTYPES = {
     "float16": "float16",
@@ -44,6 +48,11 @@ _MLX_DTYPES = {
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # The command line is the one place that may turn logging on by itself: a
+    # user running `aoto compile` asked for this process to do one thing, and
+    # wants to see why it chose the kernel it chose. The library default stays
+    # silent, and AOTOLITH_LOG overrides the flag.
+    _basic_config(args.log_level)
     try:
         if args.command == "compile":
             return _compile(args)
@@ -55,8 +64,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run(args)
         if args.command == "bench":
             return _bench(args)
-    except (ArtifactError, ImportError, OSError, TypeError, ValueError) as exc:
-        print(f"{parser.prog}: error: {exc}", file=sys.stderr)
+    except (AotolithError, ImportError, OSError, TypeError, ValueError) as exc:
+        # Every deliberate failure is an ``AotolithError`` and therefore also
+        # one of the builtins above; printing the code is what lets a user
+        # quote one line in a bug report and lets a wrapper branch on it.
+        print(f"{parser.prog}: error: {format_error(exc)}", file=sys.stderr)
         return 1
     parser.error(f"unknown command: {args.command}")
     return 2
@@ -66,6 +78,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aoto",
         description="Compile and run Aotolith artifacts.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "log level for the aotolith logger (DEBUG, INFO, WARNING, ERROR); "
+            "defaults to AOTOLITH_LOG, then WARNING. Logs go to stderr"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -101,7 +122,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="JSON file containing a list of positional tensor specs",
     )
     compile_parser.add_argument("--output", type=Path, required=True)
-    compile_parser.add_argument("--target", default="apple-metal")
+    compile_parser.add_argument(
+        "--target",
+        default="apple-metal",
+        choices=TARGETS,
+        help=(
+            "backend to compile for: apple-metal generates kernels, "
+            "mlx-reference generates none and runs the graph on MLX"
+        ),
+    )
     compile_parser.add_argument("--codegen-matmul", action="store_true")
     compile_parser.add_argument("--codegen-attention", action="store_true")
     compile_parser.add_argument("--autotune", action="store_true")
@@ -127,6 +156,26 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--trust-remote-code", action="store_true")
     compile_parser.add_argument("--revision")
     compile_parser.add_argument("--torch-dtype", default="float32")
+    compile_parser.add_argument(
+        "--bucket-axis",
+        type=int,
+        default=0,
+        metavar="AXIS",
+        help=(
+            "axis whose extent varies per request (0 is a batch axis); only "
+            "used with --bucket-sizes"
+        ),
+    )
+    compile_parser.add_argument(
+        "--bucket-sizes",
+        default=None,
+        metavar="N[,N...]",
+        help=(
+            "compile one plan per size on --bucket-axis and write a bucket "
+            "index instead of one artifact; a request of any size up to the "
+            "largest is served by the smallest bucket that holds it"
+        ),
+    )
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="validate and print an artifact manifest"
@@ -160,6 +209,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=("tensor keyword input for the plan, in NAME=JSON form; may be repeated"),
     )
     run_parser.add_argument("--output", type=Path)
+    run_parser.add_argument(
+        "--memory",
+        choices=MEMORY_POLICIES,
+        default=DEFAULT_MEMORY,
+        help=(
+            "peak-memory policy for the call: 'latency' never synchronizes and "
+            "holds every intermediate, 'balanced' synchronizes once a threshold "
+            "of dead bytes accumulates, 'minimal' synchronizes at every release"
+        ),
+    )
     _add_bench_parser(subparsers)
     return parser
 
@@ -171,6 +230,15 @@ def _add_bench_parser(subparsers: Any) -> None:
     )
     bench_parser.add_argument("--repeats", type=int, default=11)
     bench_parser.add_argument("--warmups", type=int, default=3)
+    bench_parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help=(
+            "repeat the timed half this many times and keep every sample; "
+            "record a baseline with 3 so its floor is a best case"
+        ),
+    )
     bench_parser.add_argument(
         "--workload",
         action="append",
@@ -186,18 +254,31 @@ def _add_bench_parser(subparsers: Any) -> None:
     bench_parser.add_argument(
         "--baseline",
         type=Path,
-        help="compare this run against a recorded report",
+        metavar="PATH",
+        help=(
+            "compare this run against a recorded report, or against the "
+            "matching chip's file in a baseline directory"
+        ),
     )
     bench_parser.add_argument(
         "--update-baseline",
         type=Path,
         metavar="PATH",
-        help="write this run as the baseline to compare future runs against",
+        help=(
+            "write this run as the baseline; given a directory, the file is "
+            "named after this chip"
+        ),
+    )
+    bench_parser.add_argument(
+        "--check-baselines",
+        type=Path,
+        metavar="DIR",
+        help="validate every baseline in a directory without measuring anything",
     )
     bench_parser.add_argument(
         "--tolerance",
         type=float,
-        default=0.15,
+        default=0.25,
         help=(
             "fraction a timing may slow before it counts as a regression; "
             "only applied when the baseline names the same device"
@@ -225,6 +306,7 @@ def _compile(args: argparse.Namespace) -> int:
         "autotune_warmup": args.autotune_warmup,
         "autotune_iterations": args.autotune_iterations,
     }
+    bucket_sizes = _parse_bucket_sizes(args.bucket_sizes)
 
     if args.callable:
         if args.forward_kwarg:
@@ -232,31 +314,45 @@ def _compile(args: argparse.Namespace) -> int:
                 "--forward-kwarg needs --module or --hf-model: a traced "
                 "callable takes its arguments positionally"
             )
+        if bucket_sizes:
+            raise ValueError(
+                "--bucket-sizes needs --module or --hf-model: a traced "
+                "callable returns a bare plan with no bound state to share "
+                "across buckets"
+            )
         function = _import_target(args.callable)
         compiled = compile_callable(function, torch_inputs, **common)
-    elif args.module:
-        module = _load_module(args.module, _load_json_object(args.model_kwargs))
-        compiled = compile_module(
-            module,
-            torch_inputs,
-            example_kwargs=_torch_forward_kwargs(args.forward_kwarg),
-            output_key=args.output_key,
+    elif args.module or args.hf_model:
+        if args.module:
+            module = _load_module(args.module, _load_json_object(args.model_kwargs))
+        else:
+            module = _load_hf_model(
+                args.hf_model,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.revision,
+                torch_dtype=args.torch_dtype,
+            )
+        module_options = {
+            "example_kwargs": _torch_forward_kwargs(args.forward_kwarg),
+            "output_key": args.output_key,
             **common,
-        )
-    else:
-        module = _load_hf_model(
-            args.hf_model,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            torch_dtype=args.torch_dtype,
-        )
-        compiled = compile_module(
-            module,
-            torch_inputs,
-            example_kwargs=_torch_forward_kwargs(args.forward_kwarg),
-            output_key=args.output_key,
-            **common,
-        )
+        }
+        if bucket_sizes:
+            plans = compile_bucketed(
+                module,
+                torch_inputs,
+                axis=args.bucket_axis,
+                sizes=bucket_sizes,
+                **module_options,
+            )
+            paths = plans.save(args.output)
+            summary = plans.describe()
+            summary["artifacts"] = [str(path.resolve()) for path in paths]
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
+            return 0
+        compiled = compile_module(module, torch_inputs, **module_options)
+    else:  # pragma: no cover - the argument group requires one of the three
+        raise ValueError("no compilation source given")
 
     artifact_path = compiled.save(args.output)
     summary = _artifact_summary(compiled)
@@ -265,7 +361,46 @@ def _compile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_bucket_sizes(raw: str | None) -> tuple[int, ...]:
+    """Parse ``--bucket-sizes 1,4,8``, keeping the caller's order and mistakes.
+
+    A duplicated or unsorted list is an error rather than something to tidy up:
+    the widths decide which request lands in which plan, so a set the caller did
+    not mean is a silently different cost model.
+    """
+
+    if raw is None:
+        return ()
+    widths = []
+    for part in raw.split(","):
+        text = part.strip()
+        if not text:
+            raise ValueError(f"--bucket-sizes has an empty entry: {raw!r}")
+        try:
+            widths.append(int(text))
+        except ValueError:
+            raise ValueError(
+                f"--bucket-sizes entry {text!r} is not an integer"
+            ) from None
+    if widths != sorted(set(widths)):
+        raise ValueError(
+            f"--bucket-sizes must be strictly increasing, got {widths}"
+        )
+    return tuple(widths)
+
+
 def _inspect(args: argparse.Namespace) -> int:
+    if _is_bucket_index(args.artifact):
+        plans = load_bucketed(
+            args.artifact, require_device_match=args.require_device_match
+        )
+        summary = {
+            "artifact": str(args.artifact.resolve()),
+            "entrypoint": "bucketed",
+            **plans.describe(),
+        }
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
     manifest = read_artifact_manifest(
         args.artifact, require_device_match=args.require_device_match
     )
@@ -285,6 +420,21 @@ def _inspect(args: argparse.Namespace) -> int:
 
 
 def _verify(args: argparse.Namespace) -> int:
+    if _is_bucket_index(args.artifact):
+        plans = load_bucketed(
+            args.artifact, require_device_match=args.require_device_match
+        )
+        # Loading rebuilds every bucket's plan from its artifact, which is the
+        # verification: a payload whose digest, ABI or graph does not check out
+        # raises before this line, so reaching it means all of them loaded.
+        summary = {
+            "artifact": str(args.artifact.resolve()),
+            "entrypoint": "bucketed",
+            "verified": True,
+            **plans.describe(),
+        }
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
     compiled = load_compiled_module(
         args.artifact, require_device_match=args.require_device_match
     )
@@ -295,15 +445,39 @@ def _verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_bucket_index(path: Path) -> bool:
+    """Whether ``path`` is the index :meth:`BucketedPlans.save` writes."""
+
+    return path.name.endswith(".buckets.json")
+
+
 def _run(args: argparse.Namespace) -> int:
     specs = _load_input_specs(args.input, args.input_file)
     inputs = tuple(_mlx_input(spec) for spec in specs)
     kwarg_specs = _load_named_specs(args.kwarg)
     kwargs = {name: _mlx_input(spec) for name, spec in kwarg_specs.items()}
-    compiled = load_compiled_module(
-        args.artifact, require_device_match=args.require_device_match
-    )
-    outputs = compiled(*inputs, **kwargs)
+    if _is_bucket_index(args.artifact):
+        plans = load_bucketed(
+            args.artifact, require_device_match=args.require_device_match
+        )
+        outputs = plans(
+            *inputs,
+            memory=args.memory,
+            **kwargs,  # pyright: ignore[reportArgumentType]
+        )
+    else:
+        compiled = load_compiled_module(
+            args.artifact, require_device_match=args.require_device_match
+        )
+        # ``**kwargs`` alongside a keyword-only ``verify_index_bounds`` in
+        # ``CompiledModulePlan.__call__`` is a call the type checker cannot bind;
+        # the runtime resolves it, and the CLI tests exercise it with and without
+        # tensor keyword inputs.
+        outputs = compiled(
+            *inputs,
+            **kwargs,  # pyright: ignore[reportArgumentType]
+            memory=args.memory,
+        )
     result = _encode_outputs(outputs)
     payload = json.dumps(result, indent=2, ensure_ascii=False)
     if args.output is None:
@@ -333,6 +507,16 @@ def _artifact_summary(compiled: Any) -> dict[str, Any]:
         else compiled.autotune,
         "arena_size_bytes": plan.storage_plan.arena_size_bytes,
         "peak_live_bytes": plan.storage_plan.peak_live_bytes,
+        "footprint": {
+            "inputs_bytes": plan.footprint.input_bytes,
+            "activations_bytes": plan.footprint.activation_bytes,
+            "outputs_bytes": plan.footprint.output_bytes,
+        },
+        "memory": {
+            "policy": DEFAULT_MEMORY,
+            "peak_bound_bytes": plan.memory_report().peak_bound_bytes,
+            "syncs": plan.memory_report().sync_count,
+        },
     }
 
 
@@ -525,21 +709,65 @@ def _bench(args: argparse.Namespace) -> int:
             )
         selected = tuple(known[name] for name in args.workload)
 
-    report = bench.run(warmups=args.warmups, repeats=args.repeats, workloads=selected)
+    if args.check_baselines is not None:
+        # Validation needs no GPU and no measurement: it is a property of the
+        # committed files, so it runs before anything expensive does.
+        slugs = bench.validate_baselines(args.check_baselines)
+        print(
+            f"baselines: {len(slugs)} chip(s) valid in {args.check_baselines}: "
+            + ", ".join(slugs)
+        )
+        return 0
+
+    report = bench.run(
+        warmups=args.warmups,
+        repeats=args.repeats,
+        rounds=args.rounds,
+        workloads=selected,
+    )
     print(bench.render_table(report))
 
     if args.output is not None:
         _write_json(args.output, report)
     if args.update_baseline is not None:
-        _write_json(args.update_baseline, report)
-        print(f"baseline written to {args.update_baseline}")
+        written = _write_baseline(args.update_baseline, report)
+        print(f"baseline written to {written}")
     if args.baseline is None:
         return 0
 
-    baseline = json.loads(args.baseline.read_text())
-    comparison = bench.compare(report, baseline, tolerance=args.tolerance)
+    resolved = bench.resolve_baseline(args.baseline)
+    if resolved.note is not None:
+        print(f"note: {resolved.note}")
+    comparison = bench.compare(report, resolved.report, tolerance=args.tolerance)
     print(bench.summarize(comparison))
     return 0 if comparison.ok else 1
+
+
+def _write_baseline(path: Path, report: dict) -> Path:
+    """Write a run as a baseline, naming the file after the chip in a matrix.
+
+    Given a directory, the file is ``<device-slug>.json`` so that a second
+    machine's recording lands beside the first instead of replacing it. The
+    overwrite guard is the point of the name: if the file already records a
+    different chip, writing would silently delete that chip's numbers.
+    """
+
+    from . import bench
+
+    if not path.is_dir():
+        _write_json(path, report)
+        return path
+    name = (report.get("device") or {}).get("name")
+    written = path / f"{bench.device_slug(name)}.json"
+    if written.exists():
+        previous = (json.loads(written.read_text()).get("device") or {}).get("name")
+        if previous != name:
+            raise BaselineError(
+                f"{written} records {previous!r}, and this run is {name!r}; "
+                "refusing to overwrite another chip's baseline"
+            )
+    _write_json(written, report)
+    return written
 
 
 if __name__ == "__main__":

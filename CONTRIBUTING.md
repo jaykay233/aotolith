@@ -32,7 +32,7 @@ python examples/tiny_llama_compile.py
 
 ## What a change needs
 
-Four things, and the first one is the one that gets skipped:
+Five things, and the first one is the one that gets skipped:
 
 1. **A stated motivation.** "It is cleaner" is not enough for a rewrite;
    "this drops 245 operators per decode step" is. If the change is about speed,
@@ -46,10 +46,18 @@ Four things, and the first one is the one that gets skipped:
    thermal state, and compare `min_ms` rather than the median, because
    contention only adds time. `docs/performance.md` records how the existing
    numbers were taken; match that standard.
-4. **Both language versions of whatever documentation you touched.** The READMEs
-   and `docs/` are paired: `README.md` / `README.zh-CN.md`,
-   `docs/usage.md` / `docs/usage.zh-CN.md`, and so on. `docs/architecture.md` is
-   Chinese-only.
+4. **The right error class.** A new refusal is an `AotolithError`, not a bare
+   `ValueError`: pick the class that matches the caller's decision (see
+   [`docs/errors.md`](docs/errors.md)), and if none fits, add one with a new
+   `code` and a row in both language versions of the catalog — `test_errors.py`
+   fails if the catalog and the code disagree. The builtin bases are part of the
+   contract: an existing handler must keep working.
+5. **Both language versions of whatever documentation you touched**, plus a
+   `CHANGELOG.md` entry under the version being prepared. The READMEs and
+   `docs/` are paired: `README.md` / `README.zh-CN.md`, `docs/usage.md` /
+   `docs/usage.zh-CN.md`, and so on. `docs/architecture.md` is Chinese-only.
+   What counts as a change worth an entry is in
+   [`docs/compatibility.md`](docs/compatibility.md).
 
 ## Adding an operator
 
@@ -81,6 +89,29 @@ a Python loop. It should validate what it depends on at construction time — th
 activation function, the attention masking — and raise with a message that names
 the layer, rather than producing plausible wrong numbers.
 
+## Recording a baseline for a new chip
+
+`benchmarks/baselines/` is a chip matrix: one file per chip, named by
+`device_slug` of the device name the report records (`Apple M5 Pro` ->
+`apple-m5-pro.json`). On a new machine:
+
+```bash
+aoto bench --rounds 3 --update-baseline benchmarks/baselines
+aoto bench --check-baselines benchmarks/baselines
+```
+
+The first command writes this chip's file rather than replacing a neighbour's;
+the second is what CI runs, and it catches the mistakes a hand edit makes — a
+stale schema, a file renamed away from the chip it records, a chip recorded
+twice. Commit the new file in its own change: a baseline recorded on a different
+thermal state is not a code review, and mixing it into a feature change makes the
+diff look like a regression. `--rounds 3` is not optional; a floor from fewer
+than three repeats cannot be compared, so the gate would skip it.
+
+Do not record a baseline for hardware you do not have, and do not edit a
+`device.name` to make a run compare against another chip. `compare()` decides on
+that field, so a wrong name produces a gate that passes for the wrong reason.
+
 ## Style
 
 - `ruff check` runs with only `F` and `E9`: broken code, not formatting taste.
@@ -89,18 +120,28 @@ the layer, rather than producing plausible wrong numbers.
   a comment recording the measurement that ruled out the obvious alternative is
   the point of this repository.
 - Type annotations are part of the public surface now that the wheel ships
-  `py.typed`. Annotate new public functions and methods.
+  `py.typed`. Annotate new public functions and methods. `pyrightconfig.json`
+  lists the modules CI type-checks; new public modules are added to it.
 - Prefer a refusal with a message that names the operator and the reason over a
-  silent fallback.
+  silent fallback. A refusal a caller may want to branch on is an
+  `AotolithError` from `src/aotolith/errors.py`, with a `hint` for the fix.
+- A downgrade — a fallback, a refused capability, an autotune with no winner —
+  belongs in the log at `WARNING` as well as in `plan.selections`, because the
+  caller reading the log does not have the plan yet. Import the package logger
+  (`from ._log import get_logger`), never `print`, and never configure handlers
+  outside `_log.basic_config`.
 
 ## Releasing
 
 Publishing is driven by a tag, and `.github/workflows/release.yml` checks that the
-tag matches `[project].version` before it uploads.
+tag matches the version in `src/aotolith/_version.py` — the one place the version
+lives; `pyproject.toml` reads it through `hatch`.
 
-1. Bump `version` in `pyproject.toml`.
-2. Commit, then tag: `git tag -a v0.63.0 -m "aotolith 0.63.0" && git push origin v0.63.0`.
-3. The workflow builds the sdist and wheel, runs `twine check --strict`, asserts
+1. Write the `CHANGELOG.md` entry under a new version heading, and update the
+   comparison links at the bottom of the file.
+2. Bump `__version__` in `src/aotolith/_version.py`.
+3. Commit, then tag: `git tag -a v0.64.0 -m "aotolith 0.63.0" && git push origin v0.64.0`.
+4. The workflow builds the sdist and wheel, runs `twine check --strict`, asserts
    the wheel carries `py.typed`, and publishes with PyPI trusted publishing.
 
 One-time setup, done in two web consoles rather than in this repository:
