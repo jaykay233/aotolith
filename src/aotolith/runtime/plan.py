@@ -227,6 +227,7 @@ class CompiledPlan:
     storage_plan: StoragePlan
     _runners: dict[str, Any] = field(default_factory=dict, repr=False)
     _reports: dict[str, "MemoryReport"] = field(default_factory=dict, repr=False)
+    _steppers: dict[str, Any] = field(default_factory=dict, repr=False)
     _runner_lock: Lock = field(default_factory=Lock, repr=False)
 
     @property
@@ -253,7 +254,51 @@ class CompiledPlan:
                 verify_index_bounds=verify_index_bounds,
             )
             return outputs
-        return runner(inputs, verify_index_bounds=verify_index_bounds)
+        stepper = self._stepper_for(memory, runner, inputs, verify_index_bounds)
+        if stepper is None:
+            return runner(inputs, verify_index_bounds=verify_index_bounds)
+        return stepper(*inputs)
+
+    def _stepper_for(
+        self,
+        memory: str,
+        runner: Any,
+        inputs: tuple[Any, ...],
+        verify_index_bounds: bool,
+    ) -> Any:
+        """A compiled form of ``runner``, or ``None`` when one cannot be used.
+
+        Unrolling the graph removes the interpreter's bookkeeping, but the
+        result is still a Python function that calls one kernel per node, and
+        MLX evaluates those nodes one at a time. Handing the same body to
+        ``mx.compile`` lets MLX trace it once and replay the trace, which
+        measured 2% of the step on a bandwidth-bound decode - small, but it is
+        the same 2% on both a 4-bit and a bf16 plan, so it is the per-node cost
+        rather than anything about the weights.
+
+        Two plans are deliberately left alone. A memory policy that
+        synchronizes does so to make a release real, and a compiled body would
+        replay the trace without those points, so the peak the policy promised
+        would no longer hold. And an index check reads a value back to the host,
+        which is not allowed inside a traced function, so a call that asks for
+        the checks keeps the unrolled runner.
+        """
+
+        if _sync_threshold(self, memory) is not None:
+            return None
+        if verify_index_bounds:
+            return None
+        if not all(isinstance(value, mx.array) for value in inputs):
+            return None
+        with self._runner_lock:
+            stepper = self._steppers.get(memory)
+            if stepper is not None:
+                return stepper
+            stepper = mx.compile(
+                lambda *arrays: runner(tuple(arrays), verify_index_bounds=False)
+            )
+            self._steppers[memory] = stepper
+        return stepper
 
     def _runner_for(self, memory: str) -> tuple[Any, "MemoryReport | None"]:
         """Build (and cache) the runner for one memory policy."""

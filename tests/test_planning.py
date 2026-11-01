@@ -215,3 +215,39 @@ def test_contract_reports_the_number_of_values_an_operator_writes() -> None:
     )
     with pytest.raises(ValueError, match="neg must produce 1 results, got 2"):
         check_operation(too_many, too_many.ops[0])
+
+
+def test_a_compiled_step_returns_what_the_unrolled_runner_returns() -> None:
+    # ``mx.compile`` traces the unrolled body once and replays the trace. The
+    # numbers must not move, and only the policies that do not synchronize may
+    # take this path: a release point exists to bound peak memory, and a
+    # replayed trace would not honour it.
+    def fn(x):
+        return (x * 2 + 1).reshape(2, 2), x.sum()
+
+    x = torch.randn(4)
+    plan = compile_callable(fn, (x,)).plan
+    reference = [mx.array(value.numpy()) for value in fn(x)]
+
+    first = plan(mx.array(x.numpy()), verify_index_bounds=False, memory="latency")
+    assert plan._steppers, "the second call should have used a compiled step"
+    second = plan(mx.array(x.numpy()), verify_index_bounds=False, memory="latency")
+    mx.eval(*first, *second)
+
+    for got in (first, second):
+        assert len(got) == len(reference)
+        for actual, expected in zip(got, reference, strict=True):
+            assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_the_default_policy_keeps_its_synchronization_points() -> None:
+    # ``balanced`` syncs to make its releases real, so it must not be handed to
+    # ``mx.compile``: the trace would replay without those points and the peak
+    # the policy promised would no longer hold.
+    def fn(x):
+        return x * 2 + 1
+
+    x = torch.randn(4)
+    plan = compile_callable(fn, (x,)).plan
+    plan(mx.array(x.numpy()), verify_index_bounds=False)
+    assert not plan._steppers

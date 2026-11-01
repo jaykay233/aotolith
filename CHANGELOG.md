@@ -11,6 +11,18 @@ The policy that decides what counts as a breaking change lives in
 
 ### Changed
 
+- **The unrolled runner is now handed to `mx.compile` for the policies that do
+  not synchronize.** Unrolling removed the interpreter's bookkeeping, but the
+  body still calls one kernel per node and MLX evaluates those nodes one at a
+  time; tracing it once and replaying the trace measured 2% of a decode step on
+  both a 4-bit and a bf16 plan, so it is the per-node cost rather than anything
+  about the weights. Two plans keep the unrolled runner: one whose policy
+  synchronizes, because replaying the trace would drop the release points that
+  policy exists to make real, and one asking for index checks, because a check
+  reads a value back to the host and that is not allowed inside a traced
+  function. Qwen2.5-0.5B 4-bit decode went from 1.124x to 1.169x `mlx_lm` and
+  the bf16 path from 0.965x to 1.015x, timed interleaved.
+
 - **Decode dispatches fewer layout nodes, and that is what the step time was
   made of.** A decode step for Qwen2.5-0.5B was 682 operations of which 460 were
   views; on a 4-bit model the host side of the step was 94% of the wall clock,
