@@ -16,6 +16,7 @@ from __future__ import annotations
 import struct
 from math import isfinite, isinf, isnan, prod
 from ..ir import DType
+from ..ir.types import DTYPE_ITEMSIZE
 from ..ir import Operation
 from ..ir import TensorType
 from ..op_sets import CONSTANT_OPS as _CONSTANT_POINTWISE_OPS
@@ -26,14 +27,8 @@ from ..ir.ops import integer_constant_value
 _ELEMENTS_PER_THREAD = 4
 
 
-_DTYPE_ITEMSIZE = {
-    DType.F16: 2,
-    DType.BF16: 2,
-    DType.F32: 4,
-    DType.BOOL: 1,
-    DType.I32: 4,
-    DType.I64: 8,
-}
+# The one table, defined with the dtypes it describes.
+_DTYPE_ITEMSIZE = DTYPE_ITEMSIZE
 
 
 _COMPARISON_POINTWISE_OPS = {"eq", "ne", "lt", "le", "gt", "ge"}

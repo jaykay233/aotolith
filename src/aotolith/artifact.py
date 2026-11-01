@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -14,8 +15,16 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from ._version import __version__
+from ._log import get_logger as _get_logger
+from .backends import TARGETS
 from .backends.apple import AppleMetalBackend
+from .backends.reference import TARGET as REFERENCE_TARGET
+from .backends.reference import ReferenceBackend
 from .codegen.msl import KernelArtifact
+from .errors import (
+    ArtifactCompatibilityError,
+    ArtifactError,
+)
 from .runtime.plan import CompiledPlan
 from .ir import DType, Graph, Operation, TensorType, Value
 from .planning import BufferSlot, StoragePlan, ValueLifetime
@@ -24,12 +33,17 @@ from .selection import KernelBenchmark, KernelSelection
 if TYPE_CHECKING:
     from .compiler import CompilationResult, CompiledModulePlan
 
+_LOGGER = _get_logger(__name__.rsplit(".", 1)[-1])
+
 ARTIFACT_FORMAT = "aotolith"
 # Format 5 serializes a kernel's outputs as parallel `output_ids` and
 # `tensor_types` lists so a kernel may write several values; a multi-output IR
 # operation is one kernel rather than a producer plus re-derivations of its
-# siblings. Readers still accept format 4's singular `output_id`/`tensor_type`.
+# siblings. Readers still accept format 4's singular `output_id`/`tensor_type`,
+# which is the only difference between the two layouts, so format 4 stays
+# readable instead of forcing a recompile of every stored artifact.
 FORMAT_VERSION = 5
+_SUPPORTED_FORMAT_VERSIONS = (4, 5)
 ABI_VERSION = "1.3"
 # 1.3 added `entrypoint.kwargs`, the tensor-valued keyword inputs promoted to
 # graph inputs. Artifacts without that field are the 1.2 layout, where every
@@ -46,12 +60,23 @@ _MLX_DTYPES = {
 }
 
 
-class ArtifactError(RuntimeError):
-    """Base class for invalid or incompatible compiler artifacts."""
+# The two classes live in ``errors.py`` so that every failure the package
+# raises on purpose is declared in one place; they are re-exported here because
+# this module is where a caller looks for them, and because the names predate
+# the hierarchy.
 
 
-class ArtifactCompatibilityError(ArtifactError):
-    """Raised when the current compiler cannot load an artifact ABI."""
+def _log(level: int, event: str, **fields: Any) -> None:
+    """Record an artifact event on the package logger.
+
+    Artifact handling is where a deployment notices problems first - a stale
+    file, a device that changed, a digest that no longer matches - and most of
+    those are not errors until something tries to run the plan. They are logged
+    at the level that matches what the caller has to do about them, so the
+    record exists without the package printing anything by default.
+    """
+
+    _LOGGER.log(level, "artifact %s: %s", event, fields)
 
 
 def save_compiled(
@@ -165,7 +190,7 @@ def save_compiled(
         "format_version": FORMAT_VERSION,
         "abi_version": ABI_VERSION,
         "compiler_version": __version__,
-        "target": "apple-metal",
+        "target": result.target,
         "entrypoint": {
             "kind": "module" if is_module else "callable",
             "input_count": input_count,
@@ -232,6 +257,15 @@ def save_compiled(
         temporary_path.replace(destination)
     finally:
         temporary_path.unlink(missing_ok=True)
+    _log(
+        logging.INFO,
+        "written",
+        path=str(destination),
+        bytes=destination.stat().st_size,
+        kernels=len(result.plan.kernels),
+        ops=len(result.plan.graph.ops),
+        abi=ABI_VERSION,
+    )
     return destination
 
 
@@ -250,9 +284,19 @@ def load_compiled_module(
     from .compiler import CompilationResult, CompiledModulePlan
 
     artifact_path = Path(path)
+    _log(logging.DEBUG, "opening", path=str(artifact_path))
     with _open_artifact(artifact_path) as archive:
         manifest = _read_json(archive, "manifest.json")
         _validate_manifest(manifest, require_device_match=require_device_match)
+        _log(
+            logging.INFO,
+            "read",
+            path=str(artifact_path),
+            compiler=manifest.get("compiler_version"),
+            abi=manifest.get("abi_version"),
+            format=manifest.get("format_version"),
+            device=manifest.get("profile", {}).get("device_name"),
+        )
         payloads = manifest["payloads"]
         graph_payload = _read_payload(
             archive,
@@ -297,18 +341,20 @@ def load_compiled_module(
 
         state_entries = manifest["entrypoint"]["state"]
         loaded_state: dict[str, mx.array] = {}
-        state_values: list[mx.array] = []
+        collected_state: list[mx.array] = []
         for entry in state_entries:
             # Aliased entries point at the same payload file, and decoding it
             # once keeps them aliased in memory the way they were at run time.
-            file_name = entry["file"] if isinstance(entry, Mapping) else None
-            array = loaded_state.get(file_name)
+            file_name = (
+                str(entry["file"]) if isinstance(entry, Mapping) else None
+            )
+            array = loaded_state.get(file_name) if file_name is not None else None
             if array is None:
                 array = _decode_state_array(archive, entry)
                 if file_name is not None:
                     loaded_state[file_name] = array
-            state_values.append(array)
-        state_values = tuple(state_values)
+            collected_state.append(array)
+        state_values = tuple(collected_state)
         stored_kernels = tuple(
             _decode_kernel(item) for item in _load_json_list(kernels_payload)
         )
@@ -318,17 +364,23 @@ def load_compiled_module(
         stored_storage = _decode_storage_plan(_load_json_bytes(storage_payload))
 
     compile_options = manifest["compile_options"]
-    backend = AppleMetalBackend(
-        codegen_matmul=bool(compile_options["codegen_matmul"]),
-        codegen_attention=bool(compile_options["codegen_attention"]),
-        autotune=False,
-        autotune_warmup=int(compile_options.get("autotune_warmup", 2)),
-        autotune_iterations=int(compile_options.get("autotune_iterations", 7)),
-        selection_overrides={
-            selection.output_id: selection.implementation
-            for selection in stored_selections
-        },
-    )
+    artifact_target = str(manifest["target"])
+    if artifact_target == REFERENCE_TARGET:
+        # A reference plan holds no kernels and no device assumptions, so
+        # rebuilding it needs no Metal and no selection overrides.
+        backend: AppleMetalBackend | ReferenceBackend = ReferenceBackend()
+    else:
+        backend = AppleMetalBackend(
+            codegen_matmul=bool(compile_options["codegen_matmul"]),
+            codegen_attention=bool(compile_options["codegen_attention"]),
+            autotune=False,
+            autotune_warmup=int(compile_options.get("autotune_warmup", 2)),
+            autotune_iterations=int(compile_options.get("autotune_iterations", 7)),
+            selection_overrides={
+                selection.output_id: selection.implementation
+                for selection in stored_selections
+            },
+        )
     plan = backend.compile(lowered_graph)
     _validate_rebuilt_plan(
         plan,
@@ -346,6 +398,7 @@ def load_compiled_module(
         autotune=bool(compile_options.get("autotune", False)),
         autotune_warmup=int(compile_options.get("autotune_warmup", 2)),
         autotune_iterations=int(compile_options.get("autotune_iterations", 7)),
+        target=artifact_target,
     )
     state_names = tuple(str(entry["name"]) for entry in state_entries)
     kwarg_entries = manifest["entrypoint"].get("kwargs", [])
@@ -388,10 +441,21 @@ def _validate_manifest(
         raise ArtifactCompatibilityError(
             f"unsupported artifact format: {manifest.get('format')!r}"
         )
-    if manifest.get("format_version") != FORMAT_VERSION:
+    format_version = manifest.get("format_version")
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ArtifactCompatibilityError(
-            "artifact format version mismatch: "
-            f"expected {FORMAT_VERSION}, got {manifest.get('format_version')!r}"
+            "artifact format version mismatch: expected one of "
+            f"{list(_SUPPORTED_FORMAT_VERSIONS)}, got {format_version!r}"
+        )
+    if format_version != FORMAT_VERSION:
+        # A readable older format is a compatibility path, not a normal load:
+        # say so once, at the level a deployment notices, because the artifact
+        # will keep loading that way until someone recompiles it.
+        _log(
+            logging.WARNING,
+            "older format",
+            path_format=format_version,
+            current=FORMAT_VERSION,
         )
     if manifest.get("abi_version") not in _SUPPORTED_ABI_VERSIONS:
         raise ArtifactCompatibilityError(
@@ -399,9 +463,10 @@ def _validate_manifest(
             f"{list(_SUPPORTED_ABI_VERSIONS)}, "
             f"got {manifest.get('abi_version')!r}"
         )
-    if manifest.get("target") != "apple-metal":
+    if manifest.get("target") not in TARGETS:
         raise ArtifactCompatibilityError(
-            f"unsupported artifact target: {manifest.get('target')!r}"
+            f"unsupported artifact target: {manifest.get('target')!r}",
+            hint="this release can load: " + ", ".join(TARGETS),
         )
     required = {
         "entrypoint",
@@ -416,7 +481,9 @@ def _validate_manifest(
         raise ArtifactCompatibilityError(
             f"artifact manifest is missing fields: {sorted(missing)}"
         )
-    if require_device_match:
+    if require_device_match and manifest.get("target") != REFERENCE_TARGET:
+        # A reference plan holds no kernels, so there is no compiled-for device
+        # that could differ from this one; the check has nothing to compare.
         _validate_device_profile(manifest["profile"])
 
 
@@ -699,7 +766,7 @@ def _decode_graph(payload: Mapping[str, Any]) -> Graph:
                 str(op["op"]),
                 tuple(str(value) for value in op["inputs"]),
                 tuple(str(value) for value in op["outputs"]),
-                _decode_attr(op["attrs"]),
+                _decoded_attrs(op["attrs"]),
             )
             for op in payload["ops"]
         )
@@ -764,9 +831,27 @@ def _decode_attr(value: object) -> object:
             str(value["op"]),
             tuple(str(item) for item in value["inputs"]),
             tuple(str(item) for item in value["outputs"]),
-            _decode_attr(value["attrs"]),
+            _decoded_attrs(value["attrs"]),
         )
     raise ArtifactCompatibilityError(f"unknown serialized attribute kind: {kind!r}")
+
+
+def _decoded_attrs(value: object) -> dict[str, object]:
+    """Decode an attribute mapping from an artifact.
+
+    ``_decode_attr`` is the general decoder and its return type is therefore
+    ``object``; an operation's attributes are always a mapping, and the
+    constructor wants one. Converting here keeps the narrowing in one place
+    instead of asserting at each of the two call sites.
+    """
+
+    decoded = _decode_attr(value)
+    if not isinstance(decoded, dict):
+        raise ArtifactCompatibilityError(
+            f"operation attributes must be a mapping, got "
+            f"{type(decoded).__name__}"
+        )
+    return decoded
 
 
 def _encode_kernel(kernel: KernelArtifact) -> dict[str, object]:
@@ -1058,9 +1143,17 @@ def _open_artifact(path: Path):
     try:
         with zipfile.ZipFile(path, "r") as archive:
             yield archive
-    except (FileNotFoundError, zipfile.BadZipFile) as exc:
-        raise ArtifactCompatibilityError(
-            f"cannot open compiler artifact {path}: {exc}"
+    except FileNotFoundError as exc:
+        # A missing file is not a compatibility problem: the caller's move is
+        # to restore or recompile it, not to find another compiler.
+        raise ArtifactError(
+            f"compiler artifact not found: {path}",
+            hint="compile it first, or check the path the deployment mounts",
+        ) from exc
+    except zipfile.BadZipFile as exc:
+        raise ArtifactError(
+            f"compiler artifact is not a readable archive: {path} ({exc})",
+            hint="the file is truncated or was never aotolith; recompile it",
         ) from exc
 
 
@@ -1078,3 +1171,18 @@ def _write_zip_entry(archive: zipfile.ZipFile, name: str, payload: bytes) -> Non
     info.compress_type = zipfile.ZIP_DEFLATED
     info.external_attr = 0o644 << 16
     archive.writestr(info, payload)
+
+
+# ``ArtifactError`` and ``ArtifactCompatibilityError`` belong to ``errors``;
+# they are named here because this is the module a caller reaches for when an
+# artifact fails to load, and because these names predicate the hierarchy.
+__all__ = [
+    "ABI_VERSION",
+    "ARTIFACT_FORMAT",
+    "FORMAT_VERSION",
+    "ArtifactCompatibilityError",
+    "ArtifactError",
+    "load_compiled_module",
+    "read_artifact_manifest",
+    "save_compiled",
+]

@@ -48,6 +48,10 @@ from ..codegen.norm import NormLowering
 from ..codegen.pointwise import PointwiseLowering
 from ..codegen.quantize import QuantizationLowering
 from ..codegen.reduction import ReductionLowering
+from ..errors import DeviceError
+from .._log import get_logger
+
+_LOGGER = get_logger(__name__.rsplit(".", 1)[-1])
 from ..runtime.mlx_ops.__init__ import _evaluate_mlx_op
 from ..runtime.plan import CompiledPlan, _as_arrays
 from ..target import apple as target
@@ -342,13 +346,23 @@ class AppleMetalBackend(
         tune_inputs: Sequence[Any] | None = None,
     ) -> CompiledPlan:
         if not mx.metal.is_available():
-            raise RuntimeError("Apple Metal is unavailable in this process")
+            raise DeviceError(
+                "Apple Metal is unavailable in this process",
+                hint=(
+                    "aotolith emits Metal only; run on an Apple Silicon host "
+                    "outside a sandbox that hides the GPU"
+                ),
+            )
 
         candidates = self._lower_candidates(graph)
         if _mpp_supported() and not _tensor_core_candidates_load(graph, candidates):
             # This device compiled the tensor-core kernels and refused to
             # load them, so re-lower once without them rather than leaving
             # a plan that raises on its first matmul.
+            _LOGGER.warning(
+                "tensor cores reported as available but refused the kernels; "
+                "re-lowering without them (this is what paravirtual GPUs do)"
+            )
             candidates = self._lower_candidates(graph)
 
         if self.autotune and not self.selection_overrides:
@@ -358,13 +372,64 @@ class AppleMetalBackend(
         else:
             kernels, selections, callables = self._heuristic_select(graph, candidates)
 
+        annotated = _annotate_tensor_core_fallback(selections)
+        self._log_selection_summary(graph, candidates, annotated)
         return CompiledPlan(
             graph,
             kernels,
-            _annotate_tensor_core_fallback(selections),
+            annotated,
             callables,
             plan_storage(graph),
         )
+
+    def _log_selection_summary(
+        self,
+        graph: Graph,
+        candidates: Mapping[str, _NativeCandidate],
+        selections: tuple[KernelSelection, ...],
+    ) -> None:
+        """Record what the plan runs, at the level each fact deserves.
+
+        ``plan.selections`` already answers "why this implementation" for a
+        caller holding the plan. This is for the caller who does not have one
+        yet - a compile that took forty seconds and produced a plan that is
+        mostly fallback is worth one line before the first token, not a
+        post-mortem.
+        """
+
+        native = sum(selection.implementation == "metal_kernel" for selection in selections)
+        total = len(selections)
+        device_name, architecture = _device_profile()
+        _LOGGER.info(
+            "compiled %d ops into %d selections on %s (%s): %d native, %d mlx",
+            len(graph.ops),
+            total,
+            device_name,
+            architecture,
+            native,
+            total - native,
+        )
+        skipped = sorted({op.op for op in graph.ops if op.outputs[0] not in candidates})
+        if skipped:
+            _LOGGER.debug(
+                "families with no native candidate: %s", ", ".join(skipped)
+            )
+        if target._TENSOR_CORE_BLOCK_ERROR is not None:
+            # One line, not one per kernel: this is a property of the device,
+            # and a caller who is wondering why the plan is slower than the
+            # README promised needs it said once.
+            _LOGGER.warning(
+                "tensor cores unavailable on this device (%s); native kernels "
+                "are simdgroup-only",
+                target._TENSOR_CORE_BLOCK_ERROR,
+            )
+        for selection in selections:
+            _LOGGER.debug(
+                "%s -> %s (%s)",
+                selection.output_id,
+                selection.implementation,
+                selection.reason,
+            )
 
     def _wants_native(self, op: Operation) -> bool:
         return self.selection_overrides.get(op.outputs[0]) == "metal_kernel"
@@ -628,6 +693,14 @@ class AppleMetalBackend(
         alternative_seconds: float | None,
     ) -> str:
         if winner_seconds is None:
+            # Both candidates failed to run, so the plan keeps MLX. That is a
+            # real degradation of a request the user made (``autotune=True``),
+            # and saying it only in ``selection.reason`` hides it from anyone
+            # who is not already inspecting the plan.
+            _LOGGER.warning(
+                "autotune measured no candidate for %s; MLX fallback retained",
+                winner,
+            )
             return "autotune failed for every candidate; MLX fallback retained"
         if alternative_seconds is None:
             return f"autotuned: {winner} was the only valid candidate"

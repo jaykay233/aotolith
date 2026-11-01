@@ -9,7 +9,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from .backends import AppleMetalBackend, CompiledPlan
+from .backends import REFERENCE_TARGET, TARGETS, AppleMetalBackend, Backend, CompiledPlan, ReferenceBackend
+from .runtime.plan import DEFAULT_MEMORY
+from .errors import CompilationError, PlanInputError, PlatformError
 from .capture import capture_fx
 from .ir import Graph
 from .passes import rewrite
@@ -30,11 +32,19 @@ class CompilationResult:
     autotune: bool = False
     autotune_warmup: int = 2
     autotune_iterations: int = 7
+    #: The backend this plan came from. Recorded in the artifact manifest, and
+    #: what tells the loader which backend to rebuild the plan with.
+    target: str = "apple-metal"
 
     def save(self, path: str | PathLike[str]) -> Path:
         from .artifact import save_compiled
 
         return save_compiled(self, path)
+
+    def prepare(self, memory: str = DEFAULT_MEMORY) -> Any:
+        """Unroll the runner now instead of on the first call."""
+
+        return self.plan.prepare(memory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +109,12 @@ class CompiledModulePlan:
         return self.compilation.plan
 
     @property
+    def target(self) -> str:
+        """The backend this plan came from, as recorded in its manifest."""
+
+        return self.compilation.target
+
+    @property
     def input_graph(self) -> Graph:
         return self.compilation.input_graph
 
@@ -111,21 +127,46 @@ class CompiledModulePlan:
 
         return save_compiled(self, path)
 
+    def prepare(self, memory: str = DEFAULT_MEMORY) -> Any:
+        """Unroll the runner now instead of on the first call.
+
+        A server that wants its first request to look like its second calls this
+        at startup: the unroll is paid once, here, and the returned report says
+        what the runner will do with the graph's buffers.
+        """
+
+        return self.plan.prepare(memory)
+
     def __call__(
         self,
         *inputs: Any,
         verify_index_bounds: bool = True,
+        memory: str = DEFAULT_MEMORY,
         **tensor_kwargs: Any,
     ) -> tuple[mx.array, ...]:
+        """Run the plan.
+
+        ``memory`` selects the peak-memory policy (see
+        :data:`aotolith.runtime.plan.MEMORY_POLICIES`); ``verify_index_bounds``
+        turns off the per-call index check for indices known to be in range.
+        Both names are reserved, so a model cannot promote a tensor keyword by
+        either name - ``_tensor_kwarg_values`` refuses one at compile time.
+        """
+
         if len(inputs) != self.input_count:
-            raise ValueError(
-                f"expected {self.input_count} inputs, received {len(inputs)}"
+            raise PlanInputError(
+                f"expected {self.input_count} inputs, received {len(inputs)}",
+                hint=(
+                    "positional inputs come first, then any promoted tensor "
+                    "keywords, then the state; plan.plan.graph.inputs names them"
+                ),
             )
         return self.plan(
             *inputs,
             *self._tensor_kwarg_values(tensor_kwargs),
             *self._state_values,
             verify_index_bounds=verify_index_bounds,
+            memory=memory,
         )
 
     def _tensor_kwarg_values(self, supplied: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -133,10 +174,22 @@ class CompiledModulePlan:
 
         missing = [name for name in self.tensor_kwarg_names if name not in supplied]
         if missing:
-            raise ValueError("missing tensor keyword inputs: " + ", ".join(missing))
+            raise PlanInputError(
+                "missing tensor keyword inputs: " + ", ".join(missing),
+                hint=(
+                    "this plan promoted these keywords to graph inputs: "
+                    + ", ".join(self.tensor_kwarg_names)
+                ),
+            )
         unexpected = sorted(set(supplied) - set(self.tensor_kwarg_names))
         if unexpected:
-            raise ValueError("unexpected keyword inputs: " + ", ".join(unexpected))
+            raise PlanInputError(
+                "unexpected keyword inputs: " + ", ".join(unexpected),
+                hint=(
+                    "only tensor-valued keywords are promoted; a Python value "
+                    "such as use_cache=False was baked in at compile time"
+                ),
+            )
         values: list[Any] = []
         for name, template in zip(
             self.tensor_kwarg_names, self._kwarg_templates(), strict=True
@@ -157,10 +210,52 @@ class CompiledModulePlan:
         if len(self.tensor_kwarg_templates) == len(self.tensor_kwarg_names):
             return self.tensor_kwarg_templates
         if self.tensor_kwarg_templates:
-            raise ValueError(
+            raise PlanInputError(
                 "tensor keyword templates do not match the tensor keyword names"
             )
         return tuple(_KwargLeaf() for _ in self.tensor_kwarg_names)
+
+
+def backend_for(
+    target: str,
+    *,
+    codegen_matmul: bool = False,
+    codegen_attention: bool = False,
+    autotune: bool = False,
+    autotune_warmup: int = 2,
+    autotune_iterations: int = 7,
+) -> Backend:
+    """Build the backend a target name selects.
+
+    The two targets are not variants of one another: ``apple-metal`` generates
+    kernels and has options for which ones, and ``mlx-reference`` generates
+    nothing, so asking it for codegen or autotune is a caller error rather than
+    a quiet flag that does nothing.
+    """
+
+    if target == REFERENCE_TARGET:
+        if codegen_matmul or codegen_attention or autotune:
+            raise CompilationError(
+                f"target {target!r} generates no kernels, so it has no codegen "
+                "or autotune options",
+                hint=(
+                    "compile with target='apple-metal' for generated kernels, "
+                    "or drop codegen_matmul/codegen_attention/autotune"
+                ),
+            )
+        return ReferenceBackend()
+    if target == "apple-metal":
+        return AppleMetalBackend(
+            codegen_matmul=codegen_matmul,
+            codegen_attention=codegen_attention,
+            autotune=autotune,
+            autotune_warmup=autotune_warmup,
+            autotune_iterations=autotune_iterations,
+        )
+    raise CompilationError(
+        f"unsupported target: {target}",
+        hint="supported targets are: " + ", ".join(TARGETS),
+    )
 
 
 def compile_graph(
@@ -174,20 +269,22 @@ def compile_graph(
     autotune_iterations: int = 7,
     autotune_inputs: Sequence[Any] | None = None,
 ) -> CompilationResult:
-    if target != "apple-metal":
-        raise ValueError(f"unsupported target: {target}")
-
-    # The norm fold moves work into the projection's kernel, so it has to know
-    # whether that projection will really be generated rather than lowered to
-    # MLX. It runs last, once nothing else can change the shape it folds into.
-    lowered = rewrite(graph, native_matmul=codegen_matmul)
-    plan = AppleMetalBackend(
+    backend = backend_for(
+        target,
         codegen_matmul=codegen_matmul,
         codegen_attention=codegen_attention,
         autotune=autotune,
         autotune_warmup=autotune_warmup,
         autotune_iterations=autotune_iterations,
-    ).compile(lowered, tune_inputs=autotune_inputs)
+    )
+    # The norm fold moves work into the projection's kernel, so it has to know
+    # whether that projection will really be generated rather than lowered to
+    # MLX. It runs last, once nothing else can change the shape it folds into.
+    # A target that generates nothing therefore rewrites as if no projection
+    # were native, which is what ``codegen_matmul=False`` means.
+    native_matmul = codegen_matmul and target == "apple-metal"
+    lowered = rewrite(graph, native_matmul=native_matmul)
+    plan = backend.compile(lowered, tune_inputs=autotune_inputs)
     return CompilationResult(
         plan=plan,
         input_graph=graph,
@@ -197,6 +294,7 @@ def compile_graph(
         autotune=autotune,
         autotune_warmup=autotune_warmup,
         autotune_iterations=autotune_iterations,
+        target=target,
     )
 
 
@@ -246,12 +344,21 @@ def compile_module(
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     if not isinstance(module, torch.nn.Module):
         raise TypeError(f"expected torch.nn.Module, got {type(module).__name__}")
     if getattr(module, "training", False):
-        raise ValueError("compile_module requires module.eval()")
+        raise CompilationError(
+            "compile_module requires module.eval()",
+            hint=(
+                "a graph traced in training mode contains dropout and batchnorm "
+                "updates, which a static plan cannot replay; call eval() first"
+            ),
+        )
 
     kwargs = dict(example_kwargs or {})
     static_kwargs: dict[str, Any] = {}
@@ -267,10 +374,16 @@ def compile_module(
             tensor_kwarg_values.extend(leaf.value for leaf in leaves)
         else:
             static_kwargs[name] = value
-    if "verify_index_bounds" in tensor_kwarg_names:
-        raise ValueError(
-            "a tensor keyword input cannot be named 'verify_index_bounds': "
-            "the compiled plan uses that name for its own argument"
+    reserved = {"verify_index_bounds", "memory"}
+    clashes = sorted(reserved & set(tensor_kwarg_names))
+    if clashes:
+        raise CompilationError(
+            f"a tensor keyword input cannot be named {clashes[0]!r}: "
+            "the compiled plan uses that name for its own argument",
+            hint=(
+                "rename the keyword in example_kwargs, or wrap the module so the "
+                "forward takes a differently named argument"
+            ),
         )
 
     with _tensor_attributes_as_buffers(module):
@@ -314,7 +427,10 @@ def _tensor_attributes_as_buffers(module: Any) -> Iterator[None]:
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - compile_module imports it first
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     registered: list[tuple[Any, str, Any]] = []
     try:
@@ -433,7 +549,10 @@ def _kwarg_template(
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     if isinstance(value, torch.Tensor):
         leaves.append(_KwargTensor(path, value))
@@ -678,7 +797,10 @@ def _contains_tensor(value: Any) -> bool:
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     def contains(item: Any) -> bool:
         if isinstance(item, torch.Tensor):
@@ -722,7 +844,10 @@ def _select_module_output(output: Any, output_key: str | None) -> Any:
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     selected = output
     if output_key is not None:
@@ -768,7 +893,10 @@ def _torch_tensor_to_mlx(value: Any) -> mx.array:
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for compile_module") from exc
+        raise PlatformError(
+            "PyTorch is required to compile an nn.Module",
+            hint="pip install 'aotolith[hf]' (or 'aotolith[fx]') installs it",
+        ) from exc
 
     cpu_value = value.detach().cpu()
     numpy_value = (

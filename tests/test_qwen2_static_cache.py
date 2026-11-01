@@ -286,14 +286,15 @@ def test_decode_graph_keeps_one_cache_operator_per_layer() -> None:
     )
 
 
-def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() -> None:
-    """Autotune must skip the MLX comparison, not fail, when there is none.
+def test_autotune_compares_a_kernel_against_an_mlx_reference() -> None:
+    """Autotune must have an MLX candidate to time before it can pick a kernel.
 
-    The prefill graph keeps standalone normalization because a 128-row operand
-    cannot absorb the RMS scale into its projection prologue, and normalization
-    only ever lowers to a generated kernel. Autotune used to evaluate the MLX
-    fallback for every op in order to have a reference, which raised
-    ``NotImplementedError`` before reaching the first projection.
+    Normalization had no MLX implementation - it only ever lowered to a
+    generated kernel - so autotune used to evaluate the MLX fallback for every
+    op in order to have a reference and raised ``NotImplementedError`` before
+    reaching the first projection. The interpreter now implements the norm
+    families, which is what makes the comparison a comparison: both candidates
+    are benchmarked and the kernel still wins.
     """
 
     transformers = pytest.importorskip("transformers")
@@ -314,10 +315,16 @@ def test_autotune_compiles_a_model_whose_normalization_has_no_mlx_reference() ->
     ]
     assert normalized
     for selection in normalized:
-        # No MLX reference exists, so only the kernel is benchmarked.
-        assert selection.is_native
-        assert [item.candidate for item in selection.benchmarks] == ["metal_kernel"]
-        assert "only valid candidate" in selection.reason
+        # Two candidates, both timed: that is the change. Which one wins is a
+        # per-shape timing question, and on a four-row prompt the framework's
+        # own normalization can beat a launch of its own.
+        assert sorted(item.candidate for item in selection.benchmarks) == [
+            "metal_kernel",
+            "mlx",
+        ]
+        assert selection.implementation in {"metal_kernel", "mlx"}
+        assert selection.autotuned
+        assert selection.reason
 
     tokens = runtime.greedy_generate(
         [[1, 2, 3, 4]], max_new_tokens=6, sync_each_step=False
@@ -712,3 +719,78 @@ def test_bucketed_save_writes_one_loadable_archive_per_bucket(tmp_path) -> None:
         loaded = load_compiled_module(path)
         assert len(loaded.lowered_graph.ops) > 0
         assert loaded.input_count == (3 if "prefill" in path.name else 4)
+
+
+def test_decode_mask_selects_the_trailing_window() -> None:
+    """The per-step mask replaced a ``capacity x capacity`` lookup table.
+
+    The mask has to be identical to the row the table used to return, which is
+    the one thing a rewrite of it can silently get wrong.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    runtime = _tiny_runtime(transformers)
+    capacity = runtime.cache_capacity
+
+    for valid_length in (1, 2, capacity // 2, capacity):
+        mask = runtime.decode_mask(valid_length)
+        assert tuple(mask.shape) == (1, 1, 1, capacity)
+        assert mask.dtype == mx.bool_
+        row = mask[0, 0, 0].tolist()
+        assert row == [index >= capacity - valid_length for index in range(capacity)]
+
+    with pytest.raises(ValueError, match="valid_length"):
+        runtime.decode_mask(0)
+    with pytest.raises(ValueError, match="valid_length"):
+        runtime.decode_mask(capacity + 1)
+
+
+def test_memory_footprint_counts_the_cache_and_the_weights_once() -> None:
+    transformers = pytest.importorskip("transformers")
+    runtime = _tiny_runtime(transformers)
+    footprint = runtime.memory_footprint()
+
+    head_dim = runtime.head_dim
+    per_element = mx.array(0.0, dtype=runtime.decode._state_values[0].dtype).nbytes
+    expected_cache = (
+        runtime.num_layers
+        * 2
+        * runtime.num_key_value_heads
+        * runtime.cache_capacity
+        * head_dim
+        * per_element
+    )
+    assert footprint.cache_bytes == expected_cache
+
+    # The two plans trace the same module, so a weight of the same name and
+    # shape must be the same array. Without the sharing, a single bucket held
+    # the whole checkpoint twice.
+    prefill_state = dict(zip(runtime.prefill.state_names, runtime.prefill._state_values))
+    decode_state = dict(zip(runtime.decode.state_names, runtime.decode._state_values))
+    shared = [
+        name
+        for name in set(prefill_state) & set(decode_state)
+        if prefill_state[name].shape == decode_state[name].shape
+    ]
+    assert shared
+    for name in shared:
+        assert prefill_state[name] is decode_state[name], name
+
+    unique: dict[int, int] = {}
+    for array in (*runtime.prefill._state_values, *runtime.decode._state_values):
+        unique[id(array)] = array.nbytes
+    assert footprint.weights_bytes == sum(unique.values())
+    assert footprint.step_peak_bytes > footprint.cache_bytes + footprint.weights_bytes
+    assert "cache" in footprint.describe()
+
+
+def test_a_budget_that_cannot_hold_one_step_is_refused_before_it_runs() -> None:
+    from aotolith.errors import MemoryBudgetError
+
+    transformers = pytest.importorskip("transformers")
+    runtime = _tiny_runtime(transformers)
+    footprint = runtime.memory_footprint()
+
+    assert runtime.check_memory_budget(footprint.step_peak_bytes) == footprint
+    with pytest.raises(MemoryBudgetError, match="budget"):
+        runtime.check_memory_budget(footprint.step_peak_bytes - 1)

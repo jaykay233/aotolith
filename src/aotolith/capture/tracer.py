@@ -16,6 +16,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..decompose import aten_decompositions
+from ..errors import DynamicShapeError, PlatformError, UnsupportedOperationError
 
 
 def _guard_error() -> type[BaseException]:
@@ -144,7 +145,10 @@ def trace(
     try:
         from torch.fx.experimental.proxy_tensor import make_fx
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for the FX frontend") from exc
+        raise PlatformError(
+            "PyTorch is required for the FX frontend",
+            hint="pip install 'aotolith[fx]' installs the Torch this needs",
+        ) from exc
 
     # Fake tracing keeps capture shape-only: the default "real" mode executes
     # every operator on the example inputs, so tracing a large matmul costs a
@@ -156,15 +160,15 @@ def trace(
             decomposition_table=aten_decompositions(keep),
         )(*example_inputs)
     except _guard_error() as exc:
-        raise ValueError(_data_dependent_message(exc)) from exc
+        raise DynamicShapeError(_data_dependent_message(exc)) from exc
     except _data_dependent_output_error() as exc:
-        raise ValueError(_data_output_message(exc)) from exc
+        raise DynamicShapeError(_data_output_message(exc)) from exc
     except _dynamic_output_shape_error() as exc:
-        raise ValueError(_dynamic_output_shape_message(exc)) from exc
+        raise DynamicShapeError(_dynamic_output_shape_message(exc)) from exc
     except AssertionError as exc:
         if "Please convert all Tensors to FakeTensors" not in str(exc):
             raise
-        raise NotImplementedError(
+        raise UnsupportedOperationError(
             "a tensor reached an operator without being a graph input. Fake "
             "tracing only accepts the traced inputs and registered parameters "
             "and buffers, so a constant held on the module inside a container "

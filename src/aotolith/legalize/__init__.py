@@ -38,6 +38,7 @@ from .fx import (
     _tensor_type,
 )
 from ..ir import Graph, Value
+from ..errors import CompilationError, UnsupportedOperationError
 from . import (
     attention,
     elementwise,
@@ -196,13 +197,21 @@ def legalize(
                 # it exists only to be concatenated away.
                 continue
             if not _lower_call(lowering, node, target):
-                raise ValueError(f"unsupported FX target: {target}")
+                raise UnsupportedOperationError(
+                    f"unsupported FX target: {target}",
+                    hint=(
+                        "the compiler lowers the ATen targets listed in "
+                        "docs/operators.md; this one has no lowering. Run it "
+                        "outside the compiled region, or add a handler in "
+                        "src/aotolith/legalize/"
+                    ),
+                )
         elif node.op == "output":
             from .refs import _output_ids
 
             lowering.output_ids = _output_ids(node.args[0], node_ids)
         else:
-            raise ValueError(f"unsupported FX node kind: {node.op}")
+            raise CompilationError(f"unsupported FX node kind: {node.op}")
 
     return lowering.result(lowering.output_ids)
 

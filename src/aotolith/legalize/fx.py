@@ -20,6 +20,13 @@ folded away by the legalizer when it reaches the concatenation.
 from __future__ import annotations
 
 
+from ..errors import (
+    CompilationError,
+    DynamicShapeError,
+    IRValidationError,
+    UnsupportedDTypeError,
+    UnsupportedOperationError,
+)
 from ..ir import TensorType
 from .refs import _argument_ids
 from .targets import _TORCH_DTYPES
@@ -29,17 +36,17 @@ def _node_type(node: object) -> TensorType:
     meta = getattr(node, "meta", {})
     tensor = meta.get("val")
     if tensor is None:
-        raise ValueError(f"missing concrete shape/dtype metadata for FX node: {node}")
+        raise CompilationError(f"missing concrete shape/dtype metadata for FX node: {node}")
     return _tensor_type(tensor, f"FX node {node}")
 
 
 def _tensor_type(tensor: object, context: str) -> TensorType:
     if not hasattr(tensor, "shape") or not hasattr(tensor, "dtype"):
-        raise ValueError(f"missing concrete shape/dtype metadata for {context}")
+        raise CompilationError(f"missing concrete shape/dtype metadata for {context}")
 
     dtype = _TORCH_DTYPES.get(str(tensor.dtype))
     if dtype is None:
-        raise ValueError(
+        raise UnsupportedDTypeError(
             f"unsupported dtype: {tensor.dtype} in {context}. The backend speaks "
             "float16, bfloat16, float32, bool and the integer types. A float64 "
             "tensor usually comes from a decomposition rather than the model - "
@@ -48,8 +55,9 @@ def _tensor_type(tensor: object, context: str) -> TensorType:
             "input asked for float64"
         )
     if any(dim <= 0 for dim in tensor.shape):
-        raise ValueError(
-            f"dynamic or empty shapes are not supported yet: {tuple(tensor.shape)}"
+        raise DynamicShapeError(
+            f"dynamic or empty shapes are not supported yet: "
+            f"{tuple(tensor.shape)}"
         )
     return TensorType(tuple(int(dim) for dim in tensor.shape), dtype)
 
@@ -88,7 +96,7 @@ def _reject_unsupported_dropout(graph: object) -> None:
 
     for node in getattr(graph, "nodes", ()):
         if str(getattr(node, "target", "")) == "aten.bernoulli_.float":
-            raise NotImplementedError(
+            raise UnsupportedOperationError(
                 "dropout is not supported: the traced graph draws a random "
                 "bernoulli mask (aten.bernoulli_.float), and a static plan has "
                 "no RNG state to reproduce it. Trace with dropout off - "
@@ -150,7 +158,7 @@ def _reject_random_draw(graph: object) -> None:
         named = _RANDOM_TARGETS.get(target)
         if named is None:
             continue
-        raise NotImplementedError(
+        raise UnsupportedOperationError(
             f"{named} draws a random number ({target}), and a plan holds no "
             "RNG state: replaying it would return the value tracing sampled "
             "once, or advance a generator the caller cannot see. Draw the "
@@ -174,7 +182,7 @@ def _reject_embedding_renorm(graph: object) -> None:
         target = str(getattr(node, "target", ""))
         if not target.startswith("aten.embedding_renorm_"):
             continue
-        raise NotImplementedError(
+        raise UnsupportedOperationError(
             f"F.embedding with max_norm renormalizes its weight table in place "
             f"({target}), and a plan never mutates an input or a bound weight: "
             "the gather would read the unrenormalized table. Bake the norm into "
@@ -234,7 +242,7 @@ def _reject_data_dependent_shapes(graph: object) -> None:
         target = _producing_target(node)
         named = _DATA_DEPENDENT_NAMES.get(target)
         subject = f"{named} ({target})" if named else target
-        raise ValueError(
+        raise DynamicShapeError(
             f"{subject} returns a length computed from its values, and a plan "
             "can only hold static shapes: the size is not known until the data "
             "is, so Torch refuses to guard on it too. Pass the extent in from "
@@ -284,7 +292,7 @@ def _fold_empty_cat_operands(
     if len(kept) == len(operands):
         return args
     if not kept:
-        raise ValueError(
+        raise IRValidationError(
             "cat only concatenates zero-length constants and has no result"
         )
     if len(kept) == 1:
