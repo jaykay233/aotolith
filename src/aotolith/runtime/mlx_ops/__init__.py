@@ -41,6 +41,11 @@ from .kernels import (
 from .layout import _MLX_LAYOUT_OPS, _evaluate_layout_mlx
 from .linalg import _LINALG_OPS, _evaluate_linalg_mlx
 from .matmul import _apply_mlx_matmul_epilogue, _apply_mlx_matmul_norm
+from .normalization import (
+    _evaluate_normalization_mlx,
+    _evaluate_reduction_mlx,
+    _evaluate_softmax_mlx,
+)
 from .pointwise import _evaluate_pointwise_mlx, _mlx_logaddexp
 from .scatter import _mlx_scatter_reduce
 
@@ -221,6 +226,18 @@ def _evaluate_mlx_op(
         return body_env[op.outputs[0]]
     if op.op == "attention":
         return _evaluate_attention_mlx(op, env)
+    if op.op in {"softmax", "safe_softmax"}:
+        return _evaluate_softmax_mlx(op, env[op.inputs[0]])
+    if op.op in {"sum", "mean"}:
+        return _evaluate_reduction_mlx(
+            op, env[op.inputs[0]], graph.value(op.outputs[0]).type
+        )
+    if op.op in {"layer_norm", "rms_norm"}:
+        return _evaluate_normalization_mlx(
+            op,
+            tuple(env[value_id] for value_id in op.inputs),
+            tuple(graph.value(value_id).type for value_id in op.outputs),
+        )
     if op.op == "kv_cache_append":
         return _evaluate_kv_cache_append(graph, op, env)
     if op.op == "rope":
