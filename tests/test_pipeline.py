@@ -771,6 +771,41 @@ def test_identity_and_inverse_layouts_are_eliminated() -> None:
     assert mx.array_equal(actual, expected)
 
 
+def test_a_transpose_that_only_relabels_axes_becomes_a_reshape() -> None:
+    def fn(x):
+        # (1, 1, 14, 64) -> (1, 14, 1, 64): every axis that carries data keeps
+        # the stride it had, so the transpose is a relabelling and the pass
+        # writes it as a reshape the rest of the layout sweep can cancel.
+        return x.reshape(1, 1, 14, 64).transpose(1, 2).reshape(14, 64)
+
+    x = torch.randn(14 * 64)
+    result = compile_callable(fn, (x,))
+    assert "transpose" not in [op.op for op in result.lowered_graph.ops]
+
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
+def test_a_transpose_that_moves_a_real_axis_past_a_singleton_is_kept() -> None:
+    # Swapping a singleton with an axis that carries data does not commute with
+    # flattening: (1, 5, 2, 2, 8) on axes 0 and 3 is (2, 5, 2, 1, 8) in index
+    # order, but the size-2 axis is still at the stride it had, which is not the
+    # stride its new position expects. An earlier version of this pass tested
+    # the shapes instead of the strides, rewrote this to a reshape, and returned
+    # silently wrong values - so the equality here is the point of the test.
+    def fn(x):
+        return x.reshape(1, 5, 2, 2, 8).transpose(0, 3).reshape(2, 5, 2, 1, 8)
+
+    x = torch.randn(160)
+    result = compile_callable(fn, (x,))
+    actual = result.plan(mx.array(x.numpy()))[0]
+    expected = mx.array(fn(x).numpy())
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected)
+
+
 def test_squeeze_identity_and_inverse_are_eliminated() -> None:
     def fn(x):
         unchanged = x.squeeze(1)

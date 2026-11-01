@@ -9,6 +9,30 @@ The policy that decides what counts as a breaking change lives in
 
 ## [Unreleased]
 
+### Changed
+
+- **Decode dispatches fewer layout nodes, and that is what the step time was
+  made of.** A decode step for Qwen2.5-0.5B was 682 operations of which 460 were
+  views; on a 4-bit model the host side of the step was 94% of the wall clock,
+  so the view count, not the kernels, set the rate. Three changes, all in
+  `passes/layout.py`:
+  - `simplify_layouts` now iterates to a fixpoint, because folding a pair can
+    leave an identity reshape behind that the old single sweep never saw.
+  - `collapse_trailing_layouts` is a new last pipeline step. Every fusion emits
+    views of its own, and nothing swept them up: the trailing sweep alone took
+    the decode graph from 682 to 657 ops.
+  - permutes that only relabel axes are rewritten as `reshape`, and reshape
+    composition no longer requires the middle value to have one consumer, which
+    is what freed the `(1, 896) -> (1, 1, 896) -> (1, 896)` round trips that ran
+    once per projection.
+
+  The rewrite is only applied when the permuted view is still C-contiguous in
+  its source's strides; `(1, 5, 2, 2, 8)` transposed on axes 0 and 3 is not, and
+  the first version of this pass silently returned the wrong values there. The
+  decode graph is now 466 operations, and Qwen2.5-0.5B 4-bit decode went from
+  270.9 to 331.9 tok/s against `mlx_lm`'s 295.3 on the same prompt, timed
+  interleaved: 0.909x before, 1.124x after.
+
 ### Fixed
 
 - **The published speedup over `mlx_lm` (1.21x) compared two different loop

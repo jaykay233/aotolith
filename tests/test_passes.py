@@ -34,6 +34,9 @@ def test_the_pipeline_runs_every_pass_once_in_the_documented_order() -> None:
         "fuse_activation_epilogue",
         "eliminate_common_subexpressions",
         "fuse_rms_norm_epilogue",
+        # The fusions above emit views of their own; this is the only sweep
+        # that sees the graph they leave behind.
+        "collapse_trailing_layouts",
     ]
 
     assert [name for name, _ in passes.PIPELINE] == expected

@@ -26,7 +26,11 @@ from .fusion import (
     fuse_rms_norm_epilogue,
     fuse_rope,
 )
-from .layout import fold_matmul_input_layouts, simplify_layouts
+from .layout import (
+    collapse_trailing_layouts,
+    fold_matmul_input_layouts,
+    simplify_layouts,
+)
 from .norm import fuse_norm_scale
 from .quantize import fold_quantized_weights
 
@@ -35,6 +39,7 @@ __all__ = [
     "PIPELINE",
     "POINTWISE_OPS",
     "canonicalize_batched_matmul",
+    "collapse_trailing_layouts",
     "eliminate_common_subexpressions",
     "fold_matmul_input_layouts",
     "fold_quantized_weights",

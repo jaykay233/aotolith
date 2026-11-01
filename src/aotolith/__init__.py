@@ -121,6 +121,7 @@ from .runtime.plan import (
 from .selection import KernelBenchmark, KernelSelection
 from .passes import (
     canonicalize_batched_matmul,
+    collapse_trailing_layouts,
     eliminate_common_subexpressions,
     fuse_activation_epilogue,
     fuse_attention,
@@ -203,4 +204,5 @@ __all__ = [
     "plan_storage",
     "tensor_nbytes",
     "simplify_layouts",
+    "collapse_trailing_layouts",
 ]

@@ -24,7 +24,11 @@ from .fusion import (
     fuse_rms_norm_epilogue,
     fuse_rope,
 )
-from .layout import fold_matmul_input_layouts, simplify_layouts
+from .layout import (
+    collapse_trailing_layouts,
+    fold_matmul_input_layouts,
+    simplify_layouts,
+)
 from .norm import fuse_norm_scale
 from .quantize import fold_quantized_weights
 
@@ -66,6 +70,11 @@ PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
     # collapse, and before rms norm, which looks for a single consumer.
     ("eliminate_common_subexpressions", eliminate_common_subexpressions),
     ("fuse_rms_norm_epilogue", fuse_rms_norm_epilogue),
+    # Every fusion above emits views of its own, and none of them are the
+    # frontend's to be cleaned up early. A second sweep at the end is the only
+    # place that sees the final graph, and each view it removes is one node the
+    # runner does not have to dispatch per decode step.
+    ("collapse_trailing_layouts", collapse_trailing_layouts),
 )
 
 
