@@ -118,13 +118,16 @@ tokens = runtime.greedy_generate(prompt_ids)
 
 ## 实测结果
 
-Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16，batch 1，M5 Pro。`mlx_lm` 在同一进程里读到 190.5-195.0 token/s：
+Qwen2.5-0.5B-Instruct，128 个 prompt token，生成 64 个 greedy token，BF16，batch 1，M5 Pro。`mlx_lm` 在同一进程、同样形状的循环里计时：
 
-| 配置 | prefill | decode（异步） | 相对 `mlx_lm` |
-| --- | --- | --- | --- |
-| 仅 MLX fallback | 9 500 token/s | 174.8 token/s | 0.90x |
-| `--codegen-matmul` | 11 800 token/s | **231.7 token/s** | **1.21x** |
-| `--codegen-matmul --codegen-attention` | 12 400 token/s | 232.3 token/s | 1.20x |
+| 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm`（异步） |
+| --- | --- | --- | --- | --- |
+| 仅 MLX fallback | 9 650 token/s | 154.7 token/s | 185.9 token/s | 0.77x |
+| `--codegen-matmul` | 10 872 token/s | 182.4 token/s | **239.1 token/s** | **1.00x** |
+| `--codegen-matmul --codegen-attention` | 12 379 token/s | 184.9 token/s | 239.0 token/s | 0.99x |
+| `mlx_lm` 本身 | — | 198.0 token/s | 242.1 token/s | — |
+
+codegen 的意义在**第二次**跨步，而不是第一次：全走 fallback 时比 `mlx_lm` 落后 23%，打开 matmul kernel 把这个差距抹平。它并不带来领先。本表早先写的是 1.21x，那个数字来自两边计时方式不同——本仓库的 decode 路径每步用 `mx.async_eval` 提交，而 `mlx_lm` 基线每步都等，每 token 一次设备往返值大约 15%。按同口径跨三个 prompt 长度测，decode 落在 `mlx_lm` 的 0.89-0.96x，prefill 在 32 token 上是 0.60x、128 token 起是 1.08-1.10x。`examples/compare_mlx_lm.py` 会打出这张网格。
 
 64 个 token 与 PyTorch BF16 参考实现逐位一致，开不开原生 kernel 都是如此，`mlx_lm` 产出的也是同一批 token。
 

@@ -195,31 +195,51 @@ def _mlx_lm_decode_rate(
     model, _ = load(model_path)
     ids = mx.array([prompt])
 
-    def once() -> tuple[float, list[int]]:
+    def once(sync_each_step: bool) -> tuple[float, list[int]]:
         prompt_cache = mlx_cache.make_prompt_cache(model)
         logits = model(ids, cache=prompt_cache)
         mx.eval(logits)
-        tokens = [int(mx.argmax(logits[:, -1, :], axis=-1).item())]
+        token = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+        generated = [token]
         start = time.perf_counter()
         for _ in range(decode_tokens - 1):
-            logits = model(mx.array([[tokens[-1]]]), cache=prompt_cache)
-            token = mx.argmax(logits[:, -1, :], axis=-1)
-            mx.eval(token)
-            tokens.append(int(token.item()))
-        return time.perf_counter() - start, tokens
+            out = model(token, cache=prompt_cache)
+            token = mx.argmax(out[:, -1, :], axis=-1).reshape(1, 1)
+            # Both modes submit work; they differ only in whether the step is
+            # waited on. Reading the token back every step (``.item()``, a device
+            # sync) is what this used to do, and it cost about 15% against the
+            # async loop for no reason: the comparison it fed pitted aotolith's
+            # asynchronous decode against a synchronous baseline. A benchmark has
+            # to time the same shape of loop on both sides.
+            if sync_each_step:
+                mx.eval(token)
+            else:
+                mx.async_eval(token)
+            generated.append(token)
+        mx.synchronize()
+        return time.perf_counter() - start, [int(t.item()) for t in generated]
 
     for _ in range(warmups):
-        once()
-    latencies: list[float] = []
+        once(True)
+        once(False)
+    sync_latencies: list[float] = []
+    async_latencies: list[float] = []
     tokens: list[int] = []
     for _ in range(repeats):
-        elapsed, tokens = once()
-        latencies.append(elapsed)
+        elapsed, tokens = once(True)
+        sync_latencies.append(elapsed)
+    for _ in range(repeats):
+        elapsed, tokens = once(False)
+        async_latencies.append(elapsed)
     return {
         "backend": "mlx_lm",
-        "decode": {
-            "latency_ms": _summary([value * 1000 for value in latencies]),
-            "tokens_per_s": _rate_summary(latencies, decode_tokens - 1),
+        "decode_sync_each_step": {
+            "latency_ms": _summary([value * 1000 for value in sync_latencies]),
+            "tokens_per_s": _rate_summary(sync_latencies, decode_tokens - 1),
+        },
+        "decode_async": {
+            "latency_ms": _summary([value * 1000 for value in async_latencies]),
+            "tokens_per_s": _rate_summary(async_latencies, decode_tokens - 1),
         },
         "generated_tokens": tokens,
     }

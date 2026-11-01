@@ -142,13 +142,24 @@ request runs.
 ## Results
 
 Qwen2.5-0.5B-Instruct, 128 prompt tokens, 64 greedy tokens, BF16, batch 1, on an
-M5 Pro. `mlx_lm` measured 195.5-197.2 tok/s in the same process:
+M5 Pro. `mlx_lm` was timed in the same process, under the same loop shape:
 
-| configuration | prefill | decode, async | vs `mlx_lm` |
-| --- | --- | --- | --- |
-| MLX fallback only | 9 500 tok/s | 174.8 tok/s | 0.90x |
-| `--codegen-matmul` | 11 800 tok/s | **231.7 tok/s** | **1.21x** |
-| `--codegen-matmul --codegen-attention` | 12 400 tok/s | 232.3 tok/s | 1.20x |
+| configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
+| --- | --- | --- | --- | --- |
+| MLX fallback only | 9 650 tok/s | 154.7 tok/s | 185.9 tok/s | 0.77x |
+| `--codegen-matmul` | 10 872 tok/s | 182.4 tok/s | **239.1 tok/s** | **1.00x** |
+| `--codegen-matmul --codegen-attention` | 12 379 tok/s | 184.9 tok/s | 239.0 tok/s | 0.99x |
+| `mlx_lm` itself | — | 198.0 tok/s | 242.1 tok/s | — |
+
+The point of code generation is the *second* step, not the first: the fallback
+path is 23% behind `mlx_lm` and turning on the matmul kernel closes that. It does
+not open a lead. An earlier revision of this table read 1.21x, and that came from
+timing the two sides differently — this repository's decode path submits each step
+with `mx.async_eval` while the `mlx_lm` baseline waited for every step, and a
+device round trip per token costs about 15%. Timed like for like across three
+prompt lengths, decode lands at 0.89-0.96x of `mlx_lm` and prefill at 0.60x on a
+32-token prompt, 1.08-1.10x from 128 up. `examples/compare_mlx_lm.py` prints that
+grid.
 
 All 64 tokens match the PyTorch BF16 reference exactly, with or without native
 kernels, and `mlx_lm` produces those same tokens.

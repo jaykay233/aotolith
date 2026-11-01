@@ -24,13 +24,28 @@ Qwen2 的每一次测量都用同一段 prompt、同一精度、同样的 `128 +
 
 ## Qwen2.5-0.5B，128 个 prompt token，生成 64 个
 
-| 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm` |
+| 配置 | prefill | decode（每步同步） | decode（异步） | 相对 `mlx_lm`（异步） |
 | --- | --- | --- | --- | --- |
-| 仅 MLX fallback | 9 500 token/s | 146.3 token/s | **174.8 token/s** | 0.90x |
-| `--codegen-matmul` | 11 800 token/s | 166.4 token/s | **231.7 token/s** | **1.21x** |
-| `--codegen-matmul --codegen-attention` | 12 400 token/s | 166.3 token/s | 232.3 token/s | 1.20x |
+| 仅 MLX fallback | 9 650 token/s | 154.7 token/s | 185.9 token/s | 0.77x |
+| `--codegen-matmul` | 10 872 token/s | 182.4 token/s | **239.1 token/s** | **1.00x** |
+| `--codegen-matmul --codegen-attention` | 12 379 token/s | 184.9 token/s | 239.0 token/s | 0.99x |
+| `mlx_lm` 本身 | — | 198.0 token/s | 242.1 token/s | — |
 
-（11 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致。每一行都在同一个进程里带了自己的 `mlx_lm` 基线，这些基线读到 192.2-195.3 token/s。`--codegen-attention` 那行在 decode 上与上一行落在噪声内，prefill 这里甚至略高——attention kernel 在 prefill 形状上更慢的 tile 比这台机器的运行间波动还小。）
+（同一个会话里 5 次重复取中位数；每一行的 64 个生成 token 都与 PyTorch 参考实现一致，且都在 decoder 默认的 `memory="latency"` 策略下运行。这台机器的运行间波动大到一个小时前后同一份代码量到 204 和 239 token/s，所以有意义的是比值，不是绝对值——每一行都对着旁边那行 `mlx_lm` 读。
+
+`相对 mlx_lm` 这一列是异步对异步。这是一次更正：本表早先把这个仓库的异步 decode 拿去比一个每步都用 `mx.eval` 加 `.item()` 等待的基线，而那种等待本身就值大约 15%，由此得出 1.21x。按服务循环的写法计时，`mlx_lm` 是 242.1 token/s，所以 codegen 抹平的是 fallback 路径那 23% 的差距，到达的是持平而不是领先。同步那一列从另一面说的是同一件事：0.93x——到那里 kernel 的选择已经不再决定结果，每步的 host 开销开始决定。
+
+`--codegen-attention` 那行在 decode 上与上一行落在噪声内，prefill 这里甚至略高——attention kernel 在 prefill 形状上更慢的 tile 比这台机器的运行间波动还小。）
+
+prompt 长度对 prefill 的影响远大于对 decode 的影响。在同一个进程里交错计时、两边都测、每格取 5 次的中位数：
+
+| prompt token 数 | prefill：本仓库 / `mlx_lm` | decode 同步 | decode 异步 |
+| --- | --- | --- | --- |
+| 32 | 3 392 / 5 661 token/s（0.60x） | 181.2 / 198.2（0.91x） | 226.8 / 241.2（0.94x） |
+| 128 | 12 029 / 11 122 token/s（1.08x） | 176.2 / 196.3（0.90x） | 230.7 / 241.4（0.96x） |
+| 178 | 14 702 / 13 341 token/s（1.10x） | 174.3 / 196.2（0.89x） | 228.1 / 241.4（0.94x） |
+
+32 token 的 prefill 短到让每次 launch 的地板价主导：算术只有约 0.02 ms，却摊在几百次 4-14 µs 的 launch 上，所以成本就是那个次数，而 `mlx_lm` 的图更短。到 128 token，算术开始值得这些 launch，本仓库领先 8-10%。decode 在三个长度上两边都是平的，这正是带宽受限的一步该有的样子，同时它一直落后 4-10%。`examples/compare_mlx_lm.py` 会打出整张网格。
 
 token 一致不等于数字一致。`examples/qwen_logit_distance.py` 把两条路径的最后一个 token logits 分别与 PyTorch 对比，而这个差距取决于 prefill 看到多少 token：
 

@@ -88,19 +88,49 @@ nothing else to fall back to.
 
 ## Qwen2.5-0.5B, 128 prompt tokens and 64 generated
 
-| configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` |
+| configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 9 500 tok/s | 146.3 tok/s | **174.8 tok/s** | 0.90x |
-| `--codegen-matmul` | 11 800 tok/s | 166.4 tok/s | **231.7 tok/s** | **1.21x** |
-| `--codegen-matmul --codegen-attention` | 12 400 tok/s | 166.3 tok/s | 232.3 tok/s | 1.20x |
+| MLX fallback only | 9 650 tok/s | 154.7 tok/s | 185.9 tok/s | 0.77x |
+| `--codegen-matmul` | 10 872 tok/s | 182.4 tok/s | **239.1 tok/s** | **1.00x** |
+| `--codegen-matmul --codegen-attention` | 12 379 tok/s | 184.9 tok/s | 239.0 tok/s | 0.99x |
+| `mlx_lm` itself | — | 198.0 tok/s | 242.1 tok/s | — |
 
-(Median of 11 repeats; the same 64 generated tokens as the PyTorch reference in
-every row, and each was run under the decoder's default `memory="latency"`
-policy. Each row was run with its own `mlx_lm` baseline in the same process,
-and those baselines read 192.2-195.3 tokens/s. The `--codegen-attention` row is
-within noise of the one above it on decode, and its prefill reads a little
-higher here rather than lower — the attention kernel's slower tile on prefill
-shapes is smaller than this machine's run-to-run spread.)
+(Median of 5 repeats in one session, the same 64 generated tokens as the
+PyTorch reference in every row, and each run under the decoder's default
+`memory="latency"` policy. Run-to-run spread on this machine is wide enough —
+the same code measured 204 and 239 tok/s in two sessions an hour apart — that
+the ratios matter and the absolute numbers do not; read each row against the
+`mlx_lm` row measured beside it.
+
+The `vs mlx_lm` column compares asynchronous against asynchronous. That is a
+correction: earlier revisions put this repository's asynchronous decode against a
+baseline that waited for every step with `mx.eval` and `.item()`, which is worth
+about 15% on its own, and reported 1.21x from it. `mlx_lm` does 242.1 tok/s when
+its loop is timed the way a serving loop runs, so code generation closes the 23%
+gap that the fallback path has and arrives at parity rather than at a lead. The
+sync column says the same thing from the other side: 0.93x, which is where the
+kernel choice stops mattering and per-step host overhead starts to.)
+
+The `--codegen-attention` row is within noise of the one above it on decode, and
+its prefill reads a little higher here rather than lower — the attention kernel's
+slower tile on prefill shapes is smaller than this machine's run-to-run spread.
+
+Prompt length moves prefill more than it moves decode. Timed interleaved in one
+process, both sides, median of five passes per cell:
+
+| prompt tokens | prefill: this / `mlx_lm` | decode sync | decode async |
+| --- | --- | --- | --- |
+| 32 | 3 392 / 5 661 tok/s (0.60x) | 181.2 / 198.2 (0.91x) | 226.8 / 241.2 (0.94x) |
+| 128 | 12 029 / 11 122 tok/s (1.08x) | 176.2 / 196.3 (0.90x) | 230.7 / 241.4 (0.96x) |
+| 178 | 14 702 / 13 341 tok/s (1.10x) | 174.3 / 196.2 (0.89x) | 228.1 / 241.4 (0.94x) |
+
+A 32-token prefill is short enough that the per-operation launch floor dominates:
+the arithmetic is ~0.02 ms spread over a few hundred launches at 4-14 µs each, so
+the count is the cost and `mlx_lm` runs a shorter graph. By 128 tokens the
+arithmetic pays for the launches and this repository leads by 8-10%. Decode is
+flat across the three lengths on both sides, which is what a bandwidth-bound step
+should look like, and it stays 4-10% behind. `examples/compare_mlx_lm.py` prints
+the grid.
 
 All 64 greedy tokens match the PyTorch bf16 reference exactly, with or without
 native kernels, and `mlx_lm` produces those same 64 tokens, so the comparison

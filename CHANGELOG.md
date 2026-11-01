@@ -11,6 +11,16 @@ The policy that decides what counts as a breaking change lives in
 
 ### Fixed
 
+- **The published speedup over `mlx_lm` (1.21x) compared two different loop
+  shapes.** This repository's decode path submits each step with `mx.async_eval`;
+  the baseline helper in `examples/qwen_static_cache_benchmark.py` used
+  `mx.eval` and `.item()` on every step, and a device round trip per token is
+  worth about 15%. Timed like for like, `mlx_lm` does 242.1 tok/s against this
+  repository's 239.1, so code generation closes the fallback path's 23% gap and
+  arrives at parity rather than at a lead. `--mlx-baseline` now times both modes
+  on both sides and returns them under `decode_sync_each_step` and
+  `decode_async`, so the comparison cannot drift apart again.
+
 - **The decoder runtimes lost about 20% of their decode rate between 0.62.0 and
   0.68.0**, and the docs hid it: the README still said 1.21x over `mlx_lm` while
   the same machine measured 1.03x. The cause was the memory policy added with the
@@ -30,6 +40,12 @@ The policy that decides what counts as a breaking change lives in
   budgeting is unaffected by the choice.
 
 ### Added
+
+- **`examples/compare_mlx_lm.py`**, which times prefill and both decode modes for
+  this repository and for `mlx_lm` at several prompt lengths. The existing
+  `--mlx-baseline` flag answered one question — decode rate at one prompt — and
+  left prefill unmeasured, where short prompts turn out to be the weaker case:
+  0.63x at 32 tokens, 1.03x at 128.
 
 - **`examples/qwen_op_counts.py`**, which prints the decode step's op count as
   traced, each pass's delta where it runs, and each named pass's net
