@@ -79,6 +79,7 @@ def compile_llama_static_cache(
     autotune: bool = False,
     quantize: int | None = None,
     target: str = "apple-metal",
+    memory: str = "latency",
 ) -> DecoderStaticCacheRuntime:
     """Compile a Llama causal LM for greedy single-request generation."""
 
@@ -93,6 +94,7 @@ def compile_llama_static_cache(
         quantize=quantize,
         family=FAMILY,
         target=target,
+        memory=memory,
     )
 
 

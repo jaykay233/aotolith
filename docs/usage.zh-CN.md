@@ -218,7 +218,9 @@ MLX 是惰性的。只构图不 evaluate 的 plan 调用会把每个中间值都
 
 同步点是真正的屏障，不只是 `mx.eval`。evaluate 只是把工作排进队列就返回，而一个 storage plan 认为已经用完的 buffer，在 GPU 可能还在写它的时候无法还给分配器——于是下一个算子会叠在只是名义上死掉的 buffer 上分配。跨十二个新进程实测，同一条 134 MB 的 plan 峰值有时 134 MB、有时 160 MB、有时 134 MB + 256 B。现在 runner 先 evaluate、再等待、最后删除，十二个进程测到的都正好是 `peak_bound_bytes`。
 
-默认档在本仓库自带的 workload 上一分钱不花：它们每一个的 transient 都小于 8 MiB，所以 `"balanced"` 不会发出任何同步，生成的函数体与 `"latency"` 完全一致。它在内存开始要紧的地方才生效——上面那条链上，它用 4 次同步把峰值压在 134 MB，而 `"minimal"` 用 9 次拿到同样的 134 MB。
+本节早先的版本说默认档在本仓库自带的 workload 上一分钱不花。这是错的，两个 LLM 计划就是反例：0.5B 模型的 prefill transient 有 254 MiB，在 `"balanced"` 下发 7 次同步；一个 decode step 的 transient 是 8.46 MiB，刚好越过 8 MiB 地板，发 1 次同步。每步一次屏障就足以拿走两成的步频，因为它冲掉了调用方正用来重叠下一步 host 端建图的流水线。在同一个会话里量 Qwen2.5-0.5B bf16 加 `codegen_matmul`：`"latency"` 解码 240.9 token/s，`"balanced"` 是 196；prefill 是 11 660 对 8 707 token/s。
+
+所以 `aotolith.models` 里的 decoder runtime 默认用 `"latency"`：它们存在的意义就是被重叠，而它们的峰值是权重加 KV cache，不是死掉的中间量，本来就不是这个策略要解决的问题。`compile_module` 仍默认 `"balanced"`。当界比速率更要紧时，给 decoder 传 `memory="balanced"`——`memory_footprint()` 和 `check_memory_budget()` 读的是形状而不是这个策略，所以两种选择下预算都算得准。这个策略在划算的地方收益仍然真实：上面那条 134 MB 的链，它用 4 次同步压住了峰值，而 `"minimal"` 要用 9 次才拿到同样的峰值。
 
 ```python
 compiled.plan(inputs, memory="balanced")   # 或 "latency" / "minimal"

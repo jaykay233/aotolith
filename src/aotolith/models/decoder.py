@@ -53,6 +53,7 @@ from ..errors import (
 )
 from ..ir import TensorType
 from ..planning import tensor_nbytes
+from ..runtime.plan import MEMORY_POLICIES
 from .quantized import dequantize_i4, pack_weight
 
 # Probe points for the activation pre-flight check below. They span the range
@@ -790,6 +791,12 @@ class DecoderStaticCacheRuntime:
     #: name a host should log next to the artifact rather than the class of the
     #: module it came from.
     family: str
+    #: The memory policy the plans run under, passed to every call. It decides
+    #: whether the runner may insert device barriers to reclaim dead buffers:
+    #: ``"latency"`` never does, ``"balanced"`` does at a bounded number of
+    #: release points, and ``"minimal"`` does at every one. See
+    #: :data:`aotolith.runtime.plan.MEMORY_POLICIES`.
+    memory: str
     _prefill_mask: mx.array
 
     def prefill_ids(
@@ -802,7 +809,9 @@ class DecoderStaticCacheRuntime:
                 f"expected prompt shape (1, {self.prompt_length}), got {ids.shape}"
             )
         positions = mx.arange(self.prompt_length, dtype=mx.int64)[None, :]
-        logits, cache = self.prefill(ids, positions, self._prefill_mask)
+        logits, cache = self.prefill(
+            ids, positions, self._prefill_mask, memory=self.memory
+        )
         return logits, cache
 
     def prefill_padded(
@@ -844,7 +853,9 @@ class DecoderStaticCacheRuntime:
             axis=1,
         )
         mask = mx.array(prefill_mask(length, self.prompt_length))
-        logits, cache = self.prefill(padded_ids, padded_positions, mask)
+        logits, cache = self.prefill(
+            padded_ids, padded_positions, mask, memory=self.memory
+        )
         return logits, cache
 
     def pad_cache(self, compact_cache: mx.array) -> mx.array:
@@ -901,6 +912,7 @@ class DecoderStaticCacheRuntime:
             self.decode_mask(valid_length),
             cache,
             verify_index_bounds=verify_token,
+            memory=self.memory,
         )
         # Decode is a chain of short bandwidth-bound kernels, so the host-side
         # graph build costs about a third of the GPU time per step. Handing the
@@ -1077,6 +1089,7 @@ def compile_decoder_static_cache(
     quantize: int | None = None,
     family: str | None = None,
     target: str = "apple-metal",
+    memory: str = "latency",
 ) -> DecoderStaticCacheRuntime:
     """Compile a supported causal LM for greedy single-request generation.
 
@@ -1093,6 +1106,18 @@ def compile_decoder_static_cache(
     ``"llama"``); the per-family modules pass it so a Llama entry point cannot
     quietly compile a Qwen2 checkpoint. Leaving it None accepts any family in
     :data:`FAMILIES`.
+
+    ``memory`` is the policy both plans run under. It defaults to
+    ``"latency"`` here, unlike :func:`aotolith.compile_module`, because a decode
+    runtime is built to overlap: the caller hands each step to
+    :func:`mlx.core.async_eval` and the barriers a tighter policy inserts sit
+    between those steps. Measured on a 0.5B bf16 decode, ``"balanced"`` costs
+    about 20% of the step rate (196 against 242 tok/s) to bound roughly 26 MB of
+    dead intermediates, which is a trade this path should not make on the
+    caller's behalf. Pass ``"balanced"`` when the peak matters more than the
+    rate; :meth:`DecoderStaticCacheRuntime.memory_footprint` and
+    :meth:`~DecoderStaticCacheRuntime.check_memory_budget` are computed from
+    shapes rather than from this policy, so budgeting works either way.
     """
 
     return _compile_bucket(
@@ -1105,6 +1130,7 @@ def compile_decoder_static_cache(
         quantize=quantize,
         family=family,
         target=target,
+        memory=memory,
     )
 
 
@@ -1119,8 +1145,15 @@ def _compile_bucket(
     quantize: int | None = None,
     family: str | None = None,
     target: str = "apple-metal",
+    memory: str = "latency",
 ) -> DecoderStaticCacheRuntime:
     """Compile the prefill/decode plan pair for one fixed prompt length."""
+
+    if memory not in MEMORY_POLICIES:
+        raise CompilationError(
+            f"unknown memory policy {memory!r}",
+            hint="choose one of: " + ", ".join(MEMORY_POLICIES),
+        )
 
     if prompt_length <= 0 or max_new_tokens < 0:
         raise CompilationError(
@@ -1219,6 +1252,7 @@ def _compile_bucket(
         num_key_value_heads=prefill_module.num_key_value_heads,
         head_dim=prefill_module.head_dim,
         family=prefill_module.family.name,
+        memory=memory,
         _prefill_mask=mx.array(prefill_mask(prompt_length, prompt_length)),
     )
     # Do not leave the traced module (and a second reference to the state) in

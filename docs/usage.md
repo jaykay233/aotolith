@@ -412,7 +412,7 @@ knew which values die at which operation; the runner had no way to act on it.
 | policy | what it does | peak |
 | --- | --- | --- |
 | `"latency"` | builds one graph, never synchronizes | the sum of every intermediate |
-| `"balanced"` (**default**) | evaluates and waits at release points once `max(8 MiB, transient/8)` of dead bytes has accumulated | planned peak + that threshold |
+| `"balanced"` (**default** for `compile_module`, not for decoders) | evaluates and waits at release points once `max(8 MiB, transient/8)` of dead bytes has accumulated | planned peak + that threshold |
 | `"minimal"` | evaluates and waits at every release point that frees anything | the planned peak |
 
 A synchronization point is a real barrier, not just an `mx.eval`. Evaluating
@@ -424,15 +424,32 @@ only nominally dead. Measured across twelve fresh processes, that made the same
 evaluates, waits, and then deletes, and all twelve processes measured exactly
 `peak_bound_bytes`.
 
-The default costs nothing on the workloads this repository ships: every one of
-them holds less than 8 MiB of transient, so `"balanced"` emits no synchronization
-at all and the generated body is the one `"latency"` emits. It starts working
-where memory starts mattering — on the chain above it held the peak at 134 MB
-with four synchronizations, where `"minimal"` needed nine for the same 134 MB.
+An earlier revision of this section said the default costs nothing on the
+workloads this repository ships. That was wrong, and the two LLM plans are where
+it breaks: a 0.5B model's prefill holds 254 MiB of transient and synchronizes
+seven times under `"balanced"`, and a decode step holds 8.46 MiB and synchronizes
+once, just over the 8 MiB floor. One barrier per step is enough to cost a fifth
+of the step rate, because it flushes the pipeline the caller is using to overlap
+the next step's host-side build. Measured in one session on Qwen2.5-0.5B bf16
+with `codegen_matmul`, `"latency"` decodes at 240.9 tok/s and `"balanced"` at 196,
+and prefill reads 11 660 against 8 707 tok/s.
+
+So the decoder runtimes in `aotolith.models` default to `"latency"`:
+they exist to be overlapped, and their peak is weights plus KV cache rather than
+dead intermediates, which is not the case the policy was built for.
+`compile_module` keeps `"balanced"`. Pass `memory="balanced"` to a decoder when
+the bound matters more than the rate — `memory_footprint()` and
+`check_memory_budget()` read shapes rather than this policy, so budgeting works
+under either. The policy's benefit is still real where the trade is worth it: on
+the 134 MB chain above it held the peak with four synchronizations, where
+`"minimal"` needed nine for the same peak.
 
 ```python
 compiled.plan(inputs, memory="balanced")   # or "latency" / "minimal"
 compiled(inputs, memory="minimal")          # the module entry point takes it too
+
+compile_qwen2_static_cache(model, prompt_length=128, max_new_tokens=64,
+                           memory="balanced")   # decoders default to "latency"
 ```
 
 Ask before you run:

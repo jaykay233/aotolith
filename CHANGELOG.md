@@ -9,6 +9,26 @@ The policy that decides what counts as a breaking change lives in
 
 ## [Unreleased]
 
+### Fixed
+
+- **The decoder runtimes lost about 20% of their decode rate between 0.62.0 and
+  0.68.0**, and the docs hid it: the README still said 1.21x over `mlx_lm` while
+  the same machine measured 1.03x. The cause was the memory policy added with the
+  error-code work. `compile_module` defaults to `"balanced"`, which synchronizes
+  at release points to bound dead intermediates, and the decoder runtime inherited
+  that default. A 0.5B decode step holds 8.46 MiB of transient, just over the
+  8 MiB floor, so every step paid one barrier, and one barrier per step flushes
+  the pipeline the caller uses to overlap the next step's host-side build.
+  Measured back to back on one machine: 240.9 tok/s under `"latency"` against 196
+  under `"balanced"`; prefill 11 660 against 8 707. Ablating the commit that
+  introduced it reproduced 1.20x at 6147b02 and 1.00x at a165dc2.
+
+  The decoder entry points now take `memory=` and default to `"latency"`, since
+  these runtimes exist to be overlapped and their peak is weights plus KV cache
+  rather than dead intermediates. `compile_module` keeps `"balanced"`.
+  `memory_footprint()` and `check_memory_budget()` are computed from shapes, so
+  budgeting is unaffected by the choice.
+
 ### Added
 
 - **`examples/qwen_op_counts.py`**, which prints the decode step's op count as

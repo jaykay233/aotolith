@@ -95,7 +95,8 @@ nothing else to fall back to.
 | `--codegen-matmul --codegen-attention` | 12 400 tok/s | 166.3 tok/s | 232.3 tok/s | 1.20x |
 
 (Median of 11 repeats; the same 64 generated tokens as the PyTorch reference in
-every row. Each row was run with its own `mlx_lm` baseline in the same process,
+every row, and each was run under the decoder's default `memory="latency"`
+policy. Each row was run with its own `mlx_lm` baseline in the same process,
 and those baselines read 192.2-195.3 tokens/s. The `--codegen-attention` row is
 within noise of the one above it on decode, and its prefill reads a little
 higher here rather than lower — the attention kernel's slower tile on prefill
@@ -549,11 +550,19 @@ That is also why the policy is a choice: a synchronization on a decode step whos
 whole graph is 0.6 ms is expensive. A `minimal` runner on `qwen2_decode_128`
 measured 5.3 ms against 0.6 ms — nine times the work, for a plan whose transient
 is 0.4 MB. The `balanced` threshold (`max(8 MiB, transient/8)`) exists to make
-the policy free where memory is not the problem: every workload in `aoto bench`
-holds less than 8 MiB of transient, so `balanced` emits no synchronization at all
-and measures the same as `latency` to within noise. The cost only appears on
-graphs that hold tens of megabytes of intermediates, which is where it buys
-something.
+the policy free on the synthetic workloads, which all hold less than 8 MiB of
+transient: `balanced` emits no synchronization there and measures the same as
+`latency` to within noise.
+
+It does not make the policy free on a real model. A 0.5B decode step holds
+8.46 MiB of transient — just enough to clear the floor — so `balanced` emits one
+barrier per step, and one barrier per step is enough to cost a fifth of the step
+rate, because it flushes the pipeline the caller is using to overlap the next
+step's host-side build: 240.9 tok/s under `latency` against 196 under `balanced`,
+and prefill 11 660 against 8 707 with seven barriers. The threshold's own
+estimate of the work, `transient/8`, is 1.06 MB there, which is why the 8 MiB
+floor decides the outcome rather than the fraction. That measurement is why the
+decoder runtimes default to `latency`; see [Memory](usage.md#memory).
 
 Two costs were paid for that guarantee. The first is one cache-sized comparison
 per decode step: `decode_mask` builds the window instead of indexing a

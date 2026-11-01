@@ -7,6 +7,8 @@ import mlx.core as mx
 import pytest
 import torch
 
+import aotolith as aoto
+
 from aotolith.models.qwen2 import (
     compile_qwen2_bucketed,
     compile_qwen2_static_cache,
@@ -794,3 +796,98 @@ def test_a_budget_that_cannot_hold_one_step_is_refused_before_it_runs() -> None:
     assert runtime.check_memory_budget(footprint.step_peak_bytes) == footprint
     with pytest.raises(MemoryBudgetError, match="budget"):
         runtime.check_memory_budget(footprint.step_peak_bytes - 1)
+
+
+def test_the_decode_runtime_defaults_to_the_latency_policy() -> None:
+    """A decode runtime overlaps deliberately, so it must not insert barriers.
+
+    ``compile_module`` defaults to ``"balanced"``, which synchronizes at up to
+    eight release points per call to bound dead intermediates. In a decode step
+    those barriers land between the async submissions the caller is using to
+    hide the host-side graph build, and the cost is large: on a 0.5B bf16 decode
+    ``"balanced"`` measured 196 tok/s against 242 for ``"latency"``. That is a
+    trade the runtime should not make on the caller's behalf, and nothing in the
+    API said which side it had picked, so this pins the choice.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(29)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+
+    default = compile_qwen2_static_cache(model, prompt_length=4, max_new_tokens=8)
+    assert default.memory == "latency"
+    balanced = compile_qwen2_static_cache(
+        model, prompt_length=4, max_new_tokens=8, memory="balanced"
+    )
+    assert balanced.memory == "balanced"
+
+
+def test_the_runtime_runs_the_policy_it_was_given() -> None:
+    """The policy has to reach the plan calls, not just the attribute.
+
+    The plan reports the policy it was built for and how many synchronizations
+    it performs, so asking for ``"minimal"`` and then reading the report is how
+    this checks the value is used rather than stored on the runtime and ignored.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(31)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+
+    latency = compile_qwen2_static_cache(
+        model, prompt_length=4, max_new_tokens=8, memory="latency"
+    )
+    logits, cache = latency.prefill_ids(input_ids[0].tolist())
+    mx.eval(logits, cache)
+    report = latency.decode.plan.memory_report("latency")
+    assert report.policy == "latency"
+    assert report.sync_count == 0
+
+    minimal = compile_qwen2_static_cache(
+        model, prompt_length=4, max_new_tokens=8, memory="minimal"
+    )
+    report = minimal.decode.plan.memory_report("minimal")
+    assert report.sync_count > 0
+
+
+def test_an_unknown_memory_policy_is_refused_at_compile_time() -> None:
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    with pytest.raises(aoto.CompilationError, match="unknown memory policy"):
+        compile_qwen2_static_cache(
+            model, prompt_length=4, max_new_tokens=8, memory="cheap"
+        )

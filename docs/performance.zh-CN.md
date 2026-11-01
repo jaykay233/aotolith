@@ -198,7 +198,9 @@ plan 的 storage 布局一直知道哪个值死在哪一层。在这个版本之
 
 机制必须是同步，不能只是 `del`。删掉 Python 名字本身什么都释放不了——节点还在图里；`mx.async_eval` 也释放不了，因为 buffer 在编码命令时就分配好了：同一条链用 `mx.async_eval` 量到 200.8 MB，用 `mx.eval` 量到 134.5 MB。所以 runner 在释放点 evaluate 还活着的值，再删掉刚死掉的名字，这才让 storage plan 的释放从建议变成事实。
 
-这也正是策略要可选的缘故：一个整图只要 0.6 ms 的 decode step 上，同步太贵。`minimal` 在 `qwen2_decode_128` 上量到 5.3 ms，而 `latency` 是 0.6 ms——九倍的工作，换来的只是一个 transient 只有 0.4 MB 的 plan 的界。`balanced` 的阈值（`max(8 MiB, transient/8)`）存在的意义就是让策略在内存不是问题的地方完全免费：`aoto bench` 里的每个 workload 的 transient 都小于 8 MiB，所以 `balanced` 一次同步都不发，测出来与 `latency` 在噪声内一致。代价只在持有几十兆中间值的图上出现，而那正是它能换到东西的地方。
+这也正是策略要可选的缘故：一个整图只要 0.6 ms 的 decode step 上，同步太贵。`minimal` 在 `qwen2_decode_128` 上量到 5.3 ms，而 `latency` 是 0.6 ms——九倍的工作，换来的只是一个 transient 只有 0.4 MB 的 plan 的界。`balanced` 的阈值（`max(8 MiB, transient/8)`）是为了让策略在合成负载上免费：这些 workload 的 transient 都小于 8 MiB，所以 `balanced` 一次同步都不发，测出来与 `latency` 在噪声内一致。
+
+但它并没有让策略在真实模型上免费。0.5B 的一个 decode step 持有 8.46 MiB 的 transient —— 刚好越过那道地板 —— 于是 `balanced` 每步发一次屏障，而每步一次屏障就足以拿走两成的步频：它冲掉了调用方正用来重叠下一步 host 端建图的流水线。实测 `latency` 是 240.9 token/s，`balanced` 是 196；prefill 发 7 次屏障，是 11 660 对 8 707。阈值自己的估算 `transient/8` 在这里只有 1.06 MB，所以决定结果的是 8 MiB 那道地板，不是那个比例。正是这个测量让 decoder runtime 默认用 `latency`，见[内存](usage.zh-CN.md#内存)。
 
 这个保证付了两笔代价。第一是每个 decode step 多一次"和容量等长"的比较：`decode_mask` 现算窗口，而不是去查一张 `capacity x capacity` 的布尔表。那张表在 4096 容量时是 16 MiB，到 32k 会是 1 GiB，省下的只是几微秒。第二是单桶入口与 decode plan 共享权重；`compile_qwen2_bucketed` 一直跨桶共享，但 `compile_qwen2_static_cache` 把 prefill 和 decode 分开 trace，于是留了两份 checkpoint。`memory_footprint()` 两个都报，`check_memory_budget()` 则拿预算去比"一个 decode step"的占用——一步里有两份 cache，因为它先分配要返回的 cache，才丢掉传进来的那份。
 

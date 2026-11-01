@@ -77,6 +77,7 @@ def compile_qwen2_static_cache(
     autotune: bool = False,
     quantize: int | None = None,
     target: str = "apple-metal",
+    memory: str = "latency",
 ) -> DecoderStaticCacheRuntime:
     """Compile a Qwen2/Qwen2.5 causal LM for greedy single-request generation."""
 
@@ -91,6 +92,7 @@ def compile_qwen2_static_cache(
         quantize=quantize,
         family=FAMILY,
         target=target,
+        memory=memory,
     )
 
 
