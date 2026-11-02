@@ -458,11 +458,21 @@ step is 716 MB of projections at 221 GB/s plus a 272 MB head at 364 GB/s plus
 half a millisecond of everything else, and the two large numbers are both the
 size curve.
 
-That is the whole accounting, and it is why this section ends where it does: at
-four bits, group 64, the same step moves about 278 MB instead of 988 and the same
-146 launches cost the same 4-10 us, which is why int4 lands 1.46-1.51x ahead of
-`mlx_lm` while bf16 lands level. The lever that moves bf16 is fewer bytes, not a
-faster kernel, and bf16 has no fewer bytes to offer.
+That is the whole accounting, and it is also the reason a bf16 step cannot be
+made 10% faster on this machine. Take the best case the size curve allows - every
+projection at the 279 GB/s a 17.4 MB launch reaches on its own, and the head at
+the 412 GB/s a 272 MB launch reaches - and add the 1.08 ms the 146 launches cost
+at the floor: 716 MB / 279 GB/s + 272 MB / 412 GB/s + 1.08 ms = 4.31 ms against
+today's 4.39. Winning 1.10x means 3.99 ms, which is below the sum of the curve's
+own numbers. There is no kernel change that gets there, because the bytes cannot
+be dropped and the rate on each bucket is already the rate that bucket's size
+buys.
+
+So the ordering this table produces is the whole result: 1.46-1.51x at four bits,
+1.17-1.22x at eight, and parity at bf16. Four bits, group 64, moves about 278 MB
+per step instead of 988 and pays the same 146 launches at the same 4-10 us. The
+lever that moves bf16 is fewer bytes, not a faster kernel, and bf16 has no fewer
+bytes to offer.
 
 ## Weight-only int4, and what it actually bought
 
