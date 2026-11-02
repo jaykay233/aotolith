@@ -139,6 +139,10 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 *把 attention 读去掉。* 用 query 张量本身替换 attention 输出，其余算子和 146 次 launch 的结构不变：同样三轮交错测量，step 从 4.43 ms 变成 4.20 ms，也就是说 attention 值 0.23 ms、约 5%，只占这一步 991 MB 里的 2.35 MB。上表里它每次 launch 的 7.3 us 是 dispatch 和 barrier 时间，不是流量 —— 这也正是尺寸曲线唯一描述不了的桶：14 个 threadgroup 正好一个 query head 一个，中间的两级 softmax 需要六次 threadgroup barrier。192 槽窗口里的 128 个 key 整个读下来本来就在 L2 里，靠少读字节不可能把它赚回来。
 
+随后这个 kernel 按「绕开读」的思路重写了一遍，没有留下。新写法让一个 warp 负责一组 key、一个 lane 负责一个维度，于是一个 key 行是连续 lane 读连续元素；把需要二十次 barrier 的树形 softmax 换成 `simd_max`/`simd_sum` 加一次合并；value 累加按四个 key 展开。同一次会话里它测到 11.8 us，原写法 11.0 us，而同一个 kernel 在这次会话更晚的时候测到 8.3 us —— 这个 launch 的会话内抖动比两者的差值还大，所以没有任何方向的证据，留下的是更便宜的那种写法。分阶段拆解说明了为什么赢不到东西：把 query/key 那次读整个删掉只省下 12.3 us 里的 1.4 us，score 阶段几乎免费；剩下的是 value 阶段，而它也不缺 load —— 四路展开之后仍是 11.8 us。
+
+真正把这一层和 LM head 分开的是 block 数，这一点值得单独说，因为它是实验里唯一被动过的旋钮。一个 query head 一个 threadgroup 就是 14 个 block，而这块 GPU 有几十个核，所以一个 block 开 512 个线程仍然只占一个核，加宽买不到东西：上面那次扫描把 64 到 512 线程压在同一 10% 以内。LM head 能到 412 GB/s，是因为 151936 列按每 block 四列算是 38 000 个 block，而 `qkv` 只有 36 个 block、145 GB/s。用测到的延迟套 Little 定律得到同样的结论：一次 launch 能维持的吞吐大约是它的 warp 能同时压在路上的那部分，所以小的桶受限于矩阵有多少行，而不是行怎么走。
+
 ## 权重 int4，以及它到底买到了什么
 
 `compile_qwen2_static_cache(..., quantize=64)` 把每个投影和 LM head 都打包 —— `qkv`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`lm_head` —— 而嵌入和 norm 保持原精度。token embedding 是一次只读一行的查表，每个元素 4 bit 在这里既省不到带宽又要损失精度；norm 每层只有一个向量。

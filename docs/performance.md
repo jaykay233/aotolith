@@ -367,6 +367,31 @@ is one per query head, and the two-level softmax between them needs six
 threadgroup barriers. At 128 keys of a 192-slot window the whole read fits in the
 L2 anyway, so it cannot be made to pay for itself by reading fewer bytes.
 
+That kernel was then rewritten around the read instead of the reduction, and the
+rewrite was not kept. The new shape put a warp on a group of keys and a lane on
+the dimensions, so a key row arrives as consecutive lanes on consecutive
+elements, replaced the twenty-barrier tree softmax with `simd_max`/`simd_sum`
+plus one combine, and unrolled the value accumulation four keys deep. It measures
+11.8 us against 11.0 us for the original spelling in the same session, and the
+original measured 8.3 us for the same kernel later that session, so the run-to-run
+spread on this launch is larger than the difference: there is no evidence either
+way, and the cheaper spelling is the one that stays. The phase split says why
+there is nothing to win. Removing the query/key read entirely costs 1.4 us of a
+12.3 us launch, so the score phase is nearly free; the value phase is the rest,
+and it is not short of loads either - unrolling it four keys deep leaves it at
+11.8 us.
+
+What actually separates this launch from the LM head is the block count, and that
+is worth stating because it is the one knob the experiments did move. One
+threadgroup per query head is 14 blocks on a GPU with tens of cores, and a block
+of 512 threads still occupies one core, so widening it buys nothing: the sweep
+above puts 64 to 512 threads within 10% of each other. The LM head reaches
+412 GB/s because 151936 columns at four columns per block is 38 000 blocks, and
+`qkv` reaches 145 GB/s because 1152 columns is 36. Little's law on the measured
+latency says the same thing: a launch sustains roughly what its warps can keep in
+flight, so the small buckets are limited by how many rows a matrix has, not by how
+the rows are walked.
+
 ## Weight-only int4, and what it actually bought
 
 `compile_qwen2_static_cache(..., quantize=64)` packs every projection and the LM
