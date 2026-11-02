@@ -430,12 +430,15 @@ and by 16 - same launch count, one eighth and one sixteenth of the bytes:
 
 Dividing the bytes by 46 divides the time by 4.4 and then stops. The floor is
 0.71 ms for 96 dependent launches, or 7.4 us each, paid whether a kernel moves
-15 MB or 4 MB. At full size the same chain is 3.07-3.24 ms, which is the
-221-233 GB/s the size curve predicts for launches of 1.6 to 17.4 MB - so the
-floor is 22% of the projection chain and the other 78% is streaming already at
-the rate that section measured. Nothing in the projection path can be won by
-rewriting kernels, and a merge that trades the floor for a coarser read is the
-one move the earlier section already measured as a loss.
+15 MB or 4 MB, and it is 22% of the full-size chain. The remaining 2.4-2.5 ms is
+the streaming, and it lands at 221-233 GB/s here against the 268-279 GB/s the
+size curve gives those same 1.6-17.4 MB launches standalone - 15 to 20% below,
+which is the penalty for running them in a dependent chain rather than one after
+another, and it is the same residue the threadgroup sweep above failed to move.
+So the projection path is a floor plus a size-curve rate minus a chain penalty,
+and none of the three responds to a better kernel. A merge that trades the floor
+for a coarser read is the one move the earlier section already measured as a
+loss.
 
 Measuring the three buckets of a real step in one process, five interleaved
 rounds each, closes the budget:
