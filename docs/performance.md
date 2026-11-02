@@ -392,6 +392,57 @@ latency says the same thing: a launch sustains roughly what its warps can keep i
 flight, so the small buckets are limited by how many rows a matrix has, not by how
 the rows are walked.
 
+So the obvious repair is to split the key axis, which is the other axis of the
+only matrix in this kernel: give each head four blocks of 48 keys and merge the
+partial maxima, sums and accumulators in a second, tiny launch. That makes the
+block count 56 instead of 14. It measures worse, not better:
+
+| variant | latency |
+| --- | --- |
+| one threadgroup per head, 128 threads | 10.3 us |
+| one threadgroup per head, 192 threads | 10.5 us |
+| split 2 keys with a merge launch | 16.2 us |
+| split 4 keys with a merge launch | 17.6 us |
+| split 8 keys with a merge launch | 17.6 us |
+
+The merge launch alone explains it: an empty kernel of this shape costs 5.4 us on
+this machine, so splitting trades a 4.9 us kernel for the same kernel plus six
+microseconds of merge. What rules out the idea outright is that the split kernel
+does not get faster as the split widens - eight blocks per head do one eighth the
+scoring and one eighth the accumulation each, and the pair still costs 17.6 us
+against 10.3 us for the whole head in one block. A kernel this small is paying a
+fixed cost, and adding launches to it cannot pay back. There is no split-K to be
+had here, and the reason is the same one that makes the attention bucket 7.3 us
+of dispatch in the first place.
+
+## The chain floor, and where the remaining time actually is
+
+That fixed cost is worth pinning down, because it bounds every kernel-level idea
+in this document. Twenty-four decoder layers of real shape, run as a dependent
+chain of 96 projections, then the same chain with the hidden width divided by 8
+and by 16 - same launch count, one eighth and one sixteenth of the weight bytes:
+
+| weight bytes | chain latency | effective rate | per launch |
+| --- | --- | --- | --- |
+| 991 MB | 3.07 ms | 323 GB/s | 31.9 us |
+| 124 MB | 0.74 ms | 21 GB/s | 7.8 us |
+| 62 MB | 0.71 ms | 5.5 GB/s | 7.4 us |
+
+Dividing the bytes by 16 divides the time by 4.3 and then stops. The floor is
+0.71 ms for 96 dependent launches, or 7.4 us each, and it is paid whether the
+kernel moves 10 MB or 62 KB. At full size the same chain is 2.36 ms of streaming
+at 420 GB/s plus that 0.71 ms, which is exactly the rate a single large GEMV
+reaches on this machine: **the projection chain is already at the kernel's own
+bandwidth, and its launch overhead is hidden behind it.** Nothing in the
+projection path can be won by rewriting kernels.
+
+That leaves the step's measured 4.43 ms against the chain's 3.07 ms. Attention is
+0.23 ms of the difference and the rest - recurrence, both normalizations, the
+rotary-and-cache append, the residual add, the sampling read - is about 1.1 ms
+over roughly 50 launches, which is more than 7.4 us each and is not explained by
+this document yet. That is the one bucket worth profiling next, and it is the only
+place a bf16 step can still find ten percent.
+
 ## Weight-only int4, and what it actually bought
 
 `compile_qwen2_static_cache(..., quantize=64)` packs every projection and the LM

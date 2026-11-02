@@ -143,6 +143,32 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 真正把这一层和 LM head 分开的是 block 数，这一点值得单独说，因为它是实验里唯一被动过的旋钮。一个 query head 一个 threadgroup 就是 14 个 block，而这块 GPU 有几十个核，所以一个 block 开 512 个线程仍然只占一个核，加宽买不到东西：上面那次扫描把 64 到 512 线程压在同一 10% 以内。LM head 能到 412 GB/s，是因为 151936 列按每 block 四列算是 38 000 个 block，而 `qkv` 只有 36 个 block、145 GB/s。用测到的延迟套 Little 定律得到同样的结论：一次 launch 能维持的吞吐大约是它的 warp 能同时压在路上的那部分，所以小的桶受限于矩阵有多少行，而不是行怎么走。
 
+那么最直接的修法就是切 key 轴 —— 这是这个 kernel 里唯一那个矩阵的另一条边：每个 head 给 4 个 block、每个 48 个 key，再用第二个极小的 launch 合并 partial 的 max、sum 和累加器。block 数从 14 变成 56。测出来是更差，不是更好：
+
+| 变体 | 延迟 |
+| --- | --- |
+| 一个 head 一个 threadgroup，128 线程 | 10.3 us |
+| 一个 head 一个 threadgroup，192 线程 | 10.5 us |
+| 切 2 段 key + 合并 launch | 16.2 us |
+| 切 4 段 key + 合并 launch | 17.6 us |
+| 切 8 段 key + 合并 launch | 17.6 us |
+
+光合并那次 launch 就解释了大半：这个形状的空 kernel 在这台机器上要 5.4 us，所以切分等于把一个 4.9 us 的 kernel 换成同样的 kernel 再加六微秒。彻底否掉这个想法的是：切开之后 kernel 自己并不会随份数变快 —— 每个 head 八个 block 时每块只做八分之一的打分和八分之一的累加，成对测下来仍是 17.6 us，而整个 head 放在一个 block 里是 10.3 us。这么小的 kernel 付的是固定成本，往上加 launch 不可能赚回来。这里没有 split-K 可拿，理由正是 attention 那个桶 7.3 us 的 dispatch 本身。
+
+## 链式地板，以及剩下的时间到底在哪
+
+那个固定成本值得钉死，因为它给本文里每一个 kernel 级想法划了上界。24 层真实形状的 decoder，串成 96 次投影的依赖链；再把 hidden 维度除以 8 和除以 16 —— launch 数不变，权重字节数变成八分之一和十六分之一：
+
+| 权重字节 | 链延迟 | 有效带宽 | 每次 launch |
+| --- | --- | --- | --- |
+| 991 MB | 3.07 ms | 323 GB/s | 31.9 us |
+| 124 MB | 0.74 ms | 21 GB/s | 7.8 us |
+| 62 MB | 0.71 ms | 5.5 GB/s | 7.4 us |
+
+字节数除以 16，时间只除以 4.3 然后就不动了。地板是 96 次依赖 launch 的 0.71 ms，即每次 7.4 us，无论这个 kernel 搬 10 MB 还是 62 KB 都要付。满尺寸下同一条链是 420 GB/s 的 2.36 ms 加上这 0.71 ms，而 420 GB/s 正好是这块机器上一发大 GEMV 能到的速率：**投影链已经在 kernel 自己的带宽上，它的 launch 开销本来就藏在带宽后面。** 投影路径上没有任何东西能靠改 kernel 赢回来。
+
+于是剩下的是 step 实测的 4.43 ms 与这条链 3.07 ms 之差。attention 占其中 0.23 ms，其余 —— 残差、两次归一化、旋转位置编码加 cache 追加、残差相加、采样读取 —— 大约是 50 次 launch 上的 1.1 ms，比每次 7.4 us 还多，本文还没有解释它。这是接下来唯一值得 profile 的桶，也是 bf16 一步还能找到百分之十的唯一地方。
+
 ## 权重 int4，以及它到底买到了什么
 
 `compile_qwen2_static_cache(..., quantize=64)` 把每个投影和 LM head 都打包 —— `qkv`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`lm_head` —— 而嵌入和 norm 保持原精度。token embedding 是一次只读一行的查表，每个元素 4 bit 在这里既省不到带宽又要损失精度；norm 每层只有一个向量。
