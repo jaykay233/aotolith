@@ -325,6 +325,41 @@ this, and it is why that one change measured 1.03x while removing 24 launches of
 1 KB measured nothing. Faster still means fewer bytes, which means quantized
 weights, not a better kernel.
 
+Three changes that follow from that curve were built and measured, and none of
+them moved a bf16 step in the direction it was supposed to.
+
+*Merging the four per-layer projections into one launch.* The size curve says a
+launch gets cheaper per byte as it grows, and the four projections of a layer are
+one dependent chain over one layer's 29.8 MB, so one launch of 29.8 MB should
+beat four launches of 1.6-17.4 MB. It does not. A 24-launch chain reading the
+same 715 MB measured 280-285 GB/s against 306-325 GB/s for the 96-launch chain,
+with the threadgroup size pinned to the same value in both variants so the grid
+mapping is not the variable. The curve is about how many bytes one *matrix*
+contributes, not how many bytes one dispatch touches: concatenating four
+matrices into one dispatch puts a 4864-wide reduction and three 896-wide ones
+under one mapping, and the wide one loses more than the merge saves.
+
+*Splitting the RMSNorm prologue out of the projection.* Three of the four
+projections carry a fused RMSNorm, and the inner loop recomputes the scale on
+every weight, so it reads like duplicated arithmetic. Hoisting it into its own
+kernel costs more than it saves: a chain of 24 layers with the fused prologue
+measures 103.1 us per layer, against 169.3 us when each norm is a separate
+`rms_norm` plus a separate scale multiply, which is 0.48 ms against 0.78 ms per
+step. The prologue is nearly free compared with a projection that has no norm at
+all — 103.1 us against 100.3 us per layer — so the cost is not the arithmetic the
+fusion repeats. It is the ten dependent launches per layer that the unfused
+spelling needs instead of four.
+
+*Removing the attention read.* Replacing the attention output with the query
+tensor keeps every other operator and drops the 24 attention launches: the step
+goes from 4.43 ms to 4.20 ms on the same three interleaved rounds, so attention
+is worth 0.23 ms, or 5%, and reads 2.35 MB of the step's 991 MB. Its 7.3 us per
+launch in the table above is dispatch and barrier time, not traffic, which is why
+it is the one bucket whose rate the size curve does not describe: 14 threadgroups
+is one per query head, and the two-level softmax between them needs six
+threadgroup barriers. At 128 keys of a 192-slot window the whole read fits in the
+L2 anyway, so it cannot be made to pay for itself by reading fewer bytes.
+
 ## Weight-only int4, and what it actually bought
 
 `compile_qwen2_static_cache(..., quantize=64)` packs every projection and the LM

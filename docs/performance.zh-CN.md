@@ -129,6 +129,14 @@ decode 现在受权重带宽限制，而不是受 host 限制。构建一个 ste
 
 三者合起来说明：一次 launch 能达到的速率取决于它读多少字节，而不是它的网格怎么划分。要让整个 step 都跑在 412 GB/s，那 991 MB 必须以几百 MB 一次的 launch 到达，但每一层都被切成五个严格串行的投影 —— `qkv`、`o_proj`、成对 gate/up、`down` —— 而最大的只有 17.4 MB，因为中间的非线性是真屏障。把 `gate` 和 `up` 配对正是利用了这一点，这也是为什么那一次改动测到 1.03x，而删掉 24 次 1 KB 的 launch 什么也没测到。要明显更快只能少读字节，也就是量化权重，而不是写更好的 kernel。
 
+顺着这条曲线该成立的三件事，都实现了、也测了，但都没有把 bf16 的 step 推向它该去的方向。
+
+*把一层里的四个投影合成一次 launch。* 曲线说 launch 越大每字节越便宜，而一层的四个投影本来就是一条依赖链、共读 29.8 MB，所以一次 29.8 MB 的 launch 应该快过四次 1.6–17.4 MB 的 launch。实际相反：同样读 715 MB 的 24 次 launch 链测得 280–285 GB/s，而 96 次 launch 链是 306–325 GB/s；两个变体的 threadgroup 大小都钉在同一个值上，所以变量不是网格映射。这条曲线说的是「一个矩阵贡献多少字节」，不是「一次 dispatch 碰多少字节」：把四个矩阵拼进一次 dispatch，等于让一个 4864 宽的归约和三个 896 宽的归约共用一套映射，宽的那部分损失比合并省下的更多。
+
+*把 RMSNorm 前导从投影里拆出去。* 四个投影里有三个带融合的 RMSNorm，内层循环对每个权重都重算一次 scale，看上去像重复算术。把它提到独立 kernel 里反而更贵：24 层链在融合写法下是每层 103.1 us，改成每个投影前一个独立 `rms_norm` 加一次独立 scale 乘法后是 169.3 us，也就是每步 0.48 ms 对 0.78 ms。和完全不带 norm 的投影比，这个前导几乎是免费的 —— 每层 103.1 us 对 100.3 us —— 所以代价不在融合重复的那点算术，而在不融合写法每层需要十次串行 launch，而不是四次。
+
+*把 attention 读去掉。* 用 query 张量本身替换 attention 输出，其余算子和 146 次 launch 的结构不变：同样三轮交错测量，step 从 4.43 ms 变成 4.20 ms，也就是说 attention 值 0.23 ms、约 5%，只占这一步 991 MB 里的 2.35 MB。上表里它每次 launch 的 7.3 us 是 dispatch 和 barrier 时间，不是流量 —— 这也正是尺寸曲线唯一描述不了的桶：14 个 threadgroup 正好一个 query head 一个，中间的两级 softmax 需要六次 threadgroup barrier。192 槽窗口里的 128 个 key 整个读下来本来就在 L2 里，靠少读字节不可能把它赚回来。
+
 ## 权重 int4，以及它到底买到了什么
 
 `compile_qwen2_static_cache(..., quantize=64)` 把每个投影和 LM head 都打包 —— `qkv`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`lm_head` —— 而嵌入和 norm 保持原精度。token embedding 是一次只读一行的查表，每个元素 4 bit 在这里既省不到带宽又要损失精度；norm 每层只有一个向量。

@@ -137,6 +137,29 @@ The policy that decides what counts as a breaking change lives in
   270.9 to 331.9 tok/s against `mlx_lm`'s 295.3 on the same prompt, timed
   interleaved: 0.909x before, 1.124x after.
 
+- **Three structural rewrites aimed at the bf16 step, measured and not kept.**
+  bf16 is the one width still at parity with `mlx_lm`, and
+  [`docs/performance.md`](docs/performance.md) now records where the byte budget
+  goes and why three rewrites that follow from it do not pay:
+
+  - Merging a layer's four dependent projections into one launch: 280-285 GB/s
+    against 306-325 GB/s for the 96-launch chain, with the threadgroup size
+    pinned in both variants. One dispatch cannot evaluate a 4864-wide reduction
+    and three 896-wide ones under separate mappings.
+  - Hoisting the fused RMSNorm prologue into its own kernel: 169.3 us per layer
+    against 103.1 us, because ten dependent launches per layer cost more than the
+    prologue's repeated arithmetic (103.1 us against 100.3 us for a projection
+    with no norm at all).
+  - Dropping the attention read entirely: 4.43 ms to 4.20 ms per step over three
+    interleaved rounds, so 5% of the step is 2.35 MB of the 991 MB, and it is
+    barrier and dispatch time rather than traffic.
+
+  A fourth measurement sets the scale: one decode step lands at 240 GB/s while
+  the same GEMV reaches 413 GB/s in a sustained sweep, and a fresh four-launch
+  burst of a single 544 MB matrix only reaches 282 GB/s. Both engines pay that
+  ramp, and it is why the quantized widths, which read fewer bytes, are where the
+  lead is.
+
 ### Fixed
 
 - **The published speedup over `mlx_lm` (1.21x) compared two different loop
