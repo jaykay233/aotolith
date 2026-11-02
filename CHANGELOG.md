@@ -27,14 +27,15 @@ The policy that decides what counts as a breaking change lives in
 
   | weights | aotolith | `mlx_lm` | ratio |
   | --- | --- | --- | --- |
-  | bf16 | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
-  | int4, group 64 | 485-489 tok/s | 322-333 tok/s | 1.47-1.51x |
-  | int8, group 64 | 389-392 tok/s | 319-322 tok/s | 1.22x |
+  | bf16 | 200-236 tok/s | 187-238 tok/s | 0.92-1.01x |
+  | int4, group 64 | 358-489 tok/s | 283-333 tok/s | 1.46-1.51x |
+  | int8, group 64 | 319-397 tok/s | 255-338 tok/s | 1.17-1.22x |
 
-  Those are ranges over two paired rounds in one session, each round a median of
-  three runs inside the process. The bf16 row is parity: both engines walk the
-  same 146 dependent launches over the same 991 MB, and a step lands at 240 GB/s
-  against the 413 GB/s the same GEMV reaches in a sustained read-only sweep.
+  Those are ranges over paired rounds in three sessions, each round a median of
+  three to five runs inside the process. The bf16 row is parity: both engines
+  walk the same 146 dependent launches over the same 991 MB, and a step lands at
+  240 GB/s against the 413 GB/s the same GEMV reaches in a sustained read-only
+  sweep.
 
   Eight bits is slower than four because a step streams 495 MB instead of 250,
   and its head alone is 272 MB. It is not twice as slow because a four-bit step

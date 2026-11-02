@@ -217,18 +217,20 @@ format, not the compiler. On the same prompt and the same 64 steps:
 
 | weights | bytes per step | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- | --- |
-| BF16 | 991 MB | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
-| int4, group 64 | 250 MB | **485-489 tok/s** | 322-333 tok/s | **1.47-1.51x** |
-| int8, group 64 | 495 MB | 389-392 tok/s | 319-322 tok/s | 1.22x |
+| BF16 | 991 MB | 200-236 tok/s | 187-238 tok/s | 0.92-1.01x |
+| int4, group 64 | 250 MB | **358-489 tok/s** | 283-333 tok/s | **1.46-1.51x** |
+| int8, group 64 | 495 MB | 319-397 tok/s | 255-338 tok/s | 1.17-1.22x |
 
-Those are ranges over two paired rounds in one session, each round a median of
-three runs inside the process. The same rows waited on every step are 196-208 /
-183-192 (1.07-1.09x), 369.7-370.1 / 280.9-284.1 (1.30-1.32x) and 314.6-316.6 /
-248.2-254.4 (1.24-1.27x); prefill at 128 tokens is 10 905-11 687 / 10 669-10 857
-(1.02-1.08x), 9 078-9 666 / 8 923-8 956 (1.01-1.08x) and 9 153-9 231 / 8 552-8 600
-(1.07x). Ratios move by 0.02-0.09 between sessions while absolute rates move by
-up to 18%, which is why the ranges stay visible instead of collapsing to a single
-figure.
+Those are ranges over paired rounds in three sessions, each round a median of
+three to five runs inside the process. The same rows waited on every step are
+196-208 / 183-192 (1.07-1.09x), 357.6-370.1 / 280.9-284.1 (1.26-1.32x) and
+314.6-316.6 / 248.2-254.4 (1.24-1.27x); prefill at 128 tokens is 10 752-11 687 /
+10 669-10 904 (0.99-1.08x), 9 078-9 666 / 8 923-8 956 (1.01-1.08x) and
+9 153-9 673 / 8 552-8 881 (1.07-1.09x). Ratios move by 0.02-0.09 between sessions
+while absolute rates move by up to 18%, which is why the ranges stay visible
+instead of collapsing to a single figure. The session that produced the step
+budget below is the slowest of the three on both sides — 203.6 against 215.3
+tok/s at bf16 — and it is inside these ranges rather than setting them.
 
 Four bits is the widest margin because the step stops being about bandwidth
 first. At bf16 a step has 991 MB to read and spends 4.1 ms on it, which is 58% of
@@ -253,7 +255,8 @@ stream itself plus the cost of unpacking it. Removing one instruction from that
 unpack — a nibble sign-extended by two shifts instead of a mask, a compare and a
 subtract — is what moved the four-bit row by 7%.
 
-BF16 has read 0.92x, 1.01x and 1.09x here across sessions, so it is parity and
+BF16 has read 0.92x, 1.01x, 0.95x and 1.09x here across sessions, so it is parity
+and
 not a lead — the lead comes from dropping the width. A sustained read-only sweep
 of 544 MB through the same generated GEMV runs at 413 GB/s on this machine, and
 the head alone moves 272 MB at 388-423, while a bf16 step sustains 240, so the

@@ -460,7 +460,7 @@ size curve.
 
 That is the whole accounting, and it is why this section ends where it does: at
 four bits, group 64, the same step moves about 278 MB instead of 988 and the same
-146 launches cost the same 4-10 us, which is why int4 lands 1.47-1.51x ahead of
+146 launches cost the same 4-10 us, which is why int4 lands 1.46-1.51x ahead of
 `mlx_lm` while bf16 lands level. The lever that moves bf16 is fewer bytes, not a
 faster kernel, and bf16 has no fewer bytes to offer.
 
@@ -572,18 +572,21 @@ that took 222 to 198 was worth more than its 24 launches because it also halved
 the activation traffic of the widest projection, not because it removed launches.
 
 Against `mlx_lm` quantized to the same width and timed in the same loop
-shape, 64 decode steps at the same prompt, median of three alternating runs:
+shape, 64 decode steps at the same prompt, median of three to five alternating
+runs, ranges over three sessions:
 
 | weights | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- |
-| bf16 | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
-| int4, group 64 | 485-489 tok/s | 322-333 tok/s | 1.47-1.51x |
-| int8, group 64 | 389-392 tok/s | 319-322 tok/s | 1.22x |
+| bf16 | 200-236 tok/s | 187-238 tok/s | 0.92-1.01x |
+| int4, group 64 | 358-489 tok/s | 283-333 tok/s | 1.46-1.51x |
+| int8, group 64 | 319-397 tok/s | 255-338 tok/s | 1.17-1.22x |
 
-Those are ranges over two paired rounds in one session; each round is a median of
-three runs inside the process, and the baseline is re-measured per row. Waited on
-every step the same session reads 1.07-1.09x / 1.30-1.32x / 1.24-1.27x, and
-prefill at 128 tokens 1.02-1.08x / 1.01-1.08x / 1.07x.
+The baseline is re-measured per row in every session. Waited on every step the
+same rows read 1.07-1.09x / 1.26-1.32x / 1.24-1.27x, and prefill at 128 tokens
+0.99-1.08x / 1.01-1.08x / 1.07-1.09x. The session that measured the step budget
+below is the slowest of the three on both sides — 203.6 against 215.3 tok/s at
+bf16, 200.9 against 187.1 waited on — and its ratios land inside these ranges
+rather than outside them.
 
 Timing `mlx_lm.generate()` rather than its raw decode loop inflates those ratios,
 because `generate()` adds per-token text bookkeeping the loop does not. That is
