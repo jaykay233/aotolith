@@ -72,6 +72,47 @@ def test_decode_matmul_matches_torch(rows: int, inner: int) -> None:
     assert float(np.abs(actual - expected).max()) <= 3e-2 * scale
 
 
+@pytest.mark.parametrize("bits", [4, 8])
+def test_decoding_survives_codes_at_both_ends_of_the_range(bits: int) -> None:
+    """The codes at the ends of the range must decode with the right sign.
+
+    The four-bit kernel sign-extends a nibble by shifting it into the sign
+    position and back down, and the eight-bit kernel does the same with a byte.
+    Both agree with masking and subtracting on paper; these weights put every
+    column at the extremes, where a missing extension reads -8 as 8.
+    """
+
+    quantize = quantize_int4 if bits == 4 else quantize_int8
+    unpack = dequantize_int4 if bits == 4 else dequantize_int8
+    dequantize = dequantize_i4 if bits == 4 else dequantize_i8
+    rows, inner = 64, 128
+    rng = np.random.default_rng(77 + bits)
+    weight = np.zeros((rows, inner), dtype=np.float32)
+    # Alternating extremes keep both ends in every group of one scale.
+    weight[:, 0::2] = 3.0
+    weight[:, 1::2] = -3.0
+    activation = rng.standard_normal((1, inner)).astype(np.float32)
+    packed, scales = quantize(weight, GROUP)
+
+    def call(x, packed, scales):
+        return torch.matmul(x, dequantize(packed, scales, GROUP).t())
+
+    compiled = compile_callable(
+        call,
+        (
+            torch.from_numpy(activation),
+            torch.from_numpy(packed),
+            torch.from_numpy(scales),
+        ),
+        codegen_matmul=True,
+    )
+    actual = compiled.plan(mx.array(activation), mx.array(packed), mx.array(scales))[0]
+    mx.eval(actual)
+    expected = activation @ unpack(packed, scales, GROUP).T
+    scale = float(np.abs(expected).max()) or 1.0
+    assert float(np.abs(np.asarray(actual) - expected).max()) <= 1e-5 * scale
+
+
 @pytest.mark.parametrize("batch", [2, 4, 7])
 def test_prefill_matmul_matches_torch(batch: int) -> None:
     actual, expected = _compile(48, 128, batch, seed=batch)

@@ -90,10 +90,10 @@ nothing else to fall back to.
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 9 616 tok/s | 198.4 tok/s | 230.5 tok/s | 0.96x |
-| `--codegen-matmul` | 11 466 tok/s | 211.7 tok/s | **240.9 tok/s** | **1.01x** |
-| `--codegen-matmul --codegen-attention` | 11 153 tok/s | 211.9 tok/s | 239.8 tok/s | 1.00x |
-| `mlx_lm` itself | 11 280 tok/s | 195.9 tok/s | 238.8 tok/s | — |
+| MLX fallback only | 9 224 tok/s | 199.2 tok/s | 228.5 tok/s | 0.96x |
+| `--codegen-matmul` | 12 455 tok/s | 213.5 tok/s | **232.7 tok/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 10 641-11 687 tok/s | 195.8-208.4 tok/s | 216.0-236.0 tok/s | 0.92-1.01x |
+| `mlx_lm` itself | 10 669-11 084 tok/s | 183.0-193.9 tok/s | 224.6-237.6 tok/s | — |
 
 (Median of three runs of the whole table, each run a median of five repeats, the
 same 64 generated tokens as the PyTorch reference in every row, and each run
@@ -105,14 +105,14 @@ read each row against the `mlx_lm` row measured in the same process.
 The table is re-measured whenever a commit changes per-step cost. The revision
 before this one predated replaying the unrolled decode body through `mx.compile`,
 and that commit moves exactly what the sync column reads: it reported 182.4 tok/s
-there against 211.7 now, a 16% error that had been published as 0.93x. A figure
+there against 203.3 now, a 16% error that had been published as 0.93x. A figure
 in a table is a measurement with a date, not a property of the code.)
 
 The `vs mlx_lm` column compares asynchronous against asynchronous. That is a
 correction: earlier revisions put this repository's asynchronous decode against a
 baseline that waited for every step with `mx.eval` and `.item()`, which is worth
-about 15% on its own, and reported 1.21x from it. `mlx_lm` does 238.8 tok/s when
-its loop is timed the way a serving loop runs, so code generation closes the 4%
+about 15% on its own, and reported 1.21x from it. `mlx_lm` does 224-238 tok/s when
+its loop is timed the way a serving loop runs, so code generation closes the 2%
 gap that the fallback path has and arrives at parity rather than at a lead. The
 asynchronous column cannot show more than that: both sides stream the same 991 MB
 of weights per step, so both are pinned to the same memory ceiling and the
@@ -136,7 +136,7 @@ by up to 18% between them while the ratio moves by 0.02-0.06:
 | prompt tokens | prefill: this / `mlx_lm` | decode sync | decode async |
 | --- | --- | --- | --- |
 | 32 | 0.61-0.68x | 0.94-1.09x | 0.86-1.01x |
-| 128 | 1.02-1.08x | 1.04-1.06x | 0.96-1.00x |
+| 128 | 1.02-1.08x | 1.04-1.06x | 0.96-1.02x |
 | 178 | 1.09-1.14x | 1.03-1.05x | 0.96-0.98x |
 
 The wide decode ranges at 32 tokens are one cell, not a spread across sessions.
@@ -357,15 +357,18 @@ lowers to one streaming kernel in `codegen/quantize.py` rather than to eight
 elementwise MLX passes and a stack that writes several full-sized temporaries per
 layer.
 
-The step time tracks the launch count more than the bytes — [the next section](#cutting-245-operators-out-of-a-decode-step)
-takes 245 operators out of the step and measures what that bought. What it leaves is
-a decode step whose launches are each worth about 14 µs of fixed cost: isolating
-one launch of this kernel gives `t ≈ 14 µs + bytes / 373 GB/s`, so a 2.3 MB
-gate/up launch takes 20.8 µs at 110 GB/s while the 72 MB LM head takes 288 µs at
-252 GB/s. Threadgroup size changes that by a few percent and a leaner nibble
-decode changes it by less, which is why the next lever is verifying several
-tokens per launch rather than a faster single-row kernel. The four measurements
-that line fits are in [the architecture notes](architecture.md) (in Chinese).
+The step time does not track the launch count. [The next section](#cutting-245-operators-out-of-a-decode-step)
+takes 245 operators out of the step and measures what that bought; the answer was
+less than the operator count suggests. Two later measurements settle it. Folding
+the step's two rotations into its cache write removed 48 launches — from 198 to
+150 — and moved an int8 step by 6% and an int4 step by nothing measurable. Fitting
+time against bytes and codes across the three widths charges about 236 GB/s for
+the in-model stream — the effective rate once the 146 launches are accounted
+for, against 413 GB/s of raw read and about 2 ps per four-bit code on top, and at 500M codes a step that
+second term is half of it. So a launch here is not 14 µs of wall time: the
+stream and the launches overlap, and what a narrow step waits on is the bytes and
+the unpack, which is why the next lever was a cheaper nibble decode and not a
+shorter chain.
 
 Accuracy: int4 rounds each weight onto one of 15 values inside its group, so the
 logits move, and greedy decode is a chaotic readout of that movement. Against a
@@ -386,44 +389,68 @@ word holds: four bytes instead of eight nibbles, with the scale taken over 127
 levels instead of 7. Everything else — the fold, the streaming kernel, the
 grouping — is the same code.
 
-It is slower than four bits and much more accurate, and the reason it is only
-mildly slower is the same reason four bits was worth doing: a decode step is
-host-bound. On Qwen2.5-0.5B the step time splits as
+It is slower than four bits and much more accurate, and it is only mildly
+slower because a four-bit step is not bound by bytes. Reading a decode step at
+each width says where the time goes. Multiplying the layer count and re-timing
+gives a line per width, and the machine's own read rate — a generated GEMV
+streaming 544 MB, sustained over 200 launches — is 413 GB/s. An earlier revision
+of this document put that ceiling at 267 GB/s, which was the rate a sweep through
+MLX's own reduction reached rather than the rate the kernels reach:
 
-| | host | kernel share | wall, current |
-| --- | --- | --- | --- |
-| bf16 | 5.18 ms | — | 4.34 ms |
-| int4 g64 | 2.50 ms | 0.53 ms | 2.17 ms |
-| int8 g64 | 2.92 ms | 0.57 ms | 2.72 ms |
+| | bytes per step | one layer | at 24 layers | of which the head |
+| --- | --- | --- | --- | --- |
+| bf16 | 991 MB | 0.15 ms | 4.7 ms | 1.05 ms |
+| int4 g64 | 250 MB | 0.055 ms | 2.0 ms | 0.68 ms |
+| int8 g64 | 495 MB | 0.10 ms | 3.0 ms | 0.53 ms |
 
-The host and kernel columns were measured before the decode body was handed to
-`mx.compile` and before the paired projection, and both changes lowered the
-per-step cost — which is why the wall column no longer equals their sum. The
-wall column is what the rates below imply; read the split as the reason the step
-was host-bound rather than as an accounting of today's step.
+A bf16 layer moves 30 MB in 0.13 ms, which is 230 GB/s, and the step as a whole
+moves 991 MB in 4.1 ms, which is 240 — 58% of the ceiling. The head alone, 272 MB
+in one launch, measured against the same ceiling inside the model by shrinking
+the vocabulary, reads at 264 GB/s; standalone, with nothing else on the GPU, the
+same kernel reads at 388-423. So the 40% a bf16 step gives up is the chain: 146
+dependent launches, each ramping its own reads, and `mlx_lm` walks the same chain
+at 225 GB/s. A four-bit layer moves 7.5 MB in 0.057 ms, which is 132 GB/s — a
+third of the ceiling — and its head is a quarter of the step; that step is not
+competing for bandwidth at all, which is why it is where the margin is.
 
-Doubling the weight traffic moved the kernel's own share by 0.04 ms while the
-loop body, which now walks twice the words for the same reduction, accounts for
-the rest. What the step spends its time on now is dispatch: a dependent launch
-costs about 7.6 us here, so the 222 dispatches a four-bit step used to carry were
-1.7 ms of its 2.68 ms, against under 1 ms of weight traffic. Pairing the gate and
-up projections removed 24 of them at both quantized widths, which is the whole of
-the 1.13x-to-1.41x move at four bits.
+What it pays for is the decode of the packed word. Fitting time against bytes and
+codes across the three widths puts the in-model stream at about 236 GB/s — the effective rate after 146
+launches, not the 413 GB/s the kernels reach alone — and
+charges roughly 2 ps per four-bit code on top, which at 500M codes a step is
+about half of it. That is why removing one instruction from the decode loop is
+worth 7% at four bits and nothing at bf16, and it is what the two-shift sign
+extension does: `(int)(word << 28) >> 28` instead of masking, comparing and
+subtracting. Same value, one instruction fewer, and the tokens are unchanged.
+
+The dispatch reading this section used to make was wrong, and the measurement
+that corrected it is worth stating. A decode step carries 150 launches at four
+bits now — down from 198 when the step's two rotations were folded into its cache
+write, and from 222 before the gate and up projections were paired. Those last 48
+launches were worth 6% at eight bits and nothing measurable at four, so a
+dependent launch is not a fixed 7.6 us of wall time: the stream and the launches
+overlap, and the step waits on the bytes and on the unpack instead. The pairing
+that took 222 to 198 was worth more than its 24 launches because it also halved
+the activation traffic of the widest projection, not because it removed launches.
 
 Against `mlx_lm` quantized to the same width and timed in the same loop
-shape, 64 decode steps at the same prompt:
+shape, 64 decode steps at the same prompt, median of three alternating runs:
 
 | weights | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- |
-| bf16 | 230.0 tok/s | 229.4 tok/s | 1.00x |
-| int4, group 64 | 460.7 tok/s | 327.2 tok/s | 1.41x |
-| int8, group 64 | 367.3 tok/s | 334.0 tok/s | 1.10x |
+| bf16 | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
+| int4, group 64 | 485-489 tok/s | 322-333 tok/s | 1.47-1.51x |
+| int8, group 64 | 389-392 tok/s | 319-322 tok/s | 1.22x |
 
-Timing `mlx_lm.generate()` rather than its raw decode loop would turn those into
-1.35x and 1.19x, because `generate()` adds per-token text bookkeeping the loop
-does not. That is the same loop-shape mistake an earlier revision of this
-document caught at bf16, and the reason `--mlx-baseline` quantizes the baseline
-and times both shapes rather than quoting whichever looks best.
+Those are ranges over two paired rounds in one session; each round is a median of
+three runs inside the process, and the baseline is re-measured per row. Waited on
+every step the same session reads 1.07-1.09x / 1.30-1.32x / 1.24-1.27x, and
+prefill at 128 tokens 1.02-1.08x / 1.01-1.08x / 1.07x.
+
+Timing `mlx_lm.generate()` rather than its raw decode loop inflates those ratios,
+because `generate()` adds per-token text bookkeeping the loop does not. That is
+the same loop-shape mistake an earlier revision of this document caught at bf16,
+and the reason `--mlx-baseline` quantizes the baseline and times both shapes
+rather than quoting whichever looks best.
 
 Mean relative error after quantizing the same weights is 0.63% at eight bits
 against 11.5% at four, and an eight-bit plan reproduced the bf16 checkpoint's

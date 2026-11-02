@@ -18,8 +18,7 @@ The policy that decides what counts as a breaking change lives in
   eight), and codes pack little-endian into `int32` words - eight nibbles to a
   word at four bits, four bytes at eight, so one word stays one load. The packed
   GEMV, the streaming unpack and the folding pass are shared; only the decode
-  differs, and at eight bits it is cheaper per code because a byte sign-extends
-  in two instructions where a nibble needs three.
+  differs, and at eight bits it reads a byte where four bits reads a nibble.
 
   Selected with `quantize_bits=8` next to the existing `quantize=<group size>`,
   which keeps every existing call meaning four bits. Measured on
@@ -28,22 +27,30 @@ The policy that decides what counts as a breaking change lives in
 
   | weights | aotolith | `mlx_lm` | ratio |
   | --- | --- | --- | --- |
-  | bf16 | 230.0 tok/s | 229.4 tok/s | 1.00x |
-  | int4, group 64 | 460.7 tok/s | 327.2 tok/s | 1.41x |
-  | int8, group 64 | 367.3 tok/s | 334.0 tok/s | 1.10x |
+  | bf16 | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
+  | int4, group 64 | 485-489 tok/s | 322-333 tok/s | 1.47-1.51x |
+  | int8, group 64 | 389-392 tok/s | 319-322 tok/s | 1.22x |
 
-  Eight bits is slower than four because a decode step is still host-bound, so
-  the extra 250 MB of weight traffic is nearly free: the kernel's own share moved
-  from 0.53 to 0.57 ms while the loop body, which walks twice the words for the
-  same reduction, accounts for the rest. What it buys is precision:
+  Those are ranges over two paired rounds in one session, each round a median of
+  three runs inside the process. The bf16 row is parity: both engines walk the
+  same 146 dependent launches over the same 991 MB, and a step lands at 240 GB/s
+  against the 413 GB/s the same GEMV reaches in a sustained read-only sweep.
+
+  Eight bits is slower than four because a step streams 495 MB instead of 250,
+  and its head alone is 272 MB. It is not twice as slow because a four-bit step
+  is not bound by its own bytes: fitting step time against bytes and code counts
+  across the three widths puts roughly 2 ps per four-bit code on top of the
+  stream, which is why the narrower format leaves most of its bandwidth unused
+  — 119 GB/s of a measured 413. What eight bits buys is precision:
   quantizing the same weights leaves 0.63% mean relative error against 11.5% at
   four bits, and an eight-bit plan reproduced the bf16 checkpoint's greedy
   choices for all 64 steps of a benchmark prompt.
 
   `--mlx-baseline` now quantizes the baseline to the same width. Timing
-  `mlx_lm.generate()` instead of its raw decode loop would report 1.35x and
-  1.19x, which is the loop-shape error an earlier release already corrected at
-  bf16; the table above is the like-for-like comparison.
+  `mlx_lm.generate()` instead of its raw decode loop inflates the quantized
+  ratios, because `generate()` does per-token text bookkeeping the loop does
+  not; that is the loop-shape error an earlier release already corrected at
+  bf16, and the table above is the like-for-like comparison.
 
   The four-bit path is unchanged: same packed layout, same kernel names, same
   tokens, and `weight_bits` defaults to 4 so a graph folded by an older release
@@ -59,14 +66,42 @@ The policy that decides what counts as a breaking change lives in
   The pairing existed for dense weights and skipped the packed path, because a
   packed projection is three operands where a dense one is two, so the pass that
   matched the two `matmul`s never saw them as a pair. Quantized decode therefore
-  carried two launches per MLP where bf16 carried one. At four bits that launch
-  is not free: a dependent launch costs about 7.6 us here and the step's own
-  traffic is under a millisecond, so the 222 dispatches a step carried were most
-  of its 2.68 ms. Pairing removes 24 of them at both quantized widths — 222 to
-  198, the same count bf16 already had — and the tokens are unchanged, checked
-  by comparing the 64-step greedy hash before and after at both widths.
-  Qwen2.5-0.5B decode went from 1.13x to 1.41x `mlx_lm` at four bits and from
-  1.09x to 1.10x at eight.
+  carried two launches per MLP where bf16 carried one. Pairing removes 24 of
+  them at both quantized widths — 222 to 198, the same count bf16 already had —
+  and the tokens are unchanged, checked by comparing the 64-step greedy hash
+  before and after at both widths. Measured then, four bits went from 1.13x to
+  1.41x `mlx_lm` and eight bits from 1.09x to 1.10x.
+
+  The reading offered for that gain at the time — that a dependent launch costs
+  about 7.6 us here and the step's own traffic is under a millisecond, so the
+  222 dispatches were most of the step — did not survive the next two
+  measurements, and the entry below replaces it. A launch is not free, but it
+  overlaps the weight stream, so part of what pairing bought was the launch's own
+  bytes: it halved the activation read of the widest projection in the step.
+
+- **Q and K rotation is folded into the KV cache write, and a four-bit code now
+  sign-extends in two instructions.** Both are in the decode step and both keep
+  the emitted tokens bit-identical.
+
+  Every layer rotated the query and the key with two `rope` launches and then
+  rolled the cache with a `kv_cache_append`, three dependent launches where one
+  suffices: the rotation reads the projection row the cache write is about to
+  store anyway. `fuse_rope_into_kv_cache_update` rewrites the matching
+  `rope`/`rope`/`kv_cache_append` triple into a `rope_kv_cache_append` operator
+  that emits one kernel over `query_heads + 2 * kv_heads` groups, rotating the
+  query slice on the way out and the key slice on the way in. A decode step drops
+  from 198 launches to 150. Timed by varying the layer count and interleaving the
+  runs, that is worth 6% at eight bits and nothing measurable at four — which is
+  what establishes that a four-bit step is not waiting on launches.
+
+  The four-bit unpack used to mask a nibble out of a word, compare it against 8
+  and subtract 16 when it lost: three instructions per code, over roughly five
+  hundred million codes per step. Sign-extending it with two shifts —
+  `(int)(word << (28 - 4 * offset)) >> 28` — is the same value in two, and it
+  moved four-bit decode by 7%. The multiply by the group scale stays inside the
+  per-nibble fused multiply-add; hoisting it above the eight-nibble sum would
+  also be cheaper and is not done, because it changes the intermediate rounding
+  and flips greedy tokens.
 
 - **The unrolled runner is now handed to `mx.compile` for the policies that do
   not synchronize.** Unrolling removed the interpreter's bookkeeping, but the

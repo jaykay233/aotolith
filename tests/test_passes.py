@@ -28,6 +28,7 @@ def test_the_pipeline_runs_every_pass_once_in_the_documented_order() -> None:
         "fold_quantized_weights",
         "fuse_norm_scale",
         "fuse_rope",
+        "fuse_rope_into_kv_cache_update",
         "fuse_residual_epilogue",
         "fuse_pointwise",
         "fuse_gate_up_projection",

@@ -146,27 +146,42 @@ M5 Pro. `mlx_lm` was timed in the same process, under the same loop shape:
 
 | configuration | prefill | decode, sync each step | decode, async | vs `mlx_lm` (async) |
 | --- | --- | --- | --- | --- |
-| MLX fallback only | 9 616 tok/s | 198.4 tok/s | 230.5 tok/s | 0.96x |
-| `--codegen-matmul` | 11 466 tok/s | 211.7 tok/s | **240.9 tok/s** | **1.01x** |
-| `--codegen-matmul --codegen-attention` | 11 153 tok/s | 211.9 tok/s | 239.8 tok/s | 1.00x |
-| `mlx_lm` itself | 11 280 tok/s | 195.9 tok/s | 238.8 tok/s | — |
+| MLX fallback only | 9 224 tok/s | 199.2 tok/s | 228.5 tok/s | 0.96x |
+| `--codegen-matmul` | 12 455 tok/s | 213.5 tok/s | **232.7 tok/s** | **1.01x** |
+| `--codegen-matmul --codegen-attention` | 10 641-11 687 tok/s | 195.8-208.4 tok/s | 216.0-236.0 tok/s | 0.92-1.01x |
+| `mlx_lm` itself | 10 669-11 084 tok/s | 183.0-193.9 tok/s | 224.6-237.6 tok/s | — |
 
 The point of code generation is the *second* step, not the first: the fallback
-path is 4% behind `mlx_lm` and turning on the matmul kernel closes that. It does
-not open a lead on asynchronous decode, where both sides are reading the same
-991 MB of weights per step and neither can go faster than the memory they share.
-What code generation buys is visible in the two columns a bandwidth ceiling does
-not hide: prefill, where the fallback's uncompiled graph runs 15% behind and the
-generated matmul turns that into parity, and the synchronous column, where the
-compiled plan's lower per-step host cost is worth 8%. An earlier revision of this
-table read 0.77x and 1.21x in different places, and both came from timing the
-sides differently — one against a baseline that waited for every step, one against
-a published figure instead of a measured one. Reading the same pair across three
-prompt lengths, decode lands at 0.96-1.01x of `mlx_lm` and prefill at 0.61-0.68x
-on a 32-token prompt, 1.02-1.14x from 128 up. `examples/compare_mlx_lm.py` prints
-that grid; the decode range there is wider at 32 tokens because that row is
-measured first, right after the plan compiles, and one of four sessions started
-cold. The prefill column is the stable one.
+path streams the same 991 MB per token and lands 4% behind `mlx_lm` at bf16, and
+turning on the matmul kernel puts it ahead. Attention codegen is the row to read
+for what a kernel does and does not buy: it moves prefill by 6-15% and decode by
+nothing measurable, because at one query per step the attention MLX's SDPA runs
+is 8 us and the generated one is 11.
+
+None of this opens a lead on bf16 asynchronous decode, and the reason is not a
+bandwidth ceiling — an earlier revision of this section said it was, and that
+number was wrong. A read-only sweep of 544 MB through the generated GEMV,
+sustained over 200 launches, runs at 413 GB/s on this machine; the head alone
+moves its 272 MB at 388-423. A bf16 decode step instead moves its 991 MB in
+4.1 ms, which is 240 GB/s — 58% of what the same kernel reaches when it is not
+one link in a chain of 146 dependent launches. `mlx_lm` lands in the same place,
+at 225 GB/s. So both engines lose about 40% of the machine to the dependency
+chain, and the compiler only gets to decide how much of that it can hand back:
+the synchronous column reads 1.07-1.12x, prefill 1.02-1.17x, and asynchronous
+decode 0.92-1.01x across sessions, which is parity with a 9% tail.
+
+An earlier revision of this table read 0.77x and 1.21x in different places, and
+both came from timing the sides differently — one against a baseline that waited
+for every step, one against a published figure instead of a measured one.
+Reading the same pair across three prompt lengths, decode lands at 0.96-1.02x of
+`mlx_lm` and prefill at 0.61-0.68x on a 32-token prompt, 1.02-1.14x from 128 up.
+`examples/compare_mlx_lm.py` prints that grid; the decode range there is wider
+at 32 tokens because that row is measured first, right after the plan compiles,
+and one of four sessions started cold. The prefill column is the stable one.
+
+The lead over `mlx_lm` comes from dropping the width, which is the next section.
+At bf16 there is nothing to win: both engines walk the same chain of dependent
+launches over the same 991 MB and land within noise of each other.
 
 All 64 tokens match the PyTorch BF16 reference exactly, with or without native
 kernels, and `mlx_lm` produces those same tokens.
@@ -202,43 +217,64 @@ format, not the compiler. On the same prompt and the same 64 steps:
 
 | weights | bytes per step | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- | --- |
-| BF16 | 991 MB | 230.0 tok/s | 229.4 tok/s | 1.00x |
-| int4, group 64 | 250 MB | **460.7 tok/s** | 327.2 tok/s | **1.41x** |
-| int8, group 64 | 495 MB | 367.3 tok/s | 334.0 tok/s | 1.10x |
+| BF16 | 991 MB | 216-236 tok/s | 224-238 tok/s | 0.92-1.01x |
+| int4, group 64 | 250 MB | **485-489 tok/s** | 322-333 tok/s | **1.47-1.51x** |
+| int8, group 64 | 495 MB | 389-392 tok/s | 319-322 tok/s | 1.22x |
 
-Four bits is the wider margin, and the reason is bandwidth: at bf16 a step reads
-991 MB and both engines are saturated, so there is nothing left to win. At four
-bits it reads 250 MB in about 2.2 ms — under 120 GB/s, well short of what the
-machine can stream — so the step is decided by per-launch cost rather than by
-memory, and that is where a compiled plan that emits one kernel per projection
-beats one that emits two. Eight bits sits between the two: 495 MB still leaves
-some headroom, hence the smaller gain.
+Those are ranges over two paired rounds in one session, each round a median of
+three runs inside the process. The same rows waited on every step are 196-208 /
+183-192 (1.07-1.09x), 369.7-370.1 / 280.9-284.1 (1.30-1.32x) and 314.6-316.6 /
+248.2-254.4 (1.24-1.27x); prefill at 128 tokens is 10 905-11 687 / 10 669-10 857
+(1.02-1.08x), 9 078-9 666 / 8 923-8 956 (1.01-1.08x) and 9 153-9 231 / 8 552-8 600
+(1.07x). Ratios move by 0.02-0.09 between sessions while absolute rates move by
+up to 18%, which is why the ranges stay visible instead of collapsing to a single
+figure.
 
-A decode step carried 222 dispatches at four bits before the gate and up
-projections were paired into one kernel, and 198 after. That is worth 1.13x to
-1.41x, because a dependent launch costs about 7.6 us on this machine and the
-step's own traffic is under a millisecond: at four bits the dispatch floor, not
-the weights, is what the step spends its time on. The same pairing is what bf16
-already had, which is why this changed the quantized rows and left the bf16 row
-where it was.
+Four bits is the widest margin because the step stops being about bandwidth
+first. At bf16 a step has 991 MB to read and spends 4.1 ms on it, which is 58% of
+the 413 GB/s this machine's generated GEMV reaches in a sustained sweep; the
+other 42% is the chain of dependent launches the weights have to travel through,
+and `mlx_lm` pays the same toll. At four bits the step reads 250 MB in about
+2.1 ms — 119 GB/s, less than a third of the ceiling — so it is not competing for
+bandwidth at all: it is competing on what it costs to turn a packed word back
+into eight weights, and there a generated kernel with one projection per launch
+beats one that does not fold the decode into it. Eight bits sits between the two:
+495 MB in 2.6 ms is 190 GB/s, closer to the ceiling than four bits and further
+from it than bf16, hence the smaller gain.
 
-BF16 has read 0.96x and 1.01x here and 0.99-1.01x across prompt lengths, so it is
-parity and not a lead — the lead comes from dropping the width.
+A decode step carries 150 dispatches at four bits: 24 layers of projection,
+rotation-with-cache-write, attention, projection, paired gate and up, projection,
+plus the head. It was 222 before the gate and up projections were paired and 198
+before the step's two rotations were folded into the cache write. The further 48
+launches were worth 6% at eight bits and nothing measurable at four, which says
+what the earlier reading of this table got wrong: the launches were already
+overlapped with the weight stream, and what a four-bit step waits on is the
+stream itself plus the cost of unpacking it. Removing one instruction from that
+unpack — a nibble sign-extended by two shifts instead of a mask, a compare and a
+subtract — is what moved the four-bit row by 7%.
+
+BF16 has read 0.92x, 1.01x and 1.09x here across sessions, so it is parity and
+not a lead — the lead comes from dropping the width. A sustained read-only sweep
+of 544 MB through the same generated GEMV runs at 413 GB/s on this machine, and
+the head alone moves 272 MB at 388-423, while a bf16 step sustains 240, so the
+missing 40% is the chain of dependent launches rather than the stream, and both
+engines pay it. That also retires an earlier claim in this file that the step was
+sitting on a 267 GB/s ceiling: the ceiling is 413, and the step is at 58% of it.
 
 > [!NOTE]
-> Timing `mlx_lm.generate()` instead of its raw decode loop makes the quantized
-> ratios look like 1.35x and 1.19x, because `generate()` does per-token text
-> bookkeeping the loop does not. That is the same mistake an earlier revision of
-> this README made at bf16, and it is why the helper here quantizes the baseline,
-> times both loop shapes and reports them separately. The honest number is the
-> one in the table.
+> Timing `mlx_lm.generate()` instead of its raw decode loop inflates the
+> quantized ratios, because `generate()` does per-token text bookkeeping the
+> loop does not. That is the same mistake an earlier revision of this README
+> made at bf16, and it is why the helper here quantizes the baseline, times both
+> loop shapes and reports them separately. The honest number is the one in the
+> table.
 
 The cost is accuracy, and it is the usual trade. Mean relative error against the
 source weights is 11.5% at four bits and 0.63% at eight. An eight-bit plan
 reproduced the BF16 checkpoint's greedy choices for all 64 steps of the benchmark
 prompt; a four-bit plan tracks it for 13 and then flips on a near-tie. So four
 bits is the throughput setting and eight is the one for when a change in wording
-is not acceptable, at about 12% of the four-bit rate.
+is not acceptable, at about four fifths of the four-bit rate.
 
 `docs/performance.md` splits a step into host and kernel time for each width, and
 `examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8

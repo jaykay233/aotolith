@@ -170,7 +170,7 @@ tokens = runtime.greedy_generate(prompt_ids)
 separate knob: `quantize_bits=4` (the default) packs eight nibbles to a word and
 `quantize_bits=8` packs four bytes. Both fold into the same streaming kernel, so
 asking for eight bits is a precision choice rather than a different code path —
-it costs about 12% of the decode rate over four bits and leaves roughly a
+it costs about a fifth of the decode rate over four bits and leaves roughly a
 hundredth of the rounding error. Leaving `quantize=None` compiles the bf16
 plans, and `quantize_bits` is refused in that case rather than ignored.
 

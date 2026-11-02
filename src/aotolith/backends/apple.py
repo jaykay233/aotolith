@@ -308,6 +308,8 @@ class AppleMetalBackend(
                     compiled = self._compile_rope(graph, op, index)
             elif op.op == "kv_cache_append":
                 compiled = self._compile_kv_cache_append(graph, op, index)
+            elif op.op == "rope_kv_cache_append":
+                compiled = self._compile_rope_kv_cache_append(graph, op, index)
             elif op.op == "attention":
                 if self.codegen_attention or self.autotune or self._wants_native(op):
                     compiled = self._compile_attention(graph, op, index)

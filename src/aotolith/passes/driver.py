@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from ..ir import Graph
-from .cache import fuse_kv_cache_update
+from .cache import fuse_kv_cache_update, fuse_rope_into_kv_cache_update
 from .canonicalize import canonicalize_batched_matmul
 from .cse import eliminate_common_subexpressions
 from .fusion import (
@@ -60,6 +60,11 @@ PIPELINE: tuple[tuple[str, Callable[[Graph], Graph]], ...] = (
     # sweep would fuse the multiply into a standalone region.
     ("fuse_norm_scale", fuse_norm_scale),
     ("fuse_rope", fuse_rope),
+    # The rotation exists from here on, and the roll was already matched, so
+    # this is the first point where a layer's two rotations and its cache write
+    # are all visible at once. They become one operator: at four bits a step
+    # spends more on those two launches than on the arithmetic they perform.
+    ("fuse_rope_into_kv_cache_update", fuse_rope_into_kv_cache_update),
     # The epilogues, additive ones before the pointwise sweep that would
     # otherwise swallow the region they need.
     ("fuse_residual_epilogue", fuse_residual_epilogue),

@@ -71,7 +71,10 @@ def _pair_source(
 
 
 def _stacked_row(
-    graph: Graph, value_id: str, producers: dict[str, int], consumers: dict[str, list[int]]
+    graph: Graph,
+    value_id: str,
+    producers: dict[str, int],
+    consumers: dict[str, list[int]],
 ) -> tuple[str, str, tuple[int, ...]] | None:
     """Return ``(key, value, ops_to_delete)`` for the stacked pair of new rows."""
 
@@ -146,7 +149,12 @@ def _projected_value(
     end = min(int(sliced.attrs["end"]), source_type.shape[2])
     if end - start != heads * head_dim:
         return None
-    if tuple(int(dim) for dim in reshaped.attrs["shape"]) != (batch, 1, heads, head_dim):
+    if tuple(int(dim) for dim in reshaped.attrs["shape"]) != (
+        batch,
+        1,
+        heads,
+        head_dim,
+    ):
         return None
     if int(transposed.attrs["dim0"]) != 1 or int(transposed.attrs["dim1"]) != 2:
         return None
@@ -180,6 +188,168 @@ def _half(
             continue
         return squeeze.outputs[0], (sliced_index, squeeze_index)
     return None
+
+
+def fuse_rope_into_kv_cache_update(graph: Graph) -> Graph:
+    """Fold a layer's two ``rope`` nodes into its :op:`kv_cache_append`.
+
+    A decode step rotates the query half and the key half of one projection row,
+    and then the key goes straight into the cache. The frontend spells that as a
+    slice, a reshape and a ``rope`` per half, which is two launches and two
+    layout chains per layer for under a kilobyte of arithmetic - affordable at
+    bf16, where a step is waiting on memory anyway, and the largest remaining
+    fixed cost at four bits.
+
+    The match is narrow. The key has to feed a ``kv_cache_append`` and nothing
+    else, the query has to be read by one ``attention``, both rotations have to
+    share one table pair, and both have to read the row the cache operator
+    already reads. Anything else keeps its two rotations.
+    """
+
+    graph.validate()
+    producers = _producers(graph)
+    consumers = _consumers(graph)
+
+    def layout_root(
+        value_id: str,
+    ) -> tuple[str, int, tuple[int, ...]] | None:
+        """Walk a view chain back to a projection row and its slice start."""
+
+        chain: list[int] = []
+        current = value_id
+        for _ in range(6):
+            index = producers.get(current)
+            if index is None:
+                return None
+            op = graph.ops[index]
+            if op.op in _LAYOUT_OPS or op.op == "transpose":
+                chain.append(index)
+                current = op.inputs[0]
+                continue
+            if op.op != "slice":
+                return None
+            source_type = graph.value(op.inputs[0]).type
+            if len(source_type.shape) != 3:
+                return None
+            if int(op.attrs["dim"]) % 3 != 2:
+                return None
+            chain.append(index)
+            return op.inputs[0], int(op.attrs["start"]), tuple(chain)
+        return None
+
+    #: Every rotation in the graph, keyed by the row it reads, so the query that
+    #: belongs to a layer's key is a lookup rather than a rescan.
+    rotations: dict[str, list[tuple[int, int, tuple[int, ...]]]] = {}
+    for index, op in enumerate(graph.ops):
+        if op.op != "rope" or len(op.inputs) != 3:
+            continue
+        root = layout_root(op.inputs[0])
+        if root is None:
+            continue
+        rotations.setdefault(root[0], []).append((index, root[1], root[2]))
+
+    rewrites: dict[int, Operation] = {}
+    removable: set[int] = set()
+    observed = set(graph.outputs)
+
+    for index, op in enumerate(graph.ops):
+        if op.op != "kv_cache_append":
+            continue
+        cache_id, key_id, row_id = op.inputs
+        key_rope_index = producers.get(key_id)
+        if key_rope_index is None:
+            continue
+        key_rope = graph.ops[key_rope_index]
+        if key_rope.op != "rope" or consumers.get(key_id) != [index]:
+            continue
+        cosine_id, sine_id = key_rope.inputs[1], key_rope.inputs[2]
+        key_root = layout_root(key_rope.inputs[0])
+        if key_root is None or key_root[0] != row_id:
+            continue
+        row_type = graph.value(row_id).type
+        if len(row_type.shape) != 3 or row_type.shape[1] != 1:
+            continue
+        cache_type = graph.value(cache_id).type
+        if len(cache_type.shape) != 6:
+            continue
+        batch, _heads, head_dim = (
+            cache_type.shape[2],
+            cache_type.shape[3],
+            cache_type.shape[5],
+        )
+
+        query: tuple[int, int, tuple[int, ...]] | None = None
+        for candidate in rotations.get(row_id, ()):
+            candidate_index, candidate_start, candidate_chain = candidate
+            if candidate_index in (index, key_rope_index):
+                continue
+            rotation = graph.ops[candidate_index]
+            if rotation.inputs[1] != cosine_id or rotation.inputs[2] != sine_id:
+                continue
+            readers = consumers.get(rotation.outputs[0], ())
+            if len(readers) != 1 or graph.ops[readers[0]].op != "attention":
+                continue
+            if graph.value(rotation.outputs[0]).type.shape[-1] != head_dim:
+                continue
+            query = (candidate_index, candidate_start, candidate_chain)
+            break
+        if query is None:
+            continue
+        query_index, query_start, query_chain = query
+        query_type = graph.value(graph.ops[query_index].outputs[0]).type
+        if len(query_type.shape) != 4 or query_type.shape[0] != batch:
+            continue
+        if query_type.shape[2] != 1:
+            continue
+
+        deleted = {key_rope_index, query_index, *key_root[2], *query_chain}
+        # None of the work this rewrite deletes may be read from outside it, or
+        # a value would lose its producer. The two rotations' outputs are the
+        # exception: the new operator writes the query, and the key only ever
+        # fed the cache operator.
+        rehomed = {graph.ops[query_index].outputs[0]}
+        shared = any(
+            consumer not in deleted and consumer != index
+            for op_index in deleted
+            for value_id in graph.ops[op_index].outputs
+            if value_id not in rehomed
+            for consumer in consumers.get(value_id, ())
+        ) or any(
+            value_id in observed
+            for op_index in deleted
+            for value_id in graph.ops[op_index].outputs
+            if value_id not in rehomed
+        )
+        if shared:
+            continue
+
+        rewrites[index] = Operation(
+            "rope_kv_cache_append",
+            (cache_id, row_id, cosine_id, sine_id),
+            (graph.ops[query_index].outputs[0], *op.outputs),
+            {
+                "layer": op.attrs["layer"],
+                "query_start": query_start,
+                "key_start": key_root[1],
+                "value_start": op.attrs["value_start"],
+                "query_heads": query_type.shape[1],
+            },
+        )
+        removable.update(deleted)
+
+    if not rewrites:
+        return graph
+
+    rewritten: list[Operation] = []
+    for index, op in enumerate(graph.ops):
+        replacement = rewrites.get(index)
+        if replacement is not None:
+            rewritten.append(replacement)
+        elif index in removable:
+            continue
+        else:
+            rewritten.append(op)
+    return _replace_graph(graph, tuple(rewritten), graph.outputs)
 
 
 def fuse_kv_cache_update(graph: Graph) -> Graph:
@@ -258,7 +428,9 @@ def fuse_kv_cache_update(graph: Graph) -> Graph:
             new_pair_type.shape[3],
             new_pair_type.shape[4],
         )
-        halves = [_half(graph, half, new_pair_id, producers, consumers) for half in (0, 1)]
+        halves = [
+            _half(graph, half, new_pair_id, producers, consumers) for half in (0, 1)
+        ]
         if any(half is None for half in halves):
             continue
         windows = [half[0] for half in halves]

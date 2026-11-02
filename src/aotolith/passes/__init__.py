@@ -13,7 +13,7 @@ matchers and the backend read it from there.
 from __future__ import annotations
 
 from ..op_sets import LAYOUT_OPS, POINTWISE_OPS
-from .cache import fuse_kv_cache_update
+from .cache import fuse_kv_cache_update, fuse_rope_into_kv_cache_update
 from .canonicalize import canonicalize_batched_matmul
 from .cse import eliminate_common_subexpressions
 from .driver import PIPELINE, rewrite
@@ -52,6 +52,7 @@ __all__ = [
     "fuse_residual_epilogue",
     "fuse_rms_norm_epilogue",
     "fuse_rope",
+    "fuse_rope_into_kv_cache_update",
     "rewrite",
     "simplify_layouts",
 ]

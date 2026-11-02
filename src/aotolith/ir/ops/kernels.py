@@ -399,6 +399,126 @@ def _check_kv_cache_append(graph: Graph, op: Operation) -> None:
             )
 
 
+def _check_rope_kv_cache_append(graph: Graph, op: Operation) -> None:
+    """Rotate the step's query and key, then roll and write the pair.
+
+    This is :op:`kv_cache_append` with the rotation folded in. The frontend
+    spells it as two ``rope`` nodes over two slices of the projection row plus
+    the roll, and at narrow weight widths three launches per layer cost more
+    than the arithmetic they perform, so the sequence becomes one statement:
+    rotate the query half, rotate the key half, write it into the freed slot,
+    and hand back the rotated query and the window.
+
+    ``source`` has to be one step wide. The rotation reads a head's partner
+    column from the same row it writes from, and a multi-step row would need a
+    per-step table the frontend does not produce.
+    """
+
+    cache_type, source_type, cosine_type, sine_type = (
+        graph.value(value_id).type for value_id in op.inputs
+    )
+    query_type, new_pair, key_window, value_window = (
+        graph.value(value_id).type for value_id in op.outputs
+    )
+    if len(cache_type.shape) != 6:
+        raise ValueError(
+            "rope_kv_cache_append cache must be "
+            f"[layers, 2, batch, heads, slots, dim], got {cache_type.shape}"
+        )
+    layers, pair, batch, heads, slots, head_dim = cache_type.shape
+    if pair != 2:
+        raise ValueError(
+            "rope_kv_cache_append cache must stack key and value on axis 1, got "
+            f"{cache_type.shape}"
+        )
+    layer = op.attrs.get("layer")
+    if not isinstance(layer, int) or isinstance(layer, bool):
+        raise ValueError(f"rope_kv_cache_append needs an integer layer, got {layer!r}")
+    if not 0 <= layer < layers:
+        raise ValueError(
+            f"rope_kv_cache_append layer {layer} is outside a cache of {layers} layers"
+        )
+    if head_dim % 4 != 0:
+        raise NotImplementedError(
+            "rope_kv_cache_append needs a head dimension divisible by four, got "
+            f"{head_dim}"
+        )
+    for name, operand_type in (
+        ("source", source_type),
+        ("cosine", cosine_type),
+        ("sine", sine_type),
+    ):
+        if operand_type.dtype != cache_type.dtype:
+            raise ValueError(
+                f"rope_kv_cache_append {name} dtype {operand_type.dtype} does not "
+                f"match the cache dtype {cache_type.dtype}"
+            )
+    if len(source_type.shape) != 3 or source_type.shape[0] != batch:
+        raise ValueError(
+            "rope_kv_cache_append source must be a projection row "
+            f"[{batch}, 1, width], got {source_type.shape}"
+        )
+    if source_type.shape[1] != 1:
+        raise ValueError(
+            "rope_kv_cache_append source must hold one step, got "
+            f"{source_type.shape[1]}"
+        )
+    for name, table_type in (("cosine", cosine_type), ("sine", sine_type)):
+        if table_type.shape[-1] != head_dim:
+            raise ValueError(
+                f"rope_kv_cache_append {name} table must be {head_dim} wide, got "
+                f"{table_type.shape}"
+            )
+    width = source_type.shape[2]
+    for name, key in (
+        ("query_start", "query_start"),
+        ("key_start", "key_start"),
+        ("value_start", "value_start"),
+    ):
+        start = op.attrs.get(key)
+        if not isinstance(start, int) or isinstance(start, bool):
+            raise ValueError(f"rope_kv_cache_append needs an integer {name}")
+    query_start = int(op.attrs["query_start"])
+    key_start = int(op.attrs["key_start"])
+    value_start = int(op.attrs["value_start"])
+    query_heads = op.attrs.get("query_heads")
+    if not isinstance(query_heads, int) or isinstance(query_heads, bool):
+        raise ValueError("rope_kv_cache_append needs an integer query_heads")
+    spans = (
+        ("query", query_start, query_heads * head_dim),
+        ("key", key_start, heads * head_dim),
+        ("value", value_start, heads * head_dim),
+    )
+    for name, start, extent in spans:
+        if start < 0 or start + extent > width:
+            raise ValueError(
+                f"rope_kv_cache_append {name} half at {start} with {extent} values "
+                f"does not fit a source row of {width}"
+            )
+    if query_type.shape != (batch, query_heads, 1, head_dim):
+        raise ValueError(
+            f"rope_kv_cache_append query must be "
+            f"{(batch, query_heads, 1, head_dim)}, got {query_type.shape}"
+        )
+    if query_type.dtype != cache_type.dtype:
+        raise ValueError(
+            "rope_kv_cache_append query dtype does not match the cache dtype"
+        )
+    if slots < 2:
+        raise ValueError(f"rope_kv_cache_append needs room to roll, got {slots}")
+    if new_pair.shape != (pair, batch, heads, slots, head_dim):
+        raise ValueError(
+            f"rope_kv_cache_append new pair must be "
+            f"{(pair, batch, heads, slots, head_dim)}, got {new_pair.shape}"
+        )
+    for name, window_type in (("key", key_window), ("value", value_window)):
+        if window_type.shape != (batch, heads, slots, head_dim):
+            raise ValueError(
+                f"rope_kv_cache_append {name} window must be "
+                f"{(batch, heads, slots, head_dim)}, got {window_type.shape}"
+            )
+
+
 def _check_attention(graph: Graph, op: Operation) -> None:
     query_type, key_type, value_type = (
         graph.value(value_id).type for value_id in op.inputs[:3]
@@ -626,6 +746,25 @@ CONTRACTS: dict[str, OpContract] = {
         ),
         native=True,
         extra=_check_kv_cache_append,
+    ),
+    # The roll with the rotation folded in. The frontend spells one layer as two
+    # ``rope`` nodes over two slices of the projection row plus the roll, which
+    # is three launches for under a kilobyte of arithmetic; at four bits a step
+    # is mostly dispatch, so the three become one operator.
+    "rope_kv_cache_append": OpContract(
+        arity=(4, 4),
+        dtype=DtypeRule.ANY,
+        shape=ShapeRule.FREE,
+        outputs=(4, 4),
+        attrs=(
+            AttrSpec("layer", AttrKind.INT),
+            AttrSpec("query_start", AttrKind.INT),
+            AttrSpec("key_start", AttrKind.INT),
+            AttrSpec("value_start", AttrKind.INT),
+            AttrSpec("query_heads", AttrKind.INT),
+        ),
+        native=True,
+        extra=_check_rope_kv_cache_append,
     ),
     "attention": OpContract(
         arity=(3, 4),

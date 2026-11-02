@@ -199,11 +199,41 @@ def _evaluate_kv_cache_append(
         source.shape[0], heads, 1, head_dim
     )
     pair = cache[layer]
-    row = mx.concatenate(
-        (mx.expand_dims(key, 0), mx.expand_dims(value, 0)), axis=0
-    )
+    row = mx.concatenate((mx.expand_dims(key, 0), mx.expand_dims(value, 0)), axis=0)
     new_pair = mx.concatenate((pair[:, :, :, 1:, :], row), axis=3)
     return new_pair, new_pair[0], new_pair[1]
+
+
+def _evaluate_rope_kv_cache_append(
+    graph: Graph, op: Operation, env: dict[str, mx.array]
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Rotate the step's query and key, then roll one layer's window."""
+
+    cache, source, cosine, sine = (env[value_id] for value_id in op.inputs)
+    layer = int(op.attrs["layer"])
+    batch, heads, head_dim = cache.shape[2], cache.shape[3], cache.shape[5]
+    query_heads = int(op.attrs["query_heads"])
+    row = source[:, -1]
+
+    def rotate(width: int, start: int, count: int) -> mx.array:
+        half = width // 2
+        sliver = row[:, start : start + count * width].reshape(batch, count, 1, width)
+        rotated = mx.concatenate((-sliver[..., half:], sliver[..., :half]), axis=-1)
+        table_cos = cosine.reshape(1, 1, 1, width)
+        table_sin = sine.reshape(1, 1, 1, width)
+        return sliver * table_cos + rotated * table_sin
+
+    query = rotate(head_dim, int(op.attrs["query_start"]), query_heads)
+    key = rotate(head_dim, int(op.attrs["key_start"]), heads)
+    value_start = int(op.attrs["value_start"])
+    value = row[:, value_start : value_start + heads * head_dim].reshape(
+        batch, heads, 1, head_dim
+    )
+    pair = cache[layer]
+    new_pair = mx.concatenate(
+        (pair[:, :, :, 1:, :], mx.stack((key, value), axis=0)), axis=3
+    )
+    return query, new_pair, new_pair[0], new_pair[1]
 
 
 def _evaluate_mlx_op(
@@ -241,6 +271,8 @@ def _evaluate_mlx_op(
         )
     if op.op == "kv_cache_append":
         return _evaluate_kv_cache_append(graph, op, env)
+    if op.op == "rope_kv_cache_append":
+        return _evaluate_rope_kv_cache_append(graph, op, env)
     if op.op == "rope":
         value, cosine, sine = (env[value_id] for value_id in op.inputs)
         half = value.shape[-1] // 2
@@ -545,7 +577,8 @@ def _evaluate_mlx_op(
             # logical right operand of the matmul is that weight transposed.
             scales = env[op.inputs[2]]
             unpack = (
-                _mx_dequantize_int8 if _matmul_weight_bits(op) == 8
+                _mx_dequantize_int8
+                if _matmul_weight_bits(op) == 8
                 else _mx_dequantize_int4
             )
             weight = unpack(right, scales, group_size)
@@ -572,7 +605,8 @@ def _evaluate_mlx_op(
         group_size = _matmul_weight_group_size(op)
         if group_size is not None:
             unpack = (
-                _mx_dequantize_int8 if _matmul_weight_bits(op) == 8
+                _mx_dequantize_int8
+                if _matmul_weight_bits(op) == 8
                 else _mx_dequantize_int4
             )
             weight = unpack(right, env[op.inputs[3]], group_size)

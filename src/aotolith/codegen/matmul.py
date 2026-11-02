@@ -696,9 +696,8 @@ def _emit_quantized_gemv_matmul_source(
     for offset in range(8):
         lines.extend(
             [
-                f"{indent}    int code{offset} = int((word >> {4 * offset}u) & 0xFu);",
-                f"{indent}    code{offset} = code{offset} >= 8 ? "
-                f"code{offset} - 16 : code{offset};",
+                f"{indent}    int code{offset} = "
+                f"(int)(word << {28 - 4 * offset}u) >> 28;",
                 f"{indent}    acc{offset} = fma(float(code{offset}), "
                 f"x{offset} * scale, acc{offset});",
             ]
@@ -707,10 +706,8 @@ def _emit_quantized_gemv_matmul_source(
         for offset in range(8):
             lines.extend(
                 [
-                    f"{indent}    int paired_code{offset} = int((paired_word >> "
-                    f"{4 * offset}u) & 0xFu);",
-                    f"{indent}    paired_code{offset} = paired_code{offset} >= 8 ? "
-                    f"paired_code{offset} - 16 : paired_code{offset};",
+                    f"{indent}    int paired_code{offset} = "
+                    f"(int)(paired_word << {28 - 4 * offset}u) >> 28;",
                     f"{indent}    acc{offset + 8} = fma(float(paired_code{offset}), "
                     f"x{offset} * paired_scale, acc{offset + 8});",
                 ]

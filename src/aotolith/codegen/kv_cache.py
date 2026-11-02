@@ -93,6 +93,128 @@ def _emit_kv_cache_append_source(
     return "\n".join(lines)
 
 
+def _emit_rope_kv_cache_append_source(
+    *,
+    batch: int,
+    heads: int,
+    slots: int,
+    head_dim: int,
+    layer: int,
+    value_start: int,
+    key_start: int,
+    query_start: int,
+    query_heads: int,
+    source_width: int,
+) -> str:
+    """Emit the rotation of the step's query and key together with the roll.
+
+    One kernel, two halves. The first ``query_vectors`` threads rotate the query
+    out of the projection row; the rest do the roll, and the slot they write
+    comes from the row as well - the key through the same rotation, the value
+    straight out of the packed row.
+
+    Threads are grouped four columns at a time, so a head's partner column is
+    the vector at ``offset ^ half_vectors``: the load stays contiguous and one
+    thread never straddles the half boundary.
+    """
+
+    vectors = prod((2, batch, heads, slots, head_dim)) // _VECTOR
+    query_vectors = prod((batch, query_heads, head_dim)) // _VECTOR
+    pair_stride = batch * heads * slots * head_dim
+    head_stride = slots * head_dim
+    window = (slots - 1) * head_dim
+    layer_vectors = layer * 2 * pair_stride // _VECTOR
+    head_vectors = head_dim // _VECTOR
+    half_vectors = head_vectors // 2
+    batch_heads = batch * heads
+    width_vectors = source_width // _VECTOR
+    value_vectors = value_start // _VECTOR
+    key_vectors = key_start // _VECTOR
+    query_vectors_start = query_start // _VECTOR
+
+    def rotate(
+        prefix: str,
+        target_index: str,
+        source_index: str,
+        column: str,
+        offset_name: str = "offset",
+    ) -> list[str]:
+        """Rotate one vector: ``x * cos + rotate_half(x) * sin``."""
+
+        return [
+            f"uint {prefix}partner = {source_index} - {offset_name} + "
+            f"({offset_name} ^ {half_vectors}u);",
+            f"vec<T, 4> {prefix}current = row[{source_index}];",
+            f"vec<T, 4> {prefix}rotated = row[{prefix}partner];",
+            f"float {prefix}sign = {offset_name} < {half_vectors}u ? -1.0f : 1.0f;",
+            f"vec<T, 4> {prefix}result;",
+            *[
+                f"{prefix}result[{offset}] = (T)(float({prefix}current[{offset}]) "
+                f"* float(cosine[{column} + {offset}u]) "
+                f"+ {prefix}sign * float({prefix}rotated[{offset}]) "
+                f"* float(sine[{column} + {offset}u]));"
+                for offset in range(_VECTOR)
+            ],
+            f"{target_index} = {prefix}result;",
+        ]
+
+    lines = [
+        f"device vec<T, {_VECTOR}>* queries = "
+        f"reinterpret_cast<device vec<T, {_VECTOR}>*>(out_0);",
+        f"device vec<T, {_VECTOR}>* target = "
+        f"reinterpret_cast<device vec<T, {_VECTOR}>*>(out_1);",
+        f"const device vec<T, {_VECTOR}>* window = "
+        f"reinterpret_cast<const device vec<T, {_VECTOR}>*>(in_0);",
+        f"const device vec<T, {_VECTOR}>* row = "
+        f"reinterpret_cast<const device vec<T, {_VECTOR}>*>(in_1);",
+        "const device T* cosine = in_2;",
+        "const device T* sine = in_3;",
+        "uint gid = thread_position_in_grid.x;",
+        f"if (gid < {query_vectors}u) {{",
+        f"    uint offset = gid % {head_vectors}u;",
+        f"    uint column = offset * {_VECTOR}u;",
+        *[
+            f"    {line}"
+            for line in rotate(
+                "q",
+                "queries[gid]",
+                f"{query_vectors_start}u + gid",
+                "column",
+            )
+        ],
+        "    return;",
+        "}",
+        f"uint index = gid - {query_vectors}u;",
+        f"if (index >= {vectors}u) {{ return; }}",
+        f"uint within = (index * {_VECTOR}u) % {head_stride}u;",
+        f"if (within < {window}u) {{",
+        # Every slot but the last is the same run, one row further along.
+        f"    target[index] = window[index + {layer_vectors}u + {head_vectors}u];",
+        "} else {",
+        f"    uint block = (index * {_VECTOR}u) / {head_stride}u;",
+        f"    uint offset = (within - {window}u) / {_VECTOR}u;",
+        f"    uint head_of_batch = block % {batch_heads}u;",
+        f"    bool key_half = block < {batch_heads}u;",
+        "    if (key_half) {",
+        f"        uint source = (head_of_batch / {heads}u) * {width_vectors}u "
+        f"+ {key_vectors}u + (head_of_batch % {heads}u) * {head_vectors}u "
+        "+ offset;",
+        f"        uint column = offset * {_VECTOR}u;",
+        *[
+            f"        {line}"
+            for line in rotate("k", "target[index]", "source", "column")
+        ],
+        "    } else {",
+        f"        uint source = (head_of_batch / {heads}u) * {width_vectors}u "
+        f"+ {value_vectors}u + (head_of_batch % {heads}u) * {head_vectors}u "
+        "+ offset;",
+        "        target[index] = row[source];",
+        "    }",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
 class KVCacheLowering:
     """The KV-cache roll kernel, lowered for the Apple backend."""
 
@@ -167,5 +289,95 @@ class KVCacheLowering:
             output_ids=op.outputs,
             tensor_types=tuple(graph.value(value_id).type for value_id in op.outputs),
             kind="kv_cache_append",
+        )
+        return artifact, runtime
+
+    def _compile_rope_kv_cache_append(
+        self, graph: Graph, op: Operation, index: int
+    ) -> tuple[KernelArtifact, Any] | None:
+        """Rotate the step's query and key and roll the window, in one launch.
+
+        The rotation reads a head's partner column from the same row it writes
+        from, so a head's four neighbouring columns are one thread and the
+        partner is the vector at ``offset ^ half`` - contiguous, and never
+        straddling the half boundary because both divide by four.
+        """
+
+        cache_type = graph.value(op.inputs[0]).type
+        source_type = graph.value(op.inputs[1]).type
+        query_type = graph.value(op.outputs[0]).type
+        output_type = graph.value(op.outputs[1]).type
+        layers, pair, batch, heads, slots, head_dim = cache_type.shape
+        if pair != 2:
+            raise ValueError(
+                "rope_kv_cache_append expects a key/value pair on axis 1, got "
+                f"{cache_type.shape}"
+            )
+        head_dim = int(head_dim)
+        if head_dim % _VECTOR or (head_dim // 2) % _VECTOR:
+            return None
+        value_start = int(op.attrs["value_start"])
+        key_start = int(op.attrs["key_start"])
+        query_start = int(op.attrs["query_start"])
+        width = source_type.shape[2]
+        if (
+            value_start % _VECTOR
+            or key_start % _VECTOR
+            or query_start % _VECTOR
+            or width % _VECTOR
+        ):
+            return None
+        source = _emit_rope_kv_cache_append_source(
+            batch=int(batch),
+            heads=int(heads),
+            slots=int(slots),
+            head_dim=head_dim,
+            layer=int(op.attrs["layer"]),
+            value_start=value_start,
+            key_start=key_start,
+            query_start=query_start,
+            query_heads=int(op.attrs["query_heads"]),
+            source_width=int(width),
+        )
+        name = (
+            f"metal_rope_kv_cache_append_{layers}_{int(batch)}_{int(heads)}"
+            f"_{int(slots)}_{head_dim}_{int(op.attrs['layer'])}_{index}"
+        )
+        kernel = msl._metal_kernel(
+            name,
+            ("in_0", "in_1", "in_2", "in_3"),
+            ("out_0", "out_1"),
+            source,
+            msl._MSL_HEADER,
+        )
+        roll_vectors = (
+            prod((2, int(batch), int(heads), int(slots), head_dim)) // _VECTOR
+        )
+        query_vectors = prod(query_type.shape) // _VECTOR
+        total = roll_vectors + query_vectors
+        grid = (total, 1, 1)
+        threadgroup = (min(_KV_CACHE_THREADS, total), 1, 1)
+        dtype = _MLX_DTYPES[output_type.dtype]
+
+        def runtime(*inputs: mx.array) -> tuple[mx.array, ...]:
+            outputs = kernel(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                grid=grid,
+                threadgroup=threadgroup,
+                output_shapes=[query_type.shape, output_type.shape],
+                output_dtypes=[dtype, dtype],
+            )
+            query, rolled = outputs[0], outputs[1]
+            return (query, rolled, rolled[0], rolled[1])
+
+        artifact = KernelArtifact(
+            name=name,
+            source=source,
+            header=msl._MSL_HEADER,
+            input_ids=op.inputs,
+            output_ids=op.outputs,
+            tensor_types=tuple(graph.value(value_id).type for value_id in op.outputs),
+            kind="rope_kv_cache_append",
         )
         return artifact, runtime

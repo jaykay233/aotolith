@@ -416,6 +416,8 @@ Apple backend 默认让 `attention` 调用 `mx.fast.scaled_dot_product_attention
 
 `fuse_kv_cache_update` 折掉的是 decode 的 KV-cache 滚动链。前端把它写成每层一组：从分层 cache 里切出该层、切掉最旧一个 slot 得到窗口、把这一步的 key 和从投影行读出的 value 用 `unsqueeze -> cat` 拼成 pair、`cat` 到窗口上、再 `slice -> squeeze` 拆成两半喂给 attention；value 那一路还要额外付出 `slice -> reshape -> transpose` 三个只改布局的 view。每层 11 个 op 加 3 个 value view，折成 1 个算子后每层净少 13 个，24 层一共 312 个，是 decode step 里最大的一块通用算子。pass 以那个 key 轴上的 `cat` 为锚点正向检查：窗口必须是 *同一个* pair 的前缀切片且端到端正好差一个 slot，pair 必须由层切片（可以藏在 `squeeze/reshape` 后面）从 6 维分层 cache 里取出，两半必须由 `slice(half, half+1)` 加一次 `squeeze` 解出、形状与算子输出一致，value 必须来自 projection 行的 `value_start` 处，且链上要删掉的每个 value 都不能被链外的 consumer 读到。命中的整条链换成一个 `kv_cache_append`：输入是整份 cache、这一步的 key 和打包的投影行，输出是新的 pair 和两个窗口。因为匹配依赖前端原始的 view 写法，它必须排在 `simplify_layouts` 之前。`tests/test_passes_cache.py` 覆盖四种不命中情形（窗口多切一个 slot、value 不是投影来的、pair 还有别的读者或本身就是输出）、改写前后的逐位一致、kernel 与 MLX fallback 的一致，以及多输出算子不会把 plan 退回解释执行；`tests/test_qwen2_static_cache.py` 断言 24 层 decode 的 lowering 少于 700 个 op。
 
+`fuse_rope_into_kv_cache_update` 紧接着 `fuse_rope` 之后，把旋转也收进这同一个 kernel。旋转要读的那一行（key 的新值）正是缓存写入马上要存的同一段投影行，所以「两次 `rope` + 一次 `kv_cache_append`」是三次严格串行的 launch 在算一份数据。pass 以 `kv_cache_append` 为锚点往回找：喂给它的 key 必须来自 `apply_rope`、喂给 query 的另一个 `apply_rope` 必须与它出自同一行投影、两者共享同一个 rotary 表与位置，且被替换掉的旋转输出不能被链外读到。命中后整条链换成一个 `rope_kv_cache_append`（属性 `layer`、`query_start`、`key_start`、`value_start`、`query_heads`），发射的是一个一维 grid：前 `query_vectors` 个线程把 query 从投影行旋转进输出，剩下的线程接着做原来那次滚动，写末格时先把 key 旋转、value 直接拷。线程仍按四列成组，所以一个 head 的伙伴列就是 `offset ^ half_vectors` 处的那个向量，读还是连续的，单线程不会跨越半区边界。decode step 的 launch 数从 198 降到 150，token 逐位不变。
+
 ## 4. Pointwise 融合
 
 `fuse_pointwise` 找出图的融合区域：
@@ -648,16 +650,16 @@ kernel 在同一个循环里读 gate 行和 up 行（`in_1`、`in_2`），各自
 - scale 与计算 dtype 同精度。bf16 与 f32 的 scale 之差比一个 int4 步长小三个数量级，带 f32 只会逼 kernel 持有第二种精度
 - PyTorch 侧这个格式被写成单个自定义算子 `aotolith.dequantize_i4(packed, scales, group_size)`（`models/quantized.py`，用 `register_fake` 提供 shape 规则），`legalize/quantization.py` 只把它平移成 IR 里的同名算子，`passes/quantize.py` 的 `fold_quantized_weights` 才决定它的命运
 - 该 pass 排在 `fold_matmul_input_layouts` 之后、`fuse_rope` 之前：打包权重替换的是权重操作数本身，必须等操作数布局定稿，又必须早于任何把右操作数当矩阵读的匹配器。它只处理 `transpose_b=True` 且左侧只有一行的 `matmul`/`addmm`，把 `matmul(x, dequantize_i4(...))` 改写成带 `weight_group_size` 属性的单个 `matmul`（多操作数的 `addmm` 因此把 packed 和 scales 一起带进 epilogue，`fuse_residual_epilogue` 也相应透传 `inputs[1:]` 而不是假定只有两个操作数）
-- 折叠后的 GEMV 走 `_emit_quantized_gemv_matmul_source`：一个 warp 一列，每条 lane 每步读一个字，用 `int((word >> 4k) & 0xF)` 取出 nibble 再以条件减法做符号扩展，乘激活和组 scale 后进 float 累加，再用 `simd_sum` 归约。scale 在累加前乘，因为一个组的 scale 只作用于自己那段 reduction，提出去要求组边界必须落在 warp 边界上
+- 折叠后的 GEMV 走 `_emit_quantized_gemv_matmul_source`：一个 warp 一列，每条 lane 每步读一个字，用 `(int)(word << (28 - 4 * k)) >> 28` 两条指令取出 nibble 并完成符号扩展（早先是掩码 + 比较 + 条件减法的三条），乘激活和组 scale 后进 float 累加，再用 `simd_sum` 归约。scale 在累加前乘，因为一个组的 scale 只作用于自己那段 reduction，提出去要求组边界必须落在 warp 边界上；把 scale 提到八码求和之外会更便宜，但那会改掉中间舍入、翻转 greedy token，所以没有做
 - 打包 matmul 不依赖 `codegen_matmul`：dense matmul 默认交给 MLX 是因为 MLX 的 kernel 更快，而 packed 权重一旦落到 MLX 就得先把稠密权重物化出来，正是量化要消掉的那份分配。所以只要 `_packed_matmul_supported` 认可 shape，就原生发射
 - 左侧超过一行时折叠被跳过（`M > 1` 时权重流是乘法里便宜的一半），显式 `dequantize_i4` 由 `codegen/quantize.py` 的 `QuantizationLowering` lower 成一个流式 kernel：一个字一个线程，解 8 个 nibble、乘组 scale、两次 `vec<T, 4>` 存储。相比 MLX fallback 的八个逐元素 pass 加一次 stack，它不产生中间全尺寸临时张量
 - 精度上 kernel 用 float 累加，`value`/`acc` 都是 float，只在写回时 cast。实测同一份取整后权重下，运行时相对 float32 CPU forward 的 logit 最大偏差 0.51，torch 自己的 bf16 forward 是 0.41，两者都是 bf16 噪声量级
 
 当前实测（Qwen2.5-0.5B，M5 Pro，bf16 与 int4 都开 `--codegen-attention`）：int4 异步 decode 195.3 → 272.8 token/s，同步 179.0 → 228.3；bf16 异步 199.2 → 232.2，同步 155.4 → 167.2；prefill 提高约 1.1x；峰值内存 int4 1.99 → 1.89 GiB。这些是同一会话里对 `fuse_norm_scale` 做交替消融得到的配对值，量化的收益本身没有变化（每 token 991 MB → 312 MB，峰值 4.26 → 1.89 GiB）。
 
-### 小 launch 的地板是固定的 14 µs，不是带宽
+### 一次 launch 的成本会与权重流重叠，地板不是固定的 14 µs
 
-打包 kernel 每 token 只读 312 MB，端到端却只有 ~85 GB/s，而 bf16 路径能到 ~230 GB/s。把单个 launch 隔离出来测（一个 plan 里放 48 个互相独立的同形状 matmul，各自读一份不同的权重，输出全部保活，取 7 轮最小值）后，原因就清楚了：
+打包 kernel 每 token 只读 250 MB，端到端却只有 ~114 GB/s，而 bf16 路径能到 ~236 GB/s。把单个 launch 隔离出来测（一个 plan 里放 48 个互相独立的同形状 matmul，各自读一份不同的权重，输出全部保活，取 7 轮最小值），得到的是一条干净的直线：
 
 | 形状 | dtype | 每次 launch 字节 | 时间 | 速率 |
 | --- | --- | ---: | ---: | ---: |
@@ -666,14 +668,25 @@ kernel 在同一个循环里读 gate 行和 up 行（`in_1`、`in_2`），各自
 | 151936×896（LM head） | int4 g64 | 72.3 MB | 288 µs | 252 GB/s |
 | 151936×896 | bf16 | 272 MB | 652 µs | 417 GB/s |
 
-四个点落在同一条直线上：`t ≈ 14 µs + 字节 / 373 GB/s`。也就是说每次 launch 有约 14 µs 的固定成本，之后才按带宽增长；2.3 MB 的 launch 只该花 6 µs 读字节，实际 20 µs 里大头是那 14 µs。decode 的关键路径每层是 `qkv → rope/cat → attention → o_proj → gate+up → down`，其中 4 个投影各 20-33 µs、24 层约 2.6 ms，正好是这个固定成本的 24 × 4 = 96 倍。
+`t ≈ 14 µs + 字节 / 373 GB/s`。这个式子描述的是「一个 launch 背后没有别的流可叠、前一个 launch 也不在跑」的形状：2.3 MB 的 launch 本该只花 6 µs 读字节，实际 20 µs 里大头是那 14 µs。它随后被当成 decode step 的模型用了，那是错的。decode step 不是 48 个互不依赖的 launch 背靠背，而是一条链在流自己的权重，host 线程提前把后续 launch 交出去，于是那 14 µs 摊进了流的空隙里。
 
-两个看起来该有用的改法都做了消融，都没有效果：
+把层数当成自变量就能把两件事分开：同一个 plan 只改层数（1、2、4、24），每个位宽得到一条直线，斜率是每层成本，截距才是链的固定部分。同时用一次纯读扫描量出这台机器的流——用生成的 GEMV 持续 200 次 launch 搬 544 MB，413 GB/s（本文档早前把这一项写成 267 GB/s，那是走 MLX 自己的 reduction 扫一遍能到的速率，不是 kernel 能到的速率）：
 
-- threadgroup 扫 128/256/512/1024（4864×896 分别 24.3/25.4/23.7/24.3 µs，LM head 291.7/290.8/286.4/288.5 µs）。网格形状改变的只有几个百分点，地板不动。
-- nibble 解码从「掩码 + 条件减法」换成移位对 `as_type<int>(word << s) >> 28`（两条指令换三条），同一进程里交替 A/B：0.99x / 0.94x / 0.98x，没有收益。两种写法经编译器优化后都落在同一条指令预算上，说明这几个小 launch 也不是 ALU 受限。
+| | 每步字节 | 单层 | 24 层 | 其中 head |
+| --- | ---: | ---: | ---: | ---: |
+| bf16 | 991 MB | 0.15 ms | 4.7 ms | 1.05 ms |
+| int4 g64 | 250 MB | 0.055 ms | 2.0 ms | 0.68 ms |
+| int8 g64 | 495 MB | 0.10 ms | 3.0 ms | 0.53 ms |
 
-结论：继续磨这个 kernel 的收益接近零；要让 decode 更快，只能减少关键路径上的 launch 数，也就是让一次 launch 验证多个 token（投机解码/多行 verify），而不是让单行 GEMV 更快。这一条也是上面「每次 launch 到底读多少字节才划算」的推论：4 行激活比 1 行多读 4 倍权重字节，却只多花 (4-1) × 字节/373 GB/s，固定成本被摊掉 4 倍。
+bf16 的一层搬 30 MB 花 0.13 ms，是 230 GB/s；整步 991 MB 走 4.1 ms，是 240 GB/s——只到 413 的 58%，缺的那 40% 是串行 launch 各自的 ramp，而 `mlx_lm` 走同一条链、落在 225 GB/s。head 单次 launch 搬 272 MB，在模型内量出来是 264 GB/s，单独跑是 388-423，差的就是「链里的一环」这件事。4 bit 的一层搬 7.5 MB 花 0.057 ms，只有 132 GB/s，而 head 又占了这一步的四分之一：它根本不在争带宽，钱花在别处。拿三个位宽的「字节 × 码数」一起拟合，链里能用的有效流约 236 GB/s，加上每个 4 bit 码约 2 ps；一步大约 5 亿个码，第二项就是它的一半。那个 236 是拟合出来的有效值，不是机器的上限——上限是 413，它描述的是「每步 146 次 launch 之后还剩多少流」。
+
+两项直接验证这个读法。把一步里的两次旋转折进写缓存，去掉了 48 次 launch（198 到 150）：8 bit 因此动了 6%，4 bit 一点也量不出来。如果每次 launch 真是 14 µs 的墙钟，48 × 14 µs 会是一个肉眼可见的数字，而且位数越窄占比越大——实测正好相反。所以 launch 是被流盖住的，窄位宽的一步等的是字节，以及把字节解开。
+
+早先那组 nibble 消融也要重新读：把「掩码 + 条件减法」换成移位对 `as_type<int>(word << s) >> 28`（两条指令换三条），在那个 48-launch 的 plan 里交替 A/B 是 0.99x / 0.94x / 0.98x，没有收益，当时据此写下「这几个小 launch 不是 ALU 受限」。那句话对那个 plan 成立，对 decode step 不成立：那个 plan 里每个 launch 都在等自己那份 2-8 MB 的权重，ALU 有空闲；真实的一步每 token 要解五亿个码，解包就在关键路径上。放回 decode step 里测，同样两行代码换来 7%。教训是微基准只回答它自己的形状，而 decode 的形状是「宽字节流 + 每码解包」两件事叠在一起。
+
+threadgroup 扫 128/256/512/1024（4864×896 分别 24.3/25.4/23.7/24.3 µs，LM head 291.7/290.8/286.4/288.5 µs）依然只有几个百分点，这一项没有变：网格形状不影响流，也不影响每码的指令数。
+
+结论因此不是「只能减少 launch 数」，而是两个方向的乘积：少读字节（量化，每 token 991 MB → 250 MB）和把读到的字节解得更便宜（两指令符号扩展，7%）。多行 verify（投机解码）摊掉的是 launch 和激活读取，权重仍然每行各读一次、每个码仍要解一次，所以它在 4 bit 上的空间比这个式子里看上去的小——它的价值在把激活流量摊薄，而那部分在量化之后占比已经很小。
 
 ## 12. Metal attention codegen
 

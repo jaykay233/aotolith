@@ -278,14 +278,15 @@ def test_decode_graph_keeps_one_cache_operator_per_layer() -> None:
     )
 
     graph = runtime.decode.lowered_graph
-    appends = [op for op in graph.ops if op.op == "kv_cache_append"]
+    # One cache write per layer, whether the rotation was folded into it or not.
+    appends = [
+        op for op in graph.ops if op.op in {"kv_cache_append", "rope_kv_cache_append"}
+    ]
     assert [op.attrs["layer"] for op in appends] == list(range(24))
     assert len(graph.ops) < 700
     # Nothing of the roll survives as general operators: the concatenate that
     # rebuilt the pair, and the slices that unpacked it, are all gone.
-    assert not any(
-        op.op == "cat" and int(op.attrs["dim"]) % 4 == 3 for op in graph.ops
-    )
+    assert not any(op.op == "cat" and int(op.attrs["dim"]) % 4 == 3 for op in graph.ops)
 
 
 def test_autotune_compares_a_kernel_against_an_mlx_reference() -> None:
@@ -555,7 +556,9 @@ def test_bucketed_runtime_picks_the_smallest_fitting_bucket() -> None:
 
     assert runtime.prompt_lengths == (4, 8, 16)
     assert runtime.max_prompt_length == 16
-    assert [runtime.bucket_for(length).prompt_length for length in (1, 4, 5, 8, 9, 16)] == [
+    assert [
+        runtime.bucket_for(length).prompt_length for length in (1, 4, 5, 8, 9, 16)
+    ] == [
         4,
         4,
         8,
@@ -767,7 +770,9 @@ def test_memory_footprint_counts_the_cache_and_the_weights_once() -> None:
     # The two plans trace the same module, so a weight of the same name and
     # shape must be the same array. Without the sharing, a single bucket held
     # the whole checkpoint twice.
-    prefill_state = dict(zip(runtime.prefill.state_names, runtime.prefill._state_values))
+    prefill_state = dict(
+        zip(runtime.prefill.state_names, runtime.prefill._state_values)
+    )
     decode_state = dict(zip(runtime.decode.state_names, runtime.decode._state_values))
     shared = [
         name
