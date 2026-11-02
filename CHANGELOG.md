@@ -33,9 +33,13 @@ The policy that decides what counts as a breaking change lives in
 
   Those are ranges over paired rounds in three sessions, each round a median of
   three to five runs inside the process. The bf16 row is parity: both engines
-  walk the same 146 dependent launches over the same 991 MB, and a step lands at
-  240 GB/s against the 413 GB/s the same GEMV reaches in a sustained read-only
-  sweep.
+  walk the same 146 launches over the same 991 MB, and a step lands at 240 GB/s
+  against the 409-413 GB/s one large GEMV holds while streaming a single
+  replayed matrix. That gap is per-launch ramp, not the dependency — the same
+  540 MB walked as 31 distinct one-pass 17.4 MB matrices reads at 216 GB/s, and
+  issuing the 96 projections without the dependency runs slower, 199-204
+  against 221-229 — so no kernel change recovers it, and giving the narrow projections four
+  times as many blocks moves their time by under 1%.
 
   Eight bits is slower than four because a step streams 495 MB instead of 250,
   and its head alone is 272 MB. It is not twice as slow because a four-bit step

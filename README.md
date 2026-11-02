@@ -158,17 +158,18 @@ for what a kernel does and does not buy: it moves prefill by 6-15% and decode by
 nothing measurable, because at one query per step the attention MLX's SDPA runs
 is 8 us and the generated one is 11.
 
-None of this opens a lead on bf16 asynchronous decode, and the reason is not a
-bandwidth ceiling — an earlier revision of this section said it was, and that
-number was wrong. A read-only sweep of 544 MB through the generated GEMV,
-sustained over 200 launches, runs at 413 GB/s on this machine; the head alone
-moves its 272 MB at 388-423. A bf16 decode step instead moves its 991 MB in
-4.1 ms, which is 240 GB/s — 58% of what the same kernel reaches when it is not
-one link in a chain of 146 dependent launches. `mlx_lm` lands in the same place,
-at 225 GB/s. So both engines lose about 40% of the machine to the dependency
-chain, and the compiler only gets to decide how much of that it can hand back:
-the synchronous column reads 1.07-1.12x, prefill 1.02-1.17x, and asynchronous
-decode 0.92-1.01x across sessions, which is parity with a 9% tail.
+None of this opens a lead on bf16 asynchronous decode, and the reason is not what
+an earlier revision of this section said it was. A 541 MB matrix through the
+generated GEMV streams at 409 GB/s, and the head alone moves its 272 MB at
+388-423; both are one launch replayed, which is the condition that flatters a
+rate. A bf16 decode step moves its 991 MB in 4.1 ms, which is 240 GB/s, and the
+step cannot reach the 409 because it is cut into 30 MB launches: the same 540 MB
+walked as 31 distinct 17.4 MB matrices, one pass each, reaches 216 GB/s rather
+than 409. So both engines lose about 40% of that large-launch rate to per-launch
+ramp, not to the dependency — issuing the launches independently makes it slower,
+204 GB/s against 229 — and the compiler only gets to decide how much of it it can
+hand back: the synchronous column reads 1.07-1.12x, prefill 1.02-1.17x, and
+asynchronous decode 0.92-1.01x across sessions, which is parity with a 9% tail.
 
 An earlier revision of this table read 0.77x and 1.21x in different places, and
 both came from timing the sides differently — one against a baseline that waited
@@ -180,8 +181,8 @@ at 32 tokens because that row is measured first, right after the plan compiles,
 and one of four sessions started cold. The prefill column is the stable one.
 
 The lead over `mlx_lm` comes from dropping the width, which is the next section.
-At bf16 there is nothing to win: both engines walk the same chain of dependent
-launches over the same 991 MB and land within noise of each other.
+At bf16 there is nothing to win: both engines move the same 991 MB per step in the
+same few dozen launches and land within noise of each other.
 
 All 64 tokens match the PyTorch BF16 reference exactly, with or without native
 kernels, and `mlx_lm` produces those same tokens.
@@ -234,14 +235,17 @@ tok/s at bf16 — and it is inside these ranges rather than setting them.
 
 Four bits is the widest margin because the step stops being about bandwidth
 first. At bf16 a step has 991 MB to read and spends 4.1 ms on it, which is 58% of
-the 413 GB/s this machine's generated GEMV reaches in a sustained sweep; the
-other 42% is the chain of dependent launches the weights have to travel through,
-and `mlx_lm` pays the same toll. At four bits the step reads 250 MB in about
-2.1 ms — 119 GB/s, less than a third of the ceiling — so it is not competing for
-bandwidth at all: it is competing on what it costs to turn a packed word back
-into eight weights, and there a generated kernel with one projection per launch
-beats one that does not fold the decode into it. Eight bits sits between the two:
-495 MB in 2.6 ms is 190 GB/s, closer to the ceiling than four bits and further
+the 413 GB/s one large generated GEMV holds when it streams a single matrix; the
+other 42% is not a toll for the launches being dependent — removing the
+dependency makes the chain slower, 199-204 GB/s against 221-229 — but the ramp each
+launch pays for its own bytes. Read 540 MB as one matrix and it streams at 409
+GB/s; read the same 540 MB as 31 distinct 17.4 MB matrices and it reaches 216.
+`mlx_lm` pays the same ramp. At four bits the step reads 250 MB in about
+2.1 ms — 119 GB/s, less than a third of that large-launch rate — so it is not
+competing for bandwidth at all: it is competing on what it costs to turn a packed
+word back into eight weights, and there a generated kernel with one projection per
+launch beats one that does not fold the decode into it. Eight bits sits between the
+two: 495 MB in 2.6 ms is 190 GB/s, closer to that rate than four bits and further
 from it than bf16, hence the smaller gain.
 
 A decode step carries 150 dispatches at four bits: 24 layers of projection,
@@ -256,13 +260,15 @@ unpack — a nibble sign-extended by two shifts instead of a mask, a compare and
 subtract — is what moved the four-bit row by 7%.
 
 BF16 has read 0.92x, 1.01x, 0.95x and 1.09x here across sessions, so it is parity
-and
-not a lead — the lead comes from dropping the width. A sustained read-only sweep
-of 544 MB through the same generated GEMV runs at 413 GB/s on this machine, and
-the head alone moves 272 MB at 388-423, while a bf16 step sustains 240, so the
-missing 40% is the chain of dependent launches rather than the stream, and both
-engines pay it. That also retires an earlier claim in this file that the step was
-sitting on a 267 GB/s ceiling: the ceiling is 413, and the step is at 58% of it.
+and not a lead — the lead comes from dropping the width. A single 541 MB matrix
+through the same generated GEMV streams at 409 GB/s on this machine, and the head
+alone moves 272 MB at 388-423, while a bf16 step sustains 240. That gap is not a
+dependency toll and not something a better kernel recovers: the same 540 MB cut
+into 31 one-pass 17.4 MB matrices reads at 216 GB/s instead of 409, because each
+launch amortises its own ramp over its own bytes, and giving the narrow
+projections four times as many blocks changes their time by under 1%. Both
+engines pay it, which is why bf16 lands at parity while the quantized rows do
+not: those have fewer bytes to ramp over.
 
 > [!NOTE]
 > Timing `mlx_lm.generate()` instead of its raw decode loop inflates the

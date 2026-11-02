@@ -432,13 +432,32 @@ Dividing the bytes by 46 divides the time by 4.4 and then stops. The floor is
 0.71 ms for 96 dependent launches, or 7.4 us each, paid whether a kernel moves
 15 MB or 4 MB, and it is 22% of the full-size chain. The remaining 2.4-2.5 ms is
 the streaming, and it lands at 221-233 GB/s here against the 268-279 GB/s the
-size curve gives those same 1.6-17.4 MB launches standalone - 15 to 20% below,
-which is the penalty for running them in a dependent chain rather than one after
-another, and it is the same residue the threadgroup sweep above failed to move.
-So the projection path is a floor plus a size-curve rate minus a chain penalty,
-and none of the three responds to a better kernel. A merge that trades the floor
-for a coarser read is the one move the earlier section already measured as a
-loss.
+size curve gives those same 1.6-17.4 MB launches when replayed.
+
+That gap is not what this document used to call a dependent-chain penalty, and
+the correction is worth stating because it removes the last escape route. Two
+measurements refute it. First, issuing the same 96 launches *without* the
+dependency - every projection fed the same activation, so nothing waits on
+anything - does not run faster, it runs slower: 3.51-3.59 ms against 3.12-3.24 ms
+for the dependent chain, or 199-204 GB/s against 221-229. Serialisation is not
+costing the chain anything, so no amount of overlapping could win it back. Second, giving the
+narrow projections more blocks does not move them: `qkv` takes 24.3 us as 36
+blocks of 1024 threads and 24.2 us as 288 blocks of 128, `o_proj` 23.3 against
+23.6, and `down` 35.8 against 36.0. A 2 MB launch costs what a 2 MB launch costs.
+
+What actually separates the chain from the size curve is how many launches share
+one ramp. Read 540 MB as a single matrix and it streams at 409 GB/s; read the
+same 540 MB as 31 distinct 17.4 MB matrices, one pass each, and it reaches
+216 GB/s. The bytes are identical, neither working set can fit in a cache, and
+the only difference is that one dispatch amortises its own ramp over 540 MB while
+31 dispatches each pay theirs over 17.4. Replaying a matrix hides this: the same
+17.4 MB launch replayed reads at 480 GB/s, which is the system cache answering,
+not DRAM. That is the whole residue, and it is why the size curve's mid-size
+entries are an upper bound rather than a target.
+
+So the projection path is a launch floor plus a per-launch ramp, and neither
+responds to a better kernel. A merge that trades the floor for a coarser read is
+the one move the earlier section already measured as a loss.
 
 Measuring the three buckets of a real step in one process, five interleaved
 rounds each, closes the budget:
@@ -459,14 +478,18 @@ half a millisecond of everything else, and the two large numbers are both the
 size curve.
 
 That is the whole accounting, and it is also the reason a bf16 step cannot be
-made 10% faster on this machine. Take the best case the size curve allows - every
-projection at the 279 GB/s a 17.4 MB launch reaches on its own, and the head at
-the 412 GB/s a 272 MB launch reaches - and add the 1.08 ms the 146 launches cost
-at the floor: 716 MB / 279 GB/s + 272 MB / 412 GB/s + 1.08 ms = 4.31 ms against
-today's 4.39. Winning 1.10x means 3.99 ms, which is below the sum of the curve's
-own numbers. There is no kernel change that gets there, because the bytes cannot
-be dropped and the rate on each bucket is already the rate that bucket's size
-buys.
+made 10% faster on this machine. The generous reading - every projection at the
+279 GB/s a 17.4 MB launch reaches when replayed, and the head at the 412 GB/s a
+272 MB launch reaches the same way - gives 716 MB / 279 GB/s + 272 MB / 412 GB/s
++ 1.08 ms of launch floor = 4.31 ms against today's 4.39. Winning 1.10x means
+3.99 ms, which is below even that sum. And the sum is optimistic in both terms:
+those two rates come from replaying one matrix, while a step walks distinct ones,
+and the same bytes walked one pass each reach 216-261 GB/s instead. Corrected to
+rates a one-shot launch can actually hold, the best case is *slower* than 4.31,
+so 3.99 is further away than the generous arithmetic says, not closer. There is
+no kernel change that gets there, because the bytes cannot be dropped, the rate
+on each bucket is already the rate that bucket's size buys, and the launches are
+already as few as a fusion can make them.
 
 So the ordering this table produces is the whole result: 1.46-1.51x at four bits,
 1.17-1.22x at eight, and parity at bf16. Four bits, group 64, moves about 278 MB
@@ -542,9 +565,10 @@ It is slower than four bits and much more accurate, and it is only mildly
 slower because a four-bit step is not bound by bytes. Reading a decode step at
 each width says where the time goes. Multiplying the layer count and re-timing
 gives a line per width, and the machine's own read rate — a generated GEMV
-streaming 544 MB, sustained over 200 launches — is 413 GB/s. An earlier revision
-of this document put that ceiling at 267 GB/s, which was the rate a sweep through
-MLX's own reduction reached rather than the rate the kernels reach:
+streaming a single 544 MB matrix, sustained over 200 launches — is 413 GB/s
+(409 on a re-measure). An earlier revision of this document put that ceiling at
+267 GB/s, which was the rate a sweep through MLX's own reduction reached rather
+than the rate the kernels reach:
 
 | | bytes per step | one layer | at 24 layers | of which the head |
 | --- | --- | --- | --- | --- |
@@ -553,14 +577,18 @@ MLX's own reduction reached rather than the rate the kernels reach:
 | int8 g64 | 495 MB | 0.10 ms | 3.0 ms | 0.53 ms |
 
 A bf16 layer moves 30 MB in 0.13 ms, which is 230 GB/s, and the step as a whole
-moves 991 MB in 4.1 ms, which is 240 — 58% of the ceiling. The head alone, 272 MB
-in one launch, measured against the same ceiling inside the model by shrinking
-the vocabulary, reads at 264 GB/s; standalone, with nothing else on the GPU, the
-same kernel reads at 388-423. So the 40% a bf16 step gives up is the chain: 146
-dependent launches, each ramping its own reads, and `mlx_lm` walks the same chain
-at 225 GB/s. A four-bit layer moves 7.5 MB in 0.057 ms, which is 132 GB/s — a
-third of the ceiling — and its head is a quarter of the step; that step is not
-competing for bandwidth at all, which is why it is where the margin is.
+moves 991 MB in 4.1 ms, which is 240 — 58% of that large-launch rate. The head
+alone, 272 MB in one launch, measured against the same rate inside the model by
+shrinking the vocabulary, reads at 264 GB/s; standalone, with nothing else on the
+GPU, the same kernel reads at 388-423. The 40% a bf16 step gives up is the ramp
+each launch pays for its own bytes, and the proof that it is the ramp and not the
+dependency is that the same 540 MB walked as 31 distinct 17.4 MB matrices, one
+pass each, reaches 216 GB/s against 409 for one 541 MB matrix, while issuing the
+96 projections *without* the dependency runs slower, not faster. `mlx_lm` walks
+the same launches at 225 GB/s. A four-bit layer moves 7.5 MB in 0.057 ms, which
+is 132 GB/s — a third of that rate — and its head is a quarter of the step; that
+step is not competing for bandwidth at all, which is why it is where the margin
+is.
 
 What it pays for is the decode of the packed word. Fitting time against bytes and
 codes across the three widths puts the in-model stream at about 236 GB/s — the effective rate after 146
