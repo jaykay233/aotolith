@@ -107,14 +107,20 @@ def _round_trip_weights(model: torch.nn.Module, group_size: int, bits: int = 4) 
     on the grid returns the same words - the group's widest element rounds to
     the top code, so the scale recomputes unchanged.
 
-    At four bits that survives the write-back, so the words the runtime streams
-    are byte-identical to the ones this reference consumed, which is the only
-    way to tell a decode bug from a rounding difference. At eight bits it does
-    not: the int8 step is finer than a bf16 mantissa can hold, so about 1% of
-    the codes round to the neighbour when the dequantized value is stored in
-    bf16 and packed again. The two then differ by one code out of 256, and a
-    token that sits on an exact logit tie can go either way - so for eight bits
-    the token check is a close-agreement signal, not an equality requirement.
+    That survives the bf16 write-back at both widths, and it is measured rather
+    than assumed: re-packing the written-back value changes 0 of 17 016 832
+    words in ``lm_head`` at four bits and 0 of 34 033 664 at eight. So the words
+    the runtime streams are byte-identical to the ones this reference consumed,
+    which is the only way to tell a decode bug from a rounding difference.
+
+    The token check still is not an equality test, and the reason is the walk
+    rather than the codes. This builds one greedy sequence, so the first token
+    that differs leaves the two runs reading different text and every later
+    comparison is between different prefixes. Compared on aligned prefixes -
+    both sides fed PyTorch's own token at each step - the two agree on 62 of 64
+    steps at four bits and 63 of 64 at eight, and both remaining flips sit where
+    the top two logits are 0.0000 or 0.1250 apart against a 0.08-0.24 mean
+    absolute distance. A tie is arbitrary in any implementation.
 
     The embedding stays untouched because the runtime leaves it in bf16 too.
     """

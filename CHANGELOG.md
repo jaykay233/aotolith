@@ -53,6 +53,19 @@ The policy that decides what counts as a breaking change lives in
   not; that is the loop-shape error an earlier release already corrected at
   bf16, and the table above is the like-for-like comparison.
 
+  The token check needed correcting too. The benchmark walks one greedy
+  sequence, so the first differing token leaves the two runs reading different
+  text and every later token compares different prefixes; at four bits that
+  reads 13 of 64. Measured instead on aligned prefixes, with both sides fed
+  PyTorch's own token each step, the plan agrees on 62 of 64 steps at four bits
+  and 63 of 64 at eight, and every remaining flip lands on a step whose top two
+  logits are exactly equal — undecidable in any implementation. Repacking the
+  bf16 write-back of the dequantized weights changes 0 of 17 016 832 words at
+  four bits and 0 of 34 033 664 at eight, which retires an earlier claim in
+  this file that about 1% of the int8 codes moved and explains a token flip.
+  `examples/qwen_quantized_agreement.py` reports the aligned number and the
+  gap next to each disagreement.
+
   The four-bit path is unchanged: same packed layout, same kernel names, same
   tokens, and `weight_bits` defaults to 4 so a graph folded by an older release
   still lowers to the kernel it always used.

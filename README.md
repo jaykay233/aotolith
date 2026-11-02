@@ -275,13 +275,22 @@ sitting on a 267 GB/s ceiling: the ceiling is 413, and the step is at 58% of it.
 The cost is accuracy, and it is the usual trade. Mean relative error against the
 source weights is 11.5% at four bits and 0.63% at eight. An eight-bit plan
 reproduced the BF16 checkpoint's greedy choices for all 64 steps of the benchmark
-prompt; a four-bit plan tracks it for 13 and then flips on a near-tie. So four
-bits is the throughput setting and eight is the one for when a change in wording
-is not acceptable, at about four fifths of the four-bit rate.
+prompt; a four-bit plan tracks it for 13 and then flips on a near-tie. That 13 is
+a property of the walk rather than of the weights: once one token differs the two
+runs are reading different text, so every later token compares different prefixes.
+Compare on aligned prefixes, feeding both sides the same token each step, and the
+four-bit plan agrees on 62 of 64 and the eight-bit plan on 63 of 64 — with every
+remaining flip on a step whose top two logits are exactly equal, where any
+implementation may go either way. `examples/qwen_quantized_agreement.py` prints
+that, gap column included. So four bits is the throughput setting and eight is the
+one for when a change in wording is not acceptable, at about four fifths of the
+four-bit rate.
 
 `docs/performance.md` splits a step into host and kernel time for each width, and
 `examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8
---mlx-baseline` reproduces the middle column.
+--mlx-baseline` reproduces the middle column. The quantized token agreement above
+is what `examples/qwen_quantized_agreement.py` measures; it teacher-forces both
+sides so the comparison stays on one prefix.
 
 ## How a step is compiled
 

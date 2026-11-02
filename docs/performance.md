@@ -609,15 +609,32 @@ against 11.5% at four, and an eight-bit plan reproduced the bf16 checkpoint's
 greedy choices for all 64 steps of that benchmark prompt — which is a stronger
 statement than the four-bit note above can make.
 
-One comparison needs a caveat. The benchmark's round-tripped reference is
-byte-identical to the runtime's words at four bits, because the widest weight in
-a group lands exactly on the top code and the scale therefore recomputes
-unchanged. At eight bits that survives a float32 round trip but not a bf16 write
-back: the int8 step is finer than a bf16 mantissa, so about 1% of codes round to
-the neighbour when the dequantized value is stored and packed again. On the
-benchmark prompt that one-code difference lands on a token whose top two logits
-are exactly equal, and the reference takes the other branch. `--quantize-bits 8`
-therefore reports agreement rather than requiring it.
+The benchmark's round-tripped reference is byte-identical to the runtime's words
+at **both** widths, and that is now measured rather than assumed: re-packing the
+bf16 write-back of the dequantized weight changes 0 words out of 17 016 832 in
+`lm_head`, 100 352 in `q_proj` and 544 768 in `gate_proj` at four bits, and 0 out
+of 34 033 664, 200 704 and 1 089 536 at eight. An earlier revision of this
+paragraph claimed about 1% of the int8 codes moved on that write-back; they do
+not, and the token divergence it was invoked to explain has a different cause.
+
+The cause is the prefix, not the codes. The benchmark walks one greedy sequence,
+so the moment a single token differs the two runs are reading different text and
+every later token is a comparison between different prefixes. Compare on aligned
+prefixes instead — feed PyTorch's own token to both sides at every step so the
+caches hold the same prefix — and the two implementations pick the same token on
+62 of 64 steps at four bits and 63 of 64 at eight, reproducibly across runs.
+`examples/qwen_quantized_agreement.py` reports this, and the gap column is the
+part that matters: **every remaining disagreement sits where the top two PyTorch
+logits are separated by 0.0000**, against a mean absolute logit distance of
+0.08-0.17 between the two paths. A step whose top two logits are exactly equal is
+not a step any implementation can decide; reporting 13 of 64 from the unaligned
+walk would instead have described how fast two prefixes decorrelate.
+
+That is why the token check is stated as equality at bf16 (64 of 64, aligned or
+not, because the walk never diverges) and as aligned-prefix agreement at the
+quantized widths, with the tie check standing behind it.
+`examples/qwen_static_cache_benchmark.py` reports the unaligned number, which is
+why it prints a low agreement for a plan that agrees on every decidable step.
 
 
 Autotuning is not an escape either, and until now it could not even run on a

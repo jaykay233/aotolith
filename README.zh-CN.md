@@ -171,9 +171,9 @@ BF16 在多次会话里读到 0.92x、1.01x、0.95x 和 1.09x，所以它是持�
 > [!NOTE]
 > 如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环来计时，量化后的比值会被抬高，因为 `generate()` 每 token 多做了一次文本处理。这正是本 README 早先在 bf16 上犯过、并已纠正的同一个错误，也是这里的 helper 要把基线也量化、两种循环形状都测并分开报的原因。可信的是表里那个数字。
 
-代价是精度，和所有量化一样。对原始权重平均相对误差是 4 bit 的 11.5% 和 8 bit 的 0.63%。8 bit 的 plan 在基准 prompt 的全部 64 步上都复现了 BF16 checkpoint 的 greedy 选择；4 bit 的 plan 跟了 13 步，然后在一个近似平局上翻掉。所以 4 bit 是吞吐档，而当你不能接受措辞变化时用 8 bit，代价大约是 4 bit 速率的五分之一。
+代价是精度，和所有量化一样。对原始权重平均相对误差是 4 bit 的 11.5% 和 8 bit 的 0.63%。8 bit 的 plan 在基准 prompt 的全部 64 步上都复现了 BF16 checkpoint 的 greedy 选择；4 bit 的 plan 跟了 13 步，然后在一个近似平局上翻掉。这个 13 是走法的性质，不是权重的性质：一旦有一个 token 不同，两条路径读的就是不同文本，此后每个 token 都在比较不同的前缀。改成在对齐前缀上比较 —— 每一步把同一个 token 喂给两边 —— 4 bit 的 plan 在 64 步里一致 62 步，8 bit 一致 63 步，而剩下每一处翻转都落在 top-1 与 top-2 logit 完全相等的步骤上，那种步骤任何实现都可以任选一支。`examples/qwen_quantized_agreement.py` 会连 gap 那一列一起打印出来。所以 4 bit 是吞吐档，而当你不能接受措辞变化时用 8 bit，代价大约是 4 bit 速率的五分之一。
 
-一步在每种位宽下 host 与 kernel 的时间拆分在 `docs/performance.md`，中间那一列可以用 `examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8 --mlx-baseline` 复现。
+一步在每种位宽下 host 与 kernel 的时间拆分在 `docs/performance.md`，中间那一列可以用 `examples/qwen_static_cache_benchmark.py --quantize 64 --quantize-bits 8 --mlx-baseline` 复现。上面那个量化后的 token 一致度是 `examples/qwen_quantized_agreement.py` 量的：它对两边做 teacher forcing，所以比较始终停留在同一个前缀上。
 
 ## 一步是怎么编出来的
 
