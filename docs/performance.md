@@ -297,6 +297,13 @@ direction: it wants 128-thread groups, and the 1024-thread setting that the
 narrow buckets use costs it a third of its bandwidth. So occupancy is a real
 effect, but it is not what separates the two buckets.
 
+The paired gate/up kernel looks like the exception that proves it. Measured on
+its own, 128-thread groups stream its 17.4 MB at 356 GB/s against 312 GB/s for
+the 1024-thread setting the narrow buckets select, which is 12% and would be 4%
+of a step. Put that setting into a 24-layer chain and the advantage disappears:
+128, 256, 512 and 1024 threads all land between 96 and 98 us per layer. A
+dependent chain has no room for a bucket to be tuned against its neighbours.
+
 The second is MLX's own reduction. `mx.sum` over the same bytes follows the same
 curve, and a lower one:
 
