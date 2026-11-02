@@ -420,28 +420,46 @@ of dispatch in the first place.
 That fixed cost is worth pinning down, because it bounds every kernel-level idea
 in this document. Twenty-four decoder layers of real shape, run as a dependent
 chain of 96 projections, then the same chain with the hidden width divided by 8
-and by 16 - same launch count, one eighth and one sixteenth of the weight bytes:
+and by 16 - same launch count, one eighth and one sixteenth of the bytes:
 
-| weight bytes | chain latency | effective rate | per launch |
-| --- | --- | --- | --- |
-| 991 MB | 3.07 ms | 323 GB/s | 31.9 us |
-| 124 MB | 0.74 ms | 21 GB/s | 7.8 us |
-| 62 MB | 0.71 ms | 5.5 GB/s | 7.4 us |
+| weights | chain latency | per launch |
+| --- | --- | --- |
+| 716 MB | 3.07-3.24 ms | 32.0-33.7 us |
+| 15.5 MB | 0.74 ms | 7.7 us |
+| 3.87 MB | 0.71 ms | 7.4 us |
 
-Dividing the bytes by 16 divides the time by 4.3 and then stops. The floor is
-0.71 ms for 96 dependent launches, or 7.4 us each, and it is paid whether the
-kernel moves 10 MB or 62 KB. At full size the same chain is 2.36 ms of streaming
-at 420 GB/s plus that 0.71 ms, which is exactly the rate a single large GEMV
-reaches on this machine: **the projection chain is already at the kernel's own
-bandwidth, and its launch overhead is hidden behind it.** Nothing in the
-projection path can be won by rewriting kernels.
+Dividing the bytes by 46 divides the time by 4.4 and then stops. The floor is
+0.71 ms for 96 dependent launches, or 7.4 us each, paid whether a kernel moves
+15 MB or 4 MB. At full size the same chain is 3.07-3.24 ms, which is the
+221-233 GB/s the size curve predicts for launches of 1.6 to 17.4 MB - so the
+floor is 22% of the projection chain and the other 78% is streaming already at
+the rate that section measured. Nothing in the projection path can be won by
+rewriting kernels, and a merge that trades the floor for a coarser read is the
+one move the earlier section already measured as a loss.
 
-That leaves the step's measured 4.43 ms against the chain's 3.07 ms. Attention is
-0.23 ms of the difference and the rest - recurrence, both normalizations, the
-rotary-and-cache append, the residual add, the sampling read - is about 1.1 ms
-over roughly 50 launches, which is more than 7.4 us each and is not explained by
-this document yet. That is the one bucket worth profiling next, and it is the only
-place a bf16 step can still find ten percent.
+Measuring the three buckets of a real step in one process, five interleaved
+rounds each, closes the budget:
+
+| bucket | bytes | launches | latency | rate |
+| --- | ---: | ---: | ---: | ---: |
+| 24 layers x 4 projections | 716 MB | 96 | 3.24 ms | 221 GB/s |
+| LM head | 272 MB | 1 | 0.75 ms | 364 GB/s |
+| attention, rotary-cache, sampling | ~0 | 50 | 0.40 ms | - |
+| whole step | 988 MB | 146 | 4.39 ms | 225 GB/s |
+
+The last row is 9% above the sum of the first three, which is the measurement
+noise, and attention is 0.23 ms of the 0.40 ms in the third - so its 24 launches
+cost about 10 us each and the 26 remaining launches cost about 7 us, which is
+the floor again and nothing more. There is no hidden millisecond here. A bf16
+step is 716 MB of projections at 221 GB/s plus a 272 MB head at 364 GB/s plus
+half a millisecond of everything else, and the two large numbers are both the
+size curve.
+
+That is the whole accounting, and it is why this section ends where it does: at
+four bits, group 64, the same step moves about 278 MB instead of 988 and the same
+146 launches cost the same 4-10 us, which is why int4 lands 1.47-1.51x ahead of
+`mlx_lm` while bf16 lands level. The lever that moves bf16 is fewer bytes, not a
+faster kernel, and bf16 has no fewer bytes to offer.
 
 ## Weight-only int4, and what it actually bought
 
