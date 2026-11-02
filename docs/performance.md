@@ -392,26 +392,32 @@ host-bound. On Qwen2.5-0.5B the step time splits as
 
 | | host | kernel share | wall, current |
 | --- | --- | --- | --- |
-| bf16 | 5.18 ms | — | 4.15 ms |
-| int4 g64 | 2.50 ms | 0.53 ms | 2.68 ms |
-| int8 g64 | 2.92 ms | 0.57 ms | 3.05 ms |
+| bf16 | 5.18 ms | — | 4.34 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 2.17 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 2.72 ms |
 
 The host and kernel columns were measured before the decode body was handed to
-`mx.compile`, and that change lowered per-step host cost — which is why the wall
-column no longer equals their sum. The wall column is what the rates below
-imply; read the split as the reason the step is host-bound rather than as an
-accounting of today's 2.68 ms.
+`mx.compile` and before the paired projection, and both changes lowered the
+per-step cost — which is why the wall column no longer equals their sum. The
+wall column is what the rates below imply; read the split as the reason the step
+was host-bound rather than as an accounting of today's step.
 
 Doubling the weight traffic moved the kernel's own share by 0.04 ms while the
 loop body, which now walks twice the words for the same reduction, accounts for
-the rest. Against `mlx_lm` quantized to the same width and timed in the same loop
+the rest. What the step spends its time on now is dispatch: a dependent launch
+costs about 7.6 us here, so the 222 dispatches a four-bit step used to carry were
+1.7 ms of its 2.68 ms, against under 1 ms of weight traffic. Pairing the gate and
+up projections removed 24 of them at both quantized widths, which is the whole of
+the 1.13x-to-1.41x move at four bits.
+
+Against `mlx_lm` quantized to the same width and timed in the same loop
 shape, 64 decode steps at the same prompt:
 
 | weights | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- |
-| bf16 | 240.9 tok/s | 238.8 tok/s | 1.01x |
-| int4, group 64 | 373.4 tok/s | 329.2 tok/s | 1.13x |
-| int8, group 64 | 327.4 tok/s | 300.5 tok/s | 1.09x |
+| bf16 | 230.0 tok/s | 229.4 tok/s | 1.00x |
+| int4, group 64 | 460.7 tok/s | 327.2 tok/s | 1.41x |
+| int8, group 64 | 367.3 tok/s | 334.0 tok/s | 1.10x |
 
 Timing `mlx_lm.generate()` rather than its raw decode loop would turn those into
 1.35x and 1.19x, because `generate()` adds per-token text bookkeeping the loop

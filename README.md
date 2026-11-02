@@ -202,22 +202,28 @@ format, not the compiler. On the same prompt and the same 64 steps:
 
 | weights | bytes per step | this repository | `mlx_lm`, same width | ratio |
 | --- | --- | --- | --- | --- |
-| BF16 | 991 MB | 240.9 tok/s | 238.8 tok/s | 1.01x |
-| int4, group 64 | 250 MB | **373.4 tok/s** | 329.2 tok/s | **1.13x** |
-| int8, group 64 | 495 MB | 327.4 tok/s | 300.5 tok/s | 1.09x |
+| BF16 | 991 MB | 230.0 tok/s | 229.4 tok/s | 1.00x |
+| int4, group 64 | 250 MB | **460.7 tok/s** | 327.2 tok/s | **1.41x** |
+| int8, group 64 | 495 MB | 367.3 tok/s | 334.0 tok/s | 1.10x |
 
 Four bits is the wider margin, and the reason is bandwidth: at bf16 a step reads
 991 MB and both engines are saturated, so there is nothing left to win. At four
-bits it reads 250 MB in about 2.7 ms — under 100 GB/s, well short of what the
-machine can stream — so the step is deciding on per-step overhead again, and that
-is where a compiled plan beats one node per attention layer and per projection.
-Eight bits sits between the two: 495 MB still leaves some headroom, hence the
-smaller gain.
+bits it reads 250 MB in about 2.2 ms — under 120 GB/s, well short of what the
+machine can stream — so the step is decided by per-launch cost rather than by
+memory, and that is where a compiled plan that emits one kernel per projection
+beats one that emits two. Eight bits sits between the two: 495 MB still leaves
+some headroom, hence the smaller gain.
 
-Three measurements of the same pair, alternating which runs first: 1.135x,
-1.125x and 1.138x at four bits; 1.090x, 1.091x and 1.099x at eight. BF16 has read
-0.96x and 1.01x here and 0.99-1.01x across prompt lengths, so it is parity and
-not a lead — the lead comes from dropping the width.
+A decode step carried 222 dispatches at four bits before the gate and up
+projections were paired into one kernel, and 198 after. That is worth 1.13x to
+1.41x, because a dependent launch costs about 7.6 us on this machine and the
+step's own traffic is under a millisecond: at four bits the dispatch floor, not
+the weights, is what the step spends its time on. The same pairing is what bf16
+already had, which is why this changed the quantized rows and left the bf16 row
+where it was.
+
+BF16 has read 0.96x and 1.01x here and 0.99-1.01x across prompt lengths, so it is
+parity and not a lead — the lead comes from dropping the width.
 
 > [!NOTE]
 > Timing `mlx_lm.generate()` instead of its raw decode loop makes the quantized

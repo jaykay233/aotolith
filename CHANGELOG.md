@@ -28,9 +28,9 @@ The policy that decides what counts as a breaking change lives in
 
   | weights | aotolith | `mlx_lm` | ratio |
   | --- | --- | --- | --- |
-  | bf16 | 240.9 tok/s | 238.8 tok/s | 1.01x |
-  | int4, group 64 | 373.4 tok/s | 329.2 tok/s | 1.13x |
-  | int8, group 64 | 327.4 tok/s | 300.5 tok/s | 1.09x |
+  | bf16 | 230.0 tok/s | 229.4 tok/s | 1.00x |
+  | int4, group 64 | 460.7 tok/s | 327.2 tok/s | 1.41x |
+  | int8, group 64 | 367.3 tok/s | 334.0 tok/s | 1.10x |
 
   Eight bits is slower than four because a decode step is still host-bound, so
   the extra 250 MB of weight traffic is nearly free: the kernel's own share moved
@@ -54,6 +54,19 @@ The policy that decides what counts as a breaking change lives in
   width produced it.
 
 ### Changed
+
+- **Quantized plans now pair the gate and up projections into one kernel.**
+  The pairing existed for dense weights and skipped the packed path, because a
+  packed projection is three operands where a dense one is two, so the pass that
+  matched the two `matmul`s never saw them as a pair. Quantized decode therefore
+  carried two launches per MLP where bf16 carried one. At four bits that launch
+  is not free: a dependent launch costs about 7.6 us here and the step's own
+  traffic is under a millisecond, so the 222 dispatches a step carried were most
+  of its 2.68 ms. Pairing removes 24 of them at both quantized widths — 222 to
+  198, the same count bf16 already had — and the tokens are unchanged, checked
+  by comparing the 64-step greedy hash before and after at both widths.
+  Qwen2.5-0.5B decode went from 1.13x to 1.41x `mlx_lm` at four bits and from
+  1.09x to 1.10x at eight.
 
 - **The unrolled runner is now handed to `mx.compile` for the policies that do
   not synchronize.** Unrolling removed the interpreter's bookkeeping, but the

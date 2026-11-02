@@ -582,14 +582,24 @@ def _emit_quantized_gemv_matmul_source(
         beta = 1.0
     scales_position = _matmul_quantized_scales_position(op, weight_position)
     assert scales_position is not None
+    paired = _matmul_paired_packed_slots(op, weight_position)
     output_shape = graph.value(op.outputs[0]).type.shape
 
     value = "total"
     if bias_position is not None:
         bias_type = graph.value(op.inputs[bias_position]).type
         bias_offset = _offset_expression(bias_type.shape, output_shape, output_linear)
-        value = f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
-    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+        value = (
+            f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
+        )
+    if paired is None:
+        value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+    else:
+        # Both projections accumulate in one pass over the same activation row,
+        # so the gate and up rows share every activation load. The gate is
+        # rounded to the stored element type before the sigmoid, which is the
+        # value the separate projection would have written.
+        value = "(total_up) * (paired_gate / (1.0f + metal::exp(-paired_gate)))"
 
     words = reduction // _QUANTIZED_NIBBLES
     words_per_group = group_size // _QUANTIZED_NIBBLES
@@ -610,6 +620,15 @@ def _emit_quantized_gemv_matmul_source(
             f"{scales_batch_offset}column * {words // words_per_group}u;",
         ]
     )
+    if paired is not None:
+        lines.extend(
+            [
+                f"const device int* paired_row = in_{paired[0]} + "
+                f"{weight_batch_offset}column * {words}u;",
+                f"const device T* paired_scale_row = in_{paired[1]} + "
+                f"{scales_batch_offset}column * {words // words_per_group}u;",
+            ]
+        )
     norm_slot = _matmul_norm_position(op)
     if norm_slot is not None:
         lines.extend(
@@ -620,7 +639,9 @@ def _emit_quantized_gemv_matmul_source(
     if not exact_columns:
         lines.append(f"if (column < {columns}u) {{")
     indent = "    " if not exact_columns else ""
-    lines.extend(f"{indent}float acc{offset} = 0.0f;" for offset in range(8))
+    lines.extend(
+        f"{indent}float acc{offset} = 0.0f;" for offset in range(16 if paired else 8)
+    )
     lines.extend(
         [
             f"{indent}for (uint index = lane; index < {words}u; index += 32u) {{",
@@ -629,6 +650,14 @@ def _emit_quantized_gemv_matmul_source(
             f"{indent}    float scale = float(scale_row[index / {words_per_group}u]);",
         ]
     )
+    if paired is not None:
+        lines.extend(
+            [
+                f"{indent}    uint paired_word = (uint)paired_row[index];",
+                f"{indent}    float paired_scale = "
+                f"float(paired_scale_row[index / {words_per_group}u]);",
+            ]
+        )
     if norm_slot is None:
         lines.extend(
             [
@@ -667,19 +696,42 @@ def _emit_quantized_gemv_matmul_source(
     for offset in range(8):
         lines.extend(
             [
-                f"{indent}    int code{offset} = int((word >> "
-                f"{4 * offset}u) & 0xFu);",
+                f"{indent}    int code{offset} = int((word >> {4 * offset}u) & 0xFu);",
                 f"{indent}    code{offset} = code{offset} >= 8 ? "
                 f"code{offset} - 16 : code{offset};",
                 f"{indent}    acc{offset} = fma(float(code{offset}), "
                 f"x{offset} * scale, acc{offset});",
             ]
         )
+    if paired is not None:
+        for offset in range(8):
+            lines.extend(
+                [
+                    f"{indent}    int paired_code{offset} = int((paired_word >> "
+                    f"{4 * offset}u) & 0xFu);",
+                    f"{indent}    paired_code{offset} = paired_code{offset} >= 8 ? "
+                    f"paired_code{offset} - 16 : paired_code{offset};",
+                    f"{indent}    acc{offset + 8} = fma(float(paired_code{offset}), "
+                    f"x{offset} * paired_scale, acc{offset + 8});",
+                ]
+            )
     lines.extend(
         [
             f"{indent}}}",
             f"{indent}float total = simd_sum(((acc0 + acc1) + (acc2 + acc3)) + "
             "((acc4 + acc5) + (acc6 + acc7)));",
+        ]
+    )
+    if paired is not None:
+        lines.extend(
+            [
+                f"{indent}float total_up = simd_sum(((acc8 + acc9) + (acc10 + "
+                "acc11)) + ((acc12 + acc13) + (acc14 + acc15)));",
+                f"{indent}float paired_gate = float((T)total);",
+            ]
+        )
+    lines.extend(
+        [
             f"{indent}if (lane == 0u) {{",
             f"{indent}    out[{output_linear}] = (T)({value});",
             f"{indent}}}",
@@ -733,14 +785,24 @@ def _emit_quantized_gemv_int8_source(
         beta = 1.0
     scales_position = _matmul_quantized_scales_position(op, weight_position)
     assert scales_position is not None
+    paired = _matmul_paired_packed_slots(op, weight_position)
     output_shape = graph.value(op.outputs[0]).type.shape
 
     value = "total"
     if bias_position is not None:
         bias_type = graph.value(op.inputs[bias_position]).type
         bias_offset = _offset_expression(bias_type.shape, output_shape, output_linear)
-        value = f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
-    value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+        value = (
+            f"{beta!r} * float(in_{bias_position}[{bias_offset}]) + {alpha!r} * total"
+        )
+    if paired is None:
+        value = _matmul_epilogue_value(value, op, graph, output_shape, output_linear)
+    else:
+        # Both projections accumulate in one pass over the same activation row,
+        # so the gate and up rows share every activation load. The gate is
+        # rounded to the stored element type before the sigmoid, which is the
+        # value the separate projection would have written.
+        value = "(total_up) * (paired_gate / (1.0f + metal::exp(-paired_gate)))"
 
     words = reduction // _QUANTIZED_BYTES
     words_per_group = group_size // _QUANTIZED_BYTES
@@ -761,6 +823,15 @@ def _emit_quantized_gemv_int8_source(
             f"{scales_batch_offset}column * {words // words_per_group}u;",
         ]
     )
+    if paired is not None:
+        lines.extend(
+            [
+                f"const device int* paired_row = in_{paired[0]} + "
+                f"{weight_batch_offset}column * {words}u;",
+                f"const device T* paired_scale_row = in_{paired[1]} + "
+                f"{scales_batch_offset}column * {words // words_per_group}u;",
+            ]
+        )
     norm_slot = _matmul_norm_position(op)
     if norm_slot is not None:
         lines.extend(
@@ -771,7 +842,9 @@ def _emit_quantized_gemv_int8_source(
     if not exact_columns:
         lines.append(f"if (column < {columns}u) {{")
     indent = "    " if not exact_columns else ""
-    lines.extend(f"{indent}float acc{offset} = 0.0f;" for offset in range(4))
+    lines.extend(
+        f"{indent}float acc{offset} = 0.0f;" for offset in range(8 if paired else 4)
+    )
     lines.extend(
         [
             f"{indent}for (uint index = lane; index < {words}u; index += 32u) {{",
@@ -780,6 +853,14 @@ def _emit_quantized_gemv_int8_source(
             f"{indent}    float scale = float(scale_row[index / {words_per_group}u]);",
         ]
     )
+    if paired is not None:
+        lines.extend(
+            [
+                f"{indent}    uint paired_word = (uint)paired_row[index];",
+                f"{indent}    float paired_scale = "
+                f"float(paired_scale_row[index / {words_per_group}u]);",
+            ]
+        )
     if norm_slot is None:
         lines.extend(
             [
@@ -816,10 +897,31 @@ def _emit_quantized_gemv_int8_source(
                 f"x{offset} * scale, acc{offset});",
             ]
         )
+    if paired is not None:
+        for offset in range(4):
+            lines.extend(
+                [
+                    f"{indent}    int paired_code{offset} = (int)(paired_word << "
+                    f"{24 - 8 * offset}u) >> 24;",
+                    f"{indent}    acc{offset + 4} = fma(float(paired_code{offset}), "
+                    f"x{offset} * paired_scale, acc{offset + 4});",
+                ]
+            )
     lines.extend(
         [
             f"{indent}}}",
             f"{indent}float total = simd_sum(((acc0 + acc1) + (acc2 + acc3)));",
+        ]
+    )
+    if paired is not None:
+        lines.extend(
+            [
+                f"{indent}float total_up = simd_sum((acc4 + acc5) + (acc6 + acc7));",
+                f"{indent}float paired_gate = float((T)total);",
+            ]
+        )
+    lines.extend(
+        [
             f"{indent}if (lane == 0u) {{",
             f"{indent}    out[{output_linear}] = (T)({value});",
             f"{indent}}}",
@@ -1581,6 +1683,23 @@ def _matmul_paired_weight_position(op: Operation, right_position: int) -> int | 
     return right_position + 1
 
 
+def _matmul_paired_packed_slots(
+    op: Operation, weight_position: int
+) -> tuple[int, int] | None:
+    """Weight and scale slots of the second projection, when both are packed.
+
+    The dense form keeps one tensor per projection, so the pair is two slots
+    apart; a packed projection carries its scales beside it, so the second
+    projection starts two slots after the first weight.
+    """
+
+    if _matmul_epilogue_kind(op) != "silu_mul_paired":
+        return None
+    if _matmul_weight_group_size(op) is None:
+        return None
+    return weight_position + 2, weight_position + 3
+
+
 def _matmul_norm_position(op: Operation) -> int | None:
     """Return the input slot holding a fused RMS-norm weight, if any."""
 
@@ -1638,8 +1757,9 @@ class MatmulLowering:
             expected_inputs += 1
         epilogue = _matmul_epilogue_kind(op)
         if epilogue is not None:
-            # Either a gate value to scale by, or a second weight matrix.
-            expected_inputs += 1
+            # Either a gate value to scale by, or a second weight matrix. A
+            # packed second projection brings its scales with it.
+            expected_inputs += 2 if quantized and epilogue == "silu_mul_paired" else 1
         norm_position = _matmul_norm_position(op)
         if norm_position is not None:
             expected_inputs += 1
@@ -1959,13 +2079,18 @@ class MatmulLowering:
                 "packed matmul batch dimensions are not broadcast-compatible"
             )
         if _matmul_transpose_attribute(op, "transpose_a"):
-            raise NotImplementedError("packed matmul does not support a transposed left")
+            raise NotImplementedError(
+                "packed matmul does not support a transposed left"
+            )
         if _matmul_transpose_attribute(op, "transpose_b"):
             raise ValueError(
                 "a packed weight already carries the [out, in] orientation, so "
                 "transpose_b must not be set"
             )
-        if left_type.dtype != output_type.dtype or scales_type.dtype != output_type.dtype:
+        if (
+            left_type.dtype != output_type.dtype
+            or scales_type.dtype != output_type.dtype
+        ):
             raise NotImplementedError(
                 "the packed matmul requires the activation, scales and output to "
                 "share one dtype"

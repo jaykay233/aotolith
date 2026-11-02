@@ -25,7 +25,12 @@ from aotolith.backends.apple import AppleMetalBackend
 from aotolith.capture import capture_fx
 from aotolith.models.quantized import dequantize_i4, dequantize_i8, pack_weight
 from aotolith.passes import rewrite
-from aotolith.quantize import dequantize_int4, dequantize_int8, quantize_int4, quantize_int8
+from aotolith.quantize import (
+    dequantize_int4,
+    dequantize_int8,
+    quantize_int4,
+    quantize_int8,
+)
 
 
 GROUP = 32
@@ -72,6 +77,56 @@ def test_prefill_matmul_matches_torch(batch: int) -> None:
     actual, expected = _compile(48, 128, batch, seed=batch)
     scale = float(np.abs(expected).max()) or 1.0
     assert float(np.abs(actual - expected).max()) <= 3e-2 * scale
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_decode_mlp_pairs_two_packed_projections_into_one_launch(bits: int) -> None:
+    """The gate/up pair has to fuse at both widths, not just for bf16 weights.
+
+    A packed projection is three operands where a dense one is two, so the path
+    that fused the pair for dense weights used to skip it here and paid a second
+    launch per layer. At four bits that launch is a measurable share of the step.
+    """
+
+    quantize = quantize_int4 if bits == 4 else quantize_int8
+    dequantize = dequantize_i4 if bits == 4 else dequantize_i8
+    unpack = dequantize_int4 if bits == 4 else dequantize_int8
+    rows, inner = 64, 128
+    rng = np.random.default_rng(31 + bits)
+    activation = rng.standard_normal((1, inner)).astype(np.float32)
+    gate_packed, gate_scales = quantize(
+        rng.standard_normal((rows, inner)).astype(np.float32), GROUP
+    )
+    up_packed, up_scales = quantize(
+        rng.standard_normal((rows, inner)).astype(np.float32), GROUP
+    )
+
+    def mlp(x, gate_packed, gate_scales, up_packed, up_scales):
+        gate = torch.matmul(x, dequantize(gate_packed, gate_scales, GROUP).t())
+        up = torch.matmul(x, dequantize(up_packed, up_scales, GROUP).t())
+        return torch.nn.functional.silu(gate) * up
+
+    inputs = (
+        torch.from_numpy(activation),
+        torch.from_numpy(gate_packed),
+        torch.from_numpy(gate_scales),
+        torch.from_numpy(up_packed),
+        torch.from_numpy(up_scales),
+    )
+    compiled = compile_callable(mlp, inputs, codegen_matmul=True)
+
+    assert [op.op for op in compiled.lowered_graph.ops] == ["matmul"]
+    assert compiled.lowered_graph.ops[0].attrs.get("epilogue") == "silu_mul_paired"
+
+    actual = compiled.plan(*(mx.array(value.numpy()) for value in inputs))[0]
+    mx.eval(actual)
+
+    reference = torch.from_numpy(activation)
+    gate = reference @ torch.from_numpy(unpack(gate_packed, gate_scales, GROUP)).t()
+    up = reference @ torch.from_numpy(unpack(up_packed, up_scales, GROUP)).t()
+    expected = np.asarray((torch.nn.functional.silu(gate) * up).numpy())
+    scale = float(np.abs(expected).max()) or 1.0
+    assert float(np.abs(np.asarray(actual) - expected).max()) <= 3e-2 * scale
 
 
 def test_a_single_row_matmul_keeps_no_unpacked_weight() -> None:

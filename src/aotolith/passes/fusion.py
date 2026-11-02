@@ -277,7 +277,14 @@ def fuse_gate_up_projection(graph: Graph) -> Graph:
         # two-operand form qualifies.
         if gate_op.op != "matmul" or product_op.op != "matmul":
             continue
-        if len(gate_op.inputs) != 2 or len(product_op.inputs) != 2:
+        # A packed weight carries its scales in a second slot, so the packed
+        # form has three operands where the dense form has two. Everything else
+        # about the pair - one activation, one output row per column - is the
+        # same, and leaving the packed form out was what kept quantized decode
+        # at two launches per projection where bf16 needs one.
+        packed = gate_op.attrs.get("weight_group_size") is not None
+        operands = 3 if packed else 2
+        if len(gate_op.inputs) != operands or len(product_op.inputs) != operands:
             continue
         if gate_op.attrs != product_op.attrs:
             continue
@@ -308,10 +315,27 @@ def fuse_gate_up_projection(graph: Graph) -> Graph:
         reduction = left_type.shape[-1]
         if reduction % 4 != 0:
             continue
-        if gate_weight.shape != (output_type.shape[-1], reduction):
-            continue
-        if gate_op.attrs.get("transpose_b") is not True:
-            continue
+        columns = output_type.shape[-1]
+        if packed:
+            codes = 8 if (gate_op.attrs.get("weight_bits") or 4) == 4 else 4
+            if reduction % codes != 0:
+                continue
+            if gate_weight.shape != (columns, reduction // codes):
+                continue
+            if (
+                graph.value(gate_op.inputs[2]).type
+                != graph.value(product_op.inputs[2]).type
+            ):
+                continue
+            # A packed weight already carries the [out, in] orientation, so the
+            # transpose flag has to be absent rather than set.
+            if gate_op.attrs.get("transpose_b") is True:
+                continue
+        else:
+            if gate_weight.shape != (columns, reduction):
+                continue
+            if gate_op.attrs.get("transpose_b") is not True:
+                continue
         # A transposed left operand would be routed to the tiled kernel, which
         # has no paired form.
         if gate_op.attrs.get("transpose_a") is True:
@@ -335,9 +359,21 @@ def fuse_gate_up_projection(graph: Graph) -> Graph:
 
         attrs = dict(gate_op.attrs)
         attrs["epilogue"] = "silu_mul_paired"
+        if packed:
+            # Gate and its scales, then up and its scales: the two projections
+            # keep the slot order a single packed projection would have.
+            operands = (
+                gate_left,
+                gate_op.inputs[1],
+                gate_op.inputs[2],
+                product_op.inputs[1],
+                product_op.inputs[2],
+            )
+        else:
+            operands = (gate_left, gate_op.inputs[1], product_op.inputs[1])
         rewrites[product_index] = Operation(
             "matmul",
-            (gate_left, gate_op.inputs[1], product_op.inputs[1]),
+            operands,
             product_op.outputs if product_chain else (op.outputs[0],),
             attrs,
         )
@@ -462,9 +498,7 @@ def fuse_activation_epilogue(graph: Graph) -> Graph:
     return _replace_graph(graph, tuple(rewritten), graph.outputs)
 
 
-def fuse_rms_norm_epilogue(
-    graph: Graph, *, native_matmul: bool = False
-) -> Graph:
+def fuse_rms_norm_epilogue(graph: Graph, *, native_matmul: bool = False) -> Graph:
     """Fold ``rms_norm(x) @ w`` into the projection's GEMV prologue.
 
     A single-token projection already streams the whole weight matrix and

@@ -149,19 +149,21 @@ step 的耗时更跟着 launch 数走，而不是字节数 —— [下一节](#�
 
 | | host | kernel 占比 | wall（当前） |
 | --- | --- | --- | --- |
-| bf16 | 5.18 ms | — | 4.15 ms |
-| int4 g64 | 2.50 ms | 0.53 ms | 2.68 ms |
-| int8 g64 | 2.92 ms | 0.57 ms | 3.05 ms |
+| bf16 | 5.18 ms | — | 4.34 ms |
+| int4 g64 | 2.50 ms | 0.53 ms | 2.17 ms |
+| int8 g64 | 2.92 ms | 0.57 ms | 2.72 ms |
 
-host 和 kernel 两列是在 decode body 交给 `mx.compile` 重放之前测的，那次改动降低了每步 host 开销——所以 wall 一列不再等于两者之和。wall 是下面那些速率反推出的值；host/kernel 的拆分请当作"这一步受 host 限制"的原因来读，而不是今天这 2.68 ms 的账。
+host 和 kernel 两列是在 decode body 交给 `mx.compile` 重放、以及做投影配对之前测的，这两次改动都降低了每步成本——所以 wall 一列不再等于两者之和。wall 是下面那些速率反推出的值；host/kernel 的拆分请当作"这一步曾受 host 限制"的原因来读，而不是今天这一步的账。
 
-权重流量翻倍只让 kernel 自己那部分动了 0.04 ms，剩下的都落在循环体上 —— 同样的 reduction 现在要走两倍的字。与量化到同一宽度、同样循环形状的 `mlx_lm` 对比，同 prompt 64 步：
+权重流量翻倍只让 kernel 自己那部分动了 0.04 ms，剩下的都落在循环体上 —— 同样的 reduction 现在要走两倍的字。今天这一步的时间花在派发上：在这台机器上一次依赖 launch 约值 7.6 µs，所以 4 bit 一步原本那 222 次 dispatch 就是它 2.68 ms 里的 1.7 ms，而权重流量不到 1 ms。把 gate 和 up 两个投影合并，在两个量化位宽上都去掉了 24 次，这就是 4 bit 从 1.13x 到 1.41x 的全部来源。
+
+与量化到同一宽度、同样循环形状的 `mlx_lm` 对比，同 prompt 64 步：
 
 | 权重 | 本仓库 | `mlx_lm`（同位宽） | 比值 |
 | --- | --- | --- | --- |
-| bf16 | 240.9 token/s | 238.8 token/s | 1.01x |
-| int4，group 64 | 373.4 token/s | 329.2 token/s | 1.13x |
-| int8，group 64 | 327.4 token/s | 300.5 token/s | 1.09x |
+| bf16 | 230.0 token/s | 229.4 token/s | 1.00x |
+| int4，group 64 | 460.7 token/s | 327.2 token/s | 1.41x |
+| int8，group 64 | 367.3 token/s | 334.0 token/s | 1.10x |
 
 如果改用 `mlx_lm.generate()` 而不是它原生的 decode 循环，这两行会变成 1.35x 和 1.19x，因为 `generate()` 每 token 多做一次文本处理。那正是本文档早先在 bf16 上抓到、并已纠正的同一个循环形状错误，也是 `--mlx-baseline` 要把基线也量化、两种形状都测的原因。
 
