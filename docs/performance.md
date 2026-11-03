@@ -491,6 +491,23 @@ no kernel change that gets there, because the bytes cannot be dropped, the rate
 on each bucket is already the rate that bucket's size buys, and the launches are
 already as few as a fusion can make them.
 
+One structural idea remained after that arithmetic, and it does not work either.
+If the 96 projection launches could be collapsed into roughly 24 persistent ones
+- each walking all four projections of a layer in sequence, with a device-wide
+barrier standing in for the kernel boundary so every projection keeps its own
+memory mapping - the launch floor would fall by about the 0.5 ms that 1.10x
+needs, without coarsening any single read. What that needs is a grid-wide
+barrier, and Metal does not provide one. Threadgroups are scheduled in an
+unspecified order with no guarantee of concurrent residency, so a spin on an
+atomic counter is only correct if every group happens to be resident, which is
+exactly the assumption Metal leaves open. Three variants of the barrier - one
+threadgroup per threadgroup slot, sequential consistency, then relaxed atomics
+with an explicit fence in the spin loop and a counter allocated fresh per call -
+all failed to terminate, the last of them at a grid of four threadgroups against
+sixteen GPU cores, where residency could not have been the problem. So the idea
+is unavailable at the dispatch level rather than merely unprofitable, and the
+bf16 column stays at parity because of it.
+
 So the ordering this table produces is the whole result: 1.46-1.51x at four bits,
 1.17-1.22x at eight, and parity at bf16. Four bits, group 64, moves about 278 MB
 per step instead of 988 and pays the same 146 launches at the same 4-10 us. The
