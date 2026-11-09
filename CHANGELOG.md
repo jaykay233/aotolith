@@ -121,6 +121,41 @@ The policy that decides what counts as a breaking change lives in
   also be cheaper and is not done, because it changes the intermediate rounding
   and flips greedy tokens.
 
+- **Decode attention splits a long head across threadgroups instead of walking
+  it inside one.** A decode step has one threadgroup per head, so the whole GPU
+  saw fourteen threadgroups and the per-thread serial work grew with the
+  window: at 8224 keys the kernel scored the head in 4096-key blocks with a
+  re-scaling online softmax and cost 0.93 ms per layer, 22 ms of a 25.5 ms step
+  (39 tok/s, against `mlx_lm`'s 172).
+
+  The kernel is now Flash-Decoding shaped. Grid is `(head, key chunk)`; each
+  threadgroup scores its own chunk with one key per thread, keeps a running
+  maximum and denominator, accumulates its 64-wide value slice with eight
+  threads per dimension, and writes a partial `(max, sum, acc)` in float32. A
+  second launch with one thread per dimension folds the partials with
+  `exp(m - m_global)`. Nothing is materialised for the whole window: the shared
+  tile is `weights[512] + scratch[512] + a 64-wide accumulator`, about 4 KB, so
+  the score array that used to bound the kernel to 7.7k keys is gone.
+
+  Measured per layer at 8224 keys, GPU time with dispatch amortised over a
+  twenty-call graph: 0.021 ms split, 0.055 ms for the single-launch walk at
+  7744 keys, 0.069 ms for `mx.fast.scaled_dot_product_attention`. Splits stop
+  doubling once a chunk fits two tiles (8 at 4k, 16 at 8k, capped at 32), and
+  the threshold is 4096 keys because below it the extra launch is not paid
+  back. End to end with `scripts/metal_profile_decode.py --steps 48`, split on
+  against off inside one process: 4096 went 7.09 to 6.77 ms, 8192 went 25.75
+  to 8.91 ms. Across the full sweep, 4096 is 6.94 ms (144 tok/s) and 8192 is
+  8.85 ms (113 tok/s); what is left of the 8k gap to `mlx_lm` is the cache
+  roll, not attention.
+
+  Correctness is checked as arithmetic rather than as a token hash: against
+  `mx.fast.scaled_dot_product_attention` on 5k/8k/16k windows with valid
+  lengths from 1 to full, f32 agrees to 3e-7 and bf16 to 5e-4, with boolean and
+  additive masks both. Greedy tokens are unchanged: 48 steps at 4096 and at
+  8192 return the same 48 tokens split on and split off, because folding the
+  chunk partials in float32 and the block walk's own rescaling round below the
+  argmax margin.
+
 - **The unrolled runner is now handed to `mx.compile` for the policies that do
   not synchronize.** Unrolling removed the interpreter's bookkeeping, but the
   body still calls one kernel per node and MLX evaluates those nodes one at a

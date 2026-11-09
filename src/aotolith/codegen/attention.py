@@ -28,7 +28,6 @@ from ..target import apple as target
 from ..target.apple import (
     _ATTENTION_MAX_SHARED_BYTES,
     _DECODE_ATTENTION_DTYPES,
-    _DECODE_ATTENTION_MAX_KEYS,
     _DECODE_ATTENTION_THREADS,
     _MPP_ATTENTION_KEY_TILE,
     _attention_shared_memory_bytes,
@@ -38,6 +37,35 @@ from ..target.apple import (
 )
 
 _ATTENTION_LONG_SEQUENCE_THRESHOLD = 768
+
+
+#: Keys the one-query kernel scores per pass when the head is longer than
+#: threadgroup memory can hold. The flat kernel keeps every score resident, so
+#: it only applies while one float per key still fits the shared-memory budget;
+#: past that the scores are walked a block at a time and the softmax runs
+#: online, rescaling the running total as the maximum grows. 4096 floats of
+#: scores is 16 KB, which leaves room for the reduction scratch and the query
+#: row inside the 31 KB budget. Heads past ``_DECODE_ATTENTION_SPLIT_MIN_KEYS``
+#: take the split-K path instead of this block walk.
+_DECODE_ATTENTION_BLOCK_KEYS = 4096
+
+#: Threads per threadgroup for the split-K decode kernel. One key per thread per
+#: tile, so this is also the tile width: 512 threads over 64 output dimensions
+#: gives eight threads per dimension to accumulate P·V with.
+_DECODE_ATTENTION_SPLIT_THREADS = 512
+
+#: Keys one split walks. Splits stop doubling once a chunk fits in two tiles;
+#: measured at 0.02 ms per layer from 4k to 16k keys past that point.
+_DECODE_ATTENTION_SPLIT_KEYS = 1024
+
+#: Keys past which the head is split across threadgroups. Below this the single
+#: launch is already around 0.03 ms and the extra dispatch is not paid back.
+_DECODE_ATTENTION_SPLIT_MIN_KEYS = 4096
+
+#: Fewest and most chunks a long head is cut into. Eight splits already fills
+#: the GPU at 5k keys; more than 32 only adds combine work.
+_DECODE_ATTENTION_MIN_SPLITS = 8
+_DECODE_ATTENTION_MAX_SPLITS = 32
 
 
 def _attention_key_rows_need_clamp(
@@ -459,6 +487,13 @@ class _DecodeAttentionConfig:
     mask_shape: tuple[int, ...] | None
     mask_is_boolean: bool
     dtype: DType
+    #: True when the head is too long to keep every score in threadgroup
+    #: memory, so the kernel walks it in blocks with an online softmax.
+    streamed: bool = False
+    #: Key chunks when the head is longer than one threadgroup should walk.
+    #: ``1`` keeps the single-launch kernel; more splits run one threadgroup per
+    #: (head, chunk) and combine the partial softmaxes in a second launch.
+    splits: int = 1
 
 
 def _decode_attention_config(
@@ -471,7 +506,9 @@ def _decode_attention_config(
     threadgroup: scores live in threadgroup memory, the softmax is a two-level
     reduction, and the value accumulation has no online rescaling. That removes
     the per-layer gather/spread work the generic kernels need for a one-row
-    query.
+    query. A head too long for one threadgroup is split across threadgroups
+    (``splits > 1``); only a head shape the split kernel cannot map keeps the
+    block walk.
     """
 
     query_type = graph.value(op.inputs[0]).type
@@ -485,7 +522,7 @@ def _decode_attention_config(
     value_head_dim = value_type.shape[-1]
     if query_length != 1 or op.attrs.get("causal"):
         return None
-    if key_length < 1 or key_length > _DECODE_ATTENTION_MAX_KEYS:
+    if key_length < 1:
         return None
     if query_head_dim > 256 or value_head_dim > 256:
         return None
@@ -506,8 +543,36 @@ def _decode_attention_config(
             return None
     threads = _DECODE_ATTENTION_THREADS
     shared_bytes = 4 * key_length + 4 * threads + 4 * query_head_dim
-    if shared_bytes > _ATTENTION_MAX_SHARED_BYTES:
-        return None
+    # A head longer than threadgroup memory holds is scored a block at a time
+    # rather than abandoned to the generic path, which costs an order of
+    # magnitude at one query per step.
+    streamed = shared_bytes > _ATTENTION_MAX_SHARED_BYTES
+    splits = 1
+    if (
+        key_length > _DECODE_ATTENTION_SPLIT_MIN_KEYS
+        and value_head_dim == query_head_dim
+        and _DECODE_ATTENTION_SPLIT_THREADS % value_head_dim == 0
+    ):
+        # Split the head across threadgroups instead of walking it in blocks
+        # inside one. A decode step has one threadgroup per head, which on a
+        # 14-head model is fourteen threadgroups for the whole GPU; past a few
+        # thousand keys that is the binding constraint, not arithmetic.
+        threads = _DECODE_ATTENTION_SPLIT_THREADS
+        splits = _DECODE_ATTENTION_MIN_SPLITS
+        while (
+            -(-key_length // splits) > _DECODE_ATTENTION_SPLIT_KEYS
+            and splits < _DECODE_ATTENTION_MAX_SPLITS
+        ):
+            splits *= 2
+        streamed = False
+    elif streamed:
+        block_bytes = (
+            4 * min(_DECODE_ATTENTION_BLOCK_KEYS, key_length)
+            + 4 * threads
+            + 4 * query_head_dim
+        )
+        if block_bytes > _ATTENTION_MAX_SHARED_BYTES:
+            return None
     return _DecodeAttentionConfig(
         threads=threads,
         batch=batch,
@@ -521,11 +586,522 @@ def _decode_attention_config(
         mask_shape=mask_shape,
         mask_is_boolean=mask_is_boolean,
         dtype=output_type.dtype,
+        streamed=streamed,
+        splits=splits,
     )
+
+
+def _emit_decode_attention_partial_source(
+    config: _DecodeAttentionConfig, *, splits: int, threads: int
+) -> str:
+    """Emit one key chunk of a split-K decode attention.
+
+    Flash-Decoding's shape: one threadgroup per (head, chunk) scores its own
+    slice of the head, keeps a running maximum and denominator, and writes the
+    partial ``(max, sum, acc)``. A second launch combines them, so the
+    parallelism is ``heads * splits`` instead of ``heads`` - the difference
+    between fourteen threadgroups and a hundred on a long window.
+
+    The threadgroup keeps one key's score per thread, which makes the shared
+    memory a few kilobytes regardless of the head length; the score tile is
+    never materialised for the whole window.
+    """
+
+    threads_q = config.query_head_dim
+    threads_v = config.value_head_dim
+    # Threads per output dimension when accumulating P·V. The tile has one key
+    # per thread, so this is also how the tile's keys are split per dimension.
+    per_dim = threads // threads_v
+    warps = threads // 32
+    chunk = -(-config.key_length // splits)
+    indent = "    "
+    group = config.group_size
+    heads = config.query_heads
+    kv_heads = config.key_value_heads
+    key_length = config.key_length
+    scale = config.scale
+
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint head = threadgroup_position_in_grid.x;",
+        "uint batch = threadgroup_position_in_grid.y;",
+        "uint split = threadgroup_position_in_grid.z;",
+        f"uint key_value_head = head / {group}u;",
+        f"const device T* query = in_0 "
+        f"+ (batch * {heads}u + head) * {threads_q}u;",
+        f"const device T* key_base = in_1 "
+        f"+ (batch * {kv_heads}u + key_value_head) "
+        f"* {key_length * threads_q}u;",
+        f"const device T* value_base = in_2 "
+        f"+ (batch * {kv_heads}u + key_value_head) "
+        f"* {key_length * threads_v}u;",
+        f"uint begin = split * {chunk}u;",
+        f"uint end = metal::min(begin + {chunk}u, {key_length}u);",
+        "uint count = end > begin ? end - begin : 0u;",
+        f"threadgroup float query_shared[{threads_q}];",
+        f"threadgroup float weights[{threads}];",
+        f"threadgroup float scratch[{threads}];",
+        "threadgroup float warp_scratch[32];",
+        f"threadgroup float accumulated[{threads_v}];",
+        f"for (uint dimension = tid; dimension < {threads_q}u; "
+        f"dimension += {threads}u) {{",
+        f"{indent}query_shared[dimension] = float(query[dimension]);",
+        "}",
+        f"for (uint dimension = tid; dimension < {threads_v}u; "
+        f"dimension += {threads}u) {{",
+        f"{indent}accumulated[dimension] = 0.0f;",
+        "}",
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "float running_max = -INFINITY;",
+        "float running_sum = 0.0f;",
+        f"for (uint tile = 0u; tile < count; tile += {threads}u) {{",
+        f"{indent}uint offset = tile + tid;",
+        f"{indent}float score = -INFINITY;",
+        f"{indent}if (offset < count) {{",
+        f"{indent * 2}uint key = begin + offset;",
+    ]
+    dot_lines = [
+        f"{indent * 2}const device T* row = key_base + key * {threads_q}u;",
+        f"{indent * 2}float dot0 = 0.0f;",
+        f"{indent * 2}float dot1 = 0.0f;",
+        f"{indent * 2}float dot2 = 0.0f;",
+        f"{indent * 2}float dot3 = 0.0f;",
+        f"{indent * 2}for (uint dimension = 0u; dimension < {threads_q}u; "
+        "dimension += 4u) {",
+        f"{indent * 3}dot0 = fma(query_shared[dimension], "
+        "float(row[dimension]), dot0);",
+        f"{indent * 3}dot1 = fma(query_shared[dimension + 1u], "
+        "float(row[dimension + 1u]), dot1);",
+        f"{indent * 3}dot2 = fma(query_shared[dimension + 2u], "
+        "float(row[dimension + 2u]), dot2);",
+        f"{indent * 3}dot3 = fma(query_shared[dimension + 3u], "
+        "float(row[dimension + 3u]), dot3);",
+        f"{indent * 2}}}",
+        f"{indent * 2}score = (dot0 + dot1 + dot2 + dot3) "
+        f"* float({scale!r});",
+    ]
+    if config.mask_shape is not None and config.mask_is_boolean:
+        # Skip the Q·K dot for the left pad prefix: those scores are -inf no
+        # matter what the query is, so the key row is bandwidth wasted.
+        mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+        lines.extend(
+            [
+                f"{indent * 2}if (in_3[{mask_offset}]) {{",
+                *(f"{indent}{line}" for line in dot_lines),
+                f"{indent * 2}}}",
+            ]
+        )
+    else:
+        lines.extend(dot_lines)
+        if config.mask_shape is not None:
+            mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+            lines.append(f"{indent * 2}score += float(in_3[{mask_offset}]);")
+    lines.extend(
+        [
+            f"{indent}}}",
+            f"{indent}float tile_max = metal::simd_max(score);",
+            f"{indent}if ((tid & 31u) == 0u) {{ "
+            "warp_scratch[tid >> 5u] = tile_max; }",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}if (tid < 32u) {{",
+            f"{indent * 2}float candidate = tid < {warps}u "
+            "? warp_scratch[tid] : -INFINITY;",
+            f"{indent * 2}candidate = metal::simd_max(candidate);",
+            f"{indent * 2}if (tid == 0u) {{ warp_scratch[0] = candidate; }}",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}tile_max = warp_scratch[0];",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}float new_max = metal::max(running_max, tile_max);",
+            # A fully masked tile has no finite maximum; anchor at zero so the
+            # exponentials underflow to zero instead of producing NaN.
+            f"{indent}if (metal::isinf(new_max) && new_max < 0.0f) {{",
+            f"{indent * 2}new_max = 0.0f;",
+            f"{indent}}}",
+            f"{indent}float correction = metal::exp(running_max - new_max);",
+            f"{indent}weights[tid] = offset < count "
+            "? metal::exp(score - new_max) : 0.0f;",
+            f"{indent}running_max = new_max;",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            # P·V for this tile: threads sharing an output dimension each walk
+            # a strided slice of the tile's keys, so the chain per thread is
+            # short and the merge is one small reduction.
+            f"{indent}uint part = tid / {threads_v}u;",
+            f"{indent}uint dimension = tid - part * {threads_v}u;",
+            f"{indent}float local = 0.0f;",
+            f"{indent}for (uint index = part; index < {threads}u; "
+            f"index += {per_dim}u) {{",
+            f"{indent * 2}if (tile + index >= count) {{ break; }}",
+            f"{indent * 2}uint key = begin + tile + index;",
+            f"{indent * 2}local = fma(weights[index], "
+            f"float(value_base[key * {threads_v}u + dimension]), local);",
+            f"{indent}}}",
+            f"{indent}scratch[tid] = local;",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}if (tid < {threads_v}u) {{",
+            f"{indent * 2}float total = 0.0f;",
+            f"{indent * 2}for (uint slice = 0u; slice < {per_dim}u; ++slice) {{",
+            f"{indent * 3}total += scratch[tid + slice * {threads_v}u];",
+            f"{indent * 2}}}",
+            f"{indent * 2}accumulated[tid] = "
+            "accumulated[tid] * correction + total;",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            # Denominator of the tile, same warp-first reduction as the maximum.
+            f"{indent}float tile_sum = metal::simd_sum(weights[tid]);",
+            f"{indent}if ((tid & 31u) == 0u) {{ "
+            "warp_scratch[tid >> 5u] = tile_sum; }",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}if (tid < 32u) {{",
+            f"{indent * 2}float candidate = tid < {warps}u "
+            "? warp_scratch[tid] : 0.0f;",
+            f"{indent * 2}candidate = metal::simd_sum(candidate);",
+            f"{indent * 2}if (tid == 0u) {{ warp_scratch[0] = candidate; }}",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}running_sum = running_sum * correction + warp_scratch[0];",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+            "if (tid == 0u) {",
+            f"{indent}out_m[(batch * {heads}u + head) * {splits}u + split] "
+            "= running_max;",
+            f"{indent}out_l[(batch * {heads}u + head) * {splits}u + split] "
+            "= running_sum;",
+            "}",
+            f"for (uint dimension = tid; dimension < {threads_v}u; "
+            f"dimension += {threads}u) {{",
+            f"{indent}out_acc[((batch * {heads}u + head) * {splits}u + split) "
+            f"* {threads_v}u + dimension] = accumulated[dimension];",
+            "}",
+        ]
+    )
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _emit_decode_attention_combine_source(
+    config: _DecodeAttentionConfig, *, splits: int
+) -> str:
+    """Emit the combine pass over a head's split partials.
+
+    One thread per output dimension, so a split's ``exp(m - m_global)`` weight is
+    computed once per dimension rather than being broadcast from shared memory.
+    """
+
+    heads = config.query_heads
+    value_dim = config.value_head_dim
+    return "\n".join(
+        f"        {line}"
+        for line in [
+            "uint tid = thread_position_in_threadgroup.x;",
+            "uint head = threadgroup_position_in_grid.x;",
+            "uint batch = threadgroup_position_in_grid.y;",
+            f"if (tid >= {value_dim}u) {{ return; }}",
+            "float running_max = -INFINITY;",
+            f"for (uint split = 0u; split < {splits}u; ++split) {{",
+            f"    running_max = metal::max(running_max, "
+            f"in_m[(batch * {heads}u + head) * {splits}u + split]);",
+            "}",
+            "if (metal::isinf(running_max) && running_max < 0.0f) {",
+            "    running_max = 0.0f;",
+            "}",
+            "float acc = 0.0f;",
+            "float total = 0.0f;",
+            f"for (uint split = 0u; split < {splits}u; ++split) {{",
+            "    float weight = metal::exp(",
+            f"        in_m[(batch * {heads}u + head) * {splits}u + split] "
+            "- running_max);",
+            "    acc = fma(weight,",
+            f"        in_acc[((batch * {heads}u + head) * {splits}u + split) "
+            f"* {value_dim}u + tid], acc);",
+            "    total = fma(weight,",
+            f"        in_l[(batch * {heads}u + head) * {splits}u + split], total);",
+            "}",
+            f"out[(batch * {heads}u + head) * {value_dim}u + tid] "
+            "= (T)(total > 0.0f ? acc / total : 0.0f);",
+        ]
+    )
+
+
+def _emit_streamed_decode_attention_source(config: _DecodeAttentionConfig) -> str:
+    """Emit one-query attention that walks the head in blocks.
+
+    The flat kernel needs one float of threadgroup memory per key, which caps it
+    at whatever the shared-memory budget holds. This one keeps only one block of
+    scores resident and runs the softmax online: each block contributes its own
+    maximum, the running maximum is updated, and everything accumulated so far
+    is rescaled by ``exp(old_max - new_max)``. The result is identical to
+    normalising over the whole head in one pass, because the rescaling is
+    associative and exact in the same arithmetic the flat kernel uses.
+
+    Value accumulation mirrors the flat kernel's key-range split when
+    ``threads`` is a multiple of ``value_dim``: two (or more) threads share one
+    output dimension and each walks a slice of the block, then the partials
+    merge in ``scratch``. The online rescaling still applies to the running
+    ``acc`` before the block is added, so the split only has to reduce within
+    the block. Without the split, every thread walks the whole block for its
+    dimensions and an 8k head measured ~6x the flat 4k launch - the cliff that
+    made long-context decode fall off a cliff past the shared-memory budget.
+    """
+
+    threads = config.threads
+    key_length = config.key_length
+    query_dim = config.query_head_dim
+    value_dim = config.value_head_dim
+    query_heads = config.query_heads
+    key_value_heads = config.key_value_heads
+    block = min(_DECODE_ATTENTION_BLOCK_KEYS, key_length)
+    splits = threads // value_dim if value_dim > 0 and threads % value_dim == 0 else 1
+    # Output dimensions a thread owns when the split does not apply.
+    slots = -(-value_dim // threads)
+    indent = "    "
+    lines = [
+        "uint tid = thread_position_in_threadgroup.x;",
+        "uint head = threadgroup_position_in_grid.x;",
+        "uint batch = threadgroup_position_in_grid.y;",
+        "uint query_pos = 0u;",
+        f"uint key_value_head = head / {config.group_size}u;",
+        f"const device T* query = in_0 "
+        f"+ (batch * {query_heads}u + head) * {query_dim}u;",
+        f"const device T* key_base = in_1 "
+        f"+ (batch * {key_value_heads}u + key_value_head) "
+        f"* {key_length * query_dim}u;",
+        f"const device T* value_base = in_2 "
+        f"+ (batch * {key_value_heads}u + key_value_head) "
+        f"* {key_length * value_dim}u;",
+        f"threadgroup float scores[{block}];",
+        f"threadgroup float scratch[{threads}];",
+        f"threadgroup float query_shared[{query_dim}];",
+        f"for (uint dimension = tid; dimension < {query_dim}u; "
+        f"dimension += {threads}u) {{",
+        f"{indent}query_shared[dimension] = float(query[dimension]);",
+        "}",
+    ]
+    if splits > 1:
+        # One running total per output dimension, owned by tid < value_dim.
+        # Threads above that only help score and reduce; they keep a dummy.
+        lines.append("float acc = 0.0f;")
+    else:
+        lines.extend(
+            [
+                f"float acc[{slots}];",
+                f"for (uint slot = 0u; slot < {slots}u; ++slot) {{",
+                f"{indent}acc[slot] = 0.0f;",
+                "}",
+            ]
+        )
+    lines.extend(
+        [
+            # Start at -inf so the first block's real maximum becomes the running
+            # one. Starting at 0 (a finite value no score may have reached) made
+            # the first block's weights look shift-invariant on their own but
+            # left the cross-block rescale keyed off the wrong maximum - about
+            # 1e-2 off torch on an 8k head.
+            "float running_max = -INFINITY;",
+            "float running_sum = 0.0f;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"for (uint block_start = 0u; block_start < {key_length}u; "
+            f"block_start += {block}u) {{",
+            f"{indent}uint block_keys = metal::min({block}u, {key_length}u - block_start);",
+            # Score the block.
+            f"{indent}for (uint offset = tid; offset < block_keys; "
+            f"offset += {threads}u) {{",
+            f"{indent * 2}uint key = block_start + offset;",
+        ]
+    )
+    if config.mask_shape is not None and config.mask_is_boolean:
+        mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+        lines.extend(
+            [
+                f"{indent * 2}if (!in_3[{mask_offset}]) {{",
+                f"{indent * 3}scores[offset] = -INFINITY;",
+                f"{indent * 3}continue;",
+                f"{indent * 2}}}",
+            ]
+        )
+    lines.extend(
+        [
+            f"{indent * 2}const device T* row = key_base + key * {query_dim}u;",
+            f"{indent * 2}float dot = 0.0f;",
+            f"{indent * 2}for (uint dimension = 0u; dimension < {query_dim}u; "
+            "++dimension) {",
+            f"{indent * 3}dot = fma(query_shared[dimension], float(row[dimension]), dot);",
+            f"{indent * 2}}}",
+            f"{indent * 2}float score = dot * float({config.scale!r});",
+        ]
+    )
+    if config.mask_shape is not None and not config.mask_is_boolean:
+        mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+        lines.append(f"{indent * 2}score += float(in_3[{mask_offset}]);")
+    lines.extend(
+        [
+            f"{indent * 2}scores[offset] = score;",
+            f"{indent}}}",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            # Block maximum.
+            f"{indent}float local_max = -INFINITY;",
+            f"{indent}for (uint offset = tid; offset < block_keys; "
+            f"offset += {threads}u) {{",
+            f"{indent * 2}local_max = metal::max(local_max, scores[offset]);",
+            f"{indent}}}",
+            f"{indent}scratch[tid] = local_max;",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+    )
+    lines.extend(
+        _emit_tree_reduction(threads, indent + indent, "max", "max")
+    )
+    lines.extend(
+        [
+            # A fully masked block reports -inf; fall back to the running
+            # maximum so the rescale is a no-op and the weights stay zero.
+            f"{indent}float block_max = metal::isinf(scratch[0]) "
+            "? running_max : scratch[0];",
+            # Every thread must read the reduction result before scratch is
+            # reused for the sum below.
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}float new_max = metal::max(running_max, block_max);",
+            # Leading fully-masked blocks leave new_max at -inf; anchor it at
+            # zero so exp(score - new_max) does not turn -inf scores into NaN.
+            f"{indent}if (metal::isinf(new_max) && new_max < 0.0f) {{",
+            f"{indent * 2}new_max = 0.0f;",
+            f"{indent}}}",
+            # First real block: running_max is -inf, exp(-inf - new_max) is 0,
+            # and both running_sum and acc are still zero, so the rescale is free.
+            f"{indent}float correction = metal::exp(running_max - new_max);",
+            f"{indent}float local_sum = 0.0f;",
+            f"{indent}for (uint offset = tid; offset < block_keys; "
+            f"offset += {threads}u) {{",
+            f"{indent * 2}float weight = metal::exp(scores[offset] - new_max);",
+            f"{indent * 2}scores[offset] = weight;",
+            f"{indent * 2}local_sum += weight;",
+            f"{indent}}}",
+            f"{indent}scratch[tid] = local_sum;",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+    )
+    lines.extend(
+        _emit_tree_reduction(threads, indent + indent, "sum", "sum")
+    )
+    lines.extend(
+        [
+            f"{indent}float block_sum = scratch[0];",
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{indent}running_sum = running_sum * correction + block_sum;",
+            f"{indent}running_max = new_max;",
+        ]
+    )
+    if splits > 1:
+        lines.extend(
+            [
+                f"{indent}acc *= correction;",
+                # Same key-range split the flat kernel uses: each part owns a
+                # slice of this block, then the partials merge per dimension.
+                f"{indent}uint part = tid / {value_dim}u;",
+                f"{indent}uint dimension = tid - part * {value_dim}u;",
+                f"{indent}uint begin = (block_keys * part) / {splits}u;",
+                f"{indent}uint end = (block_keys * (part + 1u)) / {splits}u;",
+                f"{indent}float partial = 0.0f;",
+                f"{indent}for (uint offset = begin; offset < end; ++offset) {{",
+                f"{indent * 2}partial = fma(scores[offset], "
+                f"float(value_base[(block_start + offset) * {value_dim}u "
+                "+ dimension]), partial);",
+                f"{indent}}}",
+                f"{indent}scratch[tid] = partial;",
+                f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+                f"{indent}if (tid < {value_dim}u) {{",
+                f"{indent * 2}float total = 0.0f;",
+                f"{indent * 2}for (uint split = 0u; split < {splits}u; ++split) {{",
+                f"{indent * 3}total += scratch[split * {value_dim}u + tid];",
+                f"{indent * 2}}}",
+                f"{indent * 2}acc += total;",
+                f"{indent}}}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"{indent}for (uint slot = 0u; slot < {slots}u; ++slot) {{",
+                f"{indent * 2}acc[slot] *= correction;",
+                f"{indent}}}",
+                f"{indent}for (uint slot = 0u; slot < {slots}u; ++slot) {{",
+                f"{indent * 2}uint dimension = tid + slot * {threads}u;",
+                f"{indent * 2}if (dimension < {value_dim}u) {{",
+                f"{indent * 3}float local = 0.0f;",
+                f"{indent * 3}for (uint offset = 0u; offset < block_keys; ++offset) {{",
+                f"{indent * 4}local = fma(scores[offset], "
+                f"float(value_base[(block_start + offset) * {value_dim}u "
+                "+ dimension]), local);",
+                f"{indent * 3}}}",
+                f"{indent * 3}acc[slot] += local;",
+                f"{indent * 2}}}",
+                f"{indent}}}",
+            ]
+        )
+    lines.extend(
+        [
+            # The next pass overwrites scores, so every thread has to be done
+            # reading it first.
+            f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+            "float inv_total = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;",
+        ]
+    )
+    if splits > 1:
+        lines.extend(
+            [
+                f"if (tid < {value_dim}u) {{",
+                f"{indent}out[(batch * {query_heads}u + head) * {value_dim}u "
+                "+ tid] = (T)(acc * inv_total);",
+                "}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"for (uint slot = 0u; slot < {slots}u; ++slot) {{",
+                f"{indent}uint dimension = tid + slot * {threads}u;",
+                f"{indent}if (dimension < {value_dim}u) {{",
+                f"{indent * 2}out[(batch * {query_heads}u + head) * {value_dim}u "
+                "+ dimension] = (T)(acc[slot] * inv_total);",
+                f"{indent}}}",
+                "}",
+            ]
+        )
+    return "\n".join(f"        {line}" for line in lines)
+
+
+def _emit_tree_reduction(
+    threads: int, indent: str, op: str, kind: str
+) -> list[str]:
+    """Emit a halving reduction over ``scratch``, one threadgroup tree.
+
+    ``op`` is ``"max"`` or ``"sum"``. An earlier spelling baked
+    ``scratch[0] + scratch[1]`` into every lane, so a 128-thread tree only ever
+    saw the two threads that own offsets 0 and 1 - fine for a tiny head, and
+    about 1% off once a head spans two 4096-key blocks.
+    """
+
+    if op == "max":
+        combine = "metal::max(scratch[tid], scratch[tid + stride])"
+    elif op == "sum":
+        combine = "scratch[tid] + scratch[tid + stride]"
+    else:
+        raise ValueError(f"unknown tree reduction op {op!r}")
+    return [
+        f"{indent}for (uint stride = {threads // 2}u; stride > 0u; stride >>= 1) {{",
+        f"{indent * 2}if (tid < stride) {{",
+        f"{indent * 3}scratch[tid] = {combine};",
+        f"{indent * 2}}}",
+        f"{indent * 2}threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"{indent}}}",
+    ]
 
 
 def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
     """Emit the one-query attention kernel body for a static head shape."""
+
+    if config.streamed:
+        return _emit_streamed_decode_attention_source(config)
 
     threads = config.threads
     key_length = config.key_length
@@ -558,19 +1134,33 @@ def _emit_decode_attention_source(config: _DecodeAttentionConfig) -> str:
         "}",
         "threadgroup_barrier(mem_flags::mem_threadgroup);",
         f"for (uint key = tid; key < {key_length}u; key += {threads}u) {{",
-        f"{indent}const device T* row = key_base + key * {query_dim}u;",
-        f"{indent}float dot = 0.0f;",
-        f"{indent}for (uint dimension = 0u; dimension < {query_dim}u; ++dimension) {{",
-        f"{indent * 2}dot = fma(query_shared[dimension], float(row[dimension]), dot);",
-        f"{indent}}}",
-        f"{indent}float score = dot * float({config.scale!r});",
     ]
-    if config.mask_shape is not None:
+    # Boolean pads are common on the left of a static-cache window. Skip the
+    # Q·K dot for those keys entirely; the score is -inf either way, and at a
+    # 4k capacity the pad prefix is free bandwidth we used to spend.
+    if config.mask_shape is not None and config.mask_is_boolean:
         mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
-        if config.mask_is_boolean:
-            lines.append(f"{indent}score = in_3[{mask_offset}] ? score : -INFINITY;")
-        else:
-            lines.append(f"{indent}score += float(in_3[{mask_offset}]);")
+        lines.extend(
+            [
+                f"{indent}if (!in_3[{mask_offset}]) {{",
+                f"{indent * 2}scores[key] = -INFINITY;",
+                f"{indent * 2}continue;",
+                f"{indent}}}",
+            ]
+        )
+    lines.extend(
+        [
+            f"{indent}const device T* row = key_base + key * {query_dim}u;",
+            f"{indent}float dot = 0.0f;",
+            f"{indent}for (uint dimension = 0u; dimension < {query_dim}u; ++dimension) {{",
+            f"{indent * 2}dot = fma(query_shared[dimension], float(row[dimension]), dot);",
+            f"{indent}}}",
+            f"{indent}float score = dot * float({config.scale!r});",
+        ]
+    )
+    if config.mask_shape is not None and not config.mask_is_boolean:
+        mask_offset = _attention_mask_offset_expression(4, config.mask_shape)
+        lines.append(f"{indent}score += float(in_3[{mask_offset}]);")
     lines.extend(
         [
             f"{indent}scores[key] = score;",
@@ -766,6 +1356,8 @@ class AttentionLowering:
         config = _decode_attention_config(graph, op)
         if config is None:
             return None
+        if config.splits > 1:
+            return self._compile_split_decode_attention(graph, op, index, config)
         output_type = graph.value(op.outputs[0]).type
         source = _emit_decode_attention_source(config)
         name = (
@@ -806,6 +1398,103 @@ class AttentionLowering:
         artifact = KernelArtifact(
             name=name,
             source=source,
+            header=_MSL_HEADER,
+            input_ids=op.inputs,
+            output_ids=op.outputs,
+            tensor_types=(output_type,),
+            kind="attention",
+        )
+        return artifact, runtime
+
+    def _compile_split_decode_attention(
+        self,
+        graph: Graph,
+        op: Operation,
+        index: int,
+        config: _DecodeAttentionConfig,
+    ) -> tuple[KernelArtifact, Any] | None:
+        """Emit the split-K decode attention and its combine pass.
+
+        Two launches replace the single block-walking kernel: the first scores
+        one key chunk per threadgroup, the second folds the partial softmaxes.
+        The extra launch is a few microseconds against a chunk walk that costs
+        hundreds at eight thousand keys.
+        """
+
+        output_type = graph.value(op.outputs[0]).type
+        splits = config.splits
+        threads = config.threads
+        value_dim = config.value_head_dim
+        partial_source = _emit_decode_attention_partial_source(
+            config, splits=splits, threads=threads
+        )
+        combine_source = _emit_decode_attention_combine_source(
+            config, splits=splits
+        )
+        if not partial_source or not combine_source:
+            return None
+        name = (
+            f"metal_decode_attention_split_{config.query_heads}"
+            f"_{config.key_value_heads}_{config.key_length}"
+            f"_{config.query_head_dim}_{config.value_head_dim}"
+            f"_{splits}_{index}"
+        )
+        combine_name = f"{name}_combine"
+        input_names = tuple(f"in_{position}" for position in range(len(op.inputs)))
+        partial = msl._metal_kernel(
+            name,
+            input_names,
+            ("out_m", "out_l", "out_acc"),
+            partial_source,
+            _MSL_HEADER,
+        )
+        combine = msl._metal_kernel(
+            combine_name,
+            ("in_m", "in_l", "in_acc"),
+            ("out",),
+            combine_source,
+            _MSL_HEADER,
+        )
+        dtype = _MLX_DTYPES[config.dtype]
+        batch = config.batch
+        heads = config.query_heads
+        partial_shapes = [
+            (batch, heads, splits),
+            (batch, heads, splits),
+            (batch, heads, splits, value_dim),
+        ]
+
+        def runtime(*inputs: mx.array) -> mx.array:
+            partials = partial(
+                inputs=list(inputs),
+                template=[("T", dtype)],
+                # mx.fast grids count threads, not threadgroups, so the head
+                # axis covers one threadgroup of `threads` threads per head.
+                grid=(heads * threads, batch, splits),
+                threadgroup=(threads, 1, 1),
+                output_shapes=partial_shapes,
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+            outputs = combine(
+                inputs=partials,
+                template=[("T", dtype)],
+                grid=(heads * value_dim, batch, 1),
+                threadgroup=(value_dim, 1, 1),
+                output_shapes=[output_type.shape],
+                output_dtypes=[dtype],
+            )
+            return outputs[0]
+
+        artifact = KernelArtifact(
+            name=name,
+            # Both passes are recorded: the combine entry point lives in the
+            # same translation unit, so the artifact describes everything the
+            # runtime launches rather than only the first pass.
+            source=(
+                f"{partial_source}\n\n"
+                f"// split-K combine pass: {combine_name}\n"
+                f"{combine_source}"
+            ),
             header=_MSL_HEADER,
             input_ids=op.inputs,
             output_ids=op.outputs,

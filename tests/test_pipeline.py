@@ -4261,6 +4261,91 @@ def test_native_decode_attention_launches_one_threadgroup_per_head(
         assert threadgroups == (heads, batch, 1)
 
 
+@pytest.mark.parametrize("mask_is_boolean", [True, False])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_native_decode_attention_splits_long_heads(batch, mask_is_boolean) -> None:
+    """A head past the split threshold is scored by (head, chunk) groups.
+
+    The two launches have to match a plain softmax over the whole head, so the
+    combine pass is checked against torch rather than only for finiteness.
+    """
+
+    head_dim = 8
+    heads = 4
+    key_value_heads = 2
+    key_length = 4200
+    dtype = DType.F32
+    values = {
+        "query": Value("query", TensorType((batch, heads, 1, head_dim), dtype)),
+        "key": Value(
+            "key", TensorType((batch, key_value_heads, key_length, head_dim), dtype)
+        ),
+        "value": Value(
+            "value", TensorType((batch, key_value_heads, key_length, head_dim), dtype)
+        ),
+        "mask": Value(
+            "mask",
+            TensorType(
+                (batch, 1, 1, key_length),
+                DType.BOOL if mask_is_boolean else dtype,
+            ),
+        ),
+        "output": Value("output", TensorType((batch, heads, 1, head_dim), dtype)),
+    }
+    graph = Graph(
+        ("query", "key", "value", "mask"),
+        values,
+        (
+            Operation(
+                "attention",
+                ("query", "key", "value", "mask"),
+                ("output",),
+                {"scale": head_dim**-0.5, "has_mask": True, "causal": False},
+            ),
+        ),
+        ("output",),
+    )
+    result = compile_graph(graph, codegen_attention=True)
+    assert [kernel.kind for kernel in result.plan.kernels] == ["attention"]
+    source = result.plan.kernels[0].source
+    assert "threadgroup float scores[" not in source
+    assert "out_acc" in source and "out_m" in source
+
+    torch.manual_seed(23)
+    query = torch.randn(batch, heads, 1, head_dim)
+    key = torch.randn(batch, key_value_heads, key_length, head_dim)
+    value = torch.randn(batch, key_value_heads, key_length, head_dim)
+    expanded_key = key.repeat_interleave(heads // key_value_heads, dim=1)
+    expanded_value = value.repeat_interleave(heads // key_value_heads, dim=1)
+    for valid_lengths in ((key_length, key_length), (1, key_length), (73, 2)):
+        valid_lengths = valid_lengths[:batch]
+        keep = torch.zeros(batch, 1, 1, key_length, dtype=torch.bool)
+        for row, valid_length in enumerate(valid_lengths):
+            keep[row, 0, 0, key_length - valid_length :] = True
+        scores = (query.double() @ expanded_key.double().transpose(-1, -2))
+        scores = (scores * (head_dim**-0.5)).masked_fill(~keep, float("-inf"))
+        expected = (torch.softmax(scores, dim=-1) @ expanded_value.double()).to(
+            torch.float32
+        )
+        mask = (
+            keep
+            if mask_is_boolean
+            else torch.where(
+                keep,
+                torch.zeros_like(keep, dtype=torch.float32),
+                torch.full_like(keep, float("-inf"), dtype=torch.float32),
+            )
+        )
+        actual = result.plan(
+            *(mx.array(tensor.numpy()) for tensor in (query, key, value, mask))
+        )[0]
+        mx.eval(actual)
+        assert mx.isfinite(actual).all().item()
+        # bf16-free: the split path accumulates in float32, so a plain softmax
+        # in double is reproduced to rounding.
+        assert mx.allclose(actual, mx.array(expected.numpy()), atol=1e-4, rtol=1e-4)
+
+
 def test_native_attention_falls_back_above_threadgroup_limit() -> None:
     def fn(query, key, value):
         return torch.nn.functional.scaled_dot_product_attention(query, key, value)

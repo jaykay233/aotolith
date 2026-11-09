@@ -74,3 +74,8 @@ build_*/
 *.ptx
 *.cubin
 *.sass
+
+# Profiler captures: gigabytes each, and the symlinks point into /tmp
+artifacts/metal_prof/*.trace
+artifacts/metal_prof/*.gputrace
+artifacts/metal_prof/*.log

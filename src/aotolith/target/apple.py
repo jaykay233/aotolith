@@ -322,9 +322,6 @@ def _select_mpp_attention_warps(query_length: int) -> int:
 _DECODE_ATTENTION_THREADS = 128
 
 
-_DECODE_ATTENTION_MAX_KEYS = 4096
-
-
 _DECODE_ATTENTION_DTYPES = frozenset({DType.F16, DType.BF16, DType.F32})
 
 
