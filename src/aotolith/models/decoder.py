@@ -327,11 +327,21 @@ class _DecoderBase(torch.nn.Module):
             torch.arange(0, self.head_dim, 2, dtype=torch.float32)[None, :]
             / self.head_dim,
         )
-        frequencies = torch.cat((frequencies, frequencies), dim=-1).to(
-            next(model.parameters()).dtype
+        # The angles stay float32 through the trigonometry and only the results
+        # are rounded to the model dtype. Rounding the *angle* to bf16 first
+        # quantizes it to a relative 2^-9, and a rotation's error grows with the
+        # position, so slot 511 of a bf16 table landed about a radian out while
+        # slot 0 was exact - one reference in float32 looked right and every
+        # bf16 decode past a few dozen tokens drifted. HF builds the table the
+        # same way: float32 cos/sin, cast once at the end.
+        frequencies = torch.cat((frequencies, frequencies), dim=-1)
+        dtype = next(model.parameters()).dtype
+        self.register_buffer(
+            "cosine_table", frequencies.cos().to(dtype), persistent=False
         )
-        self.register_buffer("cosine_table", frequencies.cos(), persistent=False)
-        self.register_buffer("sine_table", frequencies.sin(), persistent=False)
+        self.register_buffer(
+            "sine_table", frequencies.sin().to(dtype), persistent=False
+        )
         self._install(model)
 
     # ------------------------------------------------------------------

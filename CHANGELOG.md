@@ -180,6 +180,50 @@ The policy that decides what counts as a breaking change lives in
 
 ### Fixed
 
+- **The rotary table rounded the angle to the model dtype before taking its
+  cosine and sine, so every bf16 model past a few dozen tokens rotated its keys
+  by the wrong phase.** The table was built as
+
+  ```
+  frequencies = torch.arange(capacity)[:, None] / theta ** (...)
+  frequencies = torch.cat((frequencies, frequencies), -1).to(next(model.parameters()).dtype)
+  self.cosine_table = frequencies.cos()
+  ```
+
+  so a bf16 model took bf16 angles into the trigonometry. bf16 keeps eight
+  mantissa bits, which quantizes the angle to a relative 2^-9; a rotation's
+  error is proportional to the angle, so slot 0 was exact and slot 511 was
+  most of a radian out. The keys came out plausibly shaped and finite, with the
+  right magnitude (16.7 both sides at 512 tokens) and the wrong phase, which is
+  why a float32 model matched to 0.0 and every float32 reference agreed while
+  bf16 prefill logits were 12 off and a 4k decode wrote `TensorLLM` where the
+  checkpoint writes `TensorRT-LLM`. The angles now stay float32 through the
+  trigonometry and only cos/sin are cast, which is what HF does.
+
+  Measured on Qwen2.5-0.5B-Instruct at a 512-token prompt: key-cache error
+  52.5 to 0.5 (bf16 rounding), prefill logits 12.09 to 0.25, and the 1024-token
+  argmax goes from 4086 to 12 against the checkpoint's 12. Greedy tokens now
+  match the checkpoint for 8 tokens at 128, 4200 and 8300. The regression test
+  compares the table against float64 trigonometry at the far end, because the
+  near end is exact under either spelling.
+
+- **The vectorized cache roll copied only the first wave of the window.** The
+  roll moves four vectors per thread, one grid width apart, so the launch width
+  and the in-kernel stride have to be the same number - and the emitter was
+  passed the threadgroup size, 256, while the launcher started
+  `ceil(vectors / 1024) * 256` threads. Every threadgroup past the first
+  re-covered the leading vectors, so a window longer than about a thousand
+  vectors arrived with its tail left stale: 128-token prompts decoded to
+  gibberish while 12-slot fixtures in the tests, which are 48 vectors, stayed
+  green. Both emitters now take the grid width as their stride and derive it
+  from one helper.
+
+  The performance claim that came with it does not survive the repair. At
+  4168 slots the roll goes from 0.118 to 0.101 ms per launch, which is 14% of
+  a kernel that is 1.4 ms of a 6.9 ms step, and end to end 4096 measures 6.94
+  against 6.93 with the old vector width. The 6.16 ms reported for 4096 while
+  the bug was live was the missing copy, not the vector move.
+
 - **The published speedup over `mlx_lm` (1.21x) compared two different loop
   shapes.** This repository's decode path submits each step with `mx.async_eval`;
   the baseline helper in `examples/qwen_static_cache_benchmark.py` used

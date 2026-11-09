@@ -4,6 +4,7 @@ import gc
 import weakref
 
 import mlx.core as mx
+import numpy as np
 import pytest
 import torch
 
@@ -106,6 +107,143 @@ def test_tiny_qwen2_static_cache_matches_pytorch_decode() -> None:
         if op.attrs.get("epilogue") == "silu_mul_paired"
     ]
     assert gated == []
+
+
+def test_static_cache_roll_covers_a_window_wider_than_one_wave() -> None:
+    """A window that needs several copy waves must still arrive whole.
+
+    The roll moves ``_UNROLL`` vectors per thread, one grid width apart, so the
+    launch width and the in-kernel stride have to be the same number. When they
+    drifted apart the kernel copied only the leading wave: a few hundred vectors
+    of window, which is every window the tiny models above have, so they stayed
+    green while a real 148-slot window decoded to gibberish.
+
+    This model uses a 16-wide head - the narrowest shape that takes the
+    vectorized rope path, which the 8-wide heads of the tests above fall back
+    from - and a window long enough to need several waves. It compares the
+    decode logits of every step, not the greedy tokens: at this width the
+    fallback and the kernel still pick the same argmax out of a partly stale
+    window, so the token check stays green on a window that is missing its
+    newest slots.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(41)
+    model = transformers.Qwen2ForCausalLM(config).eval()
+    torch.manual_seed(5)
+    input_ids = torch.tensor(
+        [torch.randint(0, config.vocab_size, (272,)).tolist()], dtype=torch.int64
+    )
+    steps = 4
+    with torch.no_grad():
+        output = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+        past = output.past_key_values
+        expected = [output.logits[0, -1]]
+        for _ in range(steps - 1):
+            token = int(expected[-1].argmax())
+            output = model(
+                input_ids=torch.tensor([[token]], dtype=torch.int64),
+                past_key_values=past,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            past = output.past_key_values
+            expected.append(output.logits[0, -1])
+
+    runtime = compile_qwen2_static_cache(
+        model,
+        prompt_length=272,
+        max_new_tokens=8,
+        codegen_matmul=True,
+        codegen_attention=True,
+    )
+    assert runtime.cache_capacity > 272
+    # The 16-wide head is what selects the generated roll over the fallback.
+    assert any(
+        kernel.kind == "rope_kv_cache_append" for kernel in runtime.decode.plan.kernels
+    )
+
+    logits, compact = runtime.prefill_ids(input_ids.tolist())
+    mx.eval(logits, compact)
+    assert mx.allclose(
+        logits[0, -1], mx.array(expected[0].numpy()), atol=2e-3, rtol=2e-3
+    )
+
+    cache = runtime.pad_cache(compact)
+    token = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1).astype(mx.int64)
+    valid = 272
+    for step in range(1, steps):
+        valid += 1
+        logits, cache = runtime.decode_token(token, cache, valid, verify_token=False)
+        mx.eval(logits, cache)
+        assert mx.allclose(
+            logits[0, -1],
+            mx.array(expected[step].numpy()),
+            atol=2e-3,
+            rtol=2e-3,
+        ), f"decode step {step} diverged"
+        token = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1).astype(mx.int64)
+        mx.eval(token)
+
+
+def test_rotary_table_keeps_full_precision_angles_in_bfloat16() -> None:
+    """A bf16 model must not round the *angle* before taking cos/sin.
+
+    Rounding the angle to bf16 quantizes it to a relative 2^-9, and a rotation's
+    error grows with the position: the table was exact at slot 0 and about a
+    radian out by slot 500, which left prefill logits 12 off and a 4k decode
+    emitting ``TensorLLM`` instead of ``TensorRT-LLM``. Nothing here was loud -
+    the values were finite and every f32 reference matched - so the guard has to
+    be the table itself, at the far end where the error lives.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        tie_word_embeddings=True,
+        use_cache=True,
+    )
+    torch.manual_seed(41)
+    model = transformers.Qwen2ForCausalLM(config).eval().to(torch.bfloat16)
+    runtime = compile_qwen2_static_cache(
+        model, prompt_length=300, max_new_tokens=4, codegen_attention=True
+    )
+    head_dim = int(config.hidden_size // config.num_attention_heads)
+    theta = float(config.rope_theta)
+    angles = torch.arange(runtime.cache_capacity, dtype=torch.float64)[:, None] / (
+        theta ** (torch.arange(0, head_dim, 2, dtype=torch.float64)[None, :] / head_dim)
+    )
+    angles = torch.cat((angles, angles), dim=-1)
+    want_cos = angles.cos().float().numpy()
+    want_sin = angles.sin().float().numpy()
+    state = dict(zip(runtime.prefill.state_names, runtime.prefill._state_values))
+
+    # The reference is float64 math; every slot has to agree to bf16 rounding,
+    # not just the first few where the angle is small.
+    got_cos = np.asarray(state["cosine_table"].astype(mx.float32))
+    got_sin = np.asarray(state["sine_table"].astype(mx.float32))
+    np.testing.assert_allclose(got_cos, want_cos, atol=0.01)
+    np.testing.assert_allclose(got_sin, want_sin, atol=0.01)
+
+    # A table built from bf16 angles drifts by most of a radian at the far end.
+    assert np.abs(got_cos[-1] - want_cos[-1]).max() < 0.01
 
 
 def test_decode_token_rejects_out_of_vocabulary_token() -> None:

@@ -35,9 +35,27 @@ from .msl import KernelArtifact
 #: getting the threadgroups resident rather than by the copy itself.
 _KV_CACHE_THREADS = 256
 
-#: Elements per thread. Eight bytes for a bf16 window: the widest move that
-#: stays inside one instruction while the row arithmetic remains static.
-_VECTOR = 4
+#: Elements per thread move. Sixteen bytes for a bf16 window: the widest load
+#: one thread can issue without splitting the address across two instructions.
+_VECTOR = 8
+
+#: Vectors one thread moves, strided across the threadgroup so each round keeps
+#: a warp's addresses contiguous. One 8-byte vector per thread leaves the copy
+#: latency-bound - the window is only a few hundred kilobytes per layer - and
+#: four of them measures 2.7x at 4160 slots and 3.7x at 8256.
+_UNROLL = 4
+
+
+def _grid_width(vectors: int) -> int:
+    """Threads one roll launch needs for ``_UNROLL`` waves to cover ``vectors``.
+
+    Rounded up to whole threadgroups so the last wave stays coalesced, and used
+    both as the launch width and as the in-kernel stride between a thread's
+    vectors.
+    """
+
+    waves = max(-(-vectors // (_UNROLL * _KV_CACHE_THREADS)), 1)
+    return waves * _KV_CACHE_THREADS
 
 
 def _emit_kv_cache_append_source(
@@ -50,8 +68,16 @@ def _emit_kv_cache_append_source(
     value_start: int,
     source_width: int,
     source_steps: int,
+    stride: int,
 ) -> str:
-    """Emit the copy-with-one-row-substituted kernel for one static layer."""
+    """Emit the copy-with-one-row-substituted kernel for one static layer.
+
+    ``stride`` is the launched grid width, not the threadgroup size: a thread
+    moves ``_UNROLL`` vectors spaced one whole wave apart, so it has to match
+    the number of threads that are actually resident. Passing the threadgroup
+    size here instead makes every threadgroup past the first re-cover the
+    leading vectors, which silently copies only a prefix of the window.
+    """
 
     vectors = prod((2, batch, heads, slots, head_dim)) // _VECTOR
     pair_stride = batch * heads * slots * head_dim
@@ -72,22 +98,29 @@ def _emit_kv_cache_append_source(
         f"const device vec<T, {_VECTOR}>* projected = "
         f"reinterpret_cast<const device vec<T, {_VECTOR}>*>(in_2);",
         "uint gid = thread_position_in_grid.x;",
-        f"if (gid >= {vectors}u) {{ return; }}",
-        f"uint within = (gid * {_VECTOR}u) % {head_stride}u;",
-        f"if (within < {window}u) {{",
+        # Four strided vectors per thread: consecutive threads still read
+        # consecutive addresses, so the warp stays coalesced while each thread
+        # keeps four moves in flight.
+        f"for (uint step = 0u; step < {_UNROLL}u; ++step) {{",
+        f"    uint gid_index = gid + step * {stride}u;",
+        f"    if (gid_index >= {vectors}u) {{ break; }}",
+        f"    uint within = (gid_index * {_VECTOR}u) % {head_stride}u;",
+        f"    if (within < {window}u) {{",
         # Every slot but the last is the same run, one row further along.
-        f"    target[gid] = window[gid + {layer_vectors}u + {head_vectors}u];",
-        "} else {",
-        f"    uint block = (gid * {_VECTOR}u) / {head_stride}u;",
-        f"    uint offset = (within - {window}u) / {_VECTOR}u;",
-        f"    uint head_of_batch = block % {batch_heads}u;",
-        f"    bool key_half = block < {batch_heads}u;",
-        "    uint index = key_half",
-        f"        ? head_of_batch * {head_vectors}u + offset",
-        f"        : (head_of_batch / {heads}u) * {source_steps * width_vectors}u"
+        f"        target[gid_index] = window[gid_index + {layer_vectors}u "
+        f"+ {head_vectors}u];",
+        "    } else {",
+        f"        uint block = (gid_index * {_VECTOR}u) / {head_stride}u;",
+        f"        uint offset = (within - {window}u) / {_VECTOR}u;",
+        f"        uint head_of_batch = block % {batch_heads}u;",
+        f"        bool key_half = block < {batch_heads}u;",
+        "        uint index = key_half",
+        f"            ? head_of_batch * {head_vectors}u + offset",
+        f"            : (head_of_batch / {heads}u) * {source_steps * width_vectors}u"
         f" + {(source_steps - 1) * width_vectors + value_vectors}u"
         f" + (head_of_batch % {heads}u) * {head_vectors}u + offset;",
-        "    target[gid] = key_half ? keys[index] : projected[index];",
+        "        target[gid_index] = key_half ? keys[index] : projected[index];",
+        "    }",
         "}",
     ]
     return "\n".join(lines)
@@ -105,6 +138,7 @@ def _emit_rope_kv_cache_append_source(
     query_start: int,
     query_heads: int,
     source_width: int,
+    stride: int,
 ) -> str:
     """Emit the rotation of the step's query and key together with the roll.
 
@@ -144,10 +178,10 @@ def _emit_rope_kv_cache_append_source(
         return [
             f"uint {prefix}partner = {source_index} - {offset_name} + "
             f"({offset_name} ^ {half_vectors}u);",
-            f"vec<T, 4> {prefix}current = row[{source_index}];",
-            f"vec<T, 4> {prefix}rotated = row[{prefix}partner];",
+            f"vec<T, {_VECTOR}> {prefix}current = row[{source_index}];",
+            f"vec<T, {_VECTOR}> {prefix}rotated = row[{prefix}partner];",
             f"float {prefix}sign = {offset_name} < {half_vectors}u ? -1.0f : 1.0f;",
-            f"vec<T, 4> {prefix}result;",
+            f"vec<T, {_VECTOR}> {prefix}result;",
             *[
                 f"{prefix}result[{offset}] = (T)(float({prefix}current[{offset}]) "
                 f"* float(cosine[{column} + {offset}u]) "
@@ -170,6 +204,8 @@ def _emit_rope_kv_cache_append_source(
         "const device T* cosine = in_2;",
         "const device T* sine = in_3;",
         "uint gid = thread_position_in_grid.x;",
+        # The step's query rotation rides on the same launch: the first
+        # ``query_vectors`` threads do it as well as their share of the roll.
         f"if (gid < {query_vectors}u) {{",
         f"    uint offset = gid % {head_vectors}u;",
         f"    uint column = offset * {_VECTOR}u;",
@@ -182,33 +218,35 @@ def _emit_rope_kv_cache_append_source(
                 "column",
             )
         ],
-        "    return;",
         "}",
-        f"uint index = gid - {query_vectors}u;",
-        f"if (index >= {vectors}u) {{ return; }}",
-        f"uint within = (index * {_VECTOR}u) % {head_stride}u;",
-        f"if (within < {window}u) {{",
+        f"for (uint step = 0u; step < {_UNROLL}u; ++step) {{",
+        f"    uint index = gid + step * {stride}u;",
+        f"    if (index >= {vectors}u) {{ break; }}",
+        f"    uint within = (index * {_VECTOR}u) % {head_stride}u;",
+        f"    if (within < {window}u) {{",
         # Every slot but the last is the same run, one row further along.
-        f"    target[index] = window[index + {layer_vectors}u + {head_vectors}u];",
-        "} else {",
-        f"    uint block = (index * {_VECTOR}u) / {head_stride}u;",
-        f"    uint offset = (within - {window}u) / {_VECTOR}u;",
-        f"    uint head_of_batch = block % {batch_heads}u;",
-        f"    bool key_half = block < {batch_heads}u;",
-        "    if (key_half) {",
-        f"        uint source = (head_of_batch / {heads}u) * {width_vectors}u "
+        f"        target[index] = window[index + {layer_vectors}u "
+        f"+ {head_vectors}u];",
+        "    } else {",
+        f"        uint block = (index * {_VECTOR}u) / {head_stride}u;",
+        f"        uint offset = (within - {window}u) / {_VECTOR}u;",
+        f"        uint head_of_batch = block % {batch_heads}u;",
+        f"        bool key_half = block < {batch_heads}u;",
+        "        if (key_half) {",
+        f"            uint source = (head_of_batch / {heads}u) * {width_vectors}u "
         f"+ {key_vectors}u + (head_of_batch % {heads}u) * {head_vectors}u "
         "+ offset;",
-        f"        uint column = offset * {_VECTOR}u;",
+        f"            uint column = offset * {_VECTOR}u;",
         *[
-            f"        {line}"
+            f"            {line}"
             for line in rotate("k", "target[index]", "source", "column")
         ],
-        "    } else {",
-        f"        uint source = (head_of_batch / {heads}u) * {width_vectors}u "
+        "        } else {",
+        f"            uint source = (head_of_batch / {heads}u) * {width_vectors}u "
         f"+ {value_vectors}u + (head_of_batch % {heads}u) * {head_vectors}u "
         "+ offset;",
-        "        target[index] = row[source];",
+        "            target[index] = row[source];",
+        "        }",
         "    }",
         "}",
     ]
@@ -240,6 +278,7 @@ class KVCacheLowering:
         ):
             return None
         layer = int(op.attrs["layer"])
+        vectors = prod((2, batch, heads, slots, head_dim)) // _VECTOR
         source = _emit_kv_cache_append_source(
             batch=batch,
             heads=heads,
@@ -249,6 +288,7 @@ class KVCacheLowering:
             value_start=value_start,
             source_width=source_type.shape[2],
             source_steps=source_type.shape[1],
+            stride=_grid_width(vectors),
         )
         name = (
             f"metal_kv_cache_append_{layers}_{batch}_{heads}_{slots}"
@@ -262,8 +302,11 @@ class KVCacheLowering:
             msl._MSL_HEADER,
         )
         vectors = prod((2, batch, heads, slots, head_dim)) // _VECTOR
-        grid = (vectors, 1, 1)
-        threadgroup = (min(_KV_CACHE_THREADS, vectors), 1, 1)
+        # ``_UNROLL`` strided vectors per thread, so the grid covers a quarter
+        # of the moves; the threadgroup is kept whole so the last wave stays
+        # coalesced even when the vector count is not a multiple of it.
+        grid = (_grid_width(vectors), 1, 1)
+        threadgroup = (min(_KV_CACHE_THREADS, grid[0]), 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
         def runtime(*inputs: mx.array) -> tuple[mx.array, ...]:
@@ -327,6 +370,14 @@ class KVCacheLowering:
             or width % _VECTOR
         ):
             return None
+        roll_vectors = (
+            prod((2, int(batch), int(heads), int(slots), head_dim)) // _VECTOR
+        )
+        query_vectors = prod(query_type.shape) // _VECTOR
+        # The query rotation is carried by the first ``query_vectors`` threads,
+        # so the grid only has to be wide enough for the roll waves and for
+        # those threads to exist. The same width is the in-kernel stride.
+        grid = (max(_grid_width(roll_vectors), query_vectors), 1, 1)
         source = _emit_rope_kv_cache_append_source(
             batch=int(batch),
             heads=int(heads),
@@ -338,6 +389,7 @@ class KVCacheLowering:
             query_start=query_start,
             query_heads=int(op.attrs["query_heads"]),
             source_width=int(width),
+            stride=grid[0],
         )
         name = (
             f"metal_rope_kv_cache_append_{layers}_{int(batch)}_{int(heads)}"
@@ -350,13 +402,7 @@ class KVCacheLowering:
             source,
             msl._MSL_HEADER,
         )
-        roll_vectors = (
-            prod((2, int(batch), int(heads), int(slots), head_dim)) // _VECTOR
-        )
-        query_vectors = prod(query_type.shape) // _VECTOR
-        total = roll_vectors + query_vectors
-        grid = (total, 1, 1)
-        threadgroup = (min(_KV_CACHE_THREADS, total), 1, 1)
+        threadgroup = (min(_KV_CACHE_THREADS, grid[0]), 1, 1)
         dtype = _MLX_DTYPES[output_type.dtype]
 
         def runtime(*inputs: mx.array) -> tuple[mx.array, ...]:

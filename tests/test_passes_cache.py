@@ -110,6 +110,67 @@ def test_the_rewritten_graph_computes_the_same_window() -> None:
         np.testing.assert_array_equal(np.asarray(got.astype(_float32())), want)
 
 
+@pytest.mark.parametrize("capacity", [12, 300, 1024])
+def test_the_roll_covers_a_window_wider_than_one_wave(capacity: int) -> None:
+    """A window longer than one unrolled wave has to land in full.
+
+    The kernel moves ``_UNROLL`` vectors per thread, one grid width apart, so
+    the launch width and the in-kernel stride must be the same number. When
+    they were not, only the leading wave of the window was copied - invisible
+    at ``CAPACITY`` 12 above, which is 48 vectors, and garbage at a few
+    thousand.
+    """
+
+    class Roll(torch.nn.Module):
+        def forward(self, cache, projected, key):
+            pairs = []
+            key_windows = []
+            value_windows = []
+            for layer in range(LAYERS):
+                window = cache[layer][:, :, :, 1:, :]
+                value = (
+                    projected[:, :, 2 * HEADS * HEAD_DIM :]
+                    .view(1, 1, HEADS, HEAD_DIM)
+                    .transpose(1, 2)
+                )
+                new_pair = torch.cat(
+                    (window, torch.stack((key[layer], value), 0)), 3
+                )
+                pairs.append(new_pair)
+                key_windows.append(new_pair[0])
+                value_windows.append(new_pair[1])
+            return (
+                torch.stack(pairs, dim=0),
+                torch.stack(key_windows, dim=0),
+                torch.stack(value_windows, dim=0),
+            )
+
+    generator = torch.Generator().manual_seed(capacity)
+    inputs = (
+        torch.randn(
+            (LAYERS, 2, 1, HEADS, capacity, HEAD_DIM), generator=generator
+        ).to(torch.bfloat16),
+        torch.randn((1, 1, PACKED), generator=generator).to(torch.bfloat16),
+        torch.randn((LAYERS, 1, HEADS, 1, HEAD_DIM), generator=generator).to(
+            torch.bfloat16
+        ),
+    )
+
+    module = Roll().eval()
+    lowered = fuse_kv_cache_update(capture_fx(module, inputs))
+    assert [op.op for op in lowered.ops].count("kv_cache_append") == LAYERS
+
+    compiled = aoto.compile_module(module, inputs)
+    actual = compiled(*(_mx(tensor) for tensor in inputs))
+    reference = module(*inputs)
+    expected = [np.asarray(t.float().numpy()) for t in reference]
+
+    for got, want in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got.astype(_float32())), want
+        )
+
+
 def test_the_fallback_and_the_kernel_agree() -> None:
     cache, projected, key = _inputs(seed=7)
     lowered = fuse_kv_cache_update(capture_fx(Roll().eval(), (cache, projected, key)))
