@@ -65,12 +65,17 @@ that only applies to caches configured for it, and the base cache is not.
     x = rmsnorm(x, output_norm)
     logits_i = lm_head @ x_i                        the TARGET's lm_head
 
-The block attention is **non-causal**: all 7 positions see each other and the prefix.
-So the block must be run at full width 7; truncating it changes position 0's output.
+The block attention mask is **shared, not non-causal**: `self_attn_mask_swa.block_uniform
+= true` makes every block query reuse the causal row of the block's FIRST query, so the
+visible set is the prefix plus slot 0 (the anchor). The seven slots do not see each
+other; they are independent denoising positions told apart only by rope position. That
+is why slots 1..6 produce near-identical logits.
 
-The block tokens are "noise" positions (the reference labels the embedding
-`inp_noise_embd`) -- the real token identity is carried by the Markov head, not by the
-embedding. This is the semi-autoregressive part.
+Block input is `[last_token, mask_token x (block_size - 1)]`: slot 0 is the embedding of
+the committed token, every later slot is `llama_vocab_mask()`, which this vocabulary
+records as `tokenizer.ggml.mask_token_id = 75982`. It is not the anchor repeated and it
+is not a learned mask tensor -- this variant has no `mask_embd` (that tensor only exists
+in the MLA `n_lora_kv > 0` branch of the reference).
 
 **4. Markov head.** A rank-256 low-rank bigram bias, chained greedily over block
 positions. With `sample_from_anchor = true` the chain starts from the anchor token:

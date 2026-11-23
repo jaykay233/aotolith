@@ -187,3 +187,53 @@ is ~19 ms and is the next thing to attack, since GEMM is now pinned to the strea
 Against the goal: 55.2 tok/s at perfect acceptance, and at a pessimistic two of three
 drafts accepted it is still 3/0.0725 = 41 tok/s. The draft model now has a lot of
 room; it does not need to be fast to clear 20.
+
+## dspark: three bugs between "it runs" and "it drafts"
+
+The drafter ran end to end long before it drafted anything. Accepting 0.03 drafts per
+round was not a weak model, it was three separate mistakes, and the giveaway was that
+zeroing the injected features changed the output by exactly nothing while four different
+capture points all scored 2.6%.
+
+**1. Block input was the anchor repeated.** The reference feeds
+`[last_token, mask * 6]` (`batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, ...)`),
+with `mask_token_id = 75982` from `tokenizer.ggml.mask_token_id`. There is no
+`mask_embd` tensor in this variant -- it is created only in the `n_lora_kv > 0` branch.
+Without it every slot looked like the anchor and the block was degenerate.
+
+**2. Block attention was made mutual.** `block_uniform = true` means all queries share the
+*causal* row of the block's first query, so the visible keys are the prefix plus slot 0.
+Letting the seven slots see each other (my first reading of "non-causal") destroyed the
+draft.
+
+**3. The drafter left `g_m = 1` behind.** Its markov head is single row, and the target's
+final lm_head GEMM did not re-assert the row geometry, so only logits row 0 was written
+and rows 1..3 were verified against stale *draft* logits. The target's own output was
+diverging from plain greedy within two tokens, which is how this surfaced. The row
+geometry is now restored right after the drafter returns, before anything stages A.
+
+Fixing only #3 took first-draft accuracy from 2.6% to 88.3%; all three together give the
+numbers below. The rank metric (where the target's choice sits in the draft's
+distribution) is what separated "broken" from "weak": it was 57108 of 130560, which is
+noise, and is now 2644.
+
+### Measured, 120 tokens from a 40-position context
+
+| config | rows | rounds | accepted/round | tok/s |
+|---|---|---|---|---|
+| plain greedy | 1 | 120 | -- | 17.31 |
+| drafts=2 | 3 | 59 | 1.07 | 13.71 |
+| drafts=3 | 4 | 54 | 1.26 | **21.76** |
+| drafts=4 | 5 | 51 | 1.39 | 15.98 |
+| drafts=5 | 6 | 51 | 1.39 | 14.94 |
+| drafts=6 | 7 | 51 | 1.39 | 14.44 |
+| drafts=7 | 8 | 51 | 1.39 | 13.89 |
+
+drafts=3 is the only row count that hits the native m4 kernel exactly. m=3 falls back to
+three m=1 calls (151 ms/round) and m=5..8 needs two m4 groups (150-172 ms), so the
+single-group m=4 round at 104 ms wins despite accepting fewer tokens. First-draft
+accuracy is 68.5% and the accepted output is token-identical to plain greedy.
+
+Two capture points were tested for the fused features -- the residual entering a tracked
+layer versus leaving it -- and they land within noise of each other (21.76 vs 21.26
+tok/s), which is what the `-Dpre`/`-D` switch still exposes.

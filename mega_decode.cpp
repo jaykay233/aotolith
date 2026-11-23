@@ -359,7 +359,11 @@ static int64_t g_attn_np;          // positions row g_arow can see
 // groups, so the row buffers must hold 4*ceil(m/4) rows or the second group lands in
 // whatever follows. Sized for the worst case rather than for the round length.
 static const int MROW_MAX = 8;                    // anchor + up to 7 drafts
-#define AQ_ROW_STRIDE (((N_FF / 32) * 38))        // widest quantized activation row
+// Widest activation row, which is not N_FF: the drafter's encoder feeds fc a
+// 5*2048 = 10240-wide fused vector. Sized from that, or the encoder overruns the
+// tile by 4864 bytes per row and takes the process down.
+#define AQ_ROW_STRIDE (((10240 / 32) * 38))
+#define AQ_ROW_MAX_K 10240
 
 static int g_m = 1;            // rows this round
 static int g_pos0 = 0;         // absolute position of row 0
@@ -378,8 +382,7 @@ static uint8_t * b_aq4;
 static int g_use_m4 = 0;
 static int g_m4_groups = 1;                           // ceil(m/4), rows padded to 4*groups
 #define AQ4_BLK 152                                   // 4*4 + 4*2 + 4*32
-#define AQ4_ROW_STRIDE ((N_FF / 32) * AQ4_BLK)        // one group's full-K tile
-#define AQ4_MAX_K DS_IN
+#define AQ4_ROW_STRIDE ((AQ_ROW_MAX_K / 32) * AQ4_BLK)
 
 // b_* hold row 0; the existing globals point at the row being processed.
 static void select_row(int r) {
@@ -571,7 +574,7 @@ static void stage_a(const float * base, int64_t k) {
     if (g_use_m4) {
         // Rows past m are packed from a zero row: their outputs are never read, and
         // zeroing them keeps the padding out of the arithmetic entirely.
-        static float zeros[N_FF];
+        static float zeros[AQ_ROW_MAX_K];
         static const float * rows[4];
         const int nb = (int) (k / 32);
         for (int g = 0; g < g_m4_groups; ++g) {
@@ -775,6 +778,513 @@ static const char * work_path(const char * name) {
     return b;
 }
 
+// ============================================================== dspark drafter
+// MiniCPM5 2.6B DSpark: a 5-layer head over the target, 324M params, Q4_0 here.
+// The architecture and cost model are in DSPARK.md; the authoritative forward pass is
+// llama-mtmd/src/models/dflash.cpp and src/models/dspark.cpp.
+//
+// The drafter only exists to raise the acceptance rate. It cannot make the output
+// wrong: the verifier emits a draft only after reproducing it with the target, so a
+// bad drafter costs speed and nothing else. That is what makes it safe to take the
+// shortcuts below where the reference harness is ambiguous.
+static const int DS_LAYER = 5, DS_BLOCK = 7;
+static const int DS_TARGET_LAYER[DS_LAYER] = { 2, 11, 21, 31, 40 };
+static const int64_t DS_IN = (int64_t) DS_LAYER * N_EMBD;      // 10240 fused input
+static const int DS_MARKOV_RANK = 256;
+
+struct DRef { uint8_t * b; int64_t k, n; };
+
+static uint8_t * g_dsmap; static size_t g_dsmap_sz;
+static uint8_t * g_dsblob;
+
+static DRef g_ds_wq[DS_LAYER], g_ds_wk[DS_LAYER], g_ds_wv[DS_LAYER], g_ds_wo[DS_LAYER];
+static DRef g_ds_wg[DS_LAYER], g_ds_wu[DS_LAYER], g_ds_wd[DS_LAYER];
+static DRef g_ds_fc, g_ds_w2;
+static const uint8_t * g_ds_w1_raw;
+static const float * g_ds_attn_norm[DS_LAYER], * g_ds_ffn_norm[DS_LAYER];
+static const float * g_ds_qnorm[DS_LAYER], * g_ds_knorm[DS_LAYER];
+static const float * g_ds_enc_norm, * g_ds_out_norm;
+static float * g_ds_conf_row;
+static float g_ds_conf_b;
+
+static _Float16 * g_dskc, * g_dsvc;                            // [layer][pos][kv head][dim]
+static float * b_hid;                                          // [layer][row][embd]
+static float * b_concat;
+static float * b_dsbias;
+static float g_dssc[N_GPU][MAXCTX + 8];
+static int g_ds_ready = 0, g_ds_layer, g_ds_on = 0, g_ds_post = 1;
+static long long g_ds_hit0 = 0, g_ds_rounds = 0, g_ds_ranksum = 0;
+static float * g_ds_lg1 = nullptr;   // draft row-0 distribution, ranked against the target
+static int64_t g_ds_np;
+
+// 128-wide RMSNorm, used for the per-head q/k normalisation. Scalar is right here:
+// HEAD_DIM is 128 and this runs 16+2 times per row per layer.
+static void rmsnorm_vec(float * dst, const float * src, const float * w, int n) {
+    double ss = 0;
+    for (int i = 0; i < n; ++i) ss += (double) src[i] * src[i];
+    const float r = 1.0f / sqrtf((float) (ss / n) + RMS_EPS);
+    for (int i = 0; i < n; ++i) dst[i] = src[i] * r * w[i];
+}
+
+// ---------------------------------------------------------------- gguf reading
+struct DsInfo { char name[64]; const uint8_t * data; int64_t ne0, ne1; uint32_t type; };
+static DsInfo g_dst[96];
+static int g_dsn;
+
+static const uint8_t * ds_skip_val(const uint8_t * p, uint32_t t) {
+    static const int sz[13] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 };
+    if (t == 8) { uint64_t n; memcpy(&n, p, 8); return p + 8 + n; }
+    if (t == 9) {
+        uint32_t at; memcpy(&at, p, 4); p += 4;
+        uint64_t n; memcpy(&n, p, 8); p += 8;
+        for (uint64_t i = 0; i < n; ++i) p = ds_skip_val(p, at);
+        return p;
+    }
+    return p + sz[t < 13 ? t : 0];
+}
+
+static void ds_parse(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "dspark: cannot open %s\n", path); return; }
+    fseek(f, 0, SEEK_END); g_dsmap_sz = (size_t) ftell(f); fseek(f, 0, SEEK_SET);
+    g_dsmap = (uint8_t *) malloc(g_dsmap_sz);
+    if (!g_dsmap || fread(g_dsmap, 1, g_dsmap_sz, f) != g_dsmap_sz) {
+        fprintf(stderr, "dspark: read failed\n"); fclose(f); return;
+    }
+    fclose(f);
+
+    const uint8_t * p = g_dsmap;
+    uint32_t magic; memcpy(&magic, p, 4);
+    if (magic != 0x46554747u) { fprintf(stderr, "dspark: bad magic\n"); return; }
+    uint64_t nt, nkv;
+    memcpy(&nt, p + 8, 8); memcpy(&nkv, p + 16, 8);
+    p += 24;
+    for (uint64_t i = 0; i < nkv; ++i) {
+        uint64_t len; memcpy(&len, p, 8); p += 8 + len;
+        uint32_t t; memcpy(&t, p, 4); p += 4;
+        p = ds_skip_val(p, t);
+    }
+    struct Raw { char name[64]; uint64_t off; int64_t ne0, ne1; uint32_t type; };
+    static Raw raw[96];
+    for (uint64_t i = 0; i < nt && g_dsn < 96; ++i) {
+        uint64_t len; memcpy(&len, p, 8); p += 8;
+        const size_t c = len < 63 ? (size_t) len : 63;
+        memcpy(raw[g_dsn].name, p, c); raw[g_dsn].name[c] = 0; p += len;
+        uint32_t nd; memcpy(&nd, p, 4); p += 4;
+        int64_t dims[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        memcpy(dims, p, 8 * nd); p += 8 * nd;
+        uint32_t ty; memcpy(&ty, p, 4); p += 4;
+        uint64_t off; memcpy(&off, p, 8); p += 8;
+        raw[g_dsn].off = off; raw[g_dsn].type = ty;
+        raw[g_dsn].ne0 = dims[0]; raw[g_dsn].ne1 = dims[1];
+        ++g_dsn;
+    }
+    const size_t hdr = ((size_t) (p - g_dsmap) + 31) & ~(size_t) 31;   // GGUF alignment 32
+    for (int i = 0; i < g_dsn; ++i) {
+        snprintf(g_dst[i].name, sizeof g_dst[i].name, "%s", raw[i].name);
+        g_dst[i].data = g_dsmap + hdr + raw[i].off;
+        g_dst[i].ne0 = raw[i].ne0; g_dst[i].ne1 = raw[i].ne1;
+        g_dst[i].type = raw[i].type;
+    }
+    printf("dspark: %d tensors, %.1f MB\n", g_dsn, g_dsmap_sz / 1e6);
+}
+
+static const DsInfo * ds_find(const char * name) {
+    for (int i = 0; i < g_dsn; ++i)
+        if (!strcmp(g_dst[i].name, name)) return &g_dst[i];
+    fprintf(stderr, "dspark: missing tensor %s\n", name);
+    return nullptr;
+}
+
+static void ds_load(void) {
+    const char * path = getenv("MEGA_DSPARK");
+    if (!path) path = "/home/bianbu/workspace/mega/dspark-q4.gguf";
+    ds_parse(path);
+    if (!g_dsmap) return;
+
+    size_t need = 0;
+    for (int i = 0; i < g_dsn; ++i) {
+        if (g_dst[i].type != 2) continue;
+        need += (size_t) (g_dst[i].ne1 / 32) * (g_dst[i].ne0 / 32) * 576;
+    }
+    const size_t blob = (need + (1 << 21)) & ~((size_t) (1 << 21) - 1);
+    g_dsblob = (uint8_t *) aligned_alloc(1 << 21, blob);
+    if (!g_dsblob) { fprintf(stderr, "dspark: oom\n"); return; }
+    use_huge(g_dsblob, blob);
+
+    char nm[64];
+    size_t off = 0;
+    auto take = [&](DRef & r, const char * n) {
+        const DsInfo * t = ds_find(n);
+        if (!t || t->type != 2) return;
+        repack_b(g_dsblob + off, t->data, t->ne1, t->ne0);
+        r.b = g_dsblob + off; r.k = t->ne0; r.n = t->ne1;
+        off += (size_t) (t->ne1 / 32) * (t->ne0 / 32) * 576;
+    };
+    take(g_ds_fc, "fc.weight");
+    take(g_ds_w2, "markov_w2.weight");
+    const DsInfo * w1 = ds_find("markov_w1.weight");
+    if (!w1) return;
+    g_ds_w1_raw = w1->data;
+    for (int L = 0; L < DS_LAYER; ++L) {
+        snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", L);      take(g_ds_wq[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_k.weight", L);      take(g_ds_wk[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_v.weight", L);      take(g_ds_wv[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_output.weight", L); take(g_ds_wo[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate.weight", L);    take(g_ds_wg[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_up.weight", L);      take(g_ds_wu[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_down.weight", L);    take(g_ds_wd[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_norm.weight", L);   g_ds_attn_norm[L] = (const float *) ds_find(nm)->data;
+        snprintf(nm, sizeof nm, "blk.%d.ffn_norm.weight", L);    g_ds_ffn_norm[L]  = (const float *) ds_find(nm)->data;
+        snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", L); g_ds_qnorm[L]     = (const float *) ds_find(nm)->data;
+        snprintf(nm, sizeof nm, "blk.%d.attn_k_norm.weight", L); g_ds_knorm[L]     = (const float *) ds_find(nm)->data;
+    }
+    g_ds_enc_norm = (const float *) ds_find("enc.output_norm.weight")->data;
+    g_ds_out_norm = (const float *) ds_find("output_norm.weight")->data;
+    if (const DsInfo * cw = ds_find("conf_proj.weight")) {
+        g_ds_conf_row = (float *) calloc((size_t) cw->ne0, 4);
+        for (int64_t i = 0; i < cw->ne0; ++i) {
+            uint16_t h; memcpy(&h, cw->data + 2 * i, 2);
+            const uint32_t e = (uint32_t) (h & 0x7FFFu) << 16;
+            float f; memcpy(&f, &e, 4);
+            g_ds_conf_row[i] = (h & 0x8000u) ? -f : f;
+        }
+    }
+    if (const DsInfo * cb = ds_find("conf_proj.bias")) {
+        double v = 0; memcpy(&v, cb->data, 4); g_ds_conf_b = (float) v;
+    }
+
+    const size_t kvsz = (size_t) DS_LAYER * KV_LAYER_STRIDE;
+    g_dskc = (_Float16 *) aligned_alloc(64, kvsz * 2);
+    g_dsvc = (_Float16 *) aligned_alloc(64, kvsz * 2);
+    b_hid = (float *) aligned_alloc(64, (size_t) DS_LAYER * MROW_MAX * N_EMBD * 4);
+    b_dsbias = (float *) aligned_alloc(64, (size_t) (VOCAB + 64) * 4);
+    if (b_dsbias) for (int i = 0; i < 64; ++i) b_dsbias[VOCAB + i] = 1.5e30f;
+    b_concat = (float *) aligned_alloc(64, (size_t) DS_IN * 4);
+    if (!g_dskc || !g_dsvc || !b_hid || !b_dsbias || !b_concat) {
+        fprintf(stderr, "dspark: oom kv\n"); return;
+    }
+    use_huge(g_dskc, kvsz * 2);
+    use_huge(g_dsvc, kvsz * 2);
+
+    g_ds_ready = 1;
+    printf("dspark: ready (%zu MB repacked, kv %.0f MB)\n", off / 1000000, kvsz * 4 / 1e6);
+}
+
+// ------------------------------------------------------------- encoder + inject
+// Fuse the target's five tracked hidden states into one 2048-wide vector, then turn it
+// into this layer's K/V and append to the draft cache. This is how the draft sees the
+// committed prefix: through features rather than tokens.
+static void ds_encode_inject(int64_t pos, int row) {
+    static float g[2][N_EMBD];
+    static float kv[2 * N_KV * HEAD_DIM];
+    float * gg = g[0];
+    for (int L = 0; L < DS_LAYER; ++L)
+        memcpy(b_concat + (int64_t) L * N_EMBD,
+               b_hid + ((int64_t) L * MROW_MAX + row) * N_EMBD, (size_t) N_EMBD * 4);
+
+    // control: zero features isolate whether the injected prefix reaches the draft at all
+    if (getenv("MEGA_DSZERO")) memset(b_concat, 0, (size_t) DS_IN * 4);
+    if (getenv("MEGA_DSDBG")) printf("  [ds] enc pos=%lld row=%d: concat ok\n", (long long) pos, row);
+    g_m = 1; g_use_m4 = 0; g_m4_groups = 1;
+    stage_a(b_concat, DS_IN);
+    if (getenv("MEGA_DSDBG")) printf("  [ds] staged a\n");
+    g_mjn = 1;
+    g_mj[0] = { g_ds_fc.b, g_ds_fc.k, g_ds_fc.n, gg, N_EMBD };
+    run(task_mgemm);
+    if (getenv("MEGA_DSDBG")) printf("  [ds] fc done\n");
+    if (getenv("MEGA_DSDBG3")) {
+        double a = 0, b = 0;
+        for (int i = 0; i < DS_IN; ++i) a += (double) b_concat[i] * b_concat[i];
+        for (int i = 0; i < N_EMBD; ++i) b += (double) gg[i] * gg[i];
+        printf("  [enc] pos=%lld |concat|=%.4g |fc_out|=%.4g\n", (long long) pos, sqrt(a), sqrt(b));
+    }
+    rmsnorm_par(g[1], gg, g_ds_enc_norm, N_EMBD);
+    gg = g[1];
+
+    for (int L = 0; L < DS_LAYER; ++L) {
+        g_m = 1; g_use_m4 = 0;
+        stage_a(gg, N_EMBD);
+        g_mjn = 2;
+        g_mj[0] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, kv,                  N_KV * HEAD_DIM };
+        g_mj[1] = { g_ds_wv[L].b, g_ds_wv[L].k, g_ds_wv[L].n, kv + N_KV * HEAD_DIM, N_KV * HEAD_DIM };
+        run(task_mgemm);
+        for (int h = 0; h < N_KV; ++h) {
+            float * k = kv + h * HEAD_DIM;
+            rmsnorm_vec(k, k, g_ds_knorm[L], HEAD_DIM);
+            for (int i = 0; i < HEAD_DIM / 2; ++i) {
+                const float th = (float) pos * g_rope_inv[i];
+                const float c = cosf(th), s = sinf(th);
+                const float x0 = k[2 * i], x1 = k[2 * i + 1];
+                k[2 * i]     = x0 * c - x1 * s;
+                k[2 * i + 1] = x0 * s + x1 * c;
+            }
+        }
+        if (getenv("MEGA_DSDBG")) printf("  [ds] L%d wk/wv done\n", L);
+        if (getenv("MEGA_DSDBG3")) {
+            double a = 0, b = 0;
+            for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+                a += (double) kv[i] * kv[i];
+                b += (double) kv[N_KV * HEAD_DIM + i] * kv[N_KV * HEAD_DIM + i];
+            }
+            printf("  [enc] L%d pos=%lld |K|=%.4g |V|=%.4g\n", L, (long long) pos, sqrt(a), sqrt(b));
+        }
+        _Float16 * kc = g_dskc + (int64_t) L * KV_LAYER_STRIDE + pos * (N_KV * HEAD_DIM);
+        _Float16 * vc = g_dsvc + (int64_t) L * KV_LAYER_STRIDE + pos * (N_KV * HEAD_DIM);
+        for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+            kc[i] = (_Float16) kv[i];
+            vc[i] = (_Float16) kv[N_KV * HEAD_DIM + i];
+        }
+    }
+}
+
+// --------------------------------------------------------------- block attention
+// Each slot attends to the prefix plus slot 0 only (see the block_uniform note where
+// g_ds_np is set), so the whole block is one shared query-visible set of pos0 + 1 keys.
+static void task_ds_attn(int tid) {
+    const int total = DS_BLOCK * N_HEAD;
+    const int per = (total + g_participants - 1) / g_participants;
+    const int lo = per * tid;
+    int hi = (tid == g_participants - 1) ? total : per * (tid + 1);
+    if (hi > total) hi = total;
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    const int gqa = N_HEAD / N_KV;
+    for (int t = lo; t < hi; ++t) {
+        const int r = t / N_HEAD, h = t % N_HEAD;
+        const float * q = b_q + (int64_t) r * N_EMBD + h * HEAD_DIM;
+        float * out = b_attn_out + (int64_t) r * N_EMBD + h * HEAD_DIM;
+        const int hkv = h / gqa;
+        const _Float16 * kb = g_dskc + (int64_t) g_ds_layer * KV_LAYER_STRIDE + (int64_t) hkv * HEAD_DIM;
+        const _Float16 * vb = g_dsvc + (int64_t) g_ds_layer * KV_LAYER_STRIDE + (int64_t) hkv * HEAD_DIM;
+        const int64_t np = g_ds_np;
+        float * sc = g_dssc[tid];
+        float mx = -INFINITY;
+        for (int64_t i = 0; i < np; ++i) {
+            const float v = dot_head(q, kb + i * (N_KV * HEAD_DIM)) * scale;
+            sc[i] = v;
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0f;
+        for (int64_t i = 0; i < np; ++i) {
+            const float e = expf(sc[i] - mx);
+            sc[i] = e; sum += e;
+        }
+        const float rs = sum > 0.0f ? 1.0f / sum : 0.0f;
+        if (getenv("MEGA_DSDBG4") && tid == 0 && r == 0 && h == 0) {
+            printf("  [attn] L%d np=%lld pos0=%lld w:", g_ds_layer, (long long) np, (long long) (g_ds_np - 1));
+            for (int64_t i = 0; i < np && i < 10; ++i) printf(" %.3f", sc[i] * rs);
+            printf("  (last %.3f)\n", np > 10 ? sc[np - 1] * rs : 0.0f);
+        }
+        for (int d = 0; d < HEAD_DIM; ++d) out[d] = 0.0f;
+        for (int64_t i = 0; i < np; ++i)
+            axpy_head(out, vb + i * (N_KV * HEAD_DIM), sc[i] * rs);
+    }
+}
+
+// ------------------------------------------------------------------- block forward
+// The 7 noise positions through the 5 layers. Returns K drafts, after the Markov chain
+// has turned per-position logits into tokens.
+static void ds_draft(int32_t anchor, int64_t pos0, int K, int32_t * drafts) {
+    if (!g_ds_ready) { for (int i = 0; i < K; ++i) drafts[i] = anchor; return; }
+    // control: run the loader and allocate everything but skip the forward, to tell a
+    // buffer overlap apart from a wrong draft
+    if (getenv("MEGA_DSNOP")) { for (int i = 0; i < K; ++i) drafts[i] = anchor; return; }
+    const int m = DS_BLOCK;
+
+    // The draft block is [last token, mask * (block_size - 1)], not the anchor repeated:
+    // speculative.cpp fills slot 0 with the committed token and every later slot with
+    // llama_vocab_mask(). The vocabulary records that id as tokenizer.ggml.mask_token_id.
+    static float ds_mask_emb[N_EMBD];
+    static int   ds_mask_done = 0;
+    const char * mtenv = getenv("MEGA_DSMASK");
+    const int32_t mask_tok = mtenv ? (int32_t) atoi(mtenv) : 75982;
+    if (!ds_mask_done) {
+        if (mask_tok < 0 || mask_tok >= VOCAB) { fprintf(stderr, "dspark: bad mask token %d\n", mask_tok); return; }
+        select_row(0);
+        dequant_row(ds_mask_emb, g_emb->data + (int64_t) mask_tok * (N_EMBD / 32) * 18, N_EMBD);
+        ds_mask_done = 1;
+    }
+    for (int i = 0; i < m; ++i) {
+        select_row(i);
+        if (i == 0)
+            dequant_row(g_x, g_emb->data + (int64_t) anchor * (N_EMBD / 32) * 18, N_EMBD);
+        else
+            memcpy(g_x, ds_mask_emb, (size_t) N_EMBD * 4);
+    }
+
+    if ((getenv("MEGA_DSSTAGE") ? atoi(getenv("MEGA_DSSTAGE")) : 4) <= 1) {
+        for (int i = 0; i < K; ++i) drafts[i] = anchor;
+        return;
+    }
+    for (int L = 0; L < DS_LAYER; ++L) {
+        g_ds_layer = L;
+        g_m = m; g_use_m4 = 1; g_m4_groups = (m + 3) / 4;      // 7 rows = 2 groups
+        for (int r = 0; r < m; ++r)
+            rmsnorm_par(b_xa + (int64_t) r * N_EMBD, b_x + (int64_t) r * N_EMBD,
+                        g_ds_attn_norm[L], N_EMBD);
+        stage_a(b_xa, N_EMBD);
+        g_mjn = 3;
+        g_mj[0] = { g_ds_wq[L].b, g_ds_wq[L].k, g_ds_wq[L].n, b_q, N_EMBD };
+        g_mj[1] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, b_k, N_KV * HEAD_DIM };
+        g_mj[2] = { g_ds_wv[L].b, g_ds_wv[L].k, g_ds_wv[L].n, b_v, N_KV * HEAD_DIM };
+        run(task_mgemm);
+
+        for (int r = 0; r < m; ++r) {
+            for (int h = 0; h < N_HEAD; ++h) {
+                float * q = b_q + (int64_t) r * N_EMBD + h * HEAD_DIM;
+                rmsnorm_vec(q, q, g_ds_qnorm[L], HEAD_DIM);
+            }
+            for (int h = 0; h < N_KV; ++h) {
+                float * k = b_k + (int64_t) r * (N_KV * HEAD_DIM) + h * HEAD_DIM;
+                rmsnorm_vec(k, k, g_ds_knorm[L], HEAD_DIM);
+            }
+            const int pos = (int) (pos0 + r);
+            for (int h = 0; h < N_HEAD; ++h) {
+                float * q = b_q + (int64_t) r * N_EMBD + h * HEAD_DIM;
+                for (int i = 0; i < HEAD_DIM / 2; ++i) {
+                    const float th = (float) pos * g_rope_inv[i];
+                    const float c = cosf(th), s = sinf(th);
+                    const float x0 = q[2 * i], x1 = q[2 * i + 1];
+                    q[2 * i]     = x0 * c - x1 * s;
+                    q[2 * i + 1] = x0 * s + x1 * c;
+                }
+            }
+            for (int h = 0; h < N_KV; ++h) {
+                float * k = b_k + (int64_t) r * (N_KV * HEAD_DIM) + h * HEAD_DIM;
+                for (int i = 0; i < HEAD_DIM / 2; ++i) {
+                    const float th = (float) pos * g_rope_inv[i];
+                    const float c = cosf(th), s = sinf(th);
+                    const float x0 = k[2 * i], x1 = k[2 * i + 1];
+                    k[2 * i]     = x0 * c - x1 * s;
+                    k[2 * i + 1] = x0 * s + x1 * c;
+                }
+            }
+            _Float16 * kc = g_dskc + (int64_t) L * KV_LAYER_STRIDE + (pos0 + r) * (N_KV * HEAD_DIM);
+            _Float16 * vc = g_dsvc + (int64_t) L * KV_LAYER_STRIDE + (pos0 + r) * (N_KV * HEAD_DIM);
+            for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+                kc[i] = (_Float16) b_k[(int64_t) r * (N_KV * HEAD_DIM) + i];
+                vc[i] = (_Float16) b_v[(int64_t) r * (N_KV * HEAD_DIM) + i];
+            }
+        }
+        // block_uniform mask: every slot uses the anchor's causal row, so the visible
+        // keys are the prefix plus the anchor itself. The seven slots do NOT see each
+        // other -- that is what makes the block independently denoisable.
+        g_ds_np = pos0 + 1;
+        run(task_ds_attn);
+
+        stage_a(b_attn_out, N_EMBD);
+        g_mjn = 1;
+        g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, b_xa, N_EMBD };
+        run(task_mgemm);
+        for (int r = 0; r < m; ++r) {
+            float * x = b_x + (int64_t) r * N_EMBD;
+            const float * xa = b_xa + (int64_t) r * N_EMBD;
+            for (int i = 0; i < N_EMBD; ++i) x[i] += xa[i];
+        }
+
+        for (int r = 0; r < m; ++r)
+            rmsnorm_par(b_xa + (int64_t) r * N_EMBD, b_x + (int64_t) r * N_EMBD,
+                        g_ds_ffn_norm[L], N_EMBD);
+        stage_a(b_xa, N_EMBD);
+        g_mjn = 2;
+        g_mj[0] = { g_ds_wg[L].b, g_ds_wg[L].k, g_ds_wg[L].n, b_gate, N_FF };
+        g_mj[1] = { g_ds_wu[L].b, g_ds_wu[L].k, g_ds_wu[L].n, b_up, N_FF };
+        run(task_mgemm);
+        for (int r = 0; r < m; ++r) {
+            select_row(r);
+            parallel_for(N_FF, silu_fn);
+        }
+        stage_a(b_gate, N_FF);
+        g_mjn = 1;
+        g_mj[0] = { g_ds_wd[L].b, g_ds_wd[L].k, g_ds_wd[L].n, b_xa, N_EMBD };
+        run(task_mgemm);
+        for (int r = 0; r < m; ++r) {
+            float * x = b_x + (int64_t) r * N_EMBD;
+            const float * xa = b_xa + (int64_t) r * N_EMBD;
+            for (int i = 0; i < N_EMBD; ++i) x[i] += xa[i];
+        }
+    }
+
+    // final norm, then the TARGET's lm_head. Only K positions are needed but the m4
+    // path wants four rows, so row 3 runs and is ignored when K < 4.
+    const int ds_stage = getenv("MEGA_DSSTAGE") ? atoi(getenv("MEGA_DSSTAGE")) : 4;
+    if (ds_stage <= 2) { for (int i = 0; i < K; ++i) drafts[i] = anchor; return; }
+    const int rows = K <= 4 ? 4 : K;
+    for (int r = 0; r < K; ++r)
+        rmsnorm_par(b_xa + (int64_t) r * N_EMBD, b_x + (int64_t) r * N_EMBD,
+                    g_ds_out_norm, N_EMBD);
+    for (int r = K; r < rows; ++r) memset(b_xa + (int64_t) r * N_EMBD, 0, (size_t) N_EMBD * 4);
+    g_m = rows;
+    g_use_m4 = (rows >= 4);
+    g_m4_groups = g_use_m4 ? (rows + 3) / 4 : 1;
+    stage_a(b_xa, N_EMBD);
+    g_mjn = 1;
+    g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, b_logits, VOCAB };
+    run(task_mgemm);
+
+    if (ds_stage <= 3) {
+        for (int i = 0; i < K; ++i) drafts[i] = anchor;   // lm_head only, no markov
+        return;
+    }
+    // Markov chain: rank-256 bigram bias, argmaxed greedily so each position conditions
+    // on the previous choice. Started from the anchor, as sample_from_anchor implies.
+    int32_t prev = anchor;
+    static float markov[DS_MARKOV_RANK];
+    static uint8_t w1row[8 * 18];
+    for (int i = 0; i < K; ++i) {
+        memcpy(w1row, g_ds_w1_raw + (int64_t) prev * 8 * 18, 8 * 18);
+        for (int b = 0; b < 8; ++b) {
+            _Float16 sc; memcpy(&sc, w1row + b * 18, 2);
+            const uint8_t * qs = w1row + b * 18 + 2;
+            for (int j = 0; j < 16; ++j) {
+                markov[b * 32 + j]      = (float) ((int) (qs[j] & 0x0F) - 8) * (float) sc;
+                markov[b * 32 + j + 16] = (float) ((int) (qs[j] >> 4) - 8) * (float) sc;
+            }
+        }
+        g_m = 1; g_use_m4 = 0; g_m4_groups = 1;
+        if (!getenv("MEGA_DSNOSTAGE")) stage_a(markov, DS_MARKOV_RANK);
+        g_mjn = 1;
+        g_mj[0] = { g_ds_w2.b, g_ds_w2.k, g_ds_w2.n, b_dsbias, VOCAB };
+        if (!getenv("MEGA_DSNOW2")) run(task_mgemm);
+        if (b_dsbias && g_ds_w2.n != VOCAB)
+            printf("  [markov] w2 n=%lld vs VOCAB=%d\n", (long long) g_ds_w2.n, VOCAB);
+        for (int gi = 0; gi < 64; ++gi)
+            if (b_dsbias && b_dsbias[VOCAB + gi] != 1.5e30f) {
+                printf("  [markov] CANARY clobbered at +%d = %g\n", gi, b_dsbias[VOCAB + gi]);
+                b_dsbias[VOCAB + gi] = 1.5e30f;
+            }
+
+        const float * lg = b_logits + (int64_t) i * VOCAB;
+        if (getenv("MEGA_DSDBG2") && i < 3) {
+            double amax = 0, bmax = 0, bamin = 1e30;
+            for (int v = 0; v < VOCAB; ++v) {
+                const double a = fabs((double) lg[v]);
+                if (a > amax) amax = a;
+                const double b = fabs((double) b_dsbias[v]);
+                if (b > bmax) bmax = b;
+                if (b < bamin) bamin = b;
+            }
+            int bt = 0; float tv = lg[0];
+            for (int v = 1; v < VOCAB; ++v) if (lg[v] > tv) { tv = lg[v]; bt = v; }
+            printf("  [dbg] i=%d base|max|=%.4g base_top=%d(%.4g) bias|max|=%.4g |min|=%.4g\n",
+                   i, amax, bt, tv, bmax, bamin);
+        }
+        int best = 0;
+        float bv = lg[0] + b_dsbias[0];
+        for (int v = 1; v < VOCAB; ++v) {
+            const float x = lg[v] + b_dsbias[v];
+            if (x > bv) { bv = x; best = v; }
+        }
+        if (i == 0) {
+            if (!g_ds_lg1) g_ds_lg1 = (float *) malloc((size_t) VOCAB * 4);
+            for (int v = 0; v < VOCAB; ++v) lg[v];
+            if (g_ds_lg1) memcpy(g_ds_lg1, lg, (size_t) VOCAB * 4);
+        }
+        drafts[i] = best;
+        prev = best;
+    }
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char * path = work_path("mc-q4o.gguf");
@@ -786,6 +1296,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) g_nspec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-D")) g_ds_on = 1;
+        else if (!strcmp(argv[i], "-Dpre")) { g_ds_on = 1; g_ds_post = 0; }
     }
     // The packed-block size drives every weight offset, so it has to follow the
     // mode before the blob is sized or repacked.
@@ -879,7 +1391,7 @@ int main(int argc, char ** argv) {
     b_attn_out = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
     b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
     b_aq       = (uint8_t *) aligned_alloc(64, (size_t) MROW_MAX * AQ_ROW_STRIDE + 64);
-    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) 2 * (N_FF / 32) * AQ4_BLK + 4096);
+    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) 2 * AQ4_ROW_STRIDE + 4096);
     if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
         !b_attn_out || !b_logits || !b_aq || !b_aq4) { fprintf(stderr, "oom rows\n"); return 1; }
     select_row(0);
@@ -892,6 +1404,7 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < HEAD_DIM / 2; ++i)
         g_rope_inv[i] = 1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM);
 
+    if (g_ds_on) ds_load();
     bind_cpu(g_cpu_base);
     if (getenv("MEGA_CPU_BASE")) g_cpu_base = atoi(getenv("MEGA_CPU_BASE"));
     if (getenv("MEGA_NG")) {
@@ -1001,10 +1514,25 @@ int main(int argc, char ** argv) {
 
         int32_t rowtok[MROW_MAX];
         rowtok[0] = tok;
-        for (int r = 0; r < K; ++r)
-            // replay[i] is the i-th token plain greedy emitted, and `produced` of
-            // them are already committed, so the draft for row r+1 is replay[produced+r].
-            rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
+        if (g_ds_on && K > 0) {
+            TICK();
+            ds_draft(tok, produced, K, g_drafts);
+            TOCK(S_GEMM);
+            // With a replay file the round must follow the known-good continuation, so the
+            // drafter is scored against the real target instead of steering the run.
+            for (int r = 0; r < K; ++r)
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : g_drafts[r];
+            // The drafter drives the row geometry for its own block and its markov head is
+            // single row, so the target's geometry is restored before anything stages A.
+            g_m = m;
+            g_use_m4 = (m >= 4 && !g_bit3);
+            g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
+        } else {
+            for (int r = 0; r < K; ++r)
+                // replay[i] is the i-th token plain greedy emitted, and `produced` of
+                // them are already committed, so the draft for row r+1 is replay[produced+r].
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
+        }
 
         TICK();
         for (int r = 0; r < m; ++r) {
@@ -1107,6 +1635,21 @@ int main(int argc, char ** argv) {
                 const float * xa = b_xa + (int64_t) r * N_EMBD;
                 for (int i = 0; i < N_EMBD; ++i) x[i] += xa[i];
             }
+            // The drafter's encoder consumes the residual stream at these layers. The
+            // reference does not say whether extract_layers means the input to layer L
+            // or its output, so both are available and the accuracy metric decides.
+            if (g_ds_on && !g_ds_post)
+                for (int k = 0; k < DS_LAYER; ++k)
+                    if (DS_TARGET_LAYER[k] == L + 1)
+                        for (int r = 0; r < m; ++r)
+                            memcpy(b_hid + ((int64_t) k * MROW_MAX + r) * N_EMBD,
+                                   b_x + (int64_t) r * N_EMBD, (size_t) N_EMBD * 4);
+            if (g_ds_on && g_ds_post)
+                for (int k = 0; k < DS_LAYER; ++k)
+                    if (DS_TARGET_LAYER[k] == L)
+                        for (int r = 0; r < m; ++r)
+                            memcpy(b_hid + ((int64_t) k * MROW_MAX + r) * N_EMBD,
+                                   b_x + (int64_t) r * N_EMBD, (size_t) N_EMBD * 4);
             TOCK(S_MISC);
         }
 
@@ -1139,6 +1682,22 @@ int main(int argc, char ** argv) {
         // row r+1 consumed. The last kept row contributes its own prediction, so
         // acceptance is at least 1 and anything accepted is byte-identical to what
         // plain greedy would have emitted.
+        if (g_ds_on && K > 0) {
+            ++g_ds_rounds;
+            if (g_drafts[0] == pred[0]) ++g_ds_hit0;
+            if (g_ds_lg1) {
+                const float ref = g_ds_lg1[pred[0]];
+                int rank = 0;
+                for (int v = 0; v < VOCAB; ++v) if (g_ds_lg1[v] > ref) ++rank;
+                g_ds_ranksum += rank;
+                if (getenv("MEGA_DSDBG") && rounds < 12)
+                    printf("  [ds] target0=%d rank_in_draft=%d (top1=%d)\n", pred[0], rank, g_drafts[0]);
+            }
+            if (getenv("MEGA_DSDBG") && rounds < 8) {
+                printf("  [ds] draft0=%d target0=%d  %s\n", g_drafts[0], pred[0],
+                       g_drafts[0] == pred[0] ? "HIT" : "miss");
+            }
+        }
         int acc = 1;
         while (acc <= K && pred[acc - 1] == rowtok[acc]) ++acc;
         accepted_drafts += acc - 1;
@@ -1152,6 +1711,10 @@ int main(int argc, char ** argv) {
         // rows 0..acc-1 are now committed; row acc-1's prediction is the next token
         for (int i = 0; i < acc && produced + i < ngen + 8; ++i)
             emitted[produced + i] = (i + 1 < acc) ? rowtok[i + 1] : pred[acc - 1];
+        // The committed positions enter the drafter through fused target features, so
+        // they are injected after acceptance, using the rows that were just verified.
+        if (g_ds_on)
+            for (int i = 0; i < acc; ++i) ds_encode_inject(produced + i, i);
         produced += acc;
         tok = pred[acc - 1];
         ++rounds;
@@ -1165,6 +1728,10 @@ int main(int argc, char ** argv) {
             printf("tokens -> %s\n", tp);
         }
     }
+    if (g_ds_on && g_ds_rounds > 0)
+        printf("dspark: first-draft accuracy %lld/%lld = %.1f%%, mean rank of target token %.0f\n",
+               g_ds_hit0, g_ds_rounds, 100.0 * (double) g_ds_hit0 / (double) g_ds_rounds,
+               (double) g_ds_ranksum / (double) g_ds_rounds);
     if (g_nspec > 0 && rounds > 0)
         printf("spec: %d rounds, %.2f drafts accepted per round (max %d)\n",
                rounds, (double) accepted_drafts / rounds, g_nspec);
