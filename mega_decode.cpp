@@ -366,6 +366,15 @@ static int32_t g_drafts[MROW_MAX];
 static float * b_x, * b_xa, * b_gate, * b_up, * b_q, * b_k, * b_v, * b_attn_out, * b_logits;
 static uint8_t * b_aq;
 
+// The IME2 dispatcher routes count_m >= 4 to a native four-row kernel, which packs
+// four rows per 32-k block as [f32 scale x4][i16 sum x4][i8 x4 x32] and processes
+// them in one sweep. probe_m4 measured it at 1.90x the rate of four separate
+// single-row calls, bit-identical output. So m == 4 gets its own path; other row
+// counts keep the per-row loop.
+static uint8_t * b_aq4;
+static int g_use_m4 = 0;
+#define AQ4_BLK 152                                   // 4*4 + 4*2 + 4*32
+
 // b_* hold row 0; the existing globals point at the row being processed.
 static void select_row(int r) {
     g_x        = b_x        + (int64_t) r * N_EMBD;
@@ -446,6 +455,12 @@ static void task_mgemm(int tid) {
             int64_t b2 = a + g_kstep; if (b2 > n1[j]) b2 = n1[j];
             const int64_t kb = g_mj[j].k / (g_bit3 ? Q3_K : 32);
             const uint8_t * bp = g_mj[j].b + a * kb * g_blk_bytes;
+            if (g_use_m4) {
+                spacemit_kernels::ime2::gemm_kernel_i8i4(
+                    32, b_aq4, bp, nullptr, g_mj[j].c + a * 32,
+                    4, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) g_mj[j].ldc);
+                continue;
+            }
             // rows innermost: bp is now hot in L1, so rows 1..m-1 cost only their
             // MACs instead of another DRAM pass over the same 36 KB of weights.
             for (int r = 0; r < g_m; ++r) {
@@ -467,6 +482,95 @@ static void task_mgemm(int tid) {
 // split quantize_a into N_GPU contiguous 32-block ranges
 static const float * qa_src;
 static int64_t qa_k;
+static void quant_a(const float * a, int64_t k);   // defined below; stage_a needs it
+
+// Quantise four rows into one m4 tile. Same convention as quantize_a_row_i8:
+// scale = amax/127 and sum = -sum(q), so the result is bit-identical to packing
+// the rows separately and lets the two paths be compared directly.
+static const float * * pack_src;
+static int64_t pack_k;
+static uint8_t * pack_dst;
+
+// One 32-k block, four rows, into the m4 tile. Mechanically the same work as
+// quantize_a_row_i8 done four times; only the store offsets differ, so the RVV
+// version costs the same as one row and the interleaving is free. Written for
+// vlenb=128 (e32m1 gives vl=32, exactly one block); the caller falls back to the
+// scalar loop on other vector lengths.
+static inline void pack_m4_blk_rvv(const float * const * src, uint8_t * d) {
+    const size_t vl = __riscv_vsetvl_e32m1(32);
+    float sc[4];
+    int16_t sum[4];
+    for (int r = 0; r < 4; ++r) {
+        const vfloat32m1_t v = __riscv_vle32_v_f32m1(src[r], vl);
+        const vfloat32m1_t va = __riscv_vfabs_v_f32m1(v, vl);
+        const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+        const float amax = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m1_f32m1(va, zero, vl));
+        const float s_ = amax / 127.0f;
+        const float rs = s_ ? 1.0f / s_ : 0.0f;
+        sc[r] = s_;
+        const vfloat32m1_t vs = __riscv_vfmul_vf_f32m1(v, rs, vl);
+        const vint16mf2_t q16 = __riscv_vfncvt_x_f_w_i16mf2(vs, vl);
+        const vint8mf4_t q8 = __riscv_vncvt_x_x_w_i8mf4(q16, vl);
+        const vint16m1_t t0 = __riscv_vmv_v_x_i16m1(0, vl);
+        sum[r] = (int16_t) -__riscv_vmv_x_s_i16m1_i16(__riscv_vwredsum_vs_i8mf4_i16m1(q8, t0, vl));
+        __riscv_vse8_v_i8mf4((int8_t *) (d + 24 + 32 * r), q8, vl);
+    }
+    memcpy(d, sc, 16);
+    memcpy(d + 16, sum, 8);
+}
+
+static void task_pack_m4(int tid) {
+    const int64_t nb = pack_k / 32;
+    const int64_t per = (nb + g_participants - 1) / g_participants;
+    const int64_t b0 = per * tid;
+    int64_t b1 = (tid == g_participants - 1) ? nb : per * (tid + 1);
+    if (b1 > nb) b1 = nb;
+    if (__riscv_vlenb() == 128) {
+        for (int64_t b = b0; b < b1; ++b) {
+            const float * rows[4] = { pack_src[0] + b * 32, pack_src[1] + b * 32,
+                                      pack_src[2] + b * 32, pack_src[3] + b * 32 };
+            pack_m4_blk_rvv(rows, pack_dst + b * AQ4_BLK);
+        }
+        return;
+    }
+    for (int64_t b = b0; b < b1; ++b) {
+        uint8_t * d = pack_dst + b * AQ4_BLK;
+        float sc[4];
+        int16_t sum[4];
+        int8_t q[4][32];
+        for (int r = 0; r < 4; ++r) {
+            const float * src = pack_src[r] + b * 32;
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) { const float v = fabsf(src[i]); if (v > amax) amax = v; }
+            const float s_ = amax / 127.0f;
+            const float rs = s_ ? 1.0f / s_ : 0.0f;
+            sc[r] = s_;
+            int32_t t = 0;
+            for (int i = 0; i < 32; ++i) { q[r][i] = (int8_t) lrintf(src[i] * rs); t += q[r][i]; }
+            sum[r] = (int16_t) -t;
+        }
+        memcpy(d, sc, 16);
+        memcpy(d + 16, sum, 8);
+        for (int r = 0; r < 4; ++r) memcpy(d + 24 + 32 * r, q[r], 32);
+    }
+}
+
+// Stage a layer's activations for the GEMM that follows. Kept as one call so the
+// m4 tile and the per-row tiles are never mixed up by a stray call site.
+static void stage_a(const float * base, int64_t k) {
+    if (g_use_m4) {
+        static const float * rows[4];
+        rows[0] = base; rows[1] = base + k; rows[2] = base + 2 * k; rows[3] = base + 3 * k;
+        pack_src = rows; pack_k = k; pack_dst = b_aq4;
+        run(task_pack_m4);
+        return;
+    }
+    for (int r = 0; r < g_m; ++r) {
+        g_aq = b_aq + (int64_t) r * AQ_ROW_STRIDE;
+        quant_a(base + (int64_t) r * k, k);
+    }
+}
+
 static void task_quant(int tid) {
     const int64_t nb = qa_k / (g_bit3 ? Q3_K : 32);
     const int64_t per = (nb + g_participants - 1) / g_participants;
@@ -754,8 +858,9 @@ int main(int argc, char ** argv) {
     b_attn_out = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
     b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
     b_aq       = (uint8_t *) aligned_alloc(64, (size_t) MROW_MAX * AQ_ROW_STRIDE + 64);
+    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) (N_FF / 32) * AQ4_BLK + 64);
     if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
-        !b_attn_out || !b_logits || !b_aq) { fprintf(stderr, "oom rows\n"); return 1; }
+        !b_attn_out || !b_logits || !b_aq || !b_aq4) { fprintf(stderr, "oom rows\n"); return 1; }
     select_row(0);
     const size_t kvsz = (size_t) N_LAYER * KV_LAYER_STRIDE;
     g_kcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
@@ -869,6 +974,7 @@ int main(int argc, char ** argv) {
         const int K = g_nspec;
         const int m = K + 1;
         g_m = m;
+        g_use_m4 = (m == 4 && !g_bit3);
         g_pos0 = produced;   // row r sits at position produced + r
 
         int32_t rowtok[MROW_MAX];
@@ -897,10 +1003,7 @@ int main(int argc, char ** argv) {
             TOCK(S_NORM);
 
             TICK();
-            for (int r = 0; r < m; ++r) {
-                select_row(r);
-                quant_a(g_xa, N_EMBD);
-            }
+            stage_a(b_xa, N_EMBD);
             TOCK(S_QUANT);
 
             TICK();
@@ -931,10 +1034,7 @@ int main(int argc, char ** argv) {
             TOCK(S_ATTN);
 
             TICK();
-            for (int r = 0; r < m; ++r) {
-                select_row(r);
-                quant_a(g_attn_out, N_EMBD);
-            }
+            stage_a(b_attn_out, N_EMBD);
             TOCK(S_QUANT);
             TICK();
             g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, b_xa, N_EMBD };
@@ -956,10 +1056,7 @@ int main(int argc, char ** argv) {
             TOCK(S_NORM);
 
             TICK();
-            for (int r = 0; r < m; ++r) {
-                select_row(r);
-                quant_a(g_xa, N_EMBD);
-            }
+            stage_a(b_xa, N_EMBD);
             TOCK(S_QUANT);
             TICK();
             g_mjn = 2;
@@ -976,10 +1073,7 @@ int main(int argc, char ** argv) {
             TOCK(S_SILU);
 
             TICK();
-            for (int r = 0; r < m; ++r) {
-                select_row(r);
-                quant_a(g_gate, N_FF);
-            }
+            stage_a(b_gate, N_FF);
             TOCK(S_QUANT);
             TICK();
             g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, b_xa, N_EMBD };
@@ -998,8 +1092,8 @@ int main(int argc, char ** argv) {
         for (int r = 0; r < m; ++r) {
             select_row(r);
             rmsnorm_par(g_xa, g_x, g_out_norm, N_EMBD);
-            quant_a(g_xa, N_EMBD);
         }
+        stage_a(b_xa, N_EMBD);
         TOCK(S_NORM);
         TICK();
         g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, b_logits, VOCAB };

@@ -145,3 +145,45 @@ Non-GEMM overhead also grows with rows and is worth trimming later: at m=4 rmsno
 Is it worth noting that at m=1 the whole encode/quantise path (0.58 ms) costs more
 than attention (0.59)? Attention at 32 positions is trivially small; at 10K it will
 not be, which is why the vectorised attention and int8 KV remain on the list.
+
+## Native m=4: the round stops being MAC-bound
+
+The section above concluded verification was MAC-bound at ~95 GMAC/s aggregate and
+pointed at the RVV kernel. That was the wrong place to look first -- the IME2
+dispatcher already routes count_m >= 4 to a native four-row kernel, and four rows
+through it cost far less than four single-row calls.
+
+`probe_m4.cpp`, same 134 MB plane, both paths against the same weights:
+
+    4x count_m=1 :  5.755 ms    93.3 GMAC/s
+    native m=4   :  3.036 ms   176.9 GMAC/s     1.90x
+    agreement    :  maxabs 0.000e+00            bit-identical
+
+Not a near-miss: both packings quantise identically (scale = amax/127, sum = -sum(q))
+and the results match exactly, so the m4 path cannot drift.
+
+In the real decode the round at K=3 drafts goes from 155.1 ms to 72.5 ms, and the
+GEMM portion from 135.7 ms to 54.1 ms -- essentially the m=1 stream floor of 50.5 ms.
+Extra rows are nearly free again.
+
+| round | GEMM ms | tok/s |
+|---|---|---|
+| m=1 (plain) | 50.5 | 17.90 |
+| m=4 via 4x m1 | 135.7 | 25.78 |
+| m=4 native | 54.1 | 55.17 |
+
+Output still diffs identical to plain greedy, acceptance 3/3 every round.
+
+One detail worth keeping: the fused four-row activation packer was 6.87 ms as plain
+C++ (2.8x the RVV single-row quantiser) because it interleaves rows. Written with
+RVV it is 1.25 ms -- the work per row is unchanged from quantize_a_row_i8, only the
+store offsets differ, so interleaving costs nothing. It requires vlenb=128 (e32m1
+gives vl=32, one block) and falls back to the scalar loop otherwise.
+
+Where the round now goes, at 72.5 ms for up to four tokens: GEMM 54.1, then rmsnorm
+4.3 + rope 3.3 + logits 3.4 + misc 2.8 + attn 2.0 + quantA 1.3 + silu 1.1. The tail
+is ~19 ms and is the next thing to attack, since GEMM is now pinned to the stream.
+
+Against the goal: 55.2 tok/s at perfect acceptance, and at a pessimistic two of three
+drafts accepted it is still 3/0.0725 = 41 tok/s. The draft model now has a lot of
+room; it does not need to be fast to clear 20.
