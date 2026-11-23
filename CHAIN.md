@@ -104,3 +104,31 @@ is not yet "exactly llama.cpp", and the objective asks for exact.
    top of adopting the int8 GEMM path.
 4. Decode at 10K also needs a vectorised attention; 12.05 ms at 512 rows scales
    roughly linearly and would swamp the dspark gain.
+
+## The bug that made every prompt turn to noise: shared chunk counters
+
+The prefill GEMM hands 4-row groups to threads through one atomic counter per
+column block, so the faster core can simply take more. The counters were indexed
+by column block alone and reset once per stage. QKV is three jobs in one stage,
+so job 0 (`q_proj`, 32 column blocks) drained counters 0..31 to `mgroups`, and
+jobs 1 and 2 (`k_proj`, `v_proj`, only four blocks each) found their counters
+already past the end and returned without writing a single element.
+
+The symptom is not a wrong token, it is *no* token: K and V were exactly zero for
+every position of the prompt, so the KV cache the decode round read was zero, and
+the first generated id came from an empty context. `probe: K(0,0,0)` printed
+`0.00000` after a full prefill; exporting the cache showed 0 for all 1024 f16
+halves of layer 0.
+
+The fix is to give every (job, column block) its own counter, `NCHUNK = 512`, and
+reset the whole array per stage. With it, layer 0 K at position 0 differs from
+the decode path's own K for the same token by ~1e-3 in f16 units, i.e. int8
+activation noise rather than a layout error.
+
+The chain still does not reproduce the reference ids: for `The capital of France
+is` (ids `608 4894 304 6918 357`) `llama-simple` emits `8181 33` (` Paris`,`),
+while the chain emits `2781 2781 720`. The f16 attention path (`MEGA_NOI8=1`)
+gives the same ids, so int8 attention is not the cause; the deviation grows in
+the layer-0 output projection (decode `o-out` 0.00135, prefill 0.0212 added to the
+residual). That is larger than per-row int8 activation quantisation can account
+for and is the next thing to chase.
