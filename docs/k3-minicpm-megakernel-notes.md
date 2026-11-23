@@ -1173,3 +1173,44 @@ FA 省下的只有 score 缓冲：`-D` 探针量到 QK 的 store 值 20 core-s�
 10K 全层合计约 137 GB 的写 + 137 GB 的读，按 19 GB/s 折算是 14 s 的纯搬运，
 刚好是 attention 墙钟（21.7 s）与 A100 计算下界（18.6 s）之间的差。
 块环形缓冲（8 块 × 64 位 × 64 行 × 2 B = 64 KB）能把它压进 L2，预计省 3–4 s。
+
+## 12. 一个会把所有测量搞坏的陷阱：ssh 超时杀不掉板上的进程
+
+这轮排查"程序卡死"花了很久，根因不在代码：
+
+- `ssh board "timeout 240 ./md ..."` 超时后，`timeout` 杀的是**本地 ssh 那条管线**，
+  板上的 `md` 进程仍然活着。它的 7 个 worker 正卡在 barrier 上，用 `sched_yield`
+  空转 —— 实测 `ps` 显示 **731% CPU**（7 个核全满），一直持续到手动 kill。
+- 后果：之后每一次测量都跑在只剩 9 核、且 load average 10+ 的板子上，
+  表现为"程序莫名其妙卡死"或"速度莫名变慢"。
+- 正确做法：跑长任务用 `nohup ... &` 落日志，测前先
+  `pkill -9 -x md; pkill -9 -x mega3; cat /proc/loadavg` 确认 idle。
+  另外 `pkill -f './md'` 会连自己这条 ssh 会话一起杀（命令行里含 `./md`），
+  要用 `pkill -x`。
+
+清干净之后的 10K 全链基线（`./mega3 -F p10k.txt -G 10240 -n 16`）：
+
+| | 干净基线 | 之前（板上有空转进程） |
+|---|---|---|
+| prefill | **172.6 tok/s**（57.94 s） | 174.8 |
+| decode | **8.81 tok/s**（16 token） | 10.1（8 token，含首 token 摊销不同） |
+
+prefill 分解：gemm 25.72（qkv 3.05 / o 3.31 / gate+up 10.72 / down 8.64）、
+attn 21.9（qk 98.7 core-s、pv 52.6 core-s）、conv 2.36、misc 3.06、
+quant 1.67、silu 1.09、norm 0.94、packq 0.34。
+
+GEMM 折算 19830 GMAC / 25.72 s = **771 GMAC/s 聚合（96 GMAC/s/核）**，
+对 vmadot 单核上限 101.4 而言已经是 95%：**GEMM 没有单簇余量**，
+要再快只能把行分给空闲的 X100（实测 272 GMAC/s / 8 核）。
+
+### 12.1 mega_decode 的现状
+
+- 修掉了一个真 bug：`mega_decode` 的 prompt/replay 读取也用了 glibc 的
+  `fscanf`（返回 1 却不写回），10K prompt 会填满栈垃圾直接 SIGSEGV。
+  现在和 `mega3` 一样用手写扫描器 `scan_ints`。
+- 加了"整轮共读一次 KV"的 attention（`task_attn_m`）：m 行共用一次 K/V 流，
+  每位置的 `vfwcvt` 也只做一次。逐行版仍可用 `MEGA_ONEROW` 切回。
+- **但有阻塞**：在当前板上，`mega_decode` 启动后卡在 worker 线程创建之后，
+  永远到不了第一轮。旧二进制（改动前，git stash 实测）同样卡，所以与本次改动无关；
+  干净的板上也复现，且无 gdb/strace 可用。因此 decode 侧的优化全部收回 `mega3`
+  —— 那是唯一有完整可复现链路（prefill 172.6 + decode 8.81）的引擎。

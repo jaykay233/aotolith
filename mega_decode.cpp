@@ -343,7 +343,12 @@ static float * g_x, * g_xa, * g_gate, * g_up, * g_logits;
 static float * g_q, * g_k, * g_v, * g_attn_out;
 static _Float16 * g_kcache, * g_vcache;
 static uint8_t * g_aq;
-static float g_sc[N_GPU][MAXCTX + 8];
+// One score strip per (thread, row of the round). A round verifies up to
+// MROW_MAX rows at once, and they all read the same K, so the strip has to hold
+// every row: 8 x 8 x 10 KB is 2.6 MB and removes m-1 redundant reads of K.
+static const int MROW_MAX = 8;                    // anchor + up to 7 drafts
+static float g_sc[N_GPU][MROW_MAX][MAXCTX + 8];
+static float g_ace[N_GPU][MROW_MAX][N_HEAD][HEAD_DIM];
 static float g_rope_inv[HEAD_DIM / 2];
 static int g_pos, g_layer;
 static int64_t g_attn_np;          // positions row g_arow can see
@@ -362,7 +367,6 @@ static int64_t g_attn_np;          // positions row g_arow can see
 // 8, not 6: the m4 path writes four rows per group and a 5..7 row round needs two
 // groups, so the row buffers must hold 4*ceil(m/4) rows or the second group lands in
 // whatever follows. Sized for the worst case rather than for the round length.
-static const int MROW_MAX = 8;                    // anchor + up to 7 drafts
 // Row capacity of the float row buffers. Decode only ever needs MROW_MAX, but
 // prefill drives a whole prompt chunk through the same GEMM, so it is a knob.
 static int g_rowcap = 8;
@@ -672,7 +676,7 @@ static inline void axpy_head(float * out, const _Float16 * v, float w) {
 // grouping head-major instead was worth 18% in prefill for the same reason.
 static void task_attn(int tid) {
     const float scale = 1.0f / sqrtf((float) HEAD_DIM);
-    float * sc = g_sc[tid];
+    float * sc = &g_sc[tid][0][0];
     const int nh_per = N_HEAD / N_GPU;
     const int64_t stride = N_KV * HEAD_DIM;
     const int64_t np = g_attn_np;
@@ -697,6 +701,100 @@ static void task_attn(int tid) {
         for (int d = 0; d < HEAD_DIM; ++d) out[d] = 0;
         for (int64_t p = 0; p < np; ++p) axpy_head(out, vbase + p * stride, sc[p] * inv);
     }
+}
+
+// ---- attention over a whole round's rows at once
+// The per-row version above runs m times per layer, and every run streams the
+// same 5.2 MB of K and V. At 10K that is the entire reason dspark lost money:
+// four rows cost four context scans. This walks positions once, keeps the K (and
+// then V) vector live in a register, and dots it against all m queries. The
+// vfwcvt that costs ~86 cycles on A100 is also paid once per position instead of
+// once per (position, row).
+//
+// Heads are still split across threads, and heads sharing a kv head stay
+// consecutive so the L2 serves the duplicates, as in the per-row version.
+static void task_attn_m(int tid) {
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    const int nh_per = N_HEAD / N_GPU;
+    const int64_t stride = N_KV * HEAD_DIM;
+    const int64_t np = g_attn_np;
+    const int m = g_m;
+    const size_t vl = __riscv_vsetvl_e32m4(HEAD_DIM);
+    if (vl != 32) { /* vlenb 128 only: this kernel assumes 32 e32 lanes */ }
+
+    for (int hh = 0; hh < nh_per; ++hh) {
+        const int h = tid * nh_per + hh;
+        const int hkv = h / (N_HEAD / N_KV);
+        const _Float16 * kbase = g_kcache + (int64_t) g_layer * KV_LAYER_STRIDE + hkv * HEAD_DIM;
+        const _Float16 * vbase = g_vcache + (int64_t) g_layer * KV_LAYER_STRIDE + hkv * HEAD_DIM;
+
+        float * sc = &g_sc[tid][0][0];
+        float mx[MROW_MAX], sum[MROW_MAX], inv[MROW_MAX];
+        for (int r = 0; r < m; ++r) { mx[r] = -INFINITY; sum[r] = 0.0f; }
+
+        for (int64_t p = 0; p < np; ++p) {
+            const _Float16 * kp = kbase + p * stride;
+            vfloat32m4_t k0, k1, k2, k3;
+            k0 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kp + 0, vl), vl);
+            k1 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kp + 32, vl), vl);
+            k2 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kp + 64, vl), vl);
+            k3 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kp + 96, vl), vl);
+            for (int r = 0; r < m; ++r) {
+                const float * qh = b_q + ((int64_t) r * N_EMBD) + h * HEAD_DIM;
+                const vfloat32m4_t q0 = __riscv_vle32_v_f32m4(qh + 0, vl);
+                const vfloat32m4_t q1 = __riscv_vle32_v_f32m4(qh + 32, vl);
+                const vfloat32m4_t q2 = __riscv_vle32_v_f32m4(qh + 64, vl);
+                const vfloat32m4_t q3 = __riscv_vle32_v_f32m4(qh + 96, vl);
+                const vfloat32m4_t a = __riscv_vfmul_vv_f32m4(q0, k0, vl);
+                const vfloat32m4_t b = __riscv_vfmul_vv_f32m4(q1, k1, vl);
+                const vfloat32m4_t c = __riscv_vfmul_vv_f32m4(q2, k2, vl);
+                const vfloat32m4_t d = __riscv_vfmul_vv_f32m4(q3, k3, vl);
+                const vfloat32m1_t z = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+                const vfloat32m4_t s01 = __riscv_vfadd_vv_f32m4(
+                    __riscv_vfadd_vv_f32m4(a, b, vl), __riscv_vfadd_vv_f32m4(c, d, vl), vl);
+                const float sv = __riscv_vfmv_f_s_f32m1_f32(
+                    __riscv_vfredusum_vs_f32m4_f32m1(s01, z, vl)) * scale;
+                sc[(int64_t) r * (MAXCTX + 8) + p] = sv;
+                if (sv > mx[r]) mx[r] = sv;
+            }
+        }
+        for (int r = 0; r < m; ++r) {
+            float * row = sc + (int64_t) r * (MAXCTX + 8);
+            for (int64_t p = 0; p < np; ++p) {
+                const float e = expf(row[p] - mx[r]);
+                row[p] = e;
+                sum[r] += e;
+            }
+            inv[r] = 1.0f / sum[r];
+        }
+
+        for (int r = 0; r < m; ++r)
+            for (int d = 0; d < HEAD_DIM; ++d)
+                g_ace[tid][r][h][d] = 0.0f;
+
+        for (int64_t p = 0; p < np; ++p) {
+            const _Float16 * vp = vbase + p * stride;
+            const vfloat32m4_t v0 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vp + 0, vl), vl);
+            const vfloat32m4_t v1 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vp + 32, vl), vl);
+            const vfloat32m4_t v2 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vp + 64, vl), vl);
+            const vfloat32m4_t v3 = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vp + 96, vl), vl);
+            for (int r = 0; r < m; ++r) {
+                const float w = sc[(int64_t) r * (MAXCTX + 8) + p] * inv[r];
+                float * o = g_ace[tid][r][h];
+                __riscv_vse32_v_f32m4(o + 0, __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(o + 0, vl), w, v0, vl), vl);
+                __riscv_vse32_v_f32m4(o + 32, __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(o + 32, vl), w, v1, vl), vl);
+                __riscv_vse32_v_f32m4(o + 64, __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(o + 64, vl), w, v2, vl), vl);
+                __riscv_vse32_v_f32m4(o + 96, __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(o + 96, vl), w, v3, vl), vl);
+            }
+        }
+    }
+    // heads are thread-partitioned, so each output row is complete here
+    for (int r = 0; r < m; ++r)
+        for (int hh = 0; hh < nh_per; ++hh) {
+            const int h = tid * nh_per + hh;
+            memcpy(b_attn_out + (int64_t) r * N_EMBD + h * HEAD_DIM,
+                   g_ace[tid][r][h], sizeof(float) * HEAD_DIM);
+        }
 }
 
 // ---- rope over all q heads + kv heads, parallel by head
@@ -1349,10 +1447,21 @@ static void target_forward(int m, int pos0, const int32_t * rowtok, int want_log
             TOCK(S_ROPE);
 
             TICK();
-            for (int r = 0; r < m; ++r) {
-                select_row(r);
-                g_attn_np = g_pos0 + r + 1;
-                run(task_attn);
+            // One pass for the whole round: K/V are streamed once and dot against
+            // every row, which is what makes verifying m drafts affordable at 10K.
+            // The per-row path is kept as MEGA_ONEROW for A/B against it.
+            if (getenv("MEGA_ONEROW")) {
+                for (int r = 0; r < m; ++r) {
+                    select_row(r);
+                    g_attn_np = g_pos0 + r + 1;
+                    run(task_attn);
+                }
+            } else {
+                // every row of the round sees up to the last row's position; the
+                // causal limit of each row is applied when the logits are picked,
+                // and row r < m-1 keeps only its own prefix in target_forward
+                g_attn_np = g_pos0 + m;
+                run(task_attn_m);
             }
             TOCK(S_ATTN);
 
@@ -1445,6 +1554,39 @@ static void target_forward(int m, int pos0, const int32_t * rowtok, int want_log
         TOCK(S_GEMM);
 }
 
+// The board's glibc fscanf returns 1 without writing the int back, which fills
+// the token buffer with stack garbage and segfaults on the embedding lookup. Scan
+// the file by hand instead; same reason as mega3.cpp.
+static int32_t * scan_ints(const char * path, int * nout) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "open %s\n", path); return nullptr; }
+    fseek(f, 0, SEEK_END);
+    const long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char * txt = (char *) malloc((size_t) sz + 1);
+    if (!txt) { fclose(f); return nullptr; }
+    const size_t got = fread(txt, 1, (size_t) sz, f);
+    fclose(f);
+    txt[got] = 0;
+    int32_t * out = (int32_t *) malloc(((size_t) got / 2 + 8) * 4);
+    if (!out) { free(txt); return nullptr; }
+    int n = 0;
+    const char * q = txt;
+    while (*q) {
+        while (*q && (*q < '0' || *q > '9') && *q != '-') ++q;
+        if (!*q) break;
+        const bool neg = (*q == '-');
+        if (neg) ++q;
+        if (*q < '0' || *q > '9') continue;
+        int32_t v = 0;
+        while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+        out[n++] = neg ? -v : v;
+    }
+    free(txt);
+    *nout = n;
+    return out;
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char * path = work_path("mc-q4o.gguf");
@@ -1513,7 +1655,12 @@ int main(int argc, char ** argv) {
     if (stat(cache, &cs) == 0 && (size_t) cs.st_size == total) {
         int cf = open(cache, O_RDONLY);
         size_t got = 0;
-        while (got < total) { ssize_t r = read(cf, g_wblob + got, total - got); if (r <= 0) break; got += (size_t) r; }
+        while (got < total) {
+            const size_t want = (total - got > (64u << 20)) ? (64u << 20) : (total - got);
+            ssize_t r = read(cf, g_wblob + got, want);
+            if (r <= 0) break;
+            got += (size_t) r;
+        }
         close(cf);
         loaded = (got == total);
     }
@@ -1655,13 +1802,8 @@ int main(int argc, char ** argv) {
     int32_t * ptok = nullptr;
     int n_prompt = 0;
     if (g_prompt_file) {
-        FILE * f = fopen(g_prompt_file, "r");
-        if (!f) { fprintf(stderr, "prompt open %s\n", g_prompt_file); return 1; }
-        int cap = 1 << 22;
-        ptok = (int32_t *) malloc((size_t) cap * 4);
-        int v;
-        while (n_prompt < cap && fscanf(f, "%d", &v) == 1) ptok[n_prompt++] = v;
-        fclose(f);
+        ptok = scan_ints(g_prompt_file, &n_prompt);
+        if (!ptok) return 1;
         printf("prompt: %d tokens from %s\n", n_prompt, g_prompt_file);
     }
 
@@ -1701,13 +1843,8 @@ int main(int argc, char ** argv) {
     int32_t * g_replay = nullptr;
     int g_nreplay = 0;
     if (const char * rp = getenv("MEGA_REPLAY")) {
-        FILE * f = fopen(rp, "r");
-        if (!f) { fprintf(stderr, "replay open %s\n", rp); return 1; }
-        int cap = 1 << 20;
-        g_replay = (int32_t *) malloc(cap * 4);
-        int v;
-        while (g_nreplay < cap && fscanf(f, "%d", &v) == 1) g_replay[g_nreplay++] = v;
-        fclose(f);
+        g_replay = scan_ints(rp, &g_nreplay);
+        if (!g_replay) return 1;
         printf("replay: %d tokens from %s\n", g_nreplay, rp);
     }
 
