@@ -61,3 +61,41 @@ dropping off the network. They now live on UFS (`/home/bianbu/workspace/mega`) a
 survive reboots. The weights are still *streamed from RAM* at runtime, because
 decode needs 24+ GB/s and UFS is an order of magnitude short; they are read from
 UFS once at startup into an aligned huge-page blob.
+
+## The number that decides decode: m-row verification cost
+
+Decode at m=1 is entirely the weight stream: 2.28 GMAC of arithmetic against 1.26 GB
+of weights, so compute is ~3 ms of a 50 ms token and 47 ms is waiting on DRAM. That
+is why no amount of kernel work moves m=1 decode, and why speculative decoding is
+the only lever left: if m rows reuse each B tile while it is hot, the stream is paid
+once for m tokens.
+
+`probe_mscale.cpp` measures it with the real FFN-gate shape (K=2048) and a weight
+plane large enough to defeat cache (134 MB; at the model's own 12.6 MB the matrix is
+L2-resident and benchmarks at 51 GB/s, hiding the whole effect):
+
+| m | ms | vs m=1 |
+|---|---|---|
+| 1 | 3.307 | 1.00 |
+| 2 | 3.156 | 0.95 |
+| 3 | 4.396 | 1.33 |
+| 4 | 5.781 | 1.75 |
+| 5 | 7.184 | 2.17 |
+| 8 | 11.444 | 3.46 |
+
+Scaled to the measured 50.15 ms decode GEMM, verifying m rows of the target costs
+about 50/66/88/109 ms for m = 1/3/4/5. Three drafts are verified for 1.33x the cost
+of generating one token, so the economics of drafting are strongly favourable.
+
+Note m=2 coming in *below* m=1. Two kernel calls over the same tile give twice the
+outstanding loads, which hides DRAM latency that a single call cannot. Recorded as
+observed, not explained.
+
+## What this means for the three routes
+
+- **m=1 kernel work**: capped. Compute is 3 ms of 50; even a perfect GEMM saves 6%.
+- **3-bit weights**: real, 20.52 tok/s, but changes the output, so it is not
+  admissible as the final answer.
+- **dspark speculative decode**: three drafts verified per round at 1.33x the cost
+  of one token. Even at a pessimistic 60% acceptance this lands near 27 tok/s, and
+  the target is 20. This is the route.

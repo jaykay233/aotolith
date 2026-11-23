@@ -449,37 +449,73 @@ static void quant_a(const float * a, int64_t k) {
     run(task_quant);
 }
 
-// ---- attention: each thread owns N_HEAD/N_GPU heads, KV walked in position order
+// ---- attention
+//
+// The scalar version this replaces cost 0.074 ms per position, because a 128-term
+// dot was 128 scalar float multiplies plus an f16->f32 widen each time. At 10K
+// positions that extrapolates to ~755 ms/token, so it had to go.
+//
+// On A100 (vlenb 128) one e32,m4 register group holds exactly HEAD_DIM = 128
+// lanes, so a whole head-wide dot is one vle16 + vfwcvt + vfmacc + vfredusum. The
+// same code works on X100 (vlenb 32) where it takes four iterations of 32 lanes,
+// because the loop asks for its vl instead of assuming one.
+static inline float dot_head(const float * q, const _Float16 * k) {
+    const size_t vl = __riscv_vsetvl_e32m4(HEAD_DIM);
+    vfloat32m4_t a = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+    for (int d = 0; d < HEAD_DIM; ) {
+        const size_t n = __riscv_vsetvl_e32m4(HEAD_DIM - d);
+        const vfloat16m4_t kh = __riscv_vle16_v_f16m4(k + d, n);
+        const vfloat32m4_t kf = __riscv_vfwcvt_f_f_v_f32m4(kh, n);
+        const vfloat32m4_t qv = __riscv_vle32_v_f32m4(q + d, n);
+        a = __riscv_vfmacc_vv_f32m4(a, qv, kf, n);
+        d += (int) n;
+    }
+    const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(a, zero, vl));
+}
+
+// out += w * v, whole head at a time.
+static inline void axpy_head(float * out, const _Float16 * v, float w) {
+    for (int d = 0; d < HEAD_DIM; ) {
+        const size_t n = __riscv_vsetvl_e32m4(HEAD_DIM - d);
+        const vfloat16m4_t vh = __riscv_vle16_v_f16m4(v + d, n);
+        const vfloat32m4_t vf = __riscv_vfwcvt_f_f_v_f32m4(vh, n);
+        const vfloat32m4_t o = __riscv_vle32_v_f32m4(out + d, n);
+        __riscv_vse32_v_f32m4(out + d, __riscv_vfmacc_vf_f32m4(o, w, vf, n), n);
+        d += (int) n;
+    }
+}
+
+// Each thread takes N_HEAD/N_GPU heads. With N_HEAD 16 and N_KV 2 the heads
+// sharing a KV head are consecutive, so threads 0-3 all walk kv 0 and 4-7 walk
+// kv 1: four threads read the same lines, and L2 serves three of them. Making the
+// grouping head-major instead was worth 18% in prefill for the same reason.
 static void task_attn(int tid) {
     const float scale = 1.0f / sqrtf((float) HEAD_DIM);
     float * sc = g_sc[tid];
     const int nh_per = N_HEAD / N_GPU;
     const int64_t stride = N_KV * HEAD_DIM;
+    const int64_t np = g_pos + 1;
     for (int hh = 0; hh < nh_per; ++hh) {
         const int h = tid * nh_per + hh;
         const int hkv = h / (N_HEAD / N_KV);
         const float * qh = g_q + h * HEAD_DIM;
         const _Float16 * kbase = g_kcache + (int64_t) g_layer * KV_LAYER_STRIDE + hkv * HEAD_DIM;
         const _Float16 * vbase = g_vcache + (int64_t) g_layer * KV_LAYER_STRIDE + hkv * HEAD_DIM;
+
         float mx = -INFINITY;
-        for (int p = 0; p <= g_pos; ++p) {
-            const _Float16 * kp = kbase + (int64_t) p * stride;
-            float s = 0;
-            for (int d = 0; d < HEAD_DIM; ++d) s += qh[d] * (float) kp[d];
-            s *= scale;
+        for (int64_t p = 0; p < np; ++p) {
+            const float s = dot_head(qh, kbase + p * stride) * scale;
             sc[p] = s;
             if (s > mx) mx = s;
         }
         float sum = 0;
-        for (int p = 0; p <= g_pos; ++p) { const float e = expf(sc[p] - mx); sc[p] = e; sum += e; }
+        for (int64_t p = 0; p < np; ++p) { const float e = expf(sc[p] - mx); sc[p] = e; sum += e; }
         const float inv = 1.0f / sum;
+
         float * out = g_attn_out + h * HEAD_DIM;
         for (int d = 0; d < HEAD_DIM; ++d) out[d] = 0;
-        for (int p = 0; p <= g_pos; ++p) {
-            const float w = sc[p] * inv;
-            const _Float16 * vp = vbase + (int64_t) p * stride;
-            for (int d = 0; d < HEAD_DIM; ++d) out[d] += w * (float) vp[d];
-        }
+        for (int64_t p = 0; p < np; ++p) axpy_head(out, vbase + p * stride, sc[p] * inv);
     }
 }
 
