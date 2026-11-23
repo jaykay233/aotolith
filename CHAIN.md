@@ -230,6 +230,7 @@ its own numerics on a 0.04 margin).
 | vmadot | 64, m4 flush | per-row int8 | 218.2 s (47 tok/s) | 8181 (margin 0.11) |
 | vmadot | 32, m4 flush | per-row int8 | (not run) | 8181 (margin 0.13) |
 | vendor `i8i4` | 32 | Q4_0 exact | 93.8 s (109 tok/s) | 8181 (margin 1.08) |
+| vendor `i8i4_hp_m4` | 32 (K256) | Q4_0 exact | 75.8 s (135 tok/s) | 8181, then `33` |
 
 At `A_BLK=64` the flush runs four times as often and the GEMM goes from 25.6 s
 to 181 s, far more than the instruction count explains; rewriting the flush as
@@ -265,3 +266,37 @@ registers the 10K GEMM at 64 is 114 s against 37.6 s at 256, i.e. four times the
 flushes costs 3x, so fine blocks stay expensive even with no memory traffic.
 The aligned configurations therefore remain `A_BLK=64` with the memory flush
 (69 tok/s) and the exact-Q4 vendor path (109 tok/s).
+
+### The vendor K256 hp kernel is the aligned fast path
+
+`gemm_kernel_i8i4_hp_m4` is the kernel llama.cpp's own spacemit prefill uses, and
+it is a different trade from the K32 `gemm_kernel_i8i4` the `-W` path calls. It
+works on K256 superblocks and keeps the fp32 accumulators in v28-v31 for the
+whole superblock, folding each K32 scale in as it goes. Measured on one A100
+core with the same 4-row tile:
+
+| kernel | blk_len | GMAC/s |
+|---|---|---|
+| `gemm_kernel_i8i4_m4` | 32 | 33.3 |
+| `gemm_kernel_i8i4_m4` | 32, count_m 8/16/128 | 33.3 (count_m is ignored above 4) |
+| `gemm_kernel_i8i8_m4` | 32 | 33.0 |
+| `gemm_kernel_i8i4_hp_m4` | 256 | 47.7 |
+
+Wiring it in is a quantiser swap plus a stride change:
+`quantize_a_4row_i8_hp(256, ...)` writes 1160 B per 4-row group per 256 k
+(8 subblocks of 4 fp16 row scales + 4x32 int8, then a 72 B trailer of per-subblock
+sums), and B needs no repacking at all - the existing 576 B per K32 per 32 columns
+is exactly the hp subblock, so eight of them in a row are the 4608 B superblock.
+
+At 10K that is GEMM 59.0 s -> 41.1 s and prefill 94.1 s -> 75.8 s, 135.2 tok/s,
+with `-X` now the default. It also aligns better than `-W`, not worse: on
+`The capital of France is` the reference (`llama-simple`) emits `8181 33`, `-W`
+emits `8181 350` (step 1 wrong), and `-X` emits `8181 33`. Getting the same
+kernel on both sides of the comparison matters more than f32-versus-fp16 block
+scales; the hp path's own dot accuracy is 0.37% rms against the K32 path, and
+its step-0 margin is thinner (0.30 against 1.08) even though the id is right.
+
+count_m in the vendor GEMM is worth recording as a dead end: the dispatcher only
+checks `count_m >= 4`, the m4 kernel always computes 4 rows, and a benchmark that
+scales GMAC/s by count_m is measuring nothing - the wall time is flat from m=4 to
+m=128.

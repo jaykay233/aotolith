@@ -36,10 +36,13 @@ namespace spacemit_kernels { namespace rvv {
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 }
 namespace ime2 {
 size_t gemm_kernel_i8i4(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
                         float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
+size_t gemm_kernel_i8i4_hp_m4(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
+                              float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
 size_t gemm_kernel_i8i3k(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
                          float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
 }}
@@ -516,6 +519,14 @@ static void task_mgemm(int tid) {
         }
 }
 
+// 0 = vmadot, 1 = vendor K32 i8i4, 2 = vendor K256 i8i4 hp
+//
+// The default is the hp path: llama.cpp's own spacemit prefill runs the K256 hp
+// kernel, so matching it is what keeps the greedy chain on the reference ids.
+// At the 5-token prompt the K32 path emits `8181 350` while both the reference
+// and this path emit `8181 33`. 10K: 41.1 s of GEMM against 59.0 s.
+static int g_pf_vendor = 2;
+
 // ------------------------------------------------------------------ prefill GEMM
 // The m=4 vendor path needs A as, per k_blk, [f32 scale x 4][int8 data 4x32]
 // = 144 bytes; the grouped quantizer fills that. k_blks must be a multiple of 16.
@@ -562,10 +573,14 @@ static void task_pf_gemm(int tid) {
             for (int64_t a = 0; a < nb; ++a) {
                 const uint8_t * bcol = b + a * kb * 576;
                 for (int64_t g = 0; g < G; ++g) {
-                    spacemit_kernels::ime2::gemm_kernel_i8i4(
-                        32, abase + g * g_pfa_rowstride, bcol, nullptr,
-                        c + (mt * G + g) * 4 * ldc + a * 32,
-                        4, 32, (size_t) kb, (size_t) ldc);
+                    float * dst = c + (mt * G + g) * 4 * ldc + a * 32;
+                    const uint8_t * ap = abase + g * g_pfa_rowstride;
+                    if (g_pf_vendor == 2)
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m4(
+                            256, ap, bcol, nullptr, dst, 4, 32, (size_t) (kb / 8), (size_t) ldc);
+                    else
+                        spacemit_kernels::ime2::gemm_kernel_i8i4(
+                            32, ap, bcol, nullptr, dst, 4, 32, (size_t) kb, (size_t) ldc);
                 }
             }
         }
@@ -579,16 +594,27 @@ static int64_t       g_qa_rows, g_qa_k;
 static int64_t       g_qa_j;
 static void task_pf_quant(int tid) {
     const int64_t mg = g_qa_rows / 4;
-    for (int64_t g = tid; g < mg; g += g_participants)
-        spacemit_kernels::rvv::quantize_a_4row_i8(
-            32, g_qa_src + g * 4 * g_qa_k, (size_t) g_qa_k,
-            g_pfa + (g_qa_j * mg + g) * g_pfa_rowstride);
+    for (int64_t g = tid; g < mg; g += g_participants) {
+        void * dst = g_pfa + (g_qa_j * mg + g) * g_pfa_rowstride;
+        const float * src = g_qa_src + g * 4 * g_qa_k;
+        if (g_pf_vendor == 2)
+            spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, src, (size_t) g_qa_k, (uint8_t *) dst);
+        else
+            spacemit_kernels::rvv::quantize_a_4row_i8(32, src, (size_t) g_qa_k, (uint8_t *) dst);
+    }
 }
 static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
     // One 4-row record per k block is 152 B: [4 x f32 a_scale][4 x i16 a_sum]
     // [4 x 32 int8]. The vendor asm advances A by 16+8+128, so 144 overlaps the
     // next record by 8 bytes.
-    g_pfa_rowstride = (k / 32) * 152;
+    //
+    // The high-precision variant works on K256 superblocks instead: 8 subblocks
+    // of 136 B (4 x fp16 scale + 4 x 32 int8) and a 72 B trailer of per-subblock
+    // sums, 1160 B per 4-row group per 256 k. It keeps the fp32 accumulators in
+    // v28-v31 for the whole superblock and applies each K32 scale inside, which
+    // measures 47.7 GMAC/s against the K32 kernel's 33.3 - same A layout on both
+    // sides of the accumulator, one third of the block-loop overhead.
+    g_pfa_rowstride = g_pf_vendor == 2 ? (k / 256) * 1160 : (k / 32) * 152;
     g_qa_src = a;
     g_qa_rows = rows;
     g_qa_k = k;
@@ -825,7 +851,6 @@ static inline void quant_a_i8d(const float * a, int64_t rows, int64_t k, int64_t
 // per-row scale, which measured 2.0% on q/k/v and 9.9% on the activation side,
 // and a four-row chunk then drifted 17.8% away from the f32 reference by layer
 // 41 -- enough to move the argmax. Exactness first, then win the speed back.
-static int g_pf_vendor = 0;
 static inline void pf_quant(const float * a, int64_t rows, int64_t k, int64_t j) {
     if (g_pf_vendor) quant_a_4row(a, rows, k, j);
     else quant_a_i8d(a, rows, k, j);
@@ -3399,6 +3424,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     // The vendor path lays a 4-row group out as [scale x4][sum x4][int8 4x32] per
     // 32 k-elements, which is a wider record than the vmadot one.
     if (g_pf_vendor) g_a8_stride = (N_FF / 32) * 152;
+    if (g_pf_vendor == 2) g_a8_stride = (N_FF / 256) * 1160;   // K256 superblocks
     const int64_t mgmax = (R + 63) / 64 * 16;          // groups, rounded like the chunk
     const size_t pfa_bytes = (size_t) 3 * mgmax * (size_t) g_a8_stride + (4 << 20);
     g_pfa     = (uint8_t *) hugemem(pfa_bytes);
@@ -3830,8 +3856,9 @@ static void bench_prefill_gemm(int64_t rows) {
     float * out = (float *) hugemem((size_t) rows * 6144 * 4);
     // Record stride must match what quant_a_i8d/quant_a_4row actually use, and
     // the k=6144 down projection needs the scale area on top of the payload.
-    const int64_t pfa_stride = g_pf_vendor ? ((6144 / 32) * 152)
-                                           : ((6144 / 16) * 64 + (6144 / A_BLK) * 16 + 512);
+    const int64_t pfa_stride = g_pf_vendor == 2 ? ((6144 / 256) * 1160)
+                             : g_pf_vendor        ? ((6144 / 32) * 152)
+                             : ((6144 / 16) * 64 + (6144 / A_BLK) * 16 + 512);
     uint8_t * pfa = (uint8_t *) hugemem((size_t) (rows / 4) * 3 * pfa_stride + (2 << 20));
     ref_v = (float *) hugemem((size_t) rows * 6144 * 4);
     g_pfa = pfa;
@@ -4023,9 +4050,11 @@ int main(int argc, char ** argv) {
         }
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
         else if (!strcmp(argv[i], "-W")) g_pf_vendor = 1;
+        else if (!strcmp(argv[i], "-X")) g_pf_vendor = 2;   // K256 hp m4, the default
+        else if (!strcmp(argv[i], "-V0")) g_pf_vendor = 0;
     }
 
-    if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = 1;
+    if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = atoi(getenv("MEGA_VENDOR"));
     // The prefill path is int8 attention, and that decision has to be visible
     // before the X100 softmax workers are created below.
     if (g_pf_file) {
