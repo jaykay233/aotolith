@@ -1868,40 +1868,86 @@ static inline void cv_band(int tid, int64_t npos, int64_t * lo, int64_t * hi) {
     *hi = npos * (tid + 1) / g_participants;
 }
 
+// Both conv passes were scalar element loops: 2.36 s of a 58 s prefill, and all of
+// it in address arithmetic rather than arithmetic. The two layouts share one shape
+// -- 16 lanes of a vector with a fixed stride, producing 16 *contiguous* output
+// bytes -- so one vector step replaces sixteen scalar ones:
+//
+//   V  16 consecutive positions at fixed dim: source stride N_KV*HEAD_DIM*2,
+//      destination (d%64)*16 + (p%16) is contiguous.
+//   K  16 consecutive dims at fixed position: source stride KT*2 (the tile is
+//      dim-major), destination (d%16) is contiguous.
+//
+// Rounding stays lrintf-compatible (vfcvt with the default round-to-nearest-even)
+// and the max pass stays exact because |f16| values are a subset of |f32|.
 static void task_pfa_conv_max(int tid) {
     int64_t lo, hi; cv_band(tid, g_cv_npos, &lo, &hi);
+    const size_t vl = __riscv_vsetvl_e16m4(HEAD_DIM);
     for (int kv = 0; kv < N_KV; ++kv) {
         float mk = 0, mv = 0;
         for (int64_t p = lo; p < hi; ++p) {
             const _Float16 * kb = ktile(g_cv_layer, kv, (int) (p / KT));
             const _Float16 * vb = g_vpos + (int64_t) g_cv_layer * KV_LAYER_STRIDE
                                 + p * N_KV * HEAD_DIM + kv * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                const float a = fabsf((float) kb[d * KT + (p % KT)]);
-                const float b = fabsf((float) vb[d]);
-                if (a > mk) mk = a;
-                if (b > mv) mv = b;
-            }
+            // reduce in f32: the f16 reduction form ICEs this GCC, and widening is
+            // exact, so the maximum is the same real number either way
+            const vfloat32m8_t ka = __riscv_vfabs_v_f32m8(__riscv_vfwcvt_f_f_v_f32m8(
+                __riscv_vlse16_v_f16m4(kb + (p % KT), KT * (int64_t) sizeof(_Float16), vl), vl), vl);
+            const vfloat32m8_t va = __riscv_vfabs_v_f32m8(
+                __riscv_vfwcvt_f_f_v_f32m8(__riscv_vle16_v_f16m4(vb, vl), vl), vl);
+            const vfloat32m1_t kz = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+            const float a = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(ka, kz, vl));
+            const float b = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(va, kz, vl));
+            if (a > mk) mk = a;
+            if (b > mv) mv = b;
         }
         g_cv_mk[kv][tid] = mk; g_cv_mv[kv][tid] = mv;
     }
 }
 
+// 16 strided halves in, 16 contiguous int8 out.
+static inline void conv16(const _Float16 * src, int64_t stride_elems, float inv, int8_t * dst) {
+    const size_t vl = __riscv_vsetvl_e16mf2(16);
+    const vfloat16mf2_t h = __riscv_vlse16_v_f16mf2(src, stride_elems * (int64_t) sizeof(_Float16), vl);
+    vfloat32m1_t f = __riscv_vfmul_vf_f32m1(__riscv_vfwcvt_f_f_v_f32m1(h, vl), inv, vl);
+    vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
+    q = __riscv_vmax_vx_i32m1(q, -127, vl);
+    q = __riscv_vmin_vx_i32m1(q, 127, vl);
+    __riscv_vse8_v_i8mf4(dst, __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+}
+
 static void task_pfa_conv_q(int tid) {
     int64_t lo, hi; cv_band(tid, g_cv_npos, &lo, &hi);
+    // whole 16-position V blocks only; lo/hi are position bounds, so round them
+    // down to the block grid. A trailing partial block keeps the scalar loop that
+    // this replaced -- writing a full 16-lane block past npos would walk off g_v8i.
+    const int64_t vlo = lo & ~(int64_t) 15;
+    int64_t vhi = (hi + 15) & ~(int64_t) 15;
+    if (vhi > g_cv_npos) vhi = g_cv_npos & ~(int64_t) 15;
     for (int kv = 0; kv < N_KV; ++kv) {
         const float ik = g_cv_ik[kv], iv = g_cv_iv[kv];
         int8_t * vbase = g_v8i + kv * g_v8i_npb16 * 2048;
+        // K: per position, 16 dims at a time, all contiguous this position's lane
         for (int64_t p = lo; p < hi; ++p) {
             const _Float16 * kb = ktile(g_cv_layer, kv, (int) (p / KT));
+            int8_t * kdst = g_k8i + ((kv * g_k8i_npb + p / 64) * 8) * 1024 + (p % 64) * 16;
+            for (int dg = 0; dg < HEAD_DIM / 16; ++dg)
+                conv16(kb + dg * 16 * KT + (p % KT), KT, ik, kdst + dg * 1024);
+        }
+        // V: per 16-position block, 16 dims at a time
+        for (int64_t pb = vlo; pb < vhi; pb += 16) {
+            const _Float16 * vb = g_vpos + (int64_t) g_cv_layer * KV_LAYER_STRIDE
+                                + pb * N_KV * HEAD_DIM + kv * HEAD_DIM;
+            int8_t * vdst = vbase + (pb / 16) * 1024;
+            for (int d = 0; d < HEAD_DIM; ++d)
+                conv16(vb + d, N_KV * HEAD_DIM, iv,
+                       vdst + ((d / 64) * g_v8i_npb16) * 1024 + (d % 64) * 16);
+        }
+        for (int64_t p = (vhi > lo ? vhi : lo); p < hi; ++p) {
             const _Float16 * vb = g_vpos + (int64_t) g_cv_layer * KV_LAYER_STRIDE
                                 + p * N_KV * HEAD_DIM + kv * HEAD_DIM;
-            int8_t * kdst = g_k8i + ((kv * g_k8i_npb + p / 64) * 8) * 1024;
             int8_t * vdst = vbase;
             for (int d = 0; d < HEAD_DIM; ++d) {
-                int a = (int) lrintf((float) kb[d * KT + (p % KT)] * ik);
-                if (a > 127) a = 127; if (a < -127) a = -127;
-                kdst[(d / 16) * 1024 + (p % 64) * 16 + (d % 16)] = (int8_t) a;
                 int b = (int) lrintf((float) vb[d] * iv);
                 if (b > 127) b = 127; if (b < -127) b = -127;
                 vdst[((d / 64) * g_v8i_npb16 + p / 16) * 1024 + (d % 64) * 16 + (p % 16)] = (int8_t) b;
