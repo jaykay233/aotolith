@@ -381,3 +381,66 @@ assuming one `e16m4` register holds all 128 dims.
 Alignment evidence at 10K is still token 0 only: `llama-simple` has no `-c` and
 silently windows a 10K prompt down to its 512-token context, so the same-prompt
 reference continuation needs a driver that can set `n_ctx`.
+
+## The 10K cache was one position too small
+
+`MAXCTX` was 10240, and a "10K" prompt is 10241 ids: the prefill fills positions
+0..10239, then the first generated token lands at position 10240 - one past the
+last slot. Both caches are strided by `MAXCTX`, so that token's V row
+(`[layer][pos][kv][dim]`) writes over layer L+1's position 0, its K row over the
+next kv head's position block, and the rope table's last entry runs 128 floats
+past its allocation. Every 10K number and every 10K token id taken before this
+was measured with the top of the context scribbling on itself.
+
+`MAXCTX` is now 12288 and the `-F` chain refuses `pos0 + ngen > MAXCTX` instead
+of silently overrunning.
+
+## The reference was the wrong file
+
+The alignment numbers in this file were compared against `llama-simple`, which
+cannot be told `n_ctx` and therefore truncated any 10K prompt to its 512-token
+default. The ids it produced for the short prompt (`8181 33`) are what the F16
+and Q8_0 files give; with the same Q4_0 file it prints `285` (` a great idea`),
+i.e. the 4-bit file flips that token in llama.cpp's own arithmetic.
+
+`refgreedy.cpp` is the harness that fixes this: it links libllama, feeds the
+prompt as token ids straight from a file, takes `n_ctx` on the command line, and
+does nothing but argmax, so both sides run the same ids over the same context
+and print ids that can be diffed line by line.
+
+## Decode runs a different kernel than llama.cpp
+
+`llama.cpp`'s spacemit backend maps `GGML_TYPE_Q4_0` to `q4_0_32x256_q8_0` for
+every shape, and that entry point picks its **one-row** body for `count_m < 4`.
+Our decode was feeding the one-row path a K32 (`gemm_kernel_i8i4`) record
+instead of the K256 hp record (`gemm_kernel_i8i4_hp`, 290 B per 256 k for one
+row: 256 int8, 8 int16 subblock sums, one fp16 block scale at offset 288).
+
+Both are defensible numerically, and they disagree on a knife-edge prompt: on
+the 5-token prompt the K32 kernel gives `8181` (the F16 answer) while the hp
+one-row kernel gives `285`, which is what llama.cpp gives for the same file.
+
+Padding one row up to a four-row hp group and calling `_hp_m4` does **not**
+reproduce the one-row kernel - the two entry points quantise A with different
+record layouts, and the padded version gives `30930`. So:
+
+| decode kernel | 5-token first id | short-context rate |
+|---|---|---|
+| `gemm_kernel_i8i4` (K32, 1 row) | 8181 | 17.3 tok/s |
+| `gemm_kernel_i8i4_hp` (K256, 1 row) | 285 (matches llama.cpp) | 6.3 tok/s |
+| `_hp_m4` with rows 1..3 zeroed | 30930 | 5.1 tok/s |
+
+`-H` selects the second. It is 2.7x slower than the K32 kernel, so it is an
+alignment probe, not the speed path.
+
+## 2-bit weights
+
+`-q2` repacks the Q4_0 source into the vendor `nrow_block_q2_k<32>` layout
+(`gemm_kernel_i8i2k`): 2688 B per 32 rows x 256 k = 2.625 bit per weight, so the
+decode blob drops from 1416 MB to 738 MB. Short-context decode goes 17.3 ->
+24.9 tok/s. The encoding follows llama.cpp's Q2_K scheme (per-16-value min/max,
+`d = max_scale/15`, `nib = round(15*scale/max_scale)`, effective multiplier
+`nib*d` with no 1/16 - the kernel's `factor_scale` of 1/16 is undone by its
+`refactor_scale` of 16) but skips `make_qkx2_quants`, so it is not the same file
+as `llama-quantize --pure`. It is a different quantisation, hence its own token
+trajectory; it needs its own reference run before it can be called aligned.

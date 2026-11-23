@@ -34,6 +34,7 @@
 // ---------------------------------------------------------------- vendor kernels
 namespace spacemit_kernels { namespace rvv {
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
@@ -41,9 +42,13 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
 namespace ime2 {
 size_t gemm_kernel_i8i4(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
                         float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
+size_t gemm_kernel_i8i4_hp(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
+                           float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
 size_t gemm_kernel_i8i4_hp_m4(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
                               float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
 size_t gemm_kernel_i8i3k(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
+                         float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
+size_t gemm_kernel_i8i2k(size_t blk_len, const uint8_t * a, const uint8_t * b, const uint8_t * bzp,
                          float * c, size_t count_m, size_t count_n, size_t k_blks, size_t ldc);
 }}
 
@@ -64,7 +69,12 @@ void ggml_abort(const char * f, int l, const char * m, ...) {
 
 // ------------------------------------------------------------------- model shape
 static const int N_LAYER = 42, N_EMBD = 2048, N_FF = 6144, N_HEAD = 16, N_KV = 2, HEAD_DIM = 128;
-static const int N_GPU = 8, MAXCTX = 10240, VOCAB = 130560;
+// 12288, not 10240. A "10K" prompt is 10241 ids in practice, so a 10240-slot
+// cache has its last prompt position one past the end: the V cache is
+// [layer][pos][kv][dim] with a MAXCTX stride, so that position lands on the next
+// layer's position 0, and the rope table's last entry runs 128 floats off the
+// end. Every 10K number taken before this was measured on a corrupted cache.
+static const int N_GPU = 8, MAXCTX = 12288, VOCAB = 130560;
 static const int NH_PER_KV = N_HEAD / N_KV;
 static const float RMS_EPS = 1e-6f;
 static const float ROPE_BASE = 5000000.0f;
@@ -77,8 +87,15 @@ static double g_snap_rope[2];
 static const char * g_stage_name[S_NSTAGE] = {
     "embed", "rmsnorm", "quantA", "gemm", "attn", "silu", "rope", "lm_head+argmax", "misc" };
 
-static double now_s(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+// noinline + a memory clobber: with the call inlined, -O2 merged the TICK and
+// TOCK reads of the clock into one call (the sysroot declares clock_gettime in a
+// way GCC treats as loop-invariant), so every stage accumulator stayed exactly
+// zero while the total time kept being right.
+static __attribute__((noinline)) double now_s(void) {
+    struct timespec t;
+    __asm__ __volatile__("" ::: "memory");
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    __asm__ __volatile__("" ::: "memory");
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 #define TICK_DECL double _t0
@@ -193,6 +210,26 @@ static const Entry * find(const char * nm) {
 //   q3 * int8_scale[row][k16] * fp16_scale[row]
 // (no extra 1/16: that factor lives in the Q3_K reference path only).
 static int g_bit3 = 0;
+// 2-bit weights on the same K256 superblock as the 3-bit path, laid out as the
+// vendor i8i2k kernel's nrow_block_q2_k<32>:
+//   uint8 scales[16][32]   low nibble = scale nibble, high nibble = zero-point
+//                          nibble, both indexed [sub-block][row]
+//   uint8  qs[32][64]      [sub-block/4][byte within 16][row], 2-bit fields at
+//                          shift 2*(sub-block%4)
+//   fp16   scales16[32], zeros16[32]
+// per 32 output rows x 256 K = 2688 B, i.e. 2.625 bit per weight against Q3_K's
+// 3.5625 and Q4_0's 4.5.
+static int g_bit2 = 0;
+// Decode with the vendor K256 hp kernel, i.e. the same arithmetic llama.cpp's
+// spacemit backend runs for Q4_0: its kernel table maps Q4_0 to
+// q4_0_32x256_q8_0, which is gemm_kernel_i8i4_hp, and that kernel's A operand is
+// the hp record (one fp16 superblock scale, one fp16 sum per K32 subblock, 290 B
+// per 256 k for a single row) rather than the K32 m1 record the old decode path
+// fed it. A one-row A record is 290 B: 256 int8 + 8*2 subblock sums + 2 blk scale.
+static int g_hpdec = 0;
+static void dequant_row(float * dst, const uint8_t * row, int64_t k);
+static const int Q2_K = 256;
+static const size_t Q2_BLK = 32 * 16 + 32 * 64 + 32 * 2 + 32 * 2;   // 2688 B
 static const int Q3_K = 256;                 // K elements per superblock
 static const size_t Q3_BLK = 32 * 16 + 32 * 32 + 32 * 64 + 32 * 2;   // 3648 B
 static size_t g_blk_bytes = 576;
@@ -259,6 +296,74 @@ static void repack_b_q3(uint8_t * dst, const uint8_t * src, int64_t rows, int64_
                         if (q3 >= 0) mask |= (uint16_t) (1u << bi);
                     }
                     hms[kii * 32 + i] = mask;
+                }
+            }
+        }
+    }
+}
+
+// Same source, 2-bit destination. The encoding is llama.cpp's Q2_K scheme
+// without its make_qkx2_quants search: per 16-value sub-block take min and max,
+// clamp them so the range straddles zero, and let
+//   step = (max - min) / 3,  z = -min
+//   d = max_j step / 15,     dm = max_j z / 15
+//   ns = round(15 * step / d),  nz = round(15 * z / dm),  q = round((x + z)/step)
+// so the kernel's `q * ns * d - nz * dm` reproduces the value. Note the effective
+// multiplier is ns*d with no 1/16 anywhere: the vendor kernel's factor_scale of
+// 1/16 is undone by its refactor_scale of 16 in the epilogue.
+__attribute__((noinline))
+static void repack_b_q2(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k, const int * perm) {
+    const int64_t nb = k / 32, rs = nb * 18, nsup = k / Q2_K;
+    static float tile[32][Q2_K];
+    for (int64_t g = 0; g < rows; g += 32) {
+        const int64_t grp = g / 32;
+        for (int64_t sup = 0; sup < nsup; ++sup) {
+            uint8_t *  blk = dst + (grp * nsup + sup) * Q2_BLK;
+            uint8_t *  scl = blk;
+            _Float16 * s16 = (_Float16 *) (blk + 512 + 2048);
+            _Float16 * z16 = (_Float16 *) (blk + 512 + 2048 + 64);
+            memset(scl, 0, 512);
+            memset(blk + 512, 0, 2048);
+            for (int i = 0; i < 32; ++i) {
+                const int64_t sr = perm ? (int64_t) perm[g + i] : (g + i);
+                dequant_row(tile[i], src + sr * rs + sup * 8 * 18, Q2_K);
+            }
+            for (int i = 0; i < 32; ++i) {
+                float step[16], zoff[16], smax = 0, zmax = 0;
+                for (int j = 0; j < 16; ++j) {
+                    float mn = tile[i][j * 16], mx = mn;
+                    for (int b2 = 1; b2 < 16; ++b2) {
+                        const float v = tile[i][j * 16 + b2];
+                        if (v < mn) mn = v;
+                        if (v > mx) mx = v;
+                    }
+                    if (mn > 0) mn = 0;
+                    if (mx < 0) mx = 0;
+                    step[j] = (mx - mn) / 3.0f;
+                    zoff[j] = -mn;
+                    if (step[j] > smax) smax = step[j];
+                    if (zoff[j] > zmax) zmax = zoff[j];
+                }
+                const float d  = smax > 0 ? smax / 15.0f : 0.0f;
+                const float dm = zmax > 0 ? zmax / 15.0f : 0.0f;
+                s16[i] = (_Float16) d;
+                z16[i] = (_Float16) dm;
+                for (int j = 0; j < 16; ++j) {
+                    int ns = d  > 0 ? (int) lrintf(step[j] / d)  : 0;
+                    int nz = dm > 0 ? (int) lrintf(zoff[j] / dm) : 0;
+                    if (ns < 0) ns = 0; if (ns > 15) ns = 15;
+                    if (nz < 0) nz = 0; if (nz > 15) nz = 15;
+                    scl[j * 32 + i]   |= (uint8_t) ns;
+                    scl[16 * i + j]   |= (uint8_t) (nz << 4);
+                    const float eff = step[j];   // value = q * ns*d - nz*dm, and ns*d ~ step
+                    for (int b2 = 0; b2 < 16; ++b2) {
+                        const float v = tile[i][j * 16 + b2] + zoff[j];
+                        int q2 = eff > 0 ? (int) lrintf(v / eff) : 0;
+                        if (q2 < 0) q2 = 0;
+                        if (q2 > 3) q2 = 3;
+                        uint8_t * byte = blk + 512 + (int64_t) (j / 4) * 32 * 16 + i * 16 + b2;
+                        *byte |= (uint8_t) (q2 << ((j % 4) * 2));
+                    }
                 }
             }
         }
@@ -466,6 +571,7 @@ static inline _Float16 * ktile(int layer, int kv, int pblk) {
 }
 
 // attention scratch: per-thread score strip, per-thread partial accumulators
+static int g_pvprobe = 0;                     // MEGA_PVPROBE: PV without the score loads
 static const int SMAX = MAXCTX / 4 + 64;         // a thread may own up to 1/4 of ctx
 static float g_sa[N_GPU][N_HEAD][SMAX];
 static float g_acc[N_GPU][N_HEAD][HEAD_DIM];
@@ -548,11 +654,27 @@ static void task_mgemm(int tid) {
             const int64_t a = n0[j] + s * g_kstep;
             if (a >= n1[j]) continue;
             int64_t b2 = a + g_kstep; if (b2 > n1[j]) b2 = n1[j];
-            const int64_t kb = g_mj[j].k / (g_bit3 ? Q3_K : 32);
-            const uint8_t * bp = g_mj[j].b + a * kb * g_blk_bytes;
-            if (g_bit3)
+            const int64_t kb = g_mj[j].k / (g_bit3 || g_bit2 ? Q3_K : g_hpdec ? 256 : 32);
+            // The Q4_0 blob is 576 B per (32 columns x 32 k) whatever superblock the
+            // kernel reads, so the column-tile offset always strides by 32 k blocks;
+            // only the k_blks argument changes with the kernel's block length.
+            const uint8_t * bp = g_mj[j].b + a * (g_mj[j].k / 32) * g_blk_bytes;
+            if (g_bit2)
+                spacemit_kernels::ime2::gemm_kernel_i8i2k(
+                    Q2_K, g_aq, bp, nullptr, g_mj[j].c + a * 32,
+                    1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) ((b2 - a) * 32));
+            else if (g_bit3)
                 spacemit_kernels::ime2::gemm_kernel_i8i3k(
                     Q3_K, g_aq, bp, nullptr, g_mj[j].c + a * 32,
+                    1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) ((b2 - a) * 32));
+            else if (g_hpdec)
+                // llama.cpp's Q4_0 kernel table maps to q4_0_32x256_q8_0 in every
+                // case, and that kernel picks its one-row body when count_m < 4.
+                // Padding one row to four does NOT reproduce it: the one-row and
+                // four-row entry points quantize A with different record layouts,
+                // which is a 0.6-logit difference on a knife-edge prompt.
+                spacemit_kernels::ime2::gemm_kernel_i8i4_hp(
+                    256, g_aq, bp, nullptr, g_mj[j].c + a * 32,
                     1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) ((b2 - a) * 32));
             else
                 spacemit_kernels::ime2::gemm_kernel_i8i4(
@@ -1263,24 +1385,33 @@ static void task_pf_gemm_x100(int id) {
 
 static const float * qa_src;
 static int64_t qa_k;
+static float * g_qa4 = nullptr;   // 4-row activation scratch for the hp decode path
 static void task_quant(int tid) {
-    const int64_t nb = qa_k / (g_bit3 ? Q3_K : 32);
+    const int64_t nb = qa_k / (g_bit3 || g_bit2 ? Q3_K : g_hpdec ? 256 : 32);
     const int64_t per = (nb + g_participants - 1) / g_participants;
     const int64_t b0 = per * tid;
     int64_t b1 = (tid == g_participants - 1) ? nb : per * (tid + 1);
     if (b1 > nb) b1 = nb;
     if (b0 >= b1) return;
-    if (g_bit3)
+    if (g_bit3 || g_bit2)
         spacemit_kernels::rvv::quantize_a_row_i8k(Q3_K, qa_src + b0 * Q3_K, (size_t) ((b1 - b0) * Q3_K), g_aq + b0 * 292);
+    else if (g_hpdec)
+        spacemit_kernels::rvv::quantize_a_row_i8_hp(256, qa_src + b0 * 256, (size_t) ((b1 - b0) * 256), g_aq + b0 * 290);
     else
         spacemit_kernels::rvv::quantize_a_row_i8(32, qa_src + b0 * 32, (size_t) ((b1 - b0) * 32), g_aq + b0 * 38);
 }
 
 static void quant_a(const float * a, int64_t k) {
-    if (g_bit3) {
+    if (g_bit3 || g_bit2) {
         if (k < Q3_K) { spacemit_kernels::rvv::quantize_a_row_i8k(Q3_K, a, (size_t) k, g_aq); return; }
         qa_src = a; qa_k = k;
         run(task_quant);
+        return;
+    }
+    if (g_hpdec && k % 256) {
+        memcpy(g_qa4, a, k * sizeof(float));
+        memset(g_qa4 + k, 0, 3 * k * sizeof(float));
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_qa4, (size_t) k, g_aq);
         return;
     }
     if (k < 32 * g_participants) { spacemit_kernels::rvv::quantize_a_row_i8(32, a, (size_t) k, g_aq); return; }
@@ -1572,10 +1703,17 @@ static void attn_pv(int tid) {
                 const _Float16 * vp = base + (int64_t) (p0 + p) * N_KV * HEAD_DIM;
                 const vfloat32m1_t v0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp, 32), 32);
                 const vfloat32m1_t v1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + 32, 32), 32);
-                const float w0 = wk[0 * SMAX + p], w1 = wk[1 * SMAX + p];
-                const float w2 = wk[2 * SMAX + p], w3 = wk[3 * SMAX + p];
-                const float w4 = wk[4 * SMAX + p], w5 = wk[5 * SMAX + p];
-                const float w6 = wk[6 * SMAX + p], w7 = wk[7 * SMAX + p];
+                // MEGA_PVPROBE drops the eight scattered weight loads (one per
+                // 10.5 KB score row, so eight pages per position) to separate the
+                // V stream from the score reads. Results are garbage.
+                float w0, w1, w2, w3, w4, w5, w6, w7;
+                if (g_pvprobe) { w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 1e-4f; }
+                else {
+                    w0 = wk[0 * SMAX + p]; w1 = wk[1 * SMAX + p];
+                    w2 = wk[2 * SMAX + p]; w3 = wk[3 * SMAX + p];
+                    w4 = wk[4 * SMAX + p]; w5 = wk[5 * SMAX + p];
+                    w6 = wk[6 * SMAX + p]; w7 = wk[7 * SMAX + p];
+                }
                 a00 = __riscv_vfmacc_vf_f32m1(a00, w0, v0, 32);
                 a01 = __riscv_vfmacc_vf_f32m1(a01, w0, v1, 32);
                 a10 = __riscv_vfmacc_vf_f32m1(a10, w1, v0, 32);
@@ -4130,6 +4268,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-X") && i + 1 < argc) g_dbg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
+        else if (!strcmp(argv[i], "-q2")) g_bit2 = 1;
+        else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-N") && i + 1 < argc) g_pf_nb = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) g_participants = atoi(argv[++i]);
@@ -4170,6 +4310,7 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9')
                 g_x100_pct = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "-pp")) g_pvprobe = 1;
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
         else if (!strcmp(argv[i], "-W")) g_pf_vendor = 1;
         else if (!strcmp(argv[i], "-X")) g_pf_vendor = 2;   // K256 hp m4, the default
@@ -4187,7 +4328,7 @@ int main(int argc, char ** argv) {
             g_tcmstage = 1; // -Q measured 49.71 -> 44.63 s on attn at 10K
         }
     }
-    g_blk_bytes = g_bit3 ? Q3_BLK : 576;
+    g_blk_bytes = g_bit2 ? Q2_BLK : (g_bit3 ? Q3_BLK : 576);
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
     struct stat st; fstat(fd, &st); g_map_sz = (size_t) st.st_size;
@@ -4227,10 +4368,11 @@ int main(int argc, char ** argv) {
         const Entry * e = find(items[i].name);
         if (!e) { fprintf(stderr, "missing %s\n", items[i].name); return 1; }
         items[i].ref->k = e->k; items[i].ref->n = e->n;
-        total += (size_t) (e->n / 32) * (g_bit3 ? (e->k / Q3_K) * Q3_BLK : (e->k / 32) * 576);
+        total += (e->n / 32) * (g_bit2 ? (e->k / Q2_K) * Q2_BLK
+                             : g_bit3 ? (e->k / Q3_K) * Q3_BLK : (e->k / 32) * 576);
     }
     const size_t tot_pad = (total + 4096 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
-    const char * cache = work_path(g_bit3 ? "mega-w3.bin" : "mega-w.bin");
+    const char * cache = work_path(g_bit2 ? "mega-w2.bin" : g_bit3 ? "mega-w3.bin" : "mega-w.bin");
     struct stat cs;
     bool loaded = false;
     g_wblob = (uint8_t *) hugemem(tot_pad);
@@ -4251,7 +4393,10 @@ int main(int argc, char ** argv) {
             items[i].ref->b = p;
             const bool rope_pair = strstr(items[i].name, "attn_q.weight") ||
                                    strstr(items[i].name, "attn_k.weight");
-            if (g_bit3) {
+            if (g_bit2) {
+                repack_b_q2(p, e->data, e->n, e->k, nullptr);
+                p += (e->n / 32) * (e->k / Q2_K) * Q2_BLK;
+            } else if (g_bit3) {
                 repack_b_q3(p, e->data, e->n, e->k, nullptr);
                 p += (size_t) (e->n / 32) * (e->k / Q3_K) * Q3_BLK;
             } else {
@@ -4266,7 +4411,8 @@ int main(int argc, char ** argv) {
         uint8_t * p = g_wblob;
         for (int i = 0; i < ii; ++i) {
             items[i].ref->b = p;
-            p += g_bit3 ? (size_t) (items[i].ref->n / 32) * (items[i].ref->k / Q3_K) * Q3_BLK
+            p += g_bit2 ? (items[i].ref->n / 32) * (items[i].ref->k / Q2_K) * Q2_BLK
+               : g_bit3 ? (items[i].ref->n / 32) * (items[i].ref->k / Q3_K) * Q3_BLK
                         : (size_t) (items[i].ref->n / 32) * (items[i].ref->k / 32) * 576;
         }
         printf("weights: %.1f MB (cached)\n", total / 1e6);
@@ -4335,7 +4481,8 @@ int main(int argc, char ** argv) {
     g_v        = (float *) aligned_alloc(64, N_KV * HEAD_DIM * 4);
     g_attn_out = (float *) aligned_alloc(64, N_EMBD * 4);
     g_logits   = (float *) aligned_alloc(64, VOCAB * 4);
-    g_aq       = (uint8_t *) aligned_alloc(64, (size_t) N_FF * 2 + 8192);
+    g_aq       = (uint8_t *) aligned_alloc(64, (size_t) N_FF * 5 + 65536);
+    g_qa4      = (float *) aligned_alloc(64, (size_t) N_FF * 4 * sizeof(float) + 4096);
     const size_t kbytes = (size_t) N_LAYER * K_LAYER_STRIDE * 2;
     const size_t vbytes = (size_t) N_LAYER * KV_LAYER_STRIDE * 2;
     g_kdim = (_Float16 *) hugemem(kbytes);
@@ -4433,6 +4580,11 @@ int main(int argc, char ** argv) {
     int tok = prompt;
     const double t_start = now_s();
     printf("decode: %d tokens from %d\n", ngen, prompt);
+    if (pos0 + ngen > MAXCTX) {
+        fprintf(stderr, "context overflow: %lld prompt + %d generated exceeds %d\n",
+                (long long) pos0, ngen, MAXCTX);
+        return 1;
+    }
     for (int step = 0; step < ngen; ++step) {
         TICK_DECL;
         if (step == ngen - 1) {
