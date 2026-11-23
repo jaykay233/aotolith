@@ -237,3 +237,34 @@ accuracy is 68.5% and the accepted output is token-identical to plain greedy.
 Two capture points were tested for the fused features -- the residual entering a tracked
 layer versus leaving it -- and they land within noise of each other (21.76 vs 21.26
 tok/s), which is what the `-Dpre`/`-D` switch still exposes.
+
+## Correction: the RoPE pairing was wrong
+
+The 68.5% / 1.26 numbers above were measured under an interleaved RoPE
+(`(x[2i], x[2i+1])`, the GPT-NeoX pairing). This checkpoint is llama-architecture
+and rotates head halves against each other, `(x[i], x[i+64])`. It survived because
+every check in the tree compared the engine against itself, and a wrong-but-
+consistent rotation leaves self-comparison invariant.
+
+Once the chain accepted a real prompt from `llama-tokenize`, a comparison against
+`llama-simple` on `mc-q4o.gguf` made it visible immediately: after
+`The capital of France is` the reference emits `8181 33` (` Paris` `,`) and the
+interleaved version emitted `8181 350` (` Paris` `.`). `MEGA_ROPE=inter` keeps the
+old behaviour for comparison; half-split is now the default.
+
+The fix also raises drafter quality, since the features the drafter consumes are
+target features computed under that same rotation:
+
+| dspark s=3, 21-token prompt, 48 generated | interleaved | half-split |
+|---|---|---|
+| first-draft accuracy | 68.5% | 77.8% |
+| mean rank of target token in draft logits | 2644 | 47 |
+| drafts accepted per round | 1.26 | 1.83 |
+| decode tok/s | 21.76 | 21.59 |
+| plain greedy tok/s, same run | 17.31 | 17.57 |
+
+So the acceptance rate improved by 45% and the speed stayed where it was: the
+round is 131 ms regardless of how many drafts it accepts, and the extra acceptance
+only pays off against the extra row cost once attention is not the flat part of
+the budget. See `CHAIN.md` for the prompt-to-tokens pipeline and the alignment
+status.

@@ -65,6 +65,10 @@ static const int N_LAYER = 42, N_EMBD = 2048, N_FF = 6144, N_HEAD = 16, N_KV = 2
 static const int N_GPU = 8, MAXCTX = 10240, VOCAB = 130560;
 static const float RMS_EPS = 1e-6f;
 static const float ROPE_BASE = 5000000.0f;
+// llama-family checkpoints rotate the first half of each head against the second
+// half (x[i], x[i+64]); the GPT-NeoX interleaved pairing is a different model
+// family. This switches the pairing without touching the weight layout.
+static int g_rope_half = 1;   // llama convention; MEGA_ROPE=inter restores NeoX
 static const int64_t KV_LAYER_STRIDE = (int64_t) MAXCTX * N_KV * HEAD_DIM;
 
 // --------------------------------------------------------------- stage profiling
@@ -359,6 +363,10 @@ static int64_t g_attn_np;          // positions row g_arow can see
 // groups, so the row buffers must hold 4*ceil(m/4) rows or the second group lands in
 // whatever follows. Sized for the worst case rather than for the round length.
 static const int MROW_MAX = 8;                    // anchor + up to 7 drafts
+// Row capacity of the float row buffers. Decode only ever needs MROW_MAX, but
+// prefill drives a whole prompt chunk through the same GEMM, so it is a knob.
+static int g_rowcap = 8;
+static const char * g_prompt_file = nullptr;   // whitespace-separated token ids
 // Widest activation row, which is not N_FF: the drafter's encoder feeds fc a
 // 5*2048 = 10240-wide fused vector. Sized from that, or the encoder overruns the
 // tile by 4864 bytes per row and takes the process down.
@@ -698,9 +706,11 @@ static void rope_fn(int64_t lo, int64_t hi) {
         for (int i = 0; i < HEAD_DIM / 2; ++i) {
             const float th = (float) g_pos * g_rope_inv[i];
             const float c = cosf(th), s = sinf(th);
-            const float x0 = x[2 * i], x1 = x[2 * i + 1];
-            x[2 * i]     = x0 * c - x1 * s;
-            x[2 * i + 1] = x0 * s + x1 * c;
+            const int j0 = g_rope_half ? i : 2 * i;
+            const int j1 = g_rope_half ? i + HEAD_DIM / 2 : 2 * i + 1;
+            const float x0 = x[j0], x1 = x[j1];
+            x[j0] = x0 * c - x1 * s;
+            x[j1] = x0 * s + x1 * c;
         }
     }
 }
@@ -957,7 +967,8 @@ static void ds_load(void) {
     const size_t kvsz = (size_t) DS_LAYER * KV_LAYER_STRIDE;
     g_dskc = (_Float16 *) aligned_alloc(64, kvsz * 2);
     g_dsvc = (_Float16 *) aligned_alloc(64, kvsz * 2);
-    b_hid = (float *) aligned_alloc(64, (size_t) DS_LAYER * MROW_MAX * N_EMBD * 4);
+    // one row per position, and prefill pushes a whole chunk through at once
+    b_hid = (float *) aligned_alloc(64, (size_t) DS_LAYER * g_rowcap * N_EMBD * 4);
     b_dsbias = (float *) aligned_alloc(64, (size_t) (VOCAB + 64) * 4);
     if (b_dsbias) for (int i = 0; i < 64; ++i) b_dsbias[VOCAB + i] = 1.5e30f;
     b_concat = (float *) aligned_alloc(64, (size_t) DS_IN * 4);
@@ -981,7 +992,7 @@ static void ds_encode_inject(int64_t pos, int row) {
     float * gg = g[0];
     for (int L = 0; L < DS_LAYER; ++L)
         memcpy(b_concat + (int64_t) L * N_EMBD,
-               b_hid + ((int64_t) L * MROW_MAX + row) * N_EMBD, (size_t) N_EMBD * 4);
+               b_hid + ((int64_t) L * g_rowcap + row) * N_EMBD, (size_t) N_EMBD * 4);
 
     // control: zero features isolate whether the injected prefix reaches the draft at all
     if (getenv("MEGA_DSZERO")) memset(b_concat, 0, (size_t) DS_IN * 4);
@@ -1285,254 +1296,16 @@ static void ds_draft(int32_t anchor, int64_t pos0, int K, int32_t * drafts) {
     }
 }
 
-int main(int argc, char ** argv) {
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    const char * path = work_path("mc-q4o.gguf");
-    int ngen = 16, prompt = 1;
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
-        else if (!strcmp(argv[i], "-n") && i + 1 < argc) ngen = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) g_nspec = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-D")) g_ds_on = 1;
-        else if (!strcmp(argv[i], "-Dpre")) { g_ds_on = 1; g_ds_post = 0; }
-    }
-    // The packed-block size drives every weight offset, so it has to follow the
-    // mode before the blob is sized or repacked.
-    g_blk_bytes = g_bit3 ? Q3_BLK : 576;
-    if (g_nspec < 0) g_nspec = 0;
-    if (g_nspec > MROW_MAX - 1) g_nspec = MROW_MAX - 1;
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return 1; }
-    struct stat st; fstat(fd, &st); g_map_sz = (size_t) st.st_size;
-    g_map = (uint8_t *) mmap(nullptr, g_map_sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (g_map == MAP_FAILED) { perror("mmap"); return 1; }
-    close(fd);
-    gguf_index();
-
-    static char names[1 + N_LAYER * 7][64];
-    struct Item { const char * name; WRef * ref; };
-    static Item items[1 + N_LAYER * 7];
-    int ni = 0, ii = 0;
-    strcpy(names[ni], "output.weight"); items[ii++] = { names[ni++], &g_wo };
-    for (int L = 0; L < N_LAYER; ++L) {
-        const char * pat[7] = { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" };
-        WRef * dst[7] = { &g_wq[L], &g_wk[L], &g_wv[L], &g_wov[L], &g_wg[L], &g_wu[L], &g_wd[L] };
-        for (int m = 0; m < 7; ++m) {
-            snprintf(names[ni], 64, "blk.%d.%s.weight", L, pat[m]);
-            items[ii++] = { names[ni++], dst[m] };
-        }
-    }
-    size_t total = 0;
-    for (int i = 0; i < ii; ++i) {
-        const Entry * e = find(items[i].name);
-        if (!e) { fprintf(stderr, "missing %s\n", items[i].name); return 1; }
-        items[i].ref->k = e->k; items[i].ref->n = e->n;
-        total += (size_t) (e->n / 32) * (e->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
-    }
-    printf("weights: %.1f MB repacked across %d matrices\n", total / 1e6, ii);
-
-    const size_t tot_pad = (total + 4096 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
-    const char * cache = work_path(g_bit3 ? "mega-w3.bin" : "mega-w.bin");
-    struct stat cs;
-    bool loaded = false;
-    g_wblob = (uint8_t *) aligned_alloc(2 << 20, tot_pad);
-    if (!g_wblob) { fprintf(stderr, "oom weights\n"); return 1; }
-    use_huge(g_wblob, tot_pad);
-    if (stat(cache, &cs) == 0 && (size_t) cs.st_size == total) {
-        int cf = open(cache, O_RDONLY);
-        size_t got = 0;
-        while (got < total) { ssize_t r = read(cf, g_wblob + got, total - got); if (r <= 0) break; got += (size_t) r; }
-        close(cf);
-        loaded = (got == total);
-    }
-    if (!loaded) {
-        double t0 = now_s();
-        uint8_t * p = g_wblob;
-        for (int i = 0; i < ii; ++i) {
-            const Entry * e = find(items[i].name);
-            items[i].ref->b = p;
-            if (g_bit3) repack_b_q3(p, e->data, e->n, e->k);
-            else        repack_b(p, e->data, e->n, e->k);
-            p += (size_t) (e->n / 32) * (e->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
-        }
-        printf("weights: repacked in %.2f s\n", now_s() - t0);
-        int cf = open(cache, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (cf >= 0) { size_t put = 0; while (put < total) { ssize_t w = write(cf, g_wblob + put, total - put); if (w <= 0) break; put += (size_t) w; } close(cf); }
-    } else {
-        uint8_t * p = g_wblob;
-        for (int i = 0; i < ii; ++i) {
-            items[i].ref->b = p;
-            p += (size_t) (items[i].ref->n / 32) *
-                 (items[i].ref->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
-        }
-    }
-
-    g_emb = find("token_embd.weight");
-    for (int L = 0; L < N_LAYER; ++L) {
-        char nm[64];
-        snprintf(nm, sizeof nm, "blk.%d.attn_norm.weight", L);
-        g_attn_norm[L] = (const float *) find(nm)->data;
-        snprintf(nm, sizeof nm, "blk.%d.ffn_norm.weight", L);
-        g_ffn_norm[L] = (const float *) find(nm)->data;
-    }
-    g_out_norm = (const float *) find("output_norm.weight")->data;
-
-    b_x        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
-    b_xa       = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
-    b_gate     = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_FF * 4);
-    b_up       = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_FF * 4);
-    b_q        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
-    b_k        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_KV * HEAD_DIM * 4);
-    b_v        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_KV * HEAD_DIM * 4);
-    b_attn_out = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
-    b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
-    b_aq       = (uint8_t *) aligned_alloc(64, (size_t) MROW_MAX * AQ_ROW_STRIDE + 64);
-    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) 2 * AQ4_ROW_STRIDE + 4096);
-    if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
-        !b_attn_out || !b_logits || !b_aq || !b_aq4) { fprintf(stderr, "oom rows\n"); return 1; }
-    select_row(0);
-    const size_t kvsz = (size_t) N_LAYER * KV_LAYER_STRIDE;
-    g_kcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
-    g_vcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
-    if (!g_kcache || !g_vcache) { fprintf(stderr, "oom kv\n"); return 1; }
-    use_huge(g_kcache, kvsz * 2);
-    use_huge(g_vcache, kvsz * 2);
-    for (int i = 0; i < HEAD_DIM / 2; ++i)
-        g_rope_inv[i] = 1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM);
-
-    if (g_ds_on) ds_load();
-    bind_cpu(g_cpu_base);
-    if (getenv("MEGA_CPU_BASE")) g_cpu_base = atoi(getenv("MEGA_CPU_BASE"));
-    if (getenv("MEGA_NG")) {
-        g_participants = atoi(getenv("MEGA_NG"));
-        if (g_participants < 1) g_participants = 1;
-        if (g_participants > N_GPU) g_participants = N_GPU;
-    }
-    for (int i = 1; i < g_participants; ++i) {
-        pthread_t t;
-        pthread_create(&t, nullptr, worker, (void *) (intptr_t) i);
-        pthread_detach(t);
-    }
-
-    // ---- micro: raw streaming read of the same weight blob, same threads
-    if (getenv("MEGA_RAW")) {
-        static volatile uint64_t raw_sink;
-        const size_t bytes = ((size_t) (g_wo.n / 32) * (g_wo.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes) & ~(size_t) 511;
-        for (int round = 0; round < 3; ++round) {
-            const double a = now_s();
-            run([](int tid) {
-                const size_t bytes = ((size_t) (g_wo.n / 32) * (g_wo.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes) & ~(size_t) 511;
-                const size_t per = bytes / g_participants;
-                const uint8_t * p = g_wo.b + per * tid;
-                const uint8_t * e = p + per;
-                uint64_t acc = 0;
-                while (p + 512 <= e) {
-                    uint64_t a0, a1, a2, a3, a4, a5, a6, a7;
-                    memcpy(&a0, p + 0, 8);   memcpy(&a1, p + 64, 8);
-                    memcpy(&a2, p + 128, 8); memcpy(&a3, p + 192, 8);
-                    memcpy(&a4, p + 256, 8); memcpy(&a5, p + 320, 8);
-                    memcpy(&a6, p + 384, 8); memcpy(&a7, p + 448, 8);
-                    acc ^= a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ a6 ^ a7;
-                    p += 512;
-                }
-                if (acc == 0x5a5a5a5a5a5a5a5aULL) raw_sink = acc;
-            });
-            const double d = now_s() - a;
-            printf("  raw stream %zu MB  %6.3f ms  %6.1f GB/s\n", bytes >> 20, d * 1e3, bytes / d / 1e9);
-        }
-        g_quit.store(1, std::memory_order_release);
-        barrier();
-        return 0;
-    }
-
-    // ---- micro: per-matrix streaming rate through the same call path
-    if (getenv("MEGA_BW")) {
-        struct { const char * nm; WRef w; float * c; } t[] = {
-            { "output  150MB", g_wo,    g_logits },
-            { "ffn_gate  7MB", g_wg[0], g_gate },
-            { "ffn_down  7MB", g_wd[0], g_xa },
-            { "attn_q  2.4MB", g_wq[0], g_q },
-        };
-        for (auto & e : t) {
-            double best = 1e9;
-            for (int r = 0; r < 8; ++r) {
-                const double a = now_s();
-                quant_a(g_xa, e.w.k);
-                g_mjn = 1; g_mj[0] = { e.w.b, e.w.k, e.w.n, e.c };
-                run(task_mgemm);
-                const double d = now_s() - a;
-                if (r >= 2 && d < best) best = d;
-            }
-            const double mb = (double) (e.w.n / 32) *
-                              (e.w.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes / 1e6;
-            printf("  %s  %6.3f ms  %6.1f GB/s\n", e.nm, best * 1e3, mb / 1e3 / best);
-        }
-        g_quit.store(1, std::memory_order_release);
-        barrier();
-        return 0;
-    }
-
-    // ---- decode
-    int tok = prompt;
-    const double t_start = now_s();
-    // Replay drafts: a file of token ids from a plain greedy run, so the round has
-    // known-correct drafts and acceptance must be m-1 on every round. This is how
-    // the multi-row path is checked for exactness without any draft model.
-    int32_t * g_replay = nullptr;
-    int g_nreplay = 0;
-    if (const char * rp = getenv("MEGA_REPLAY")) {
-        FILE * f = fopen(rp, "r");
-        if (!f) { fprintf(stderr, "replay open %s\n", rp); return 1; }
-        int cap = 1 << 20;
-        g_replay = (int32_t *) malloc(cap * 4);
-        int v;
-        while (g_nreplay < cap && fscanf(f, "%d", &v) == 1) g_replay[g_nreplay++] = v;
-        fclose(f);
-        printf("replay: %d tokens from %s\n", g_nreplay, rp);
-    }
-
-    printf("decode: %d tokens from %d (kstep=%d, drafts=%d, rows=%d)\n",
-           ngen, prompt, g_kstep, g_nspec, g_nspec + 1);
-
-    int32_t * emitted = (int32_t *) malloc((size_t) (ngen + 8) * 4);   // for MEGA_TOKOUT
-    int produced = 0;
-    int rounds = 0;
-    long long accepted_drafts = 0;
-    int32_t pred[MROW_MAX];
-    while (produced < ngen) {
-        TICK_DECL;
-        const int K = g_nspec;
-        const int m = K + 1;
-        g_m = m;
-        g_use_m4 = (m >= 4 && !g_bit3);
-        g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
-        g_pos0 = produced;   // row r sits at position produced + r
-
-        int32_t rowtok[MROW_MAX];
-        rowtok[0] = tok;
-        if (g_ds_on && K > 0) {
-            TICK();
-            ds_draft(tok, produced, K, g_drafts);
-            TOCK(S_GEMM);
-            // With a replay file the round must follow the known-good continuation, so the
-            // drafter is scored against the real target instead of steering the run.
-            for (int r = 0; r < K; ++r)
-                rowtok[r + 1] = g_replay ? g_replay[produced + r] : g_drafts[r];
-            // The drafter drives the row geometry for its own block and its markov head is
-            // single row, so the target's geometry is restored before anything stages A.
-            g_m = m;
-            g_use_m4 = (m >= 4 && !g_bit3);
-            g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
-        } else {
-            for (int r = 0; r < K; ++r)
-                // replay[i] is the i-th token plain greedy emitted, and `produced` of
-                // them are already committed, so the draft for row r+1 is replay[produced+r].
-                rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
-        }
+// The target model's forward for m rows at absolute positions pos0 .. pos0+m-1.
+// Decode calls it once per verification block, prefill once per prompt chunk.
+// want_logits is decode-only: a prefill chunk would need m * VOCAB floats when only
+// the very last prompt position's distribution is ever read.
+static void target_forward(int m, int pos0, const int32_t * rowtok, int want_logits) {
+    TICK_DECL;
+    g_m = m;
+    g_use_m4 = (m >= 4 && !g_bit3);
+    g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
+    g_pos0 = pos0;
 
         TICK();
         for (int r = 0; r < m; ++r) {
@@ -1642,16 +1415,22 @@ int main(int argc, char ** argv) {
                 for (int k = 0; k < DS_LAYER; ++k)
                     if (DS_TARGET_LAYER[k] == L + 1)
                         for (int r = 0; r < m; ++r)
-                            memcpy(b_hid + ((int64_t) k * MROW_MAX + r) * N_EMBD,
+                            memcpy(b_hid + ((int64_t) k * g_rowcap + r) * N_EMBD,
                                    b_x + (int64_t) r * N_EMBD, (size_t) N_EMBD * 4);
             if (g_ds_on && g_ds_post)
                 for (int k = 0; k < DS_LAYER; ++k)
                     if (DS_TARGET_LAYER[k] == L)
                         for (int r = 0; r < m; ++r)
-                            memcpy(b_hid + ((int64_t) k * MROW_MAX + r) * N_EMBD,
+                            memcpy(b_hid + ((int64_t) k * g_rowcap + r) * N_EMBD,
                                    b_x + (int64_t) r * N_EMBD, (size_t) N_EMBD * 4);
             TOCK(S_MISC);
         }
+
+    if (!want_logits) return;
+    if (m > MROW_MAX) {
+        fprintf(stderr, "target_forward: %d rows of logits exceeds %d\n", m, MROW_MAX);
+        return;
+    }
 
         TICK();
         for (int r = 0; r < m; ++r) {
@@ -1664,6 +1443,339 @@ int main(int argc, char ** argv) {
         g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, b_logits, VOCAB };
         run(task_mgemm);
         TOCK(S_GEMM);
+}
+
+int main(int argc, char ** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    const char * path = work_path("mc-q4o.gguf");
+    int ngen = 16, prompt = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc) ngen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) g_nspec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-D")) g_ds_on = 1;
+        else if (!strcmp(argv[i], "-Dpre")) { g_ds_on = 1; g_ds_post = 0; }
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc) g_prompt_file = argv[++i];
+    }
+    // The packed-block size drives every weight offset, so it has to follow the
+    // mode before the blob is sized or repacked.
+    g_blk_bytes = g_bit3 ? Q3_BLK : 576;
+    // Must be settled before any row buffer is sized; rounded to whole four-row
+    // groups because the m4 path always works in units of four.
+    if (const char * rs = getenv("MEGA_ROWS")) {
+        const int v = atoi(rs);
+        if (v >= 4) g_rowcap = (v + 3) / 4 * 4;
+    }
+    if (const char * rp = getenv("MEGA_ROPE")) g_rope_half = strcmp(rp, "inter") != 0;
+    if (g_nspec < 0) g_nspec = 0;
+    if (g_nspec > MROW_MAX - 1) g_nspec = MROW_MAX - 1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    struct stat st; fstat(fd, &st); g_map_sz = (size_t) st.st_size;
+    g_map = (uint8_t *) mmap(nullptr, g_map_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (g_map == MAP_FAILED) { perror("mmap"); return 1; }
+    close(fd);
+    gguf_index();
+
+    static char names[1 + N_LAYER * 7][64];
+    struct Item { const char * name; WRef * ref; };
+    static Item items[1 + N_LAYER * 7];
+    int ni = 0, ii = 0;
+    strcpy(names[ni], "output.weight"); items[ii++] = { names[ni++], &g_wo };
+    for (int L = 0; L < N_LAYER; ++L) {
+        const char * pat[7] = { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" };
+        WRef * dst[7] = { &g_wq[L], &g_wk[L], &g_wv[L], &g_wov[L], &g_wg[L], &g_wu[L], &g_wd[L] };
+        for (int m = 0; m < 7; ++m) {
+            snprintf(names[ni], 64, "blk.%d.%s.weight", L, pat[m]);
+            items[ii++] = { names[ni++], dst[m] };
+        }
+    }
+    size_t total = 0;
+    for (int i = 0; i < ii; ++i) {
+        const Entry * e = find(items[i].name);
+        if (!e) { fprintf(stderr, "missing %s\n", items[i].name); return 1; }
+        items[i].ref->k = e->k; items[i].ref->n = e->n;
+        total += (size_t) (e->n / 32) * (e->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
+    }
+    printf("weights: %.1f MB repacked across %d matrices\n", total / 1e6, ii);
+
+    const size_t tot_pad = (total + 4096 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
+    const char * cache = work_path(g_bit3 ? "mega-w3.bin" : "mega-w.bin");
+    struct stat cs;
+    bool loaded = false;
+    g_wblob = (uint8_t *) aligned_alloc(2 << 20, tot_pad);
+    if (!g_wblob) { fprintf(stderr, "oom weights\n"); return 1; }
+    use_huge(g_wblob, tot_pad);
+    if (stat(cache, &cs) == 0 && (size_t) cs.st_size == total) {
+        int cf = open(cache, O_RDONLY);
+        size_t got = 0;
+        while (got < total) { ssize_t r = read(cf, g_wblob + got, total - got); if (r <= 0) break; got += (size_t) r; }
+        close(cf);
+        loaded = (got == total);
+    }
+    if (!loaded) {
+        double t0 = now_s();
+        uint8_t * p = g_wblob;
+        for (int i = 0; i < ii; ++i) {
+            const Entry * e = find(items[i].name);
+            items[i].ref->b = p;
+            if (g_bit3) repack_b_q3(p, e->data, e->n, e->k);
+            else        repack_b(p, e->data, e->n, e->k);
+            p += (size_t) (e->n / 32) * (e->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
+        }
+        printf("weights: repacked in %.2f s\n", now_s() - t0);
+        int cf = open(cache, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (cf >= 0) { size_t put = 0; while (put < total) { ssize_t w = write(cf, g_wblob + put, total - put); if (w <= 0) break; put += (size_t) w; } close(cf); }
+    } else {
+        uint8_t * p = g_wblob;
+        for (int i = 0; i < ii; ++i) {
+            items[i].ref->b = p;
+            p += (size_t) (items[i].ref->n / 32) *
+                 (items[i].ref->k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes;
+        }
+    }
+
+    g_emb = find("token_embd.weight");
+    for (int L = 0; L < N_LAYER; ++L) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "blk.%d.attn_norm.weight", L);
+        g_attn_norm[L] = (const float *) find(nm)->data;
+        snprintf(nm, sizeof nm, "blk.%d.ffn_norm.weight", L);
+        g_ffn_norm[L] = (const float *) find(nm)->data;
+    }
+    g_out_norm = (const float *) find("output_norm.weight")->data;
+
+    b_x        = (float *) aligned_alloc(64, (size_t) g_rowcap * N_EMBD * 4);
+    b_xa       = (float *) aligned_alloc(64, (size_t) g_rowcap * N_EMBD * 4);
+    b_gate     = (float *) aligned_alloc(64, (size_t) g_rowcap * N_FF * 4);
+    b_up       = (float *) aligned_alloc(64, (size_t) g_rowcap * N_FF * 4);
+    b_q        = (float *) aligned_alloc(64, (size_t) g_rowcap * N_EMBD * 4);
+    b_k        = (float *) aligned_alloc(64, (size_t) g_rowcap * N_KV * HEAD_DIM * 4);
+    b_v        = (float *) aligned_alloc(64, (size_t) g_rowcap * N_KV * HEAD_DIM * 4);
+    b_attn_out = (float *) aligned_alloc(64, (size_t) g_rowcap * N_EMBD * 4);
+    // logits are only ever read for a handful of rows (a decode block, or the
+    // last prefill position), so they keep the decode width whatever the rowcap is
+    b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
+    b_aq       = (uint8_t *) aligned_alloc(64, (size_t) g_rowcap * AQ_ROW_STRIDE + 64);
+    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) (g_rowcap / 4) * AQ4_ROW_STRIDE + 4096);
+    if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
+        !b_attn_out || !b_logits || !b_aq || !b_aq4) { fprintf(stderr, "oom rows\n"); return 1; }
+    select_row(0);
+    const size_t kvsz = (size_t) N_LAYER * KV_LAYER_STRIDE;
+    g_kcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
+    g_vcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
+    if (!g_kcache || !g_vcache) { fprintf(stderr, "oom kv\n"); return 1; }
+    use_huge(g_kcache, kvsz * 2);
+    use_huge(g_vcache, kvsz * 2);
+    for (int i = 0; i < HEAD_DIM / 2; ++i)
+        g_rope_inv[i] = 1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM);
+
+    if (g_ds_on) ds_load();
+    bind_cpu(g_cpu_base);
+    if (getenv("MEGA_CPU_BASE")) g_cpu_base = atoi(getenv("MEGA_CPU_BASE"));
+    if (getenv("MEGA_NG")) {
+        g_participants = atoi(getenv("MEGA_NG"));
+        if (g_participants < 1) g_participants = 1;
+        if (g_participants > N_GPU) g_participants = N_GPU;
+    }
+    for (int i = 1; i < g_participants; ++i) {
+        pthread_t t;
+        pthread_create(&t, nullptr, worker, (void *) (intptr_t) i);
+        pthread_detach(t);
+    }
+
+    // ---- micro: raw streaming read of the same weight blob, same threads
+    if (getenv("MEGA_RAW")) {
+        static volatile uint64_t raw_sink;
+        const size_t bytes = ((size_t) (g_wo.n / 32) * (g_wo.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes) & ~(size_t) 511;
+        for (int round = 0; round < 3; ++round) {
+            const double a = now_s();
+            run([](int tid) {
+                const size_t bytes = ((size_t) (g_wo.n / 32) * (g_wo.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes) & ~(size_t) 511;
+                const size_t per = bytes / g_participants;
+                const uint8_t * p = g_wo.b + per * tid;
+                const uint8_t * e = p + per;
+                uint64_t acc = 0;
+                while (p + 512 <= e) {
+                    uint64_t a0, a1, a2, a3, a4, a5, a6, a7;
+                    memcpy(&a0, p + 0, 8);   memcpy(&a1, p + 64, 8);
+                    memcpy(&a2, p + 128, 8); memcpy(&a3, p + 192, 8);
+                    memcpy(&a4, p + 256, 8); memcpy(&a5, p + 320, 8);
+                    memcpy(&a6, p + 384, 8); memcpy(&a7, p + 448, 8);
+                    acc ^= a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ a6 ^ a7;
+                    p += 512;
+                }
+                if (acc == 0x5a5a5a5a5a5a5a5aULL) raw_sink = acc;
+            });
+            const double d = now_s() - a;
+            printf("  raw stream %zu MB  %6.3f ms  %6.1f GB/s\n", bytes >> 20, d * 1e3, bytes / d / 1e9);
+        }
+        g_quit.store(1, std::memory_order_release);
+        barrier();
+        return 0;
+    }
+
+    // ---- micro: per-matrix streaming rate through the same call path
+    if (getenv("MEGA_BW")) {
+        struct { const char * nm; WRef w; float * c; } t[] = {
+            { "output  150MB", g_wo,    g_logits },
+            { "ffn_gate  7MB", g_wg[0], g_gate },
+            { "ffn_down  7MB", g_wd[0], g_xa },
+            { "attn_q  2.4MB", g_wq[0], g_q },
+        };
+        for (auto & e : t) {
+            double best = 1e9;
+            for (int r = 0; r < 8; ++r) {
+                const double a = now_s();
+                quant_a(g_xa, e.w.k);
+                g_mjn = 1; g_mj[0] = { e.w.b, e.w.k, e.w.n, e.c };
+                run(task_mgemm);
+                const double d = now_s() - a;
+                if (r >= 2 && d < best) best = d;
+            }
+            const double mb = (double) (e.w.n / 32) *
+                              (e.w.k / (g_bit3 ? Q3_K : 32)) * g_blk_bytes / 1e6;
+            printf("  %s  %6.3f ms  %6.1f GB/s\n", e.nm, best * 1e3, mb / 1e3 / best);
+        }
+        g_quit.store(1, std::memory_order_release);
+        barrier();
+        return 0;
+    }
+
+    // ---- prefill
+    // The prompt enters as token ids (llama-tokenize emits exactly these), goes
+    // through the same target_forward the decode round uses, in chunks of g_rowcap
+    // rows, and leaves its KV in the cache at positions 0 .. n-2. The last prompt
+    // token is deliberately not consumed here: it becomes the decode round's anchor,
+    // so the very first round already produces the first generated token.
+    int32_t * ptok = nullptr;
+    int n_prompt = 0;
+    if (g_prompt_file) {
+        FILE * f = fopen(g_prompt_file, "r");
+        if (!f) { fprintf(stderr, "prompt open %s\n", g_prompt_file); return 1; }
+        int cap = 1 << 22;
+        ptok = (int32_t *) malloc((size_t) cap * 4);
+        int v;
+        while (n_prompt < cap && fscanf(f, "%d", &v) == 1) ptok[n_prompt++] = v;
+        fclose(f);
+        printf("prompt: %d tokens from %s\n", n_prompt, g_prompt_file);
+    }
+
+    int produced = 0;
+    if (n_prompt > 0) {
+        const double tp0 = now_s();
+        int chunk = g_rowcap;
+        if (const char * pc = getenv("MEGA_PFCHUNK")) {
+            const int v = atoi(pc);
+            if (v >= 1 && v < chunk) chunk = v;
+        }
+        int done = 0;
+        // leave the last token for the decode round
+        const int total = n_prompt - 1;
+        while (done < total) {
+            const int cm = (total - done < chunk) ? (total - done) : chunk;
+            target_forward(cm, done, ptok + done, 0);
+            // The drafter sees committed positions only through fused target
+            // features, so every prefilled position has to be injected too.
+            if (g_ds_on)
+                for (int r = 0; r < cm; ++r) ds_encode_inject(done + r, r);
+            done += cm;
+        }
+        const double tp = now_s() - tp0;
+        memset(g_stage, 0, sizeof g_stage);   // prefill must not pollute decode stats
+        printf("prefill: %d tokens in %.3f s (%.2f tok/s, %d-row chunks)\n",
+               total, tp, total / tp, chunk);
+        produced = total;
+    }
+
+    // ---- decode
+    int tok = (n_prompt > 0) ? ptok[n_prompt - 1] : prompt;
+    const double t_start = now_s();
+    // Replay drafts: a file of token ids from a plain greedy run, so the round has
+    // known-correct drafts and acceptance must be m-1 on every round. This is how
+    // the multi-row path is checked for exactness without any draft model.
+    int32_t * g_replay = nullptr;
+    int g_nreplay = 0;
+    if (const char * rp = getenv("MEGA_REPLAY")) {
+        FILE * f = fopen(rp, "r");
+        if (!f) { fprintf(stderr, "replay open %s\n", rp); return 1; }
+        int cap = 1 << 20;
+        g_replay = (int32_t *) malloc(cap * 4);
+        int v;
+        while (g_nreplay < cap && fscanf(f, "%d", &v) == 1) g_replay[g_nreplay++] = v;
+        fclose(f);
+        printf("replay: %d tokens from %s\n", g_nreplay, rp);
+    }
+
+    printf("decode: %d tokens from pos %d (kstep=%d, drafts=%d, rows=%d)\n",
+           ngen, produced, g_kstep, g_nspec, g_nspec + 1);
+
+    // emitted holds the whole sequence, prompt included, so the dump is directly
+    // comparable with the reference model's full token stream.
+    int32_t * emitted = (int32_t *) malloc((size_t) (n_prompt + ngen + 8) * 4);
+    if (n_prompt > 0) memcpy(emitted, ptok, (size_t) n_prompt * 4);
+    // With a prompt, produced starts at the anchor's position (the last prompt
+    // token), so generated tokens land one slot after the copied prompt.
+    const int em_off = (n_prompt > 0) ? 1 : 0;
+    int rounds = 0;
+    long long accepted_drafts = 0;
+    int32_t pred[MROW_MAX];
+    // produced is an absolute position, so the bound is "prefix + ngen", not ngen.
+    const int n_target = produced + ngen;
+    while (produced < n_target) {
+        TICK_DECL;
+        const int K = g_nspec;
+        const int m = K + 1;
+        g_m = m;
+        g_use_m4 = (m >= 4 && !g_bit3);
+        g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
+        g_pos0 = produced;   // row r sits at position produced + r
+
+        int32_t rowtok[MROW_MAX];
+        rowtok[0] = tok;
+        if (g_ds_on && K > 0) {
+            TICK();
+            ds_draft(tok, produced, K, g_drafts);
+            TOCK(S_GEMM);
+            // With a replay file the round must follow the known-good continuation, so the
+            // drafter is scored against the real target instead of steering the run.
+            for (int r = 0; r < K; ++r)
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : g_drafts[r];
+            // The drafter drives the row geometry for its own block and its markov head is
+            // single row, so the target's geometry is restored before anything stages A.
+            g_m = m;
+            g_use_m4 = (m >= 4 && !g_bit3);
+            g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
+        } else {
+            for (int r = 0; r < K; ++r)
+                // replay[i] is the i-th token plain greedy emitted, and `produced` of
+                // them are already committed, so the draft for row r+1 is replay[produced+r].
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
+        }
+
+        // Drafter first: it drives the row geometry for its own block. Then one
+        // forward for the whole block, however those rows were chosen.
+        TICK();
+        if (g_ds_on && K > 0) {
+            ds_draft(tok, produced, K, g_drafts);
+            TOCK(S_GEMM);
+            // With a replay file the round must follow the known-good continuation, so the
+            // drafter is scored against the real target instead of steering the run.
+            for (int r = 0; r < K; ++r)
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : g_drafts[r];
+        } else {
+            TOCK(S_GEMM);
+            for (int r = 0; r < K; ++r)
+                // replay[i] is the i-th token plain greedy emitted, and `produced` of
+                // them are already committed, so the draft for row r+1 is replay[produced+r].
+                rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
+        }
+
+        target_forward(m, produced, rowtok, 1);
 
         // Row r's argmax is the target's greedy choice after position pos0+r, so it
         // is directly comparable with draft r+1's token.
@@ -1709,8 +1821,8 @@ int main(int argc, char ** argv) {
         }
 
         // rows 0..acc-1 are now committed; row acc-1's prediction is the next token
-        for (int i = 0; i < acc && produced + i < ngen + 8; ++i)
-            emitted[produced + i] = (i + 1 < acc) ? rowtok[i + 1] : pred[acc - 1];
+        for (int i = 0; i < acc && produced + em_off + i < n_prompt + ngen + 8; ++i)
+            emitted[produced + em_off + i] = (i + 1 < acc) ? rowtok[i + 1] : pred[acc - 1];
         // The committed positions enter the drafter through fused target features, so
         // they are injected after acceptance, using the rows that were just verified.
         if (g_ds_on)
@@ -1722,7 +1834,8 @@ int main(int argc, char ** argv) {
     if (const char * tp = getenv("MEGA_TOKOUT")) {
         FILE * f = fopen(tp, "w");
         if (f) {
-            for (int i = 0; i < produced; ++i) fprintf(f, "%d ", emitted[i]);
+            const int nout = produced + em_off;
+            for (int i = 0; i < nout; ++i) fprintf(f, "%d ", emitted[i]);
             fputc('\n', f);
             fclose(f);
             printf("tokens -> %s\n", tp);
@@ -1737,13 +1850,14 @@ int main(int argc, char ** argv) {
                rounds, (double) accepted_drafts / rounds, g_nspec);
 
     const double dt = now_s() - t_start;
+    const int n_gen = produced - (n_prompt > 0 ? n_prompt - 1 : 0);
     printf("--- stage breakdown (ms/token) ---\n");
     for (int i = 0; i < S_NSTAGE; ++i)
         if (g_stage[i] > 0) printf("  %-16s %7.2f  (%4.1f%%)\n", g_stage_name[i],
                                    g_stage[i] * 1000.0 / (rounds ? rounds : 1),
                                    100.0 * g_stage[i] / dt);
     printf("decode: %d tokens in %d rounds, %.3f s -> %.2f tok/s (%.1f ms/round)\n",
-           produced, rounds, dt, produced / dt, rounds ? dt * 1e3 / rounds : 0.0);
+           n_gen, rounds, dt, n_gen / dt, rounds ? dt * 1e3 / rounds : 0.0);
 
     g_quit.store(1, std::memory_order_release);
     barrier();
