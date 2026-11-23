@@ -718,50 +718,86 @@ static int64_t  g_x_rowstride;
 static const float * g_a8_src;
 static int64_t g_a8_rows, g_a8_k, g_a8_j;
 static int64_t g_a8_stride;
+// One activation scale per 256 k-elements per row. Per-row scaling had to cover
+// 2048 values including outliers, so its step was ~10x coarser than llama.cpp's
+// per-block scheme and V at layer 0 came out -0.0365 against a -0.0025 reference.
+// 256 (16 vmadot steps) measured 0.0048 against per-32's 0.0021 and per-row's
+// 0.0364, i.e. most of the accuracy for a flush every 16 steps instead of 2.
+static const int A_BLK = 256, A_BSTEP = A_BLK / 16;
+// lane = row*8 + col, so the four row scales repeat eight times each
+static const uint32_t ROWIDX[32] = { 0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+                                     2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3 };
+// Same map widened to 128 lanes: the four cg groups of a 64-column tile repeat
+// the one 32-lane pattern, so a single m4 gather expands four row scales.
+static const uint32_t * rowidx4(void) {
+    static uint32_t t[128];
+    static int init = 0;
+    if (!init) { for (int i = 0; i < 128; ++i) t[i] = ROWIDX[i & 31]; init = 1; }
+    return t;
+}
+static int64_t g_a8_nblk;
 static void task_pf_quant_i8(int tid) {
     const int64_t k = g_a8_k, kst = k / 16, mg = g_a8_rows / 4;
+    const int64_t nblk = k / A_BLK;
     for (int64_t g = tid; g < mg; g += g_participants) {
         uint8_t * rec = g_pfa + (g_a8_j * mg + g) * g_a8_stride;
         int8_t *  pay = (int8_t *) rec;
-        float *   sc  = (float *) (rec + kst * 64);
+        float *   sc  = (float *) (rec + kst * 64);      // [block][row], 4 per block
+        float rowmax[4], rowsc[4];
+        for (int r = 0; r < 4; ++r) rowmax[r] = 0;
+        // pass 1: one max per (row, 256-element block); the row max falls out too
+        for (int64_t b = 0; b < nblk; ++b) {
+            for (int r = 0; r < 4; ++r) {
+                const float * a = g_a8_src + ((g * 4 + r) * k) + b * A_BLK;
+                float mx = 0;
+                for (int64_t i = 0; i < A_BLK; ) {
+                    const size_t vl = __riscv_vsetvl_e32m4((size_t) (A_BLK - i));
+                    vfloat32m4_t v = __riscv_vle32_v_f32m4(a + i, vl);
+                    v = __riscv_vfabs_v_f32m4(v, vl);
+                    const vfloat32m1_t red =
+                        __riscv_vfredmax_vs_f32m4_f32m1(v, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl);
+                    const float m = __riscv_vfmv_f_s_f32m1_f32(red);
+                    if (m > mx) mx = m;
+                    i += (int64_t) vl;
+                }
+                sc[b * 4 + r] = mx > 0 ? mx / 127.0f : 1.0f;
+                if (mx > rowmax[r]) rowmax[r] = mx;
+            }
+        }
+        for (int r = 0; r < 4; ++r) {
+            rowsc[r] = rowmax[r] > 0 ? rowmax[r] / 127.0f : 1.0f;
+            if (g_x8_want && g_a8_j == 0) g_a8xs[g * 4 + r] = rowsc[r];
+        }
+        // pass 2: quantise against the block's own scale
         for (int r = 0; r < 4; ++r) {
             const float * a = g_a8_src + ((g * 4 + r) * k);
-            // pass 1: max |a| over the row
-            float mx = 0;
-            for (int64_t i = 0; i < k; ) {
-                const size_t vl = __riscv_vsetvl_e32m4((size_t) (k - i));
-                vfloat32m4_t v = __riscv_vle32_v_f32m4(a + i, vl);
-                v = __riscv_vfabs_v_f32m4(v, vl);
-                const vfloat32m1_t red =
-                    __riscv_vfredmax_vs_f32m4_f32m1(v, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl);
-                const float m = __riscv_vfmv_f_s_f32m1_f32(red);
-                if (m > mx) mx = m;
-                i += (int64_t) vl;
-            }
-            const float s = mx > 0 ? mx / 127.0f : 1.0f;
-            const float inv = 1.0f / s;
-            for (int lane = 0; lane < 32; ++lane) sc[r * 32 + lane] = s;
-            if (g_x8_want && g_a8_j == 0) g_a8xs[g * 4 + r] = s;
-            // pass 2: scale, round to nearest even, clamp, narrow, store 16 bytes
+            const float xr = rowsc[r] > 0 ? 1.0f / rowsc[r] : 1.0f;   // X100 keeps a row scale
             for (int64_t t = 0; t < kst; ++t) {
                 const size_t vl = __riscv_vsetvl_e32m1(16);
+                const int64_t b = (t / A_BSTEP);
+                const float s = sc[b * 4 + r];
                 vfloat32m1_t v = __riscv_vle32_v_f32m1(a + t * 16, vl);
-                v = __riscv_vfmul_vf_f32m1(v, inv, vl);
-                vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(v, vl);
+                vfloat32m1_t qf = __riscv_vfmul_vf_f32m1(v, 1.0f / s, vl);
+                vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(qf, vl);
                 q = __riscv_vmax_vx_i32m1(q, -127, vl);
                 q = __riscv_vmin_vx_i32m1(q, 127, vl);
                 const vint16mf2_t b16 = __riscv_vncvt_x_x_w_i16mf2(q, vl);
                 const vint8mf4_t b8 = __riscv_vncvt_x_x_w_i8mf4(b16, vl);
                 __riscv_vse8_v_i8mf4(pay + t * 64 + r * 16, b8, vl);
                 if (g_x8_want && g_a8_j == 0) {
-                    // Same sixteen bytes go to the X100 record, split into the two
-                    // 8-wide depth steps. Fusing costs two stores per row here and
-                    // saves re-reading the whole matrix afterwards.
+                    // The X100 tail columns keep one scale per row, so requantise
+                    // there rather than reusing the block-scaled bytes.
+                    vfloat32m1_t xf = __riscv_vfmul_vf_f32m1(v, xr, vl);
+                    vint32m1_t xq = __riscv_vfcvt_x_f_v_i32m1(xf, vl);
+                    xq = __riscv_vmax_vx_i32m1(xq, -127, vl);
+                    xq = __riscv_vmin_vx_i32m1(xq, 127, vl);
+                    const vint8mf4_t x8 =
+                        __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(xq, vl), vl);
                     int8_t * xo = g_a8x + g * g_x_rowstride + t * 64 + r * 8;
                     const size_t v8 = __riscv_vsetvl_e8mf4(8);
-                    __riscv_vse8_v_i8mf4(xo, b8, v8);
+                    __riscv_vse8_v_i8mf4(xo, x8, v8);
                     __riscv_vse8_v_i8mf4(xo + 32,
-                        __riscv_vslidedown_vx_i8mf4(b8, 8, (size_t) 16), v8);
+                        __riscv_vslidedown_vx_i8mf4(x8, 8, (size_t) 16), v8);
                     __riscv_vsetvl_e32m1((size_t) 16);
                 }
             }
@@ -769,11 +805,32 @@ static void task_pf_quant_i8(int tid) {
     }
     (void) kst;
 }
-static void quant_a_i8d(const float * a, int64_t rows, int64_t k, int64_t j) {
-    g_a8_stride = (k / 16) * 64 + 128;  // payload, then 32 pre-expanded scales
+static inline void quant_a_i8d(const float * a, int64_t rows, int64_t k, int64_t j) {
+    // Payload, then 4 x 32 pre-expanded row scales (one 32-lane copy per row of
+    // the 4-row group) = 512 B. Reserving only 128 B let each group's scale
+    // block overwrite the first 384 B of the next group's payload, i.e. the
+    // first 96 k-elements of every group were garbage on top of quantisation.
+    // Payload is (k/16) 64-byte steps; the scales are one f32 per (4-row group,
+    // k-block) pair, i.e. 16 B per block. The old fixed 512 B reserved room for
+    // only 32 blocks, so a 6144-wide down projection at A_BLK=64 wrote 1.5 KB
+    // past the record and every following group's payload was destroyed.
+    g_a8_stride = (k / 16) * 64 + (k / A_BLK) * 16 + 64;
+    g_a8_nblk = k / A_BLK;
     g_a8_src = a; g_a8_rows = rows; g_a8_k = k; g_a8_j = j;
     run(task_pf_quant_i8);
 }
+// Vendor-precision prefill: the same m4 i8i4 kernel the decode path runs, which
+// keeps the Q4_0 block scales exactly and quantises activations per 32 k
+// elements. The vmadot path re-quantises the dequantised weights to int8 with a
+// per-row scale, which measured 2.0% on q/k/v and 9.9% on the activation side,
+// and a four-row chunk then drifted 17.8% away from the f32 reference by layer
+// 41 -- enough to move the argmax. Exactness first, then win the speed back.
+static int g_pf_vendor = 0;
+static inline void pf_quant(const float * a, int64_t rows, int64_t k, int64_t j) {
+    if (g_pf_vendor) quant_a_4row(a, rows, k, j);
+    else quant_a_i8d(a, rows, k, j);
+}
+
 
 // One GEMM over a weight tile: for each 64-column block, sweep every 4-row group
 // so the 1 KB weight tile is fetched once and reused. That loop order is worth
@@ -784,6 +841,7 @@ static void quant_a_i8d(const float * a, int64_t rows, int64_t k, int64_t j) {
 // time. Vectorised it is 8 cvt + 8 mul + 4x8 lane moves, and the per-lane scale
 // products are hoisted out because they only depend on the column block.
 static int32_t g_i8c[8][256];
+static float   g_i8f[8][256];   // float accumulator between scale blocks
 static float   g_i8t[8][256];
 static float   g_a8s[8][4];
 static const int64_t CH = 8;              // row groups per scheduling chunk
@@ -827,19 +885,48 @@ static void task_pf_gemm_i8(int tid) {
                 for (int64_t g = rt; g < rend; ++g) {
                     const uint8_t * arec = g_pfa + (j * mgroups + g) * g_a8_stride;
                     const float * asc = (const float *) (arec + kst * 64);
-                    gemm_i8d_4x64((const int8_t *) arec, bcol, g_i8c[tid], kst);
-                    if (g_noepi) { c[(g * 4) + nb] = (float) g_i8c[tid][0]; continue; }
-                    for (int k2 = 0; k2 < 4; ++k2) g_a8s[tid][k2] = asc[k2 * 32];
+                    if (g_noepi) {
+                        gemm_i8d_4x64((const int8_t *) arec, bcol, g_i8c[tid], kst);
+                        c[(g * 4) + nb] = (float) g_i8c[tid][0];
+                        continue;
+                    }
+                    // One vmadot run per scale block, flushed into f32 with that
+                    // block's four row scales. The scale vector repeats each row's
+                    // scale over its eight columns (lane = row*8 + col).
+                    float * facc = g_i8f[tid];
+                    memset(facc, 0, 256 * 4);
+                    const vuint32m1_t ridx = __riscv_vle32_v_u32m1(ROWIDX, 32);
+                    for (int64_t b = 0; b < kst; b += A_BSTEP) {
+                        const int64_t ns = (kst - b < A_BSTEP) ? (kst - b) : A_BSTEP;
+                        gemm_i8d_4x64((const int8_t *) arec + b * 64, bcol + b * 1024,
+                                      g_i8c[tid], ns);
+                        // four contiguous row scales -> 32 lanes of (row*8+col) order
+                        const vfloat32m1_t s4 = __riscv_vle32_v_f32m1(asc + (b / A_BSTEP) * 4, 4);
+                        // The flush is charged once per scale block, so at A_BLK=64 it
+                        // runs four times as often as at 256 and the m1 version (6 ops
+                        // per 32 lanes, 48 per flush) cost 9.3x the whole GEMM. Same
+                        // arithmetic in m4: 128 lanes per op, 12 ops per flush.
+                        const size_t vl4 = __riscv_vsetvl_e32m4(128);
+                        const vfloat32m4_t sv4 = __riscv_vrgather_vv_f32m4(
+                            __riscv_vlmul_ext_v_f32m1_f32m4(s4),
+                            __riscv_vle32_v_u32m4(rowidx4(), vl4), vl4);
+                        for (int h4 = 0; h4 < 2; ++h4) {
+                            const vint32m4_t iv = __riscv_vle32_v_i32m4(g_i8c[tid] + h4 * 128, vl4);
+                            vfloat32m4_t fv = __riscv_vfcvt_f_x_v_f32m4(iv, vl4);
+                            fv = __riscv_vfmul_vv_f32m4(fv, sv4, vl4);
+                            const vfloat32m4_t acc = __riscv_vle32_v_f32m4(facc + h4 * 128, vl4);
+                            __riscv_vse32_v_f32m4(facc + h4 * 128, __riscv_vfadd_vv_f32m4(acc, fv, vl4), vl4);
+                        }
+                    }
                     float * base = crow + (g * 4) * ldc;
                     for (int cg = 0; cg < 8; ++cg) {
                         size_t vl = __riscv_vsetvl_e32m1(32);
-                        const vint32m1_t iv = __riscv_vle32_v_i32m1(g_i8c[tid] + cg * 32, vl);
-                        vfloat32m1_t fv = __riscv_vfcvt_f_x_v_f32m1(iv, vl);
-                        fv = __riscv_vfmul_vv_f32m1(fv, __riscv_vle32_v_f32m1(bsv + cg * 32, vl), vl);
+                        const vfloat32m1_t fv = __riscv_vfmul_vv_f32m1(
+                            __riscv_vle32_v_f32m1(facc + cg * 32, vl),
+                            __riscv_vle32_v_f32m1(bsv + cg * 32, vl), vl);
                         for (int r = 0; r < 4; ++r) {
-                            vfloat32m1_t sh = r ? __riscv_vslidedown_vx_f32m1(fv, (size_t) (r * 8), vl) : fv;
+                            const vfloat32m1_t sh = r ? __riscv_vslidedown_vx_f32m1(fv, (size_t) (r * 8), vl) : fv;
                             vl = __riscv_vsetvl_e32m1(8);
-                            sh = __riscv_vfmul_vf_f32m1(sh, g_a8s[tid][r], vl);
                             __riscv_vse32_v_f32m1(base + r * ldc + cg * 8, sh, vl);
                             vl = __riscv_vsetvl_e32m1(32);
                         }
@@ -1574,7 +1661,10 @@ static const int I8_ROWS = I8_G * PFA_ROWS;
 static const int WBLK = (MAXCTX / 16) * 64;    // int8 attention weights per row group
 static int64_t g_pfa_rows, g_pfa_ctx;
 static float * g_pq;                        // [rows][N_HEAD][HEAD_DIM]
-static float * g_pfa_out;                   // [rows][N_HEAD][HEAD_DIM], layer 0 only
+static float * g_pfa_out;                   // [rows][N_HEAD][HEAD_DIM], refilled per layer
+// The int8 PV wrote its result only when layer == 0, so every layer past the
+// first ran the out-projection on layer 0's attention output; layer 1 came out
+// 0.49 relative away from the f32 reference while layer 0 was 0.03.
 static float g_ppv_tmp[N_GPU][4 * N_HEAD * HEAD_DIM];
 static float g_psa[N_GPU][PFA_ROWS][MAXCTX];    // per-thread scores (f16 path)
 // The int8 path keeps its raw scores in int16 fixed point at 1/128. A row of
@@ -2347,7 +2437,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
                     printf(" | nq=%d\n", nq);
                 }
             }
-            if (layer != 0 || !g_pfa_out) continue;
+            if (!g_pfa_out) continue;
             const size_t vl8 = __riscv_vsetvl_e32m1(8);
             for (int r = 0; r < 4; ++r) {
                 const int rr = gg * 4 + r;
@@ -2689,7 +2779,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
             }
         }
 
-        if (layer != 0 || !g_pfa_out) continue;
+        if (!g_pfa_out) continue;
         const size_t vl8 = __riscv_vsetvl_e32m1(8);
         for (int gg = 0; gg < I8_G; ++gg)
             for (int r = 0; r < 4; ++r) {
@@ -3055,8 +3145,11 @@ static void silu_rows_band(int64_t lo, int64_t hi) {
             q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.2402265070f, vl), vl);
             q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.6931471806f, vl), vl);
             q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
-            // 2^n by writing the exponent field directly
-            const vint32m2_t bits = __riscv_vsll_vx_i32m2(ni, 23, vl);
+            // 2^n by writing the exponent field directly; the bias of 127 has to
+            // be added before the shift, else n=0 gives 0.0 and silu(x) collapses
+            // to x, which made the prefill FFN 3.4x too large.
+            const vint32m2_t bits = __riscv_vsll_vx_i32m2(
+                __riscv_vadd_vx_i32m2(ni, 127, vl), 23, vl);
             q = __riscv_vfmul_vv_f32m2(q, __riscv_vreinterpret_v_i32m2_f32m2(bits), vl);
             const vfloat32m2_t den = __riscv_vfadd_vf_f32m2(q, 1.0f, vl);
             __riscv_vse32_v_f32m2(p + i, __riscv_vfdiv_vv_f32m2(x, den, vl), vl);
@@ -3070,8 +3163,10 @@ static void silu_rows(float * g, int64_t rows) {
 }
 
 // The FFN is silu(gate) * up, and the up half of the pair has to be folded in
-// before the down projection. silu_rows alone left it out, so prefill fed
-// silu(gate) into ffn_down; the up projection was computed and thrown away.
+// before the down projection. This used to multiply gate by up without the
+// sigmoid at all, so prefill ran a plain gated-linear unit; layer 0 came out
+// 3.4x the reference. silu and the multiply share one pass over the row, so
+// the gate value is only loaded and stored once.
 static const float * silu_mul_up;
 static void silu_mul_band(int64_t lo, int64_t hi) {
     for (int64_t r = lo; r < hi; ++r) {
@@ -3079,9 +3174,24 @@ static void silu_mul_band(int64_t lo, int64_t hi) {
         const float * u = silu_mul_up + r * N_FF;
         for (int i = 0; i < N_FF; ) {
             const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_FF - i));
+            const vfloat32m2_t x = __riscv_vle32_v_f32m2(p + i, vl);
+            const vfloat32m2_t t = __riscv_vfmul_vf_f32m2(
+                __riscv_vfneg_v_f32m2(x, vl), 1.4426950408889634f, vl);
+            const vint32m2_t ni = __riscv_vfcvt_x_f_v_i32m2(t, vl);
+            const vfloat32m2_t f = __riscv_vfsub_vv_f32m2(
+                t, __riscv_vfcvt_f_x_v_f32m2(ni, vl), vl);
+            vfloat32m2_t q = __riscv_vfmv_v_f_f32m2(0.0013333558f, vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0096181291f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0555041087f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.2402265070f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.6931471806f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
+            q = __riscv_vfmul_vv_f32m2(q, __riscv_vreinterpret_v_i32m2_f32m2(
+                __riscv_vsll_vx_i32m2(__riscv_vadd_vx_i32m2(ni, 127, vl), 23, vl)), vl);
+            const vfloat32m2_t s = __riscv_vfdiv_vv_f32m2(
+                x, __riscv_vfadd_vf_f32m2(q, 1.0f, vl), vl);
             __riscv_vse32_v_f32m2(p + i,
-                __riscv_vfmul_vv_f32m2(__riscv_vle32_v_f32m2(p + i, vl),
-                                       __riscv_vle32_v_f32m2(u + i, vl), vl), vl);
+                __riscv_vfmul_vv_f32m2(s, __riscv_vle32_v_f32m2(u + i, vl), vl), vl);
             i += (int) vl;
         }
     }
@@ -3285,7 +3395,10 @@ static bool export_kv(int64_t npos) {
 static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     if (!g_i8w) { fprintf(stderr, "real prefill needs the int8 weight copy (-I)\n"); return false; }
     const int64_t NP = npref;
-    g_a8_stride = (N_FF / 16) * 64 + 128;
+    g_a8_stride = (N_FF / 16) * 64 + (N_FF / A_BLK) * 16 + 64;
+    // The vendor path lays a 4-row group out as [scale x4][sum x4][int8 4x32] per
+    // 32 k-elements, which is a wider record than the vmadot one.
+    if (g_pf_vendor) g_a8_stride = (N_FF / 32) * 152;
     const int64_t mgmax = (R + 63) / 64 * 16;          // groups, rounded like the chunk
     const size_t pfa_bytes = (size_t) 3 * mgmax * (size_t) g_a8_stride + (4 << 20);
     g_pfa     = (uint8_t *) hugemem(pfa_bytes);
@@ -3339,20 +3452,20 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
             t_norm+=now_s()-_a; _a=now_s();
             g_x8_want = g_x100;
-            for (int j = 0; j < 3; ++j) quant_a_i8d(g_pfxa, C, N_EMBD, j);
+            for (int j = 0; j < 3; ++j) pf_quant(g_pfxa, C, N_EMBD, j);
             g_x8_want = 0;
             t_quant+=now_s()-_a; _a=now_s();
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 3;
-            g_pfj[0] = { g_wq[L].b8, g_wq[L].k, g_wq[L].n, g_pq,  N_HEAD * HEAD_DIM, 0 };
-            g_pfj[1] = { g_wk[L].b8, g_wk[L].k, g_wk[L].n, g_pfk, N_KV * HEAD_DIM, 0 };
-            g_pfj[2] = { g_wv[L].b8, g_wv[L].k, g_wv[L].n, g_pfv, N_KV * HEAD_DIM, 0 };
+            g_pfj[0] = { g_pf_vendor ? g_wq[L].b : g_wq[L].b8, g_wq[L].k, g_wq[L].n, g_pq,  N_HEAD * HEAD_DIM, 0 };
+            g_pfj[1] = { g_pf_vendor ? g_wk[L].b : g_wk[L].b8, g_wk[L].k, g_wk[L].n, g_pfk, N_KV * HEAD_DIM, 0 };
+            g_pfj[2] = { g_pf_vendor ? g_wv[L].b : g_wv[L].b8, g_wv[L].k, g_wv[L].n, g_pfv, N_KV * HEAD_DIM, 0 };
             for (int j = 0; j < 3; ++j) {
                 const int64_t nx = (g_pfj[j].n * g_x100_pct / 100) & ~(int64_t) 63;
                 if (g_x100) g_pfj[j].nlim = g_pfj[j].n - nx;
             }
             if (g_x100) x100_prepare(g_pfj, 3);
-            run(task_pf_gemm_i8);
+            if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gqkv+=_g; } _a=now_s();
 
@@ -3383,91 +3496,150 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
                        rv[0], rv[1], rv_row[0], rv_row[1], rv_blk[0], rv_blk[1]);
                 printf("pf int8  V %.5f %.5f   (rowA vs blkA spread %.5f)\n",
                        g_pfv[0], g_pfv[1], rv_row[0] - rv_blk[0]);
+                {   // would a clipped abs-max scale buy back the per-row error?
+                    float rms = 0;
+                    for (int i = 0; i < N_EMBD; ++i) rms += g_pfxa[i] * g_pfxa[i];
+                    rms = sqrtf(rms / N_EMBD);
+                    static float aq[N_EMBD], rv2[N_KV * HEAD_DIM];
+                    printf("row rms %.4f max %.4f\n", rms, mx);
+                    static const float kks[7] = { 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 16.0f };
+                    for (int ki = 0; ki < 7; ++ki) {
+                        const float kk = kks[ki];
+                        const float lim = fminf(mx, kk * rms);
+                        const float sc = lim / 127.0f;
+                        for (int i = 0; i < N_EMBD; ++i) {
+                            float q = g_pfxa[i] / sc;
+                            q = fmaxf(-127.0f, fminf(127.0f, q));
+                            aq[i] = sc * (float) (int) lrintf(q);
+                        }
+                        probe_ref_gemm(rv2, wv, aq, N_KV * HEAD_DIM, N_EMBD);
+                        printf("  clip %.1f rms (lim %.3f): V0 %.5f err %.5f\n",
+                               kk, lim, rv2[0], rv2[0] - rv[0]);
+                    }
+                    printf("  blkA err %.5f   rowA(max) err %.5f\n", rv_blk[0] - rv[0], rv_row[0] - rv[0]);
+                    static const int bss[5] = { 32, 64, 128, 256, 512 };
+                    for (int bi = 0; bi < 5; ++bi) {
+                        const int bs = bss[bi];
+                        static float aq2[N_EMBD];
+                        for (int b0 = 0; b0 < N_EMBD; b0 += bs) {
+                            float m3 = 0;
+                            for (int i = 0; i < bs; ++i) m3 = fmaxf(m3, fabsf(g_pfxa[b0 + i]));
+                            const float s3 = m3 > 0 ? m3 / 127.0f : 1.0f;
+                            for (int i = 0; i < bs; ++i)
+                                aq2[b0 + i] = s3 * (float) (int) lrintf(g_pfxa[b0 + i] / s3);
+                        }
+                        probe_ref_gemm(rv2, wv, aq2, N_KV * HEAD_DIM, N_EMBD);
+                        printf("  block %3d: V0 %.5f err %.5f\n", bs, rv2[0], rv2[0] - rv[0]);
+                    }
+                }
             }
             prefill_qk_store(L, base, cm);
             t_rope+=now_s()-_r0;
 
             t_misc+=now_s()-_a; _a=now_s();
+            if (getenv("MEGA_ZV")) memset(g_v8i, 0, (size_t) N_KV * ((base + cm + 15) / 16) * 2048);
             pfa_convert_kv_i8(L, base + cm);
             t_conv+=now_s()-_a; _a=now_s();
             g_pfa_ctx = base;
             g_pfa_rows = C;
+            if (L == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/pf_q.bin", "wb");
+                fwrite(g_pq, 4, (size_t) (C * N_HEAD * HEAD_DIM), fp); fclose(fp);
+            }
             double _p=now_s();
             pfa_pack_q(C);
             t_packq+=now_s()-_p; _p=now_s();
             pfa_run(L);   // re-derives the tile count from g_pfa_rows
             t_attn+=now_s()-_p; _a=now_s();
-            if (L == 0 && getenv("MEGA_DUMP") && cm == 1) {
-                dump_row("pf", 0, 'o', g_pfa_out);   // attention output, all heads
-                dump_n("pf", 0, 'v', g_pfv, N_KV * HEAD_DIM);
-                {   // what the f16 cache actually got for position 0
-                    static float vc[N_KV * HEAD_DIM];
-                    for (int i = 0; i < N_KV * HEAD_DIM; ++i) vc[i] = (float) g_vpos[i];
-                    dump_n("pf", 0, 'w', vc, N_KV * HEAD_DIM);
-                }
+            if (getenv("MEGA_PROBE")) printf("probe L%d v8sc %.6g %.6g k8sc %.6g %.6g\n",
+                                             L, g_v8isc[0], g_v8isc[1], g_k8isc[0], g_k8isc[1]);
+            if (L == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/pf_oall.bin", "wb");
+                fwrite(g_pfa_out, 4, (size_t) (C * N_EMBD), fp); fclose(fp);
+            }
+            if (getenv("MEGA_DUMP")) {
+                dump_row("pf", L, 'o', g_pfa_out + (int64_t) (cm - 1) * N_EMBD);
+                dump_n("pf", L, 'v', g_pfv, N_KV * HEAD_DIM);
+                // what the f16 cache actually got for the last row
+                static float vc[N_KV * HEAD_DIM];
+                const int64_t vlast = g_pos - 1;
+                for (int i = 0; i < N_KV * HEAD_DIM; ++i)
+                    vc[i] = (float) g_vpos[(int64_t) L * KV_LAYER_STRIDE + (vlast % MAXCTX) * N_KV * HEAD_DIM + i];
+                dump_n("pf", L, 'w', vc, N_KV * HEAD_DIM);
             }
 
             { double _z=now_s();
             memset(g_pfa_out + cm * N_EMBD, 0, (size_t) (C - cm) * N_EMBD * 4);
             t_zero+=now_s()-_z; }
             g_x8_want = g_x100;
-            quant_a_i8d(g_pfa_out, C, N_EMBD, 0);
+            pf_quant(g_pfa_out, C, N_EMBD, 0);
             g_x8_want = 0;
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
-            g_pfj[0] = { g_wov[L].b8, g_wov[L].k, g_wov[L].n, g_pfxa, N_EMBD, 0 };
+            g_pfj[0] = { g_pf_vendor ? g_wov[L].b : g_wov[L].b8, g_wov[L].k, g_wov[L].n, g_pfxa, N_EMBD, 0 };
             if (g_x100) {
                 const int64_t nx = (g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63;
                 g_pfj[0].nlim = g_pfj[0].n - nx;
                 x100_prepare(g_pfj, 1);
             }
-            run(task_pf_gemm_i8);
+            if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
             { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
-            if (getenv("MEGA_DUMP") && cm == 1) dump_row("pf", L, 'a', g_pfx);
+            if (getenv("MEGA_DUMP")) dump_row("pf", L, 'a', g_pfx + (int64_t) (cm - 1) * N_EMBD);
 
             rmsnorm_rows(g_pfxa, g_pfx, g_ffn_norm[L], C);
+            if (getenv("MEGA_DUMP")) dump_row("pf", L, 'n', g_pfxa + (int64_t) (cm - 1) * N_EMBD);
             g_x8_want = g_x100;
-            for (int j = 0; j < 2; ++j) quant_a_i8d(g_pfxa, C, N_EMBD, j);
+            for (int j = 0; j < 2; ++j) pf_quant(g_pfxa, C, N_EMBD, j);
             g_x8_want = 0;
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 2;
-            g_pfj[0] = { g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF, 0 };
-            g_pfj[1] = { g_wu[L].b8, g_wu[L].k, g_wu[L].n, g_pfup,   N_FF, 0 };
+            g_pfj[0] = { g_pf_vendor ? g_wg[L].b : g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF, 0 };
+            g_pfj[1] = { g_pf_vendor ? g_wu[L].b : g_wu[L].b8, g_wu[L].k, g_wu[L].n, g_pfup,   N_FF, 0 };
             if (g_x100) {
                 g_pfj[0].nlim = g_pfj[0].n - ((g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63);
                 g_pfj[1].nlim = g_pfj[1].n - ((g_pfj[1].n * g_x100_pct / 100) & ~(int64_t) 63);
                 x100_prepare(g_pfj, 2);
             }
-            run(task_pf_gemm_i8);
+            if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_ggu+=_g; } _a=now_s();
 
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 gate/up: %.5f %.5f %.5f | %.5f %.5f\n",
                                                        g_pfgate[0], g_pfgate[1], g_pfgate[2], g_pfup[0], g_pfup[1]);
+            if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 h: %.5f %.5f %.5f | h[6143]=%.5f\n",
+                                                       g_pfgate[0], g_pfgate[1], g_pfgate[3072], g_pfgate[6143]);
             double _s=now_s();
             silu_mul_rows(g_pfgate, g_pfup, C);
+            if (L == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/pf_h.bin", "wb");
+                fwrite(g_pfgate + (int64_t) (C - 1) * N_FF, 4, (size_t) N_FF, fp); fclose(fp);
+                fp = fopen("/tmp/pf_up.bin", "wb");
+                fwrite(g_pfup + (int64_t) (C - 1) * N_FF, 4, (size_t) N_FF, fp); fclose(fp);
+            }
             t_silu+=now_s()-_s; _s=now_s();
             g_x8_want = g_x100;
-            quant_a_i8d(g_pfgate, C, N_FF, 0);
+            pf_quant(g_pfgate, C, N_FF, 0);
             g_x8_want = 0;
             t_quant+=now_s()-_s;
             _a=now_s();   // else the next t_gemm also bills silu and this quant
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
-            g_pfj[0] = { g_wd[L].b8, g_wd[L].k, g_wd[L].n, g_pfxa, N_EMBD, 0 };
+            g_pfj[0] = { g_pf_vendor ? g_wd[L].b : g_wd[L].b8, g_wd[L].k, g_wd[L].n, g_pfxa, N_EMBD, 0 };
             if (g_x100) {
                 g_pfj[0].nlim = g_pfj[0].n - ((g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63);
                 x100_prepare(g_pfj, 1);
             }
-            run(task_pf_gemm_i8);
+            if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
+            if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 down: %.5f %.5f %.5f\n",
+                                                       g_pfxa[0], g_pfxa[1], g_pfxa[2]);
             { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }   // C rows, not C * N_EMBD: it takes a row count
             t_misc+=now_s()-_a; _a=now_s();
-            if (getenv("MEGA_DUMP") && cm == 1) dump_row("pf", L, 'f', g_pfx);
+            if (getenv("MEGA_DUMP")) dump_row("pf", L, 'f', g_pfx + (int64_t) (cm - 1) * N_EMBD);
         }
     }
     const double dt = now_s() - t0;
@@ -3656,7 +3828,10 @@ static void bench_prefill_gemm(int64_t rows) {
     const float * act = actb;
     // scratch: rows x 6144 floats is enough for any of these GEMMs
     float * out = (float *) hugemem((size_t) rows * 6144 * 4);
-    const int64_t pfa_stride = g_i8w ? ((6144 / 16) * 64 + 64) : ((6144 / 32) * 152);
+    // Record stride must match what quant_a_i8d/quant_a_4row actually use, and
+    // the k=6144 down projection needs the scale area on top of the payload.
+    const int64_t pfa_stride = g_pf_vendor ? ((6144 / 32) * 152)
+                                           : ((6144 / 16) * 64 + (6144 / A_BLK) * 16 + 512);
     uint8_t * pfa = (uint8_t *) hugemem((size_t) (rows / 4) * 3 * pfa_stride + (2 << 20));
     ref_v = (float *) hugemem((size_t) rows * 6144 * 4);
     g_pfa = pfa;
@@ -3847,8 +4022,10 @@ int main(int argc, char ** argv) {
                 g_x100_pct = atoi(argv[++i]);
         }
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
+        else if (!strcmp(argv[i], "-W")) g_pf_vendor = 1;
     }
 
+    if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = 1;
     // The prefill path is int8 attention, and that decision has to be visible
     // before the X100 softmax workers are created below.
     if (g_pf_file) {
@@ -4123,6 +4300,7 @@ int main(int argc, char ** argv) {
             TICK();
             rmsnorm_par(g_xa, g_x, g_attn_norm[L], N_EMBD);
             TOCK(S_NORM);
+            if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", L, 'n', g_xa);
 
             quant_a(g_xa, N_EMBD);
             TICK();
@@ -4173,15 +4351,31 @@ int main(int argc, char ** argv) {
 
             if (L == 0 && step == 0 && getenv("MEGA_PROBE")) printf("dcL0 gate/up: %.5f %.5f %.5f | %.5f %.5f\n",
                                                                    g_gate[0], g_gate[1], g_gate[2], g_up[0], g_up[1]);
+            if (L == 0 && step == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/dc_g.bin", "wb");
+                fwrite(g_gate, 4, N_FF, fp); fclose(fp);
+                fp = fopen("/tmp/dc_u.bin", "wb");
+                fwrite(g_up, 4, N_FF, fp); fclose(fp);
+                printf("vsetvl m1 = %d, m2 = %d\n",
+                       (int) __riscv_vsetvl_e32m1(4096), (int) __riscv_vsetvl_e32m2(4096));
+            }
             TICK();
             parallel_for(N_FF, silu_fn);
             TOCK(S_SILU);
+            if (L == 0 && step == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/dc_h.bin", "wb");
+                fwrite(g_gate, 4, N_FF, fp); fclose(fp);
+            }
 
             quant_a(g_gate, N_FF);
             TICK();
             g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, g_xa };
             run(task_mgemm);
             TOCK(S_GEMM);
+            if (L == 0 && step == 0 && getenv("MEGA_DUMP")) {
+                FILE * fp = fopen("/tmp/dc_d.bin", "wb");
+                fwrite(g_xa, 4, N_EMBD, fp); fclose(fp);
+            }
             TICK();
             parallel_for(N_EMBD, residual_add_fn);
             TOCK(S_MISC);
@@ -4208,6 +4402,23 @@ int main(int argc, char ** argv) {
                 }
             }
             if (step < 10) printf("  step %d -> %d (%.4f)\n", step, best, bv);
+            if (step == 0 && getenv("MEGA_TOP")) {
+                // top-8 straight off the head, so the gap to the f32 reference
+                // (8181 at 10.83, 280 at 9.65) is visible instead of hidden
+                // behind a single argmax
+                static int idx[8]; static float val[8];
+                for (int j = 0; j < 8; ++j) { idx[j] = -1; val[j] = -INFINITY; }
+                for (int v2 = 0; v2 < g_wo.n; ++v2) {
+                    const float x2 = g_logits[v2];
+                    if (x2 <= val[7]) continue;
+                    int j = 7;
+                    while (j > 0 && val[j - 1] < x2) { val[j] = val[j - 1]; idx[j] = idx[j - 1]; --j; }
+                    val[j] = x2; idx[j] = v2;
+                }
+                printf("  top8:");
+                for (int j = 0; j < 8; ++j) printf(" %d(%.2f)", idx[j], val[j]);
+                printf("\n");
+            }
             tok = best;
         }
         TOCK(S_HEAD);

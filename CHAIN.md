@@ -169,3 +169,72 @@ roughly an order of magnitude coarser than per-32-block; on this row it costs
 15x the error. Prefill uses per-row because the vmadot kernel accumulates int32
 over the whole K; per-block scales would need a float flush every 32 elements,
 which is the open question for alignment.
+
+## Alignment: the attention output was layer 0's, for every layer
+
+The int8 PV path wrote its result into `g_pfa_out` only when `layer == 0`
+(`if (layer != 0 || !g_pfa_out) continue;` in both PV variants). Every layer past
+the first therefore ran its output projection on the *previous* layer 0 attention
+output, and the residual accumulated the same 2048-vector 42 times. With that
+guard removed, a four-row chunk tracks the f32 reference layer by layer:
+
+| layer | attention+residual | after FFN |
+|---|---|---|
+| 0  | 2.8e-2 | 3.0e-2 |
+| 8  | 8.5e-2 | 8.7e-2 |
+| 32 | 8.2e-2 | 8.1e-2 |
+| 41 | 7.8e-2 | 1.4e-1 |
+
+A single-row prefill (no attention mixing) sits at 1e-2 to 3e-3 the whole way,
+so the remaining drift is the four-row path.
+
+Two smaller faults found while measuring:
+
+* **Activation record stride.** `g_a8_stride` reserved a fixed 512 B for the
+  per-block scales. At `A_BLK=256` the k=6144 down projection needs 384 B, so
+  everything looked fine; at 64 it needs 1536 B and each group's scale block
+  overwrote the next group's payload. Sized from `k/A_BLK` now.
+* **No way to see the head.** `argmax` hides how close the logits are, so
+  `MEGA_TOP=1` prints the top eight with values. Against the f32 reference for
+  the same 5-token prompt (`8181 10.83, 280 9.65, 285 9.38`), the vmadot path
+  gave `285 9.68, 280 9.41, 8181 8.97`: the right candidate set, with `8181`
+  short by 1.9.
+
+## Exact Q4_0 block scales: the tokens line up
+
+The vmadot path re-quantises the dequantised 4-bit weights to int8 with one
+scale per output row. On layer 0 that is 2.0% on the q/k/v projections; the
+activation side at `A_BLK=256` adds 9.9%. Running the same projections through
+the vendor m4 `i8i4` kernel instead - which keeps each Q4_0 block's own scale
+and quantises activations per 32 k elements - matches the reference:
+
+```
+prefill: 4 tokens in 0.838 s
+step 0 -> 8181 (10.7097)
+  top8: 8181(10.71) 280(9.63) 285(9.34) 8266(8.92) 2297(8.69) 310(8.03) ...
+```
+
+`-W` (or `MEGA_VENDOR=1`) selects it: `pf_quant()` picks the quantiser and the
+`PfJob` weight pointer picks the Q4_0 copy (`b`) over the requantised one
+(`b8`); everything downstream, including the f16 KV cache, is unchanged. The
+first two greedy ids agree with the f32 reference (`8181`, then `350` - the
+reference has `350 20.086` and `33 20.043`, so llama.cpp picking `33` there is
+its own numerics on a 0.04 margin).
+
+### The price, at 10K
+
+| prefill GEMM | activation blocks | weights | 10K prefill | first id |
+|---|---|---|---|---|
+| vmadot | 256 | per-row int8 | 57.6 s (178 tok/s) | 285 |
+| vmadot | 128 | per-row int8 | 115.0 s (89 tok/s) | 285 |
+| vmadot | 64, m4 flush | per-row int8 | 218.2 s (47 tok/s) | 8181 (margin 0.11) |
+| vmadot | 32, m4 flush | per-row int8 | (not run) | 8181 (margin 0.13) |
+| vendor `i8i4` | 32 | Q4_0 exact | 93.8 s (109 tok/s) | 8181 (margin 1.08) |
+
+At `A_BLK=64` the flush runs four times as often and the GEMM goes from 25.6 s
+to 181 s, far more than the instruction count explains; rewriting the flush as
+m4 (128 lanes per op, 12 ops instead of 48 per block) only bought 315 s to
+218 s. The accumulator round-trip per block is the suspect. Fine activation
+blocks plus exact weights is the configuration that both aligns and stays fast,
+and that needs the block loop inside the kernel with the f32 accumulators held
+in registers.
