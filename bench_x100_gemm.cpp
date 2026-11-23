@@ -115,9 +115,13 @@ static void unpack(int32_t * out, const int32_t * buf) {
     // int32 apart, column groups 8. Indexing the row pair by r%2 instead of r/2
     // made rows 2..3 read rows 0..1, which is the "32/128 wrong" this check used
     // to report -- the asm was right and the harness was wrong.
+    // lane = row_in_pair*4 + col_in_group, so the pair term and the in-pair term
+    // are separate offsets. Dropping (r%2)*4 made rows 1 and 3 read rows 0 and 2,
+    // which is the 32/128 the check used to report.
     for (int r = 0; r < x100::ROWS; ++r)
         for (int c = 0; c < x100::COLS; ++c)
-            out[r * x100::COLS + c] = buf[(r / 2) * 32 + (c / 4) * 8 + (c % 4)];
+            out[r * x100::COLS + c] =
+                buf[(r / 2) * 32 + (c / 4) * 8 + (r % 2) * 4 + (c % 4)];
 }
 
 static int g_nthread = 8;
@@ -179,6 +183,38 @@ int main(int argc, char ** argv) {
         }
     printf("4x16 x K=%d vs exact scalar: %d/%d wrong (model+asm)\n",
            K, bad, 2 * x100::ROWS * x100::COLS);
+    if (bad) {
+        printf("   asm-vs-exact map (r=row, c=col):\n");
+        for (int r = 0; r < x100::ROWS; ++r) {
+            printf("   r%d:", r);
+            for (int c = 0; c < x100::COLS; ++c) {
+                int32_t exact = 0;
+                for (int k = 0; k < K; ++k) exact += rawA[r * K + k] * rawB[c * K + k];
+                const char ch = got[r * x100::COLS + c] == exact ? '.' :
+                                (ref[r * x100::COLS + c] == exact ? 'S' : 'X');
+                printf("%c", ch);
+            }
+            printf("\n");
+        }
+        printf("   ref-vs-exact map:\n");
+        for (int r = 0; r < x100::ROWS; ++r) {
+            printf("   r%d:", r);
+            for (int c = 0; c < x100::COLS; ++c) {
+                int32_t exact = 0;
+                for (int k = 0; k < K; ++k) exact += rawA[r * K + k] * rawB[c * K + k];
+                printf("%c", ref[r * x100::COLS + c] == exact ? '.' : 'X');
+            }
+            printf("\n");
+        }
+        printf("   delta rows 0..3, cols 0..3 (asm - exact):\n");
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                int32_t exact = 0;
+                for (int k = 0; k < K; ++k) exact += rawA[r * K + k] * rawB[c * K + k];
+                printf("     r%d c%d: asm %d exact %d\n", r, c, got[r * x100::COLS + c], exact);
+            }
+        }
+    }
     printf("B %.1f MB, A %.1f MB, %d threads, %d depth steps\n",
            N * (double) K / 1e6, M * (double) K / 1e6, g_nthread, (int) nstep);
 
