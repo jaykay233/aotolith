@@ -2,9 +2,12 @@
 //
 // `llama-simple` has no way to set n_ctx, so a 10K prompt is silently truncated
 // to its 512-token default, and `llama-cli`'s non-interactive switches differ
-// between builds. This links libllama directly: tokenize nothing (the ids come
-// from a file), disable all sampling but argmax, and print just the ids so the
-// megakernel's own chain can be diffed against them token by token.
+// between builds. This links libllama directly: the ids come from a file (no
+// tokeniser in the loop), all sampling is off, and it prints just the ids so the
+// megakernel's chain can be diffed against them token by token.
+//
+// The prompt goes through in n_batch-sized slices because llama_decode asserts
+// n_tokens <= cparams.n_batch; only the last slice asks for logits.
 #include "llama.h"
 #include <cstdio>
 #include <cstdlib>
@@ -33,48 +36,46 @@ int main(int argc, char ** argv) {
     if (!model) { fprintf(stderr, "load failed\n"); return 1; }
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = (uint32_t) (ids.size() + ngen + 32 > (size_t) nctx ? ids.size() + ngen + 32 : (size_t) nctx);
-    cp.n_batch = (uint32_t) cp.n_ctx;
-    cp.n_ubatch = (uint32_t) cp.n_ctx;
+    cp.n_ctx = (uint32_t) nctx;
+    cp.n_batch = 2048;      // llama.cpp defaults; a single 10K decode asserts
+    cp.n_ubatch = 512;
     cp.no_perf = true;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
 
-    const int n_embd = llama_model_n_embd(model);
-    (void) n_embd;
     const int np = (int) ids.size();
-    llama_batch b = llama_batch_init(np, 0, 1);
-    for (int i = 0; i < np; ++i) {
-        b.token[i] = ids[i];
-        b.pos[i] = i;
-        b.n_seq_id[i] = 1;
-        b.seq_id[i][0] = 0;
-        b.logits[i] = (i == np - 1);
+    for (int i0 = 0; i0 < np; i0 += 512) {
+        const int n = (np - i0 < 512) ? (np - i0) : 512;
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; ++i) {
+            b.token[i] = ids[i0 + i];
+            b.pos[i] = i0 + i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = (i0 + i == np - 1);
+        }
+        b.n_tokens = n;
+        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "decode failed at %d\n", i0); return 1; }
+        llama_batch_free(b);
     }
-    b.n_tokens = np;
-    if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed\n"); return 1; }
 
-    llama_token cur = 0;
-    int pos = np - 1;   // last prompt token sat at np-1; the next one goes at np
+    const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    int pos = np - 1;
     printf("prompt %d\n", np);
-    (void) cur;
     for (int s = 0; s < ngen; ++s) {
         const float * lg = llama_get_logits_ith(ctx, -1);
-        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
-        int best = 0; float bv = lg[0];
+        int best = 0;
+        float bv = lg[0];
         for (int v = 1; v < nv; ++v) if (lg[v] > bv) { bv = lg[v]; best = v; }
         printf("  step %d -> %d (%.4f)\n", s, best, bv);
         fflush(stdout);
         if (s + 1 == ngen) break;
         llama_batch one = llama_batch_init(1, 0, 1);
-        one.token[0] = best; one.pos[0] = pos + 1; one.n_seq_id[0] = 1;
+        one.token[0] = best; one.pos[0] = ++pos; one.n_seq_id[0] = 1;
         one.seq_id[0][0] = 0; one.logits[0] = true; one.n_tokens = 1;
         if (llama_decode(ctx, one) != 0) { fprintf(stderr, "step decode failed\n"); return 1; }
         llama_batch_free(one);
-        cur = best; ++pos;
     }
-    (void) cur;
-    llama_batch_free(b);
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();

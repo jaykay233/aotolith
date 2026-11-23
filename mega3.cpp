@@ -856,6 +856,47 @@ static void repack_b_i8(uint8_t * dst, const uint8_t * src, int64_t rows, int64_
     }
 }
 
+// The prefill int8 copy has to be built from whatever the decode path actually
+// uses, otherwise the two halves of the chain run different numbers. With -q2
+// that source is the 2-bit blob, so this walks it back to fp32 first.
+static void repack_b_i8_q2(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k) {
+    const int64_t nsup = k / Q2_K, kst = k / 16;
+    int8_t * pay = (int8_t *) dst;
+    float *  scl = (float *) (dst + (size_t) rows * k);
+    static float row[8192];
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t grp = r / 32, i = r % 32;
+        for (int64_t sup = 0; sup < nsup; ++sup) {
+            const uint8_t * blk = src + (grp * nsup + sup) * Q2_BLK;
+            const float d  = (float) ((const _Float16 *) (blk + 512 + 2048))[i];
+            const float dm = (float) ((const _Float16 *) (blk + 512 + 2048 + 64))[i];
+            for (int j = 0; j < 16; ++j) {
+                const float s = (float) (blk[j * 32 + i] & 0x0F) * d;
+                const float z = (float) (blk[16 * i + j] >> 4) * dm;
+                for (int b2 = 0; b2 < 16; ++b2) {
+                    const int q = (blk[512 + (j / 4) * 512 + i * 16 + b2] >> ((j % 4) * 2)) & 3;
+                    row[sup * 256 + j * 16 + b2] = (float) q * s - z;
+                }
+            }
+        }
+        float mx = 0;
+        for (int64_t x = 0; x < k; ++x) mx = fmaxf(mx, fabsf(row[x]));
+        const float sc = mx > 0 ? mx / 127.0f : 1.0f;
+        const float inv = 1.0f / sc;
+        const int64_t cb = r / 64, cc = r % 64;
+        {
+            const int64_t sg = (cb * 8 + cc / 8) * 32;
+            for (int lane = (int) (cc % 8); lane < 32; lane += 8) scl[sg + lane] = sc;
+        }
+        for (int64_t x = 0; x < k; ++x) {
+            int v = (int) lrintf(row[x] * inv);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            pay[((cb * kst + x / 16) << 10) + cc * 16 + (x % 16)] = (int8_t) v;
+        }
+    }
+}
+
 // 4 rows x 64 cols, K = ksteps*16. Both loads are whole-register (EEW-explicit,
 // because `vl8r.v` is an e8 alias and the dots need SEW=e32).
 static void gemm_i8d_4x64(const int8_t * A, const int8_t * B, int32_t * C, int64_t ksteps) {
@@ -4429,7 +4470,7 @@ int main(int argc, char ** argv) {
         uint8_t * blob8 = (uint8_t *) hugemem(pad8);
         if (!blob8) { fprintf(stderr, "oom int8 weights\n"); return 1; }
         use_huge(blob8, pad8);
-        const char * c8 = work_path("mega-w8b.bin");
+        const char * c8 = work_path(g_bit2 ? "mega-w8b-q2.bin" : "mega-w8b.bin");
         struct stat cs8;
         bool l8 = false;
         if (stat(c8, &cs8) == 0 && (size_t) cs8.st_size == t8) {
@@ -4453,7 +4494,8 @@ int main(int argc, char ** argv) {
                 items[i].ref->b8 = p;
                 const bool rope_pair = strstr(items[i].name, "attn_q.weight") ||
                                        strstr(items[i].name, "attn_k.weight");
-                repack_b_i8(p, e->data, e->n, e->k, nullptr);
+                if (g_bit2) repack_b_i8_q2(p, items[i].ref->b, e->n, e->k);
+                else        repack_b_i8(p, e->data, e->n, e->k, nullptr);
                 p += ((size_t) e->n * e->k + (size_t) e->n * 16 + 4095) & ~(size_t) 4095;
             }
             printf("weights: int8 copy in %.2f s (%.1f MB)\n", now_s() - t0, t8 / 1e6);
