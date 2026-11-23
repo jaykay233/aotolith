@@ -1014,6 +1014,63 @@ static inline vfloat32m4_t exp2f_poly_m4(vfloat32m4_t t, size_t vl) {
     return __riscv_vfmul_vv_f32m4(p, __riscv_vreinterpret_v_i32m4_f32m4(ex), vl);
 }
 
+// ------------------------------------------------ exp2 without the polynomial
+// The six-term polynomial above is twelve vector instructions on a chain six
+// FMA deep: probe_exp3 puts it at 43 cycles per eight lanes on X100 and the
+// chain, not the op count, is what costs. Two cheaper forms:
+//
+//   mode 1, three instructions. vfcvt.x.f of t*2^23 leaves floor(t) in the
+//   exponent field and the fraction in the mantissa, so reinterpreting
+//   (that + 127<<23) is 2^floor(t)*(1+f). Measured 6.15% maximum relative error,
+//   always an overestimate, at 14 cycles per eight lanes.
+//   mode 2, seven. Same, then multiply by a table of 2^f/(1+f) bucketed on the
+//   top three mantissa bits: the residual is the variation of that ratio inside
+//   a 1/8 bucket, a few tenths of a percent, at 21 cycles.
+//
+// The table has to fit one f32m1 register on the narrow cluster (VLMAX 8), so
+// eight buckets, not thirty-two -- a 32-entry gather reads zeros there.
+static int g_exp3 = 0;
+static float g_exp3_tab[32];
+static void exp3_init(void) {
+    for (int k = 0; k < 8; ++k) {
+        const double f = (k + 0.5) / 8.0;
+        g_exp3_tab[k] = (float) (pow(2.0, f) / (1.0 + f));
+    }
+    for (int k = 8; k < 32; ++k) g_exp3_tab[k] = 1.0f;
+}
+
+static inline vfloat32m1_t exp2f_e(vfloat32m1_t t, size_t vl) {
+    if (!g_exp3) return exp2f_poly(t, vl);
+    const vint32m1_t i = __riscv_vfcvt_x_f_v_i32m1(
+        __riscv_vfmul_vf_f32m1(t, 8388608.0f, vl), vl);
+    const vint32m1_t yb = __riscv_vadd_vx_i32m1(i, 127 << 23, vl);
+    vfloat32m1_t y = __riscv_vreinterpret_v_i32m1_f32m1(yb);
+    if (g_exp3 == 2) {
+        const vuint32m1_t low = __riscv_vand_vx_u32m1(
+            __riscv_vreinterpret_v_i32m1_u32m1(yb), 0x7FFFFF, vl);
+        const vuint32m1_t idx = __riscv_vsrl_vx_u32m1(low, 20, vl);
+        y = __riscv_vfmul_vv_f32m1(
+            y, __riscv_vrgather_vv_f32m1(__riscv_vle32_v_f32m1(g_exp3_tab, vl), idx, vl), vl);
+    }
+    return y;
+}
+
+static inline vfloat32m4_t exp2f_e_m4(vfloat32m4_t t, size_t vl) {
+    if (!g_exp3) return exp2f_poly_m4(t, vl);
+    const vint32m4_t i = __riscv_vfcvt_x_f_v_i32m4(
+        __riscv_vfmul_vf_f32m4(t, 8388608.0f, vl), vl);
+    const vint32m4_t yb = __riscv_vadd_vx_i32m4(i, 127 << 23, vl);
+    vfloat32m4_t y = __riscv_vreinterpret_v_i32m4_f32m4(yb);
+    if (g_exp3 == 2) {
+        const vuint32m4_t low = __riscv_vand_vx_u32m4(
+            __riscv_vreinterpret_v_i32m4_u32m4(yb), 0x7FFFFF, vl);
+        const vuint32m4_t idx = __riscv_vsrl_vx_u32m4(low, 20, vl);
+        y = __riscv_vfmul_vv_f32m4(
+            y, __riscv_vrgather_vv_f32m4(__riscv_vle32_v_f32m4(g_exp3_tab, vl), idx, vl), vl);
+    }
+    return y;
+}
+
 static void attn_exp_sum(int tid) {
     const int len = g_p1[tid] - g_p0[tid];
     if (len <= 0) return;
@@ -1031,8 +1088,8 @@ static void attn_exp_sum(int tid) {
                 __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), 1.4426950408889634f, 32);
             const vfloat32m1_t t1 = __riscv_vfmul_vf_f32m1(
                 __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i + 32, 32), mx, 32), 1.4426950408889634f, 32);
-            const vfloat32m1_t e0 = exp2f_poly(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
-            const vfloat32m1_t e1 = exp2f_poly(__riscv_vfmax_vf_f32m1(t1, -126.0f, 32), 32);
+            const vfloat32m1_t e0 = exp2f_e(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
+            const vfloat32m1_t e1 = exp2f_e(__riscv_vfmax_vf_f32m1(t1, -126.0f, 32), 32);
             __riscv_vse32_v_f32m1(row + i, e0, 32);
             __riscv_vse32_v_f32m1(row + i + 32, e1, 32);
             vs = __riscv_vfadd_vv_f32m1(vs, __riscv_vfadd_vv_f32m1(e0, e1, 32), 32);
@@ -1040,7 +1097,7 @@ static void attn_exp_sum(int tid) {
         for (; i + 32 <= len; i += 32) {
             const vfloat32m1_t t0 = __riscv_vfmul_vf_f32m1(
                 __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), 1.4426950408889634f, 32);
-            const vfloat32m1_t e0 = exp2f_poly(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
+            const vfloat32m1_t e0 = exp2f_e(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
             __riscv_vse32_v_f32m1(row + i, e0, 32);
             vs = __riscv_vfadd_vv_f32m1(vs, e0, 32);
         }
@@ -1203,20 +1260,7 @@ static void silu_fn(int64_t lo, int64_t hi) {
         vfloat32m1_t t = __riscv_vfmul_vf_f32m1(x, -1.4426950408889634f, vl);
         t = __riscv_vfmax_vf_f32m1(t, -126.0f, vl);
         t = __riscv_vfmin_vf_f32m1(t,  126.0f, vl);
-        vint32m1_t ie = __riscv_vfcvt_x_f_v_i32m1(t, vl);
-        vfloat32m1_t ei = __riscv_vfcvt_f_x_v_f32m1(ie, vl);
-        vfloat32m1_t f = __riscv_vfsub_vv_f32m1(t, ei, vl);
-        vfloat32m1_t p = __riscv_vfmv_v_f_f32m1(0.00015403530f, vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(0.0013333558f, vl), vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(0.0096181291f, vl), vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(0.0555041087f, vl), vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(0.2402265070f, vl), vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(0.6931471806f, vl), vl);
-        p = __riscv_vfmadd_vv_f32m1(p, f, __riscv_vfmv_v_f_f32m1(1.0f, vl), vl);
-        vint32m1_t ex = __riscv_vadd_vx_i32m1(ie, 127, vl);
-        ex = __riscv_vsll_vx_i32m1(ex, 23, vl);
-        const vfloat32m1_t den = __riscv_vfadd_vf_f32m1(
-            __riscv_vfmul_vv_f32m1(p, __riscv_vreinterpret_v_i32m1_f32m1(ex), vl), 1.0f, vl);
+        const vfloat32m1_t den = __riscv_vfadd_vf_f32m1(exp2f_e(t, vl), 1.0f, vl);
         __riscv_vse32_v_f32m1(g_gate + i, __riscv_vfmul_vv_f32m1(__riscv_vfdiv_vv_f32m1(x, den, vl), u, vl), vl);
     }
 }
@@ -1304,7 +1348,7 @@ static void pfa_softmax_row(float * row, int len, double * t_sm) {
     for (; i + 32 <= len; i += 32) {
         const vfloat32m1_t t = __riscv_vfmul_vf_f32m1(
             __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), 1.4426950408889634f, 32);
-        const vfloat32m1_t e = exp2f_poly(__riscv_vfmax_vf_f32m1(t, -126.0f, 32), 32);
+        const vfloat32m1_t e = exp2f_e(__riscv_vfmax_vf_f32m1(t, -126.0f, 32), 32);
         __riscv_vse32_v_f32m1(row + i, e, 32);
         vs = __riscv_vfadd_vv_f32m1(vs, e, 32);
     }
@@ -2178,7 +2222,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
             const vint32m4_t s32 = __riscv_vsext_vf2_i32m4(
                 __riscv_vle16_v_i16m2(base + (size_t) i * 32, v16), vl);
             vfloat32m4_t t = __riscv_vfmul_vv_f32m4(__riscv_vfcvt_f_x_v_f32m4(s32, vl), klane, vl);
-            t = exp2f_poly_m4(__riscv_vfmax_vf_f32m4(__riscv_vfsub_vv_f32m4(t, mlane, vl),
+            t = exp2f_e_m4(__riscv_vfmax_vf_f32m4(__riscv_vfsub_vv_f32m4(t, mlane, vl),
                                                      -127.0f, vl), vl);
             acc = __riscv_vfadd_vv_f32m4(acc, t, vl);
             const vint32m4_t iv = __riscv_vfcvt_x_f_v_i32m4(__riscv_vfmul_vf_f32m4(t, 127.0f, vl), vl);
@@ -3250,6 +3294,7 @@ static void abort_bt(int) {
 
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    exp3_init();
     if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
     const char * path = work_path("mc-q4o.gguf");
     int ngen = 16, prompt = 1;
@@ -3294,6 +3339,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_pf_tile = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-F") && i + 1 < argc) g_pf_file = argv[++i];
         else if (!strcmp(argv[i], "-G") && i + 1 < argc) g_pf_chunk = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-e") && i + 1 < argc) g_exp3 = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-g")) g_gatemode = 1;
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
     }
