@@ -238,3 +238,30 @@ m4 (128 lanes per op, 12 ops instead of 48 per block) only bought 315 s to
 blocks plus exact weights is the configuration that both aligns and stays fast,
 and that needs the block loop inside the kernel with the f32 accumulators held
 in registers.
+
+### Moving the accumulators into registers: the flush gets cheap, the layout wins
+
+Attempted and reverted. `gemm_i8d_4x64_blk` kept both accumulator sets in vector
+registers across the k loop, running the dot 16 steps then folding the block's
+four row scales in with `vfcvt` + `vfmacc` before the next block. That does
+remove the round-trip: at `A_BLK=256` the 10K GEMM went 69.0 s -> 37.6 s and the
+whole prefill 104.8 s -> 71.8 s (142.6 tok/s).
+
+Two hardware behaviours cost a day and are worth recording:
+
+1. `vrgather.vv` with `vd == vs2` raises an illegal instruction on A100. The
+   instruction needs a different destination register even though the source is
+   dead afterwards.
+2. `vmadot vD` writes 64 bits past its own register: with markers in `v17..v31`
+   only `v17` changed after `vmadot v16`. A destination must be even, so every
+   odd register directly above an accumulator is unusable for anything that
+   lives across the dot - which is where the 8 f32 accumulators had been left.
+
+Those two are fixed, but the port is still not numerically equal to
+`gemm_i8d_4x64`: the second 32-column pass (`B + 512` -> `C + 128`) disagrees
+with the legacy kernel's registers 4-7, while the first pass matches exactly.
+`A_BLK=64` would also have been the wrong trade anyway - with the flush in
+registers the 10K GEMM at 64 is 114 s against 37.6 s at 256, i.e. four times the
+flushes costs 3x, so fine blocks stay expensive even with no memory traffic.
+The aligned configurations therefore remain `A_BLK=64` with the memory flush
+(69 tok/s) and the exact-Q4 vendor path (109 tok/s).
