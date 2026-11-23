@@ -1047,3 +1047,75 @@ TCM staging（`-Q`）再加一次纯 memcpy 的流式搬运，从 130.9 降到 5
   2 个 Q 寄存器），预期再省 2 s 量级。
 - gemm 25.56 s 已经是 846 GMAC/s 聚合（106 GMAC/s/核），A 簇基本到顶；X100 在这段时间
   空转，把 FFN 的一小部分行分给 X100（实测 625–652 GMAC/s）是唯一还没试的大块。
+
+## 10. prefill→decode 串成一条链，以及 10K decode 的天花板（2026-11-23 下午）
+
+### 10.1 链条
+
+`-F p10k.txt` 之前 prefill 完、导出 KV 就 `return 0`，decode 根本没跑。现在：
+
+- 加 `pos0`：prefill 处理了 `0..nt-2`，decode 从最后一个 prompt token 在位置 `nt-1` 开始，
+  直接复用 prefill 写进同一份 f16 KV 的缓存（`g_vpos` / `ktile`），不重新加载。
+- `prefill_release()` 释放 prefill 专用的大缓冲（10K chunk 下几百 MB），
+  避免把 decode 的attention 工作集挤到 DRAM 之外。
+- 三个 bench 分支加 `!pos0` 守卫，否则 `real_prefill` 会把 `g_pfa_rows` 置上、
+  串完链又跑一遍 241 s 的合成 attention bench。
+
+实测（`-F p10k.txt -G 10240 -n 8`，单进程）：
+
+| 阶段 | 结果 |
+|---|---|
+| prefill | 9999 tokens / 57.0 s = **175.4 tok/s** |
+| decode（10K，贪心） | 8 tokens / 0.794 s = **10.1 tok/s** |
+
+### 10.2 板子的内存天花板（实测，决定了 decode 的上限）
+
+| 线程数 | 聚合读带宽 |
+|---|---|
+| 1 | 6.8 GB/s |
+| 4 | 12.5 GB/s |
+| 8 | 17.5 GB/s |
+| 12 | 19.0 GB/s |
+| 16 | 19.3 GB/s |
+
+即 12 核之后就饱和。10K decode 每 token 必须搬：权重 1265 MB（Q4_0）+ KV 440 MB（f16）
+= 1705 MB → 88 ms/token 的下限，也就是 **11.6 tok/s**。实测 10.1 tok/s，已经贴着这条线。
+
+也就是说：q4 权重 + f16 KV 时，**10K decode 的 20 tok/s 在物理上不可能**。要到 50 ms/token，
+总流量必须 ≤ 965 MB。可行的组合只有：
+
+- KV 改 int8：440 → 220 MB
+- 权重改 2 bit（厂商已有 `gemm_kernel_i8i2k`）：1265 → ~720 MB
+
+两者合计 ~940 MB → ~49 ms/token → 20 tok/s 量级。只做其中一项都不够
+（int8 KV 单独：1445 MB → 15.8 tok/s；2 bit 单独：1160 MB → 12.6 tok/s）。
+
+### 10.3 decode attention 的实测分解（10K，ms/token）
+
+`qk 15.1  exp 2.0  pv 22.9  fin 0.6`，合计 40.6 ms，占每 token 时间的 41%。
+qk 读 K 220 MB 用 15.1 ms（14.6 GB/s），pv 读 V 220 MB 用 22.9 ms（9.6 GB/s）——
+都没到 19.3 GB/s，说明这两段还有 1.3–2 倍的向量化空间，改完可以把 attention 压到 ~20 ms。
+
+### 10.4 `-q3`（3 bit 权重）能跑，但不能用于对齐
+
+`-q3` 把 Q4_0 反量化后按每 k16 重新量化成 3 bit（`repack_b_q3`，`gemm_kernel_i8i3k`）：
+
+- 权重 1265.2 → **1001.6 MB**（0.79 倍，因为 Q3_K 要存每 k16 的 int8 scale + fp16 + mask）
+- 短上下文 decode 16.45 → **20.37 tok/s**
+- 但贪心输出在**第 1 个 token** 就和 Q4_0 分叉（`5 2104 394…` vs `5 367 22179…`），
+  因为这是自定的 per-k16 缩放，不是 llama.cpp 的 Q3_K。
+
+所以 `-q3` 只能当速度探针。要既压字节又保持"与 llama.cpp 对齐"，必须用 llama.cpp
+自己的量化器产出 Q3_K/Q2_K，再喂给厂商的 i8i3k/i8i2k 内核。
+
+### 10.5 一个和数值无关、但会打断脚本的退出崩溃
+
+`-O2` 构建在 main 返回时报 `stack smashing detected`。已确认：
+
+- `-n 0`（不生成任何 token）也会触发，所以发生在加载/repack 阶段，与 decode 无关；
+- `-O1` 或 `-fno-stack-protector` 不触发，ASan 全程无报告；
+- 早于本次改动（`76a8862`）就存在，`-t 1`、加大栈都照样触发；
+- 数值不受影响（prefill 的 `worst at dim 84` 与非崩溃构建逐位一致）。
+
+判断是 GCC 15 在 RVV 动态 `vlenb` 帧 + 32 个向量寄存器 spill 上的代码生成问题，
+不是源码越界。当前测量构建统一加 `-fno-stack-protector` 绕开，另用 `-O1` 交叉验证数值。

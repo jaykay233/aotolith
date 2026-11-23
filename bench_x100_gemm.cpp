@@ -111,9 +111,13 @@ static void x100_gemm(int32_t * out, const int8_t * arow, const int8_t * bcol, i
 
 // Kernel output is [colgroup][lane]; the scalar model writes [row][col].
 static void unpack(int32_t * out, const int32_t * buf) {
+    // The kernel stores one block per (row pair, column group): row pairs sit 32
+    // int32 apart, column groups 8. Indexing the row pair by r%2 instead of r/2
+    // made rows 2..3 read rows 0..1, which is the "32/128 wrong" this check used
+    // to report -- the asm was right and the harness was wrong.
     for (int r = 0; r < x100::ROWS; ++r)
         for (int c = 0; c < x100::COLS; ++c)
-            out[r * x100::COLS + c] = buf[(c / 4) * 8 + (r % 2) * 4 + (c % 4)];
+            out[r * x100::COLS + c] = buf[(r / 2) * 32 + (c / 4) * 8 + (c % 4)];
 }
 
 static int g_nthread = 8;

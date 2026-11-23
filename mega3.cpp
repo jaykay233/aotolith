@@ -194,6 +194,7 @@ static const int Q3_K = 256;                 // K elements per superblock
 static const size_t Q3_BLK = 32 * 16 + 32 * 32 + 32 * 64 + 32 * 2;   // 3648 B
 static size_t g_blk_bytes = 576;
 
+__attribute__((noinline))
 static void repack_b_q3(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k, const int * perm) {
     const int64_t nb = k / 32, rs = nb * 18, nsup = k / Q3_K;
     static float tile[32][Q3_K];
@@ -1393,6 +1394,8 @@ static int64_t g_k8i_npb, g_v8i_npb16, g_q8i_nqg;
 static int g_pfa_i8 = 0;
 static int64_t g_pq_rows = 0;
 static int g_pfa_dbg1 = 0;
+static int g_nopv = 0, g_qk_trace = 0;
+static __thread int16_t g_nspark[8 * 32];
 static int g_nostore = 0;   // diagnostic: park score stores in one L1 block
 static int g_gatemode = 0;  // correctness gate: emit only the generated token ids
 static int g_top5 = 0;      // with -g, also emit the top-5 logits per step
@@ -2087,7 +2090,10 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
             qk4(op, q8g + gg * 512, kb, HEAD_DIM / 16);
-            int16_t * dst = blk + (size_t) gg * SC_GSTRIDE;
+            // Diagnostic: parking every store in one L1 block removes the score
+            // buffer's write traffic without changing the dot loop, which bounds
+            // what compressing the scores could buy.
+            int16_t * dst = g_nostore ? g_nspark : blk + (size_t) gg * SC_GSTRIDE;
             for (int j = 0; j < 8; ++j) {
                 const vint32m1_t a = __riscv_vle32_v_i32m1(raw[j], vl32);
                 __riscv_vse16_v_i16mf2(dst + j * 32,
@@ -2343,7 +2349,7 @@ static void task_pfa_pipe_A(int tid) {
             TileSlot & sl = g_tslot[r.slot];
             const int64_t qb = tile_qb(old);
             const double _v = now_s();
-            pfa_pv_i8(g_pipe_layer, tile_h(old), qb, sl.w8 + g_w8off, sl.wsc);
+            if (!g_nopv) pfa_pv_i8(g_pipe_layer, tile_h(old), qb, sl.w8 + g_w8off, sl.wsc);
             g_pfa_pv[tid] += now_s() - _v;
             pend[0] = pend[1];
             --npend;
@@ -2356,7 +2362,13 @@ static void task_pfa_pipe_A(int tid) {
         TileSlot & sl = g_tslot[slot];
         const double _q = now_s();
         pfa_qk_i8(h, qb, sl.scores);
-        g_pfa_qk[tid] += now_s() - _q;
+        const double _qq = now_s() - _q;
+        g_pfa_qk[tid] += _qq;
+        if (g_qk_trace && qb + I8_ROWS + (int64_t) g_pfa_ctx > 10100)
+            fprintf(stderr, "[qk] ctx=%lld qb=%lld npb=%lld %.3f ms -> %.1f GMAC/s\n",
+                    (long long) g_pfa_ctx, (long long) qb,
+                    (long long) ((g_pfa_ctx + qb + I8_ROWS + 63) / 64), _qq * 1e3,
+                    (double) I8_ROWS * (g_pfa_ctx + qb + I8_ROWS) * HEAD_DIM / _qq / 1e9);
         r.st.store(1, std::memory_order_release);
         pend[npend++] = t;
     }
@@ -2561,6 +2573,7 @@ static void * hugemem(size_t n) {
     return aligned_alloc(a, (n + a - 1) & ~(a - 1));
 }
 
+
 static const char * work_path(const char * name);
 // ---------------------------------------------------------------------------
 // Real prefill.
@@ -2575,6 +2588,31 @@ static const char * work_path(const char * name);
 // chunk, which is 20 passes of 1.27 GB at 10K.
 // ---------------------------------------------------------------------------
 static float * g_pfx, * g_pfxa, * g_pfgate, * g_pfup, * g_pfk, * g_pfv;
+
+// Prefill scratch is sized for a whole 10K chunk (hundreds of MB) and decode
+// needs none of it. Releasing it before decode keeps the working set of the
+// generation loop inside the cache the attention pass cares about.
+static void prefill_release(void) {
+    free(g_pfa);     g_pfa = nullptr;
+    free(g_pfx);     g_pfx = nullptr;
+    free(g_pfxa);    g_pfxa = nullptr;
+    free(g_pfgate);  g_pfgate = nullptr;
+    free(g_pfup);    g_pfup = nullptr;
+    free(g_pfk);     g_pfk = nullptr;
+    free(g_pfv);     g_pfv = nullptr;
+    free(g_pq);      g_pq = nullptr;
+    free(g_pfa_out); g_pfa_out = nullptr;
+    free(g_k8i);     g_k8i = nullptr;
+    free(g_v8i);     g_v8i = nullptr;
+    free(g_q8i);     g_q8i = nullptr;
+    free(g_psa16);   g_psa16 = nullptr;
+    free(g_q8isc);   g_q8isc = nullptr;
+    free(g_tslot);   g_tslot = nullptr;
+    free(g_tile);    g_tile = nullptr;
+    g_pfa_i8 = 0;
+    g_tile_n = 0;
+    g_pq_rows = 0;
+}
 
 // Same accumulation shape as rmsnorm_par (double partial sums) so prefill and
 // decode agree on the residual stream bit for bit where it matters. Rows are
@@ -3198,10 +3236,24 @@ static const char * work_path(const char * name) {
     return b;
 }
 
+#include <execinfo.h>
+#include <signal.h>
+// The process aborts with "stack smashing detected" after the last token, which
+// means one canary-protected frame was overwritten but the SEGV-free path hides
+// which one. Print the frames from the abort handler instead of guessing.
+static void abort_bt(int) {
+    void * bt[64];
+    const int n = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(134);
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
     const char * path = work_path("mc-q4o.gguf");
     int ngen = 16, prompt = 1;
+    int64_t pos0 = 0;                 // first decode position (prompt length with -F)
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) ngen = atoi(argv[++i]);
@@ -3223,6 +3275,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-J")) g_pfa_i8 = 1;
         else if (!strcmp(argv[i], "-Y")) g_pfa_dbg1 = 1;
         else if (!strcmp(argv[i], "-D")) g_nostore = 1;
+        else if (!strcmp(argv[i], "-0")) g_nopv = 1;
+        else if (!strcmp(argv[i], "-1")) g_qk_trace = 1;
         else if (!strcmp(argv[i], "-K")) g_pipe = 1;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) g_w8off = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-z")) g_vsmall = 1;
@@ -3475,12 +3529,23 @@ int main(int argc, char ** argv) {
         free(txt);
         printf("prompt: %lld tokens from %s\n", (long long) nt, g_pf_file);
         // the last prompt token stays out: decode uses it as its first anchor
-        if (!real_prefill(toks, nt - 1, g_pf_chunk)) return 1;
+        const int64_t np = nt - 1;
+        const int32_t anchor = toks[np];
+        if (!real_prefill(toks, np, g_pf_chunk)) return 1;
         free(toks);
-        return 0;
+        // The prefill just wrote positions 0..np-1 into the same f16 KV cache
+        // decode reads, so generation continues from the last prompt token at
+        // position np instead of starting from an empty context.
+        prefill_release();
+        prompt = anchor;
+        pos0 = np;
+        printf("chain: decode starts at position %lld (anchor %d)\n",
+               (long long) pos0, prompt);
     }
-    if (g_pfa_rows > 0) { bench_prefill_attn(); return 0; }
-    if (g_pf_rows > 0) { bench_prefill_gemm(g_pf_rows); return 0; }
+    // A chained -F run has already used these buffers; the benches would rerun
+    // the synthetic attention on top of the prompt's geometry.
+    if (!pos0 && g_pfa_rows > 0) { bench_prefill_attn(); return 0; }
+    if (!pos0 && g_pf_rows > 0) { bench_prefill_gemm(g_pf_rows); return 0; }
 
     int tok = prompt;
     const double t_start = now_s();
@@ -3492,7 +3557,7 @@ int main(int argc, char ** argv) {
             g_snap_rope[0] = g_t_rope_math;
             g_snap_rope[1] = g_t_rope_app;
         }
-        g_pos = step;
+        g_pos = (int) (pos0 + step);
         TICK();
         dequant_row(g_x, g_emb->data + (int64_t) tok * (N_EMBD / 32) * 18, N_EMBD);
         TOCK(S_EMB);
