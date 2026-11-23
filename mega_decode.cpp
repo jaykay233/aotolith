@@ -342,6 +342,43 @@ static uint8_t * g_aq;
 static float g_sc[N_GPU][MAXCTX + 8];
 static float g_rope_inv[HEAD_DIM / 2];
 static int g_pos, g_layer;
+static int64_t g_attn_np;          // positions row g_arow can see
+
+// ------------------------------------------------------------ multi-row decode
+// Verifying m drafts at once only pays if the weight stream is paid once rather
+// than m times. probe_mscale measured 3 rows at 1.33x the cost of 1, 5 rows at
+// 2.17x (DECODE.md). So every round -- plain or speculative -- runs m rows, and
+// the GEMM nests rows innermost inside the n-block walk, after the B tile has
+// been fetched, so each tile is read from DRAM once and used m times.
+//
+// The single-row functions above are reused unchanged: select_row repoints the
+// global buffers at one row, so norm / rope / attention / silu keep working on one
+// row at a time. Only the GEMM needs all rows at once, and it uses the row bases
+// directly.
+static const int MROW_MAX = 6;                    // anchor + up to 5 drafts
+#define AQ_ROW_STRIDE (((N_FF / 32) * 38))        // widest quantized activation row
+
+static int g_m = 1;            // rows this round
+static int g_pos0 = 0;         // absolute position of row 0
+static int g_nspec = 0;        // drafts per round
+static int32_t g_drafts[MROW_MAX];
+
+static float * b_x, * b_xa, * b_gate, * b_up, * b_q, * b_k, * b_v, * b_attn_out, * b_logits;
+static uint8_t * b_aq;
+
+// b_* hold row 0; the existing globals point at the row being processed.
+static void select_row(int r) {
+    g_x        = b_x        + (int64_t) r * N_EMBD;
+    g_xa       = b_xa       + (int64_t) r * N_EMBD;
+    g_gate     = b_gate     + (int64_t) r * N_FF;
+    g_up       = b_up       + (int64_t) r * N_FF;
+    g_q        = b_q        + (int64_t) r * N_EMBD;
+    g_k        = b_k        + (int64_t) r * (N_KV * HEAD_DIM);
+    g_v        = b_v        + (int64_t) r * (N_KV * HEAD_DIM);
+    g_attn_out = b_attn_out + (int64_t) r * N_EMBD;
+    g_logits   = b_logits   + (int64_t) r * VOCAB;
+    g_aq       = b_aq       + (int64_t) r * AQ_ROW_STRIDE;
+}
 
 // ------------------------------------------------------------------ fused pieces
 // parallel rmsnorm: partial sums per thread, then a coordinated scale pass
@@ -385,7 +422,7 @@ static void dequant_row(float * dst, const uint8_t * row, int64_t k) {
 }
 
 // ---- multi-GEMM: several matrices sharing one quantized A, issued interleaved
-struct MJob { const uint8_t * b; int64_t k, n; float * c; };
+struct MJob { const uint8_t * b; int64_t k, n; float * c; int64_t ldc; };
 static MJob g_mj[8];
 static int g_mjn;
 static int g_kstep = 4;
@@ -408,14 +445,21 @@ static void task_mgemm(int tid) {
             if (a >= n1[j]) continue;
             int64_t b2 = a + g_kstep; if (b2 > n1[j]) b2 = n1[j];
             const int64_t kb = g_mj[j].k / (g_bit3 ? Q3_K : 32);
-            if (g_bit3)
-                spacemit_kernels::ime2::gemm_kernel_i8i3k(
-                    Q3_K, g_aq, g_mj[j].b + a * kb * g_blk_bytes, nullptr, g_mj[j].c + a * 32,
-                    1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) ((b2 - a) * 32));
-            else
-                spacemit_kernels::ime2::gemm_kernel_i8i4(
-                    32, g_aq, g_mj[j].b + a * kb * g_blk_bytes, nullptr, g_mj[j].c + a * 32,
-                    1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) ((b2 - a) * 32));
+            const uint8_t * bp = g_mj[j].b + a * kb * g_blk_bytes;
+            // rows innermost: bp is now hot in L1, so rows 1..m-1 cost only their
+            // MACs instead of another DRAM pass over the same 36 KB of weights.
+            for (int r = 0; r < g_m; ++r) {
+                const uint8_t * aq = b_aq + (int64_t) r * AQ_ROW_STRIDE;
+                float * c = g_mj[j].c + (int64_t) r * g_mj[j].ldc + a * 32;
+                if (g_bit3)
+                    spacemit_kernels::ime2::gemm_kernel_i8i3k(
+                        Q3_K, aq, bp, nullptr, c,
+                        1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) g_mj[j].ldc);
+                else
+                    spacemit_kernels::ime2::gemm_kernel_i8i4(
+                        32, aq, bp, nullptr, c,
+                        1, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) g_mj[j].ldc);
+            }
         }
     }
 }
@@ -464,7 +508,7 @@ static inline float dot_head(const float * q, const _Float16 * k) {
     vfloat32m4_t a = __riscv_vfmv_v_f_f32m4(0.0f, vl);
     for (int d = 0; d < HEAD_DIM; ) {
         const size_t n = __riscv_vsetvl_e32m4(HEAD_DIM - d);
-        const vfloat16m4_t kh = __riscv_vle16_v_f16m4(k + d, n);
+        const vfloat16m2_t kh = __riscv_vle16_v_f16m2(k + d, n);
         const vfloat32m4_t kf = __riscv_vfwcvt_f_f_v_f32m4(kh, n);
         const vfloat32m4_t qv = __riscv_vle32_v_f32m4(q + d, n);
         a = __riscv_vfmacc_vv_f32m4(a, qv, kf, n);
@@ -478,7 +522,7 @@ static inline float dot_head(const float * q, const _Float16 * k) {
 static inline void axpy_head(float * out, const _Float16 * v, float w) {
     for (int d = 0; d < HEAD_DIM; ) {
         const size_t n = __riscv_vsetvl_e32m4(HEAD_DIM - d);
-        const vfloat16m4_t vh = __riscv_vle16_v_f16m4(v + d, n);
+        const vfloat16m2_t vh = __riscv_vle16_v_f16m2(v + d, n);
         const vfloat32m4_t vf = __riscv_vfwcvt_f_f_v_f32m4(vh, n);
         const vfloat32m4_t o = __riscv_vle32_v_f32m4(out + d, n);
         __riscv_vse32_v_f32m4(out + d, __riscv_vfmacc_vf_f32m4(o, w, vf, n), n);
@@ -495,7 +539,7 @@ static void task_attn(int tid) {
     float * sc = g_sc[tid];
     const int nh_per = N_HEAD / N_GPU;
     const int64_t stride = N_KV * HEAD_DIM;
-    const int64_t np = g_pos + 1;
+    const int64_t np = g_attn_np;
     for (int hh = 0; hh < nh_per; ++hh) {
         const int h = tid * nh_per + hh;
         const int hkv = h / (N_HEAD / N_KV);
@@ -616,10 +660,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) g_nspec = atoi(argv[++i]);
     }
     // The packed-block size drives every weight offset, so it has to follow the
     // mode before the blob is sized or repacked.
     g_blk_bytes = g_bit3 ? Q3_BLK : 576;
+    if (g_nspec < 0) g_nspec = 0;
+    if (g_nspec > MROW_MAX - 1) g_nspec = MROW_MAX - 1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
@@ -697,16 +744,19 @@ int main(int argc, char ** argv) {
     }
     g_out_norm = (const float *) find("output_norm.weight")->data;
 
-    g_x        = (float *) aligned_alloc(64, N_EMBD * 4);
-    g_xa       = (float *) aligned_alloc(64, N_EMBD * 4);
-    g_gate     = (float *) aligned_alloc(64, N_FF * 4);
-    g_up       = (float *) aligned_alloc(64, N_FF * 4);
-    g_q        = (float *) aligned_alloc(64, N_EMBD * 4);
-    g_k        = (float *) aligned_alloc(64, N_KV * HEAD_DIM * 4);
-    g_v        = (float *) aligned_alloc(64, N_KV * HEAD_DIM * 4);
-    g_attn_out = (float *) aligned_alloc(64, N_EMBD * 4);
-    g_logits   = (float *) aligned_alloc(64, VOCAB * 4);
-    g_aq       = (uint8_t *) aligned_alloc(64, (N_FF / 32 + 2) * 38);
+    b_x        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
+    b_xa       = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
+    b_gate     = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_FF * 4);
+    b_up       = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_FF * 4);
+    b_q        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
+    b_k        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_KV * HEAD_DIM * 4);
+    b_v        = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_KV * HEAD_DIM * 4);
+    b_attn_out = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
+    b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
+    b_aq       = (uint8_t *) aligned_alloc(64, (size_t) MROW_MAX * AQ_ROW_STRIDE + 64);
+    if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
+        !b_attn_out || !b_logits || !b_aq) { fprintf(stderr, "oom rows\n"); return 1; }
+    select_row(0);
     const size_t kvsz = (size_t) N_LAYER * KV_LAYER_STRIDE;
     g_kcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
     g_vcache = (_Float16 *) aligned_alloc(64, kvsz * 2);
@@ -790,119 +840,227 @@ int main(int argc, char ** argv) {
     // ---- decode
     int tok = prompt;
     const double t_start = now_s();
-    printf("decode: %d tokens from %d (kstep=%d)\n", ngen, prompt, g_kstep);
-    for (int step = 0; step < ngen; ++step) {
+    // Replay drafts: a file of token ids from a plain greedy run, so the round has
+    // known-correct drafts and acceptance must be m-1 on every round. This is how
+    // the multi-row path is checked for exactness without any draft model.
+    int32_t * g_replay = nullptr;
+    int g_nreplay = 0;
+    if (const char * rp = getenv("MEGA_REPLAY")) {
+        FILE * f = fopen(rp, "r");
+        if (!f) { fprintf(stderr, "replay open %s\n", rp); return 1; }
+        int cap = 1 << 20;
+        g_replay = (int32_t *) malloc(cap * 4);
+        int v;
+        while (g_nreplay < cap && fscanf(f, "%d", &v) == 1) g_replay[g_nreplay++] = v;
+        fclose(f);
+        printf("replay: %d tokens from %s\n", g_nreplay, rp);
+    }
+
+    printf("decode: %d tokens from %d (kstep=%d, drafts=%d, rows=%d)\n",
+           ngen, prompt, g_kstep, g_nspec, g_nspec + 1);
+
+    int32_t * emitted = (int32_t *) malloc((size_t) (ngen + 8) * 4);   // for MEGA_TOKOUT
+    int produced = 0;
+    int rounds = 0;
+    long long accepted_drafts = 0;
+    int32_t pred[MROW_MAX];
+    while (produced < ngen) {
         TICK_DECL;
-        g_pos = step;
+        const int K = g_nspec;
+        const int m = K + 1;
+        g_m = m;
+        g_pos0 = produced;   // row r sits at position produced + r
+
+        int32_t rowtok[MROW_MAX];
+        rowtok[0] = tok;
+        for (int r = 0; r < K; ++r)
+            // replay[i] is the i-th token plain greedy emitted, and `produced` of
+            // them are already committed, so the draft for row r+1 is replay[produced+r].
+            rowtok[r + 1] = g_replay ? g_replay[produced + r] : tok;
+
         TICK();
-        dequant_row(g_x, g_emb->data + (int64_t) tok * (N_EMBD / 32) * 18, N_EMBD);
+        for (int r = 0; r < m; ++r) {
+            select_row(r);
+            dequant_row(g_x, g_emb->data + (int64_t) rowtok[r] * (N_EMBD / 32) * 18, N_EMBD);
+        }
         TOCK(S_EMB);
 
         for (int L = 0; L < N_LAYER; ++L) {
             g_layer = L;
+            // All rows are normalized and quantized before the GEMM because the
+            // GEMM walks rows innermost and needs every row's activation ready.
             TICK();
-            rmsnorm_par(g_xa, g_x, g_attn_norm[L], N_EMBD);
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                rmsnorm_par(g_xa, g_x, g_attn_norm[L], N_EMBD);
+            }
             TOCK(S_NORM);
 
             TICK();
-            quant_a(g_xa, N_EMBD);
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                quant_a(g_xa, N_EMBD);
+            }
             TOCK(S_QUANT);
+
             TICK();
             g_mjn = 3;
-            g_mj[0] = { g_wq[L].b, g_wq[L].k, g_wq[L].n, g_q };
-            g_mj[1] = { g_wk[L].b, g_wk[L].k, g_wk[L].n, g_k };
-            g_mj[2] = { g_wv[L].b, g_wv[L].k, g_wv[L].n, g_v };
+            g_mj[0] = { g_wq[L].b, g_wq[L].k, g_wq[L].n, b_q, N_EMBD };
+            g_mj[1] = { g_wk[L].b, g_wk[L].k, g_wk[L].n, b_k, N_KV * HEAD_DIM };
+            g_mj[2] = { g_wv[L].b, g_wv[L].k, g_wv[L].n, b_v, N_KV * HEAD_DIM };
             run(task_mgemm);
             TOCK(S_GEMM);
 
+            // Each row is rotated and cached at its own position, then attends to
+            // everything up to and including itself. Rows are written before any
+            // attention runs, so row r sees the earlier drafts of its own block.
             TICK();
-            rope_and_cache();
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                g_pos = g_pos0 + r;
+                rope_and_cache();
+            }
             TOCK(S_ROPE);
+
             TICK();
-            run(task_attn);
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                g_attn_np = g_pos0 + r + 1;
+                run(task_attn);
+            }
             TOCK(S_ATTN);
 
-            quant_a(g_attn_out, N_EMBD);
             TICK();
-            g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, g_xa };
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                quant_a(g_attn_out, N_EMBD);
+            }
+            TOCK(S_QUANT);
+            TICK();
+            g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, b_xa, N_EMBD };
             run(task_mgemm);
             TOCK(S_GEMM);
             TICK();
-            for (int i = 0; i < N_EMBD; ++i) g_x[i] += g_xa[i];
+            for (int r = 0; r < m; ++r) {
+                float * x = b_x + (int64_t) r * N_EMBD;
+                const float * xa = b_xa + (int64_t) r * N_EMBD;
+                for (int i = 0; i < N_EMBD; ++i) x[i] += xa[i];
+            }
             TOCK(S_MISC);
 
             TICK();
-            rmsnorm_par(g_xa, g_x, g_ffn_norm[L], N_EMBD);
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                rmsnorm_par(g_xa, g_x, g_ffn_norm[L], N_EMBD);
+            }
             TOCK(S_NORM);
 
-            quant_a(g_xa, N_EMBD);
+            TICK();
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                quant_a(g_xa, N_EMBD);
+            }
+            TOCK(S_QUANT);
             TICK();
             g_mjn = 2;
-            g_mj[0] = { g_wg[L].b, g_wg[L].k, g_wg[L].n, g_gate };
-            g_mj[1] = { g_wu[L].b, g_wu[L].k, g_wu[L].n, g_up };
+            g_mj[0] = { g_wg[L].b, g_wg[L].k, g_wg[L].n, b_gate, N_FF };
+            g_mj[1] = { g_wu[L].b, g_wu[L].k, g_wu[L].n, b_up, N_FF };
             run(task_mgemm);
             TOCK(S_GEMM);
 
             TICK();
-            if (getenv("MEGA_SILUCHK")) {
-                static float ref[N_FF];
-                for (int j = 0; j < N_FF; ++j) {
-                    const float gv = g_gate[j];
-                    ref[j] = (gv / (1.0f + expf(-gv))) * g_up[j];
-                }
-                parallel_for(N_FF, silu_fn);
-                double md = 0; int mi = -1; double mrel = 0;
-                for (int j = 0; j < N_FF; ++j) {
-                    const double d = fabs((double) g_gate[j] - ref[j]);
-                    if (d > md) { md = d; mi = j; }
-                    const double r = d / (fabs((double) ref[j]) + 1e-30);
-                    if (r > mrel) mrel = r;
-                }
-                if (L % 10 == 0 || md > 1e-4)
-                    printf("  [silu L%02d] maxabs=%.3e maxrel=%.3e gate=%.4f\n", L, md, mrel, g_gate[mi]);
-                for (int j = 0; j < N_FF; ++j) g_gate[j] = ref[j];
-            } else {
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
                 parallel_for(N_FF, silu_fn);
             }
             TOCK(S_SILU);
 
-            quant_a(g_gate, N_FF);
             TICK();
-            g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, g_xa };
+            for (int r = 0; r < m; ++r) {
+                select_row(r);
+                quant_a(g_gate, N_FF);
+            }
+            TOCK(S_QUANT);
+            TICK();
+            g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, b_xa, N_EMBD };
             run(task_mgemm);
             TOCK(S_GEMM);
             TICK();
-            for (int i = 0; i < N_EMBD; ++i) g_x[i] += g_xa[i];
+            for (int r = 0; r < m; ++r) {
+                float * x = b_x + (int64_t) r * N_EMBD;
+                const float * xa = b_xa + (int64_t) r * N_EMBD;
+                for (int i = 0; i < N_EMBD; ++i) x[i] += xa[i];
+            }
             TOCK(S_MISC);
         }
 
         TICK();
-        rmsnorm_par(g_xa, g_x, g_out_norm, N_EMBD);
+        for (int r = 0; r < m; ++r) {
+            select_row(r);
+            rmsnorm_par(g_xa, g_x, g_out_norm, N_EMBD);
+            quant_a(g_xa, N_EMBD);
+        }
         TOCK(S_NORM);
-        quant_a(g_xa, N_EMBD);
         TICK();
-        g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits };
+        g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, b_logits, VOCAB };
         run(task_mgemm);
         TOCK(S_GEMM);
+
+        // Row r's argmax is the target's greedy choice after position pos0+r, so it
+        // is directly comparable with draft r+1's token.
         TICK();
-        int best = 0, second = -1;
-        float bv = g_logits[0], b2 = -INFINITY;
-        for (int i = 1; i < VOCAB; ++i) {
-            if (g_logits[i] > bv) { b2 = bv; second = best; bv = g_logits[i]; best = i; }
-            else if (g_logits[i] > b2) { b2 = g_logits[i]; second = i; }
+        for (int r = 0; r < m; ++r) {
+            const float * lg = b_logits + (int64_t) r * VOCAB;
+            int best = 0;
+            float bv = lg[0];
+            for (int i = 1; i < VOCAB; ++i)
+                if (lg[i] > bv) { bv = lg[i]; best = i; }
+            pred[r] = best;
         }
-        if (step < 10)
-            printf("  step %d -> %d (%.4f)  2nd %d (%.4f)  margin %.3e\n",
-                   step, best, bv, second, b2, bv - b2);
         TOCK(S_HEAD);
-        tok = best;
+
+        // Longest matching prefix: row r is kept only if it predicted the draft that
+        // row r+1 consumed. The last kept row contributes its own prediction, so
+        // acceptance is at least 1 and anything accepted is byte-identical to what
+        // plain greedy would have emitted.
+        int acc = 1;
+        while (acc <= K && pred[acc - 1] == rowtok[acc]) ++acc;
+        accepted_drafts += acc - 1;
+
+        if (rounds < 6 || getenv("MEGA_VERBOSE")) {
+            printf("  round %d: drafts", rounds);
+            for (int r = 0; r < K; ++r) printf(" %d", rowtok[r + 1]);
+            printf(" | accepted %d/%d | next %d\n", acc - 1, K, pred[acc - 1]);
+        }
+
+        // rows 0..acc-1 are now committed; row acc-1's prediction is the next token
+        for (int i = 0; i < acc && produced + i < ngen + 8; ++i)
+            emitted[produced + i] = (i + 1 < acc) ? rowtok[i + 1] : pred[acc - 1];
+        produced += acc;
+        tok = pred[acc - 1];
+        ++rounds;
     }
+    if (const char * tp = getenv("MEGA_TOKOUT")) {
+        FILE * f = fopen(tp, "w");
+        if (f) {
+            for (int i = 0; i < produced; ++i) fprintf(f, "%d ", emitted[i]);
+            fputc('\n', f);
+            fclose(f);
+            printf("tokens -> %s\n", tp);
+        }
+    }
+    if (g_nspec > 0 && rounds > 0)
+        printf("spec: %d rounds, %.2f drafts accepted per round (max %d)\n",
+               rounds, (double) accepted_drafts / rounds, g_nspec);
+
     const double dt = now_s() - t_start;
     printf("--- stage breakdown (ms/token) ---\n");
     for (int i = 0; i < S_NSTAGE; ++i)
         if (g_stage[i] > 0) printf("  %-16s %7.2f  (%4.1f%%)\n", g_stage_name[i],
-                                   g_stage[i] * 1000.0 / ngen, 100.0 * g_stage[i] / dt);
-    printf("decode: %d tokens in %.3f s -> %.2f tok/s\n", ngen, dt, ngen / dt);
+                                   g_stage[i] * 1000.0 / (rounds ? rounds : 1),
+                                   100.0 * g_stage[i] / dt);
+    printf("decode: %d tokens in %d rounds, %.3f s -> %.2f tok/s (%.1f ms/round)\n",
+           produced, rounds, dt, produced / dt, rounds ? dt * 1e3 / rounds : 0.0);
 
     g_quit.store(1, std::memory_order_release);
     barrier();

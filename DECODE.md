@@ -99,3 +99,49 @@ observed, not explained.
 - **dspark speculative decode**: three drafts verified per round at 1.33x the cost
   of one token. Even at a pessimistic 60% acceptance this lands near 27 tok/s, and
   the target is 20. This is the route.
+
+## Multi-row verification is in, and it is exact
+
+`mega_decode` now runs every round as m rows: row 0 is the pending token, rows
+1..K are drafts, all sharing one pass over the weights. The GEMM nests rows
+innermost inside the n-block walk so the 36 KB B tile is read once and used m
+times. `-s K` sets the draft count; K=0 reproduces the old single-token path.
+
+Exactness was checked without any draft model by replaying true greedy output:
+
+    ./mega_decode -n 40 -p 692 MEGA_TOKOUT=/tmp/plain.txt      # 18.00 tok/s
+    MEGA_REPLAY=/tmp/plain.txt ./mega_decode -n 40 -p 692 -s 3 # 25.72 tok/s
+
+Acceptance was 3/3 on every round and the two token streams diffed identical. So
+anything the verifier accepts is byte-identical to plain greedy by construction --
+it only ever emits a draft it has itself reproduced, or its own argmax.
+
+Measured round cost and rate at full acceptance:
+
+| rows | GEMM ms | vs m=1 | tok/s |
+|---|---|---|---|
+| 1 | 50.5 | 1.00 | 17.90 |
+| 2 | 76.9 | 1.52 | 23.02 |
+| 3 | 105.4 | 2.09 | 24.33 |
+| 4 | 135.7 | 2.69 | 25.78 |
+| 5 | 165.8 | 3.28 | 26.29 |
+| 6 | 196.9 | 3.90 | 25.88 |
+
+Every extra row costs a flat ~28 ms. That number is the important finding: 2.28
+GMAC per row at 95 GMAC/s aggregate. So past m=1 the binding constraint flips from
+DRAM bandwidth to IME2 arithmetic throughput -- at m=1 the GEMM runs at 25 GB/s and
+only exercises 45 GMAC/s of the engine, but at m=4 the MACs alone need 98 ms.
+
+That has a direct consequence for how to go further. mega3's prefill GEMM uses the
+RVV int8 dot kernel at 809.8 GMAC/s, roughly 8x IME2's 95. Verification is exactly
+the regime that is MAC-bound rather than stream-bound, so running the rows through
+the RVV kernel instead of IME2 should keep an m=4 round near the 50 ms stream floor
+instead of 135 ms, i.e. on the order of 60+ tok/s. IME2 stays right for m=1, where
+the stream hides everything.
+
+Non-GEMM overhead also grows with rows and is worth trimming later: at m=4 rmsnorm
+4.0 + quantA 2.4 + rope 3.2 + misc 2.9 ms is ~13% of the round.
+
+Is it worth noting that at m=1 the whole encode/quantise path (0.58 ms) costs more
+than attention (0.59)? Attention at 32 positions is trivially small; at 10K it will
+not be, which is why the vectorised attention and int8 KV remain on the list.
