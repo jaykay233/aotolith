@@ -355,7 +355,10 @@ static int64_t g_attn_np;          // positions row g_arow can see
 // global buffers at one row, so norm / rope / attention / silu keep working on one
 // row at a time. Only the GEMM needs all rows at once, and it uses the row bases
 // directly.
-static const int MROW_MAX = 6;                    // anchor + up to 5 drafts
+// 8, not 6: the m4 path writes four rows per group and a 5..7 row round needs two
+// groups, so the row buffers must hold 4*ceil(m/4) rows or the second group lands in
+// whatever follows. Sized for the worst case rather than for the round length.
+static const int MROW_MAX = 8;                    // anchor + up to 7 drafts
 #define AQ_ROW_STRIDE (((N_FF / 32) * 38))        // widest quantized activation row
 
 static int g_m = 1;            // rows this round
@@ -373,7 +376,10 @@ static uint8_t * b_aq;
 // counts keep the per-row loop.
 static uint8_t * b_aq4;
 static int g_use_m4 = 0;
+static int g_m4_groups = 1;                           // ceil(m/4), rows padded to 4*groups
 #define AQ4_BLK 152                                   // 4*4 + 4*2 + 4*32
+#define AQ4_ROW_STRIDE ((N_FF / 32) * AQ4_BLK)        // one group's full-K tile
+#define AQ4_MAX_K DS_IN
 
 // b_* hold row 0; the existing globals point at the row being processed.
 static void select_row(int r) {
@@ -456,9 +462,13 @@ static void task_mgemm(int tid) {
             const int64_t kb = g_mj[j].k / (g_bit3 ? Q3_K : 32);
             const uint8_t * bp = g_mj[j].b + a * kb * g_blk_bytes;
             if (g_use_m4) {
-                spacemit_kernels::ime2::gemm_kernel_i8i4(
-                    32, b_aq4, bp, nullptr, g_mj[j].c + a * 32,
-                    4, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) g_mj[j].ldc);
+                for (int g = 0; g < g_m4_groups; ++g) {
+                    const uint8_t * aq = b_aq4 + (int64_t) g * (kb * AQ4_BLK);
+                    float * c = g_mj[j].c + (int64_t) g * 4 * g_mj[j].ldc + a * 32;
+                    spacemit_kernels::ime2::gemm_kernel_i8i4(
+                        32, aq, bp, nullptr, c,
+                        4, (size_t) ((b2 - a) * 32), (size_t) kb, (size_t) g_mj[j].ldc);
+                }
                 continue;
             }
             // rows innermost: bp is now hot in L1, so rows 1..m-1 cost only their
@@ -559,10 +569,21 @@ static void task_pack_m4(int tid) {
 // m4 tile and the per-row tiles are never mixed up by a stray call site.
 static void stage_a(const float * base, int64_t k) {
     if (g_use_m4) {
+        // Rows past m are packed from a zero row: their outputs are never read, and
+        // zeroing them keeps the padding out of the arithmetic entirely.
+        static float zeros[N_FF];
         static const float * rows[4];
-        rows[0] = base; rows[1] = base + k; rows[2] = base + 2 * k; rows[3] = base + 3 * k;
-        pack_src = rows; pack_k = k; pack_dst = b_aq4;
-        run(task_pack_m4);
+        const int nb = (int) (k / 32);
+        for (int g = 0; g < g_m4_groups; ++g) {
+            for (int r = 0; r < 4; ++r) {
+                const int row = g * 4 + r;
+                rows[r] = (row < g_m) ? base + (int64_t) row * k
+                                      : (r == 0 ? zeros : rows[r - 1]);
+                if (row >= g_m) rows[r] = zeros;
+            }
+            pack_src = rows; pack_k = k; pack_dst = b_aq4 + (int64_t) g * nb * AQ4_BLK;
+            run(task_pack_m4);
+        }
         return;
     }
     for (int r = 0; r < g_m; ++r) {
@@ -858,7 +879,7 @@ int main(int argc, char ** argv) {
     b_attn_out = (float *) aligned_alloc(64, (size_t) MROW_MAX * N_EMBD * 4);
     b_logits   = (float *) aligned_alloc(64, (size_t) MROW_MAX * VOCAB * 4);
     b_aq       = (uint8_t *) aligned_alloc(64, (size_t) MROW_MAX * AQ_ROW_STRIDE + 64);
-    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) (N_FF / 32) * AQ4_BLK + 64);
+    b_aq4      = (uint8_t *) aligned_alloc(64, (size_t) 2 * (N_FF / 32) * AQ4_BLK + 4096);
     if (!b_x || !b_xa || !b_gate || !b_up || !b_q || !b_k || !b_v ||
         !b_attn_out || !b_logits || !b_aq || !b_aq4) { fprintf(stderr, "oom rows\n"); return 1; }
     select_row(0);
@@ -974,7 +995,8 @@ int main(int argc, char ** argv) {
         const int K = g_nspec;
         const int m = K + 1;
         g_m = m;
-        g_use_m4 = (m == 4 && !g_bit3);
+        g_use_m4 = (m >= 4 && !g_bit3);
+        g_m4_groups = g_use_m4 ? (m + 3) / 4 : 1;
         g_pos0 = produced;   // row r sits at position produced + r
 
         int32_t rowtok[MROW_MAX];
