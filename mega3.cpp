@@ -2324,7 +2324,10 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
     alignas(64) static __thread int32_t pacc[I8_G][8][32];
     const int nq = (nn + 15) / 16;
     for (int half = 0; half < 2; ++half) {
-        const int8_t * vb = g_v8i + (kv * g_v8i_npb16 + half * g_v8i_npb16) * 1024;
+        // Each kv head owns two 64-dim halves, i.e. 2 * npb16 blocks of 1024 B.
+        // Adding only half*npb16 put kv 1's first half on kv 0's second half, so
+        // heads 8..15 attended over the wrong V.
+        const int8_t * vb = g_v8i + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
         for (int gg = 0; gg < I8_G; ++gg) {
@@ -2635,7 +2638,10 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
     for (int gg = 0; gg < I8_G; ++gg) nqg[gg] = (L + gg * 4 + 4 + 15) / 16;
 
     for (int half = 0; half < 2; ++half) {
-        const int8_t * vb = g_v8i + (kv * g_v8i_npb16 + half * g_v8i_npb16) * 1024;
+        // Each kv head owns two 64-dim halves, i.e. 2 * npb16 blocks of 1024 B.
+        // Adding only half*npb16 put kv 1's first half on kv 0's second half, so
+        // heads 8..15 attended over the wrong V.
+        const int8_t * vb = g_v8i + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
 
@@ -3063,6 +3069,72 @@ static void silu_rows(float * g, int64_t rows) {
     parallel_for(rows, silu_rows_band);
 }
 
+// The FFN is silu(gate) * up, and the up half of the pair has to be folded in
+// before the down projection. silu_rows alone left it out, so prefill fed
+// silu(gate) into ffn_down; the up projection was computed and thrown away.
+static const float * silu_mul_up;
+static void silu_mul_band(int64_t lo, int64_t hi) {
+    for (int64_t r = lo; r < hi; ++r) {
+        float * p = silu_rows_buf + r * N_FF;
+        const float * u = silu_mul_up + r * N_FF;
+        for (int i = 0; i < N_FF; ) {
+            const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_FF - i));
+            __riscv_vse32_v_f32m2(p + i,
+                __riscv_vfmul_vv_f32m2(__riscv_vle32_v_f32m2(p + i, vl),
+                                       __riscv_vle32_v_f32m2(u + i, vl), vl), vl);
+            i += (int) vl;
+        }
+    }
+}
+static void silu_mul_rows(float * g, const float * up, int64_t rows) {
+    silu_rows_buf = g;
+    silu_mul_up = up;
+    parallel_for(rows, silu_mul_band);
+}
+
+// Layer-by-layer probe: writes one row of the residual stream so the two paths
+// (chunked prefill and single-token decode) can be compared numerically instead
+// of by generated ids, which only says "same" or "different".
+// Scalar Q4_0 dot for one output row: the reference the two GEMM paths must
+// agree with. Writes `n` outputs = W(n x k) . x(k).
+static void probe_ref_gemm(float * out, const uint8_t * w, const float * x, int64_t n, int64_t k) {
+    const int64_t nb = k / 32, rs = nb * 18;
+    for (int64_t r = 0; r < n; ++r) {
+        const uint8_t * row = w + r * rs;
+        double acc = 0;
+        for (int64_t b = 0; b < nb; ++b) {
+            _Float16 sc; memcpy(&sc, row + b * 18, 2);
+            const uint8_t * q = row + b * 18 + 2;
+            for (int j = 0; j < 16; ++j) {
+                acc += (double) sc * ((double) ((int) (q[j] & 0x0F) - 8) * (double) x[b * 32 + j]
+                                    + (double) ((int) (q[j] >> 4) - 8) * (double) x[b * 32 + 16 + j]);
+            }
+        }
+        out[r] = (float) acc;
+    }
+}
+
+static void dump_n(const char * tag, int layer, char when, const float * row, int64_t n) {
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/%s_%02d%c.bin", tag, layer, when);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    size_t put = 0;
+    const size_t bytes = (size_t) n * 4;
+    while (put < bytes) { ssize_t w = write(fd, (const uint8_t *) row + put, bytes - put); if (w <= 0) break; put += (size_t) w; }
+    close(fd);
+}
+static void dump_row(const char * tag, int layer, char when, const float * row) {
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/%s_%02d%c.bin", tag, layer, when);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    size_t put = 0;
+    const size_t bytes = (size_t) N_EMBD * 4;
+    while (put < bytes) { ssize_t w = write(fd, (const uint8_t *) row + put, bytes - put); if (w <= 0) break; put += (size_t) w; }
+    close(fd);
+}
+
 static float * add_dst; static const float * add_src;
 static void add_rows_band(int64_t lo, int64_t hi) {
     for (int64_t r = lo; r < hi; ++r) {
@@ -3259,6 +3331,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             dequant_row(g_pfx + r * N_EMBD,
                         g_emb->data + (int64_t) toks[base + r] * (N_EMBD / 32) * 18, N_EMBD);
         }
+        if (getenv("MEGA_DUMP") && cm == 1) dump_row("pf", 0, 'e', g_pfx);
         for (int64_t r = cm; r < C; ++r) memset(g_pfx + r * N_EMBD, 0, (size_t) N_EMBD * 4);
 
         for (int L = 0; L < N_LAYER; ++L) {
@@ -3284,6 +3357,33 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             { const double _g=now_s()-_a; t_gemm+=_g; t_gqkv+=_g; } _a=now_s();
 
             double _r0=now_s();
+            if (L == 0 && getenv("MEGA_PROBE_REF")) {
+                static float rv[N_KV * HEAD_DIM];
+                const uint8_t * wv = (const uint8_t *) find("blk.0.attn_v.weight")->data;
+                probe_ref_gemm(rv, wv, g_pfxa, N_KV * HEAD_DIM, N_EMBD);
+                // same dot, but on the activation quantised two ways: one scale for the
+                // whole row (the prefill layout), one per 32-block (what decode uses)
+                static float ar[N_EMBD], a32[N_EMBD];
+                float mx = 0;
+                for (int i = 0; i < N_EMBD; ++i) mx = fmaxf(mx, fabsf(g_pfxa[i]));
+                const float sr = mx > 0 ? mx / 127.0f : 1.0f;
+                for (int i = 0; i < N_EMBD; ++i)
+                    ar[i] = sr * (float) (int) lrintf(g_pfxa[i] / sr);
+                for (int b = 0; b < N_EMBD / 32; ++b) {
+                    float m2 = 0;
+                    for (int i = 0; i < 32; ++i) m2 = fmaxf(m2, fabsf(g_pfxa[b * 32 + i]));
+                    const float s2 = m2 > 0 ? m2 / 127.0f : 1.0f;
+                    for (int i = 0; i < 32; ++i)
+                        a32[b * 32 + i] = s2 * (float) (int) lrintf(g_pfxa[b * 32 + i] / s2);
+                }
+                static float rv_row[N_KV * HEAD_DIM], rv_blk[N_KV * HEAD_DIM];
+                probe_ref_gemm(rv_row, wv, ar, N_KV * HEAD_DIM, N_EMBD);
+                probe_ref_gemm(rv_blk, wv, a32, N_KV * HEAD_DIM, N_EMBD);
+                printf("ref f32A V %.5f %.5f   rowA %.5f %.5f   blkA %.5f %.5f\n",
+                       rv[0], rv[1], rv_row[0], rv_row[1], rv_blk[0], rv_blk[1]);
+                printf("pf int8  V %.5f %.5f   (rowA vs blkA spread %.5f)\n",
+                       g_pfv[0], g_pfv[1], rv_row[0] - rv_blk[0]);
+            }
             prefill_qk_store(L, base, cm);
             t_rope+=now_s()-_r0;
 
@@ -3297,6 +3397,15 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             t_packq+=now_s()-_p; _p=now_s();
             pfa_run(L);   // re-derives the tile count from g_pfa_rows
             t_attn+=now_s()-_p; _a=now_s();
+            if (L == 0 && getenv("MEGA_DUMP") && cm == 1) {
+                dump_row("pf", 0, 'o', g_pfa_out);   // attention output, all heads
+                dump_n("pf", 0, 'v', g_pfv, N_KV * HEAD_DIM);
+                {   // what the f16 cache actually got for position 0
+                    static float vc[N_KV * HEAD_DIM];
+                    for (int i = 0; i < N_KV * HEAD_DIM; ++i) vc[i] = (float) g_vpos[i];
+                    dump_n("pf", 0, 'w', vc, N_KV * HEAD_DIM);
+                }
+            }
 
             { double _z=now_s();
             memset(g_pfa_out + cm * N_EMBD, 0, (size_t) (C - cm) * N_EMBD * 4);
@@ -3317,8 +3426,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
             { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
-            if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 attn-res: %.5f %.5f %.5f\n",
-                                                       g_pfx[0], g_pfx[1], g_pfx[2]);
+            if (getenv("MEGA_DUMP") && cm == 1) dump_row("pf", L, 'a', g_pfx);
 
             rmsnorm_rows(g_pfxa, g_pfx, g_ffn_norm[L], C);
             g_x8_want = g_x100;
@@ -3340,7 +3448,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 gate/up: %.5f %.5f %.5f | %.5f %.5f\n",
                                                        g_pfgate[0], g_pfgate[1], g_pfgate[2], g_pfup[0], g_pfup[1]);
             double _s=now_s();
-            silu_rows(g_pfgate, C);
+            silu_mul_rows(g_pfgate, g_pfup, C);
             t_silu+=now_s()-_s; _s=now_s();
             g_x8_want = g_x100;
             quant_a_i8d(g_pfgate, C, N_FF, 0);
@@ -3359,8 +3467,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
             { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }   // C rows, not C * N_EMBD: it takes a row count
             t_misc+=now_s()-_a; _a=now_s();
-            if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 ffn-res: %.5f %.5f %.5f\n",
-                                                       g_pfx[0], g_pfx[1], g_pfx[2]);
+            if (getenv("MEGA_DUMP") && cm == 1) dump_row("pf", L, 'f', g_pfx);
         }
     }
     const double dt = now_s() - t0;
@@ -4009,6 +4116,7 @@ int main(int argc, char ** argv) {
         TICK();
         dequant_row(g_x, g_emb->data + (int64_t) tok * (N_EMBD / 32) * 18, N_EMBD);
         TOCK(S_EMB);
+        if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", 0, 'e', g_x);
 
         for (int L = 0; L < N_LAYER; ++L) {
             g_layer = L;
@@ -4028,6 +4136,10 @@ int main(int argc, char ** argv) {
             TICK();
             rope_all();
             TOCK(S_ROPE);
+            if (L == 0 && step == 0 && getenv("MEGA_DUMP")) {
+                dump_n("dc", 0, 'v', g_v, N_KV * HEAD_DIM);
+                dump_n("dc", 0, 'k', g_k, N_KV * HEAD_DIM);
+            }
 
             TICK();
             for (int h = 0; h < N_HEAD; ++h)
@@ -4045,8 +4157,7 @@ int main(int argc, char ** argv) {
             TICK();
             parallel_for(N_EMBD, residual_add_fn);
             TOCK(S_MISC);
-            if (L == 0 && step == 0 && getenv("MEGA_PROBE")) printf("dcL0 attn-res: %.5f %.5f %.5f\n",
-                                                                   g_x[0], g_x[1], g_x[2]);
+            if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", L, 'a', g_x);
 
             TICK();
             rmsnorm_par(g_xa, g_x, g_ffn_norm[L], N_EMBD);
@@ -4074,8 +4185,7 @@ int main(int argc, char ** argv) {
             TICK();
             parallel_for(N_EMBD, residual_add_fn);
             TOCK(S_MISC);
-            if (L == 0 && step == 0 && getenv("MEGA_PROBE")) printf("dcL0 ffn-res: %.5f %.5f %.5f\n",
-                                                                   g_x[0], g_x[1], g_x[2]);
+            if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", L, 'f', g_x);
         }
 
         TICK();

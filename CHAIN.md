@@ -132,3 +132,40 @@ gives the same ids, so int8 attention is not the cause; the deviation grows in
 the layer-0 output projection (decode `o-out` 0.00135, prefill 0.0212 added to the
 residual). That is larger than per-row int8 activation quantisation can account
 for and is the next thing to chase.
+
+## Two more bugs behind the noise: V head 1, and a missing multiply
+
+With K/V actually written, the chain still produced garbage. Two structural
+faults explained why, and both are of the same kind: a value that was computed
+and then never used, or used with the wrong stride.
+
+* **V half stride.** The int8 V cache is `[kv][dim/64][pos/16]` blocks of
+  1024 B, i.e. each kv head owns two blocks per position block. PV addressed it
+  as `(kv * npb16 + half * npb16) * 1024`, so kv 0 read blocks 0 and 1 (right)
+  and kv 1 read blocks 1 and 2 (kv 0's second half and its own first half).
+  Heads 0..7 were correct, heads 8..15 attended over the wrong V: with a single
+  visible position the attention output for those heads should equal V itself,
+  and it was off by 0.27.
+* **`silu(gate) * up`.** Prefill computed the up projection into `g_pfup` and
+  then fed `silu(gate)` alone into `ffn_down`. The up half was dead work, and
+  the FFN was wrong by a factor that grows with the residual norm.
+
+After both, the layer-0 attention output matches the cached V to 8e-4 (was
+0.27), and the first generated id moves from `2781` to `33` - which is the
+*second* id of the reference (`8181 33`): one greedy step away instead of
+unrelated.
+
+The remaining gap is numerical, and it is localised. Measured at layer 0's V
+projection against a scalar f32 reference over the same normalised row:
+
+| activation quantisation | V[0]   |
+|---|---|
+| f32                    | -0.00250 |
+| per-row int8 (prefill) | -0.03885 |
+| per-32-block int8 (decode) | -0.00037 |
+
+Per-row scaling has to cover 2048 values including outliers, so its step is
+roughly an order of magnitude coarser than per-32-block; on this row it costs
+15x the error. Prefill uses per-row because the vmadot kernel accumulates int32
+over the whole K; per-block scales would need a float flush every 32 elements,
+which is the open question for alignment.
