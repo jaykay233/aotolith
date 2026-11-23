@@ -393,6 +393,48 @@ static void parallel_for(int64_t n, void (*fn)(int64_t, int64_t)) {
     run(task_pf);
 }
 
+// ------------------------------------------------- X100 elementwise work pool
+// The eight X100 cores (0-7) have no IME2 and are idle while prefill runs its
+// GEMMs, but rmsnorm, the activation quantiser, silu and the KV int8 conversion
+// are pure elementwise RVV anywhere on the chip. Handing them sixteen bands
+// instead of eight keeps every result bit-identical -- the bands only change who
+// writes which element -- so this is the one way to use the second cluster
+// without touching the greedy chain.
+static std::atomic<int> g_el_gen{0}, g_el_done{0};
+static void (*g_el_fn)(int) = nullptr;
+static int g_el_parts = 8;
+static int g_el_last = 8;               // how many bands the last run_el used
+static int g_el_on = 0;                 // set only while the X100 threads exist
+
+static void run_el(void (*fn)(int)) {
+    if (!g_el_on) { g_el_last = 8; run(fn); return; }
+    g_el_last = 16;
+    g_el_fn = fn;
+    g_el_parts = 16;
+    g_el_done.store(0, std::memory_order_relaxed);
+    g_el_gen.fetch_add(1, std::memory_order_release);
+    run(fn);                                   // A cluster takes ids 0..7
+    while (g_el_done.load(std::memory_order_acquire) < 8) sched_yield();
+    g_el_parts = 8;
+}
+// An A100 core is VLEN=1024 at 1.8 GHz and an X100 core VLEN=256 at 2.2 GHz, so an
+// even sixteen-way split leaves the A cluster waiting on bands that are four times
+// slower: silu got *worse* (1.52 -> 1.78 s) before the weights were added. A
+// thread's share is 3 units on the A cluster and 1 on X100.
+// conv is a streaming pass whose cost follows thread count rather than per-thread
+// speed, so it takes an even sixteen-way split: 6.4 s -> 4.4 s. The compute-bound
+// passes (rmsnorm, silu, the vendor quantiser) stay on the A cluster, where a
+// weighted attempt measured them slower than the plain eight-way split -- an X100
+// core's f32 vector throughput is much worse than a quarter of an A100 core's.
+static const int CV_W[16] = { 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1 };
+static inline void band_w(const int * W, int tid, int64_t n, int64_t * lo, int64_t * hi) {
+    if (g_el_parts != 16) { *lo = n * tid / g_el_parts; *hi = n * (tid + 1) / g_el_parts; return; }
+    int64_t tot = 0, pre = 0, mine = W[tid];
+    for (int t = 0; t < 16; ++t) tot += W[t];
+    for (int t = 0; t < tid; ++t) pre += W[t];
+    *lo = n * pre / tot; *hi = n * (pre + mine) / tot;
+}
+
 // ---------------------------------------------------------------- model buffers
 static uint8_t * g_wblob;
 struct WRef { const uint8_t * b; int64_t k, n; const uint8_t * b8; };
@@ -542,6 +584,7 @@ static int g_pf_reps = 0;            // repeat q_proj to isolate compute peak
 static uint8_t * g_pfa;              // quantized A for the whole chunk
 static int64_t g_pfa_rowstride;      // bytes per 4-row group
 
+static int g_x100;              // defined with the X100 section below
 struct PfJob {
     const uint8_t * b; int64_t k, n; float * c; int64_t ldc;
     int64_t nlim;   // A100 stops here; the tail columns belong to the X100 cluster
@@ -552,7 +595,10 @@ static int g_pfjn;
 static void task_pf_gemm(int tid) {
     const int64_t mgroups = g_pf_rows / 4;
     for (int j = 0; j < g_pfjn; ++j) {
-        const int64_t nb = g_pfj[j].n / 32;
+        // nlim is the A100's share of the columns when the X100 cluster takes the
+        // tail; reading n here made both clusters compute every column, so the
+        // X100 work was duplicate and the two wrote the same C elements.
+        const int64_t nb = (g_x100 && g_pfj[j].nlim > 0 ? g_pfj[j].nlim : g_pfj[j].n) / 32;
         const int64_t kb = g_pfj[j].k / 32;
         const int64_t ldc = g_pfj[j].ldc;
         const uint8_t * b = g_pfj[j].b;
@@ -571,7 +617,10 @@ static void task_pf_gemm(int tid) {
                 abase = g_tcm[tid];
             }
             for (int64_t a = 0; a < nb; ++a) {
-                const uint8_t * bcol = b + a * kb * 576;
+                // MEGA_BHOT=1 keeps one 36 KB B column block for every column:
+                // the results are garbage, but it isolates whether the GEMM is
+                // limited by streaming B or by the kernel's own issue rate.
+                const uint8_t * bcol = b + (getenv("MEGA_BHOT") ? 0 : a * kb * 576);
                 for (int64_t g = 0; g < G; ++g) {
                     float * dst = c + (mt * G + g) * 4 * ldc + a * 32;
                     const uint8_t * ap = abase + g * g_pfa_rowstride;
@@ -981,7 +1030,8 @@ static void task_pf_gemm_i8(int tid) {
 // the A100 path just built, and both are the same size. That keeps the numerics
 // identical in kind (per-row activation scale, per-row weight scale) instead of
 // introducing a second quantisation scheme.
-static int g_x100 = 0;          // -Y: hand a column share of prefill GEMM to X100
+// g_x100 is declared above the prefill GEMM (it decides how many columns the A
+// cluster runs); -Y turns it on.
 static int g_x100_pct = 23;     // X100 takes this share of the columns
 
 static void task_pf_gemm_x100(int id);
@@ -2260,15 +2310,14 @@ static void pv4(int8_t * const * acc, const int8_t * w8g, const int8_t * vblk, i
 // quantise. Scalar and single-threaded this cost 6.3 s of the 63.8 s end-to-end;
 // it is embarrassingly parallel over (kv head, position band), so both passes run
 // on all eight A cores now.
-static float g_cv_mk[N_KV][N_GPU], g_cv_mv[N_KV][N_GPU];
+static float g_cv_mk[N_KV][16], g_cv_mv[N_KV][16];
 static float g_cv_ik[N_KV], g_cv_iv[N_KV];
 
 static int64_t g_cv_lo;                     // first position this call converts
 
 static inline void cv_band(int tid, int64_t lo0, int64_t npos, int64_t * lo, int64_t * hi) {
-    const int64_t n = npos - lo0;
-    *lo = lo0 + n * tid / g_participants;
-    *hi = lo0 + n * (tid + 1) / g_participants;
+    int64_t a, b; band_w(CV_W, tid, npos - lo0, &a, &b);
+    *lo = lo0 + a; *hi = lo0 + b;
 }
 
 // Both conv passes were scalar element loops: 2.36 s of a 58 s prefill, and all of
@@ -2285,22 +2334,32 @@ static inline void cv_band(int tid, int64_t lo0, int64_t npos, int64_t * lo, int
 // and the max pass stays exact because |f16| values are a subset of |f32|.
 static void task_pfa_conv_max(int tid) {
     int64_t lo, hi; cv_band(tid, g_cv_lo, g_cv_npos, &lo, &hi);
-    const size_t vl = __riscv_vsetvl_e16m4(HEAD_DIM);
+    // The dim walk is chunked by vsetvl rather than assuming one register holds a
+    // whole head: the A cluster is VLEN=1024 and the X100 cluster VLEN=256, so
+    // vsetvl_e16m4(128) returns 64 there and the tail would be skipped.
     for (int kv = 0; kv < N_KV; ++kv) {
         float mk = 0, mv = 0;
         for (int64_t p = lo; p < hi; ++p) {
             const _Float16 * kb = ktile(g_cv_layer, kv, (int) (p / KT));
             const _Float16 * vb = g_vpos + (int64_t) g_cv_layer * KV_LAYER_STRIDE
                                 + p * N_KV * HEAD_DIM + kv * HEAD_DIM;
-            // reduce in f32: the f16 reduction form ICEs this GCC, and widening is
-            // exact, so the maximum is the same real number either way
-            const vfloat32m8_t ka = __riscv_vfabs_v_f32m8(__riscv_vfwcvt_f_f_v_f32m8(
-                __riscv_vlse16_v_f16m4(kb + (p % KT), KT * (int64_t) sizeof(_Float16), vl), vl), vl);
-            const vfloat32m8_t va = __riscv_vfabs_v_f32m8(
-                __riscv_vfwcvt_f_f_v_f32m8(__riscv_vle16_v_f16m4(vb, vl), vl), vl);
-            const vfloat32m1_t kz = __riscv_vfmv_s_f_f32m1(0.0f, 1);
-            const float a = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(ka, kz, vl));
-            const float b = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(va, kz, vl));
+            float a = 0, b = 0;
+            for (int d = 0; d < HEAD_DIM; ) {
+                const size_t vl = __riscv_vsetvl_e16m4((size_t) (HEAD_DIM - d));
+                // reduce in f32: the f16 reduction form ICEs this GCC, and widening
+                // is exact, so the maximum is the same real number either way
+                const vfloat32m8_t ka = __riscv_vfabs_v_f32m8(__riscv_vfwcvt_f_f_v_f32m8(
+                    __riscv_vlse16_v_f16m4(kb + d * KT + (p % KT),
+                                           KT * (int64_t) sizeof(_Float16), vl), vl), vl);
+                const vfloat32m8_t va = __riscv_vfabs_v_f32m8(
+                    __riscv_vfwcvt_f_f_v_f32m8(__riscv_vle16_v_f16m4(vb + d, vl), vl), vl);
+                const vfloat32m1_t kz = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+                const float da = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(ka, kz, vl));
+                const float db = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(va, kz, vl));
+                if (da > a) a = da;
+                if (db > b) b = db;
+                d += (int) vl;
+            }
             if (a > mk) mk = a;
             if (b > mv) mv = b;
         }
@@ -2310,13 +2369,16 @@ static void task_pfa_conv_max(int tid) {
 
 // 16 strided halves in, 16 contiguous int8 out.
 static inline void conv16(const _Float16 * src, int64_t stride_elems, float inv, int8_t * dst) {
-    const size_t vl = __riscv_vsetvl_e16mf2(16);
-    const vfloat16mf2_t h = __riscv_vlse16_v_f16mf2(src, stride_elems * (int64_t) sizeof(_Float16), vl);
-    vfloat32m1_t f = __riscv_vfmul_vf_f32m1(__riscv_vfwcvt_f_f_v_f32m1(h, vl), inv, vl);
-    vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
-    q = __riscv_vmax_vx_i32m1(q, -127, vl);
-    q = __riscv_vmin_vx_i32m1(q, 127, vl);
-    __riscv_vse8_v_i8mf4(dst, __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+    // LMUL m2/m4 with a fixed sixteen lanes: e16mf2 holds only eight lanes on a
+    // VLEN=256 core, and chunking it there left the second half of every block
+    // unwritten. e16m2 holds sixteen on both clusters (VLEN 256 and 1024).
+    const size_t vl = __riscv_vsetvl_e16m2(16);
+    const vfloat16m2_t h = __riscv_vlse16_v_f16m2(src, stride_elems * (int64_t) sizeof(_Float16), vl);
+    vfloat32m4_t f = __riscv_vfmul_vf_f32m4(__riscv_vfwcvt_f_f_v_f32m4(h, vl), inv, vl);
+    vint32m4_t q = __riscv_vfcvt_x_f_v_i32m4(f, vl);
+    q = __riscv_vmax_vx_i32m4(q, -127, vl);
+    q = __riscv_vmin_vx_i32m4(q, 127, vl);
+    __riscv_vse8_v_i8m1(dst, __riscv_vncvt_x_x_w_i8m1(__riscv_vncvt_x_x_w_i16m2(q, vl), vl), vl);
 }
 
 static void task_pfa_conv_q(int tid) {
@@ -2374,20 +2436,30 @@ static void pfa_convert_kv_i8(int layer, int64_t npos) {
     if (npos <= 0) return;
     const double _cm0 = now_s();
     g_cv_lo = 0;
-    run(task_pfa_conv_max);
+    if (getenv("MEGA_NOEL_CONV")) run(task_pfa_conv_max); else run_el(task_pfa_conv_max);
     const double _cm1 = now_s();
     for (int kv = 0; kv < N_KV; ++kv) {
+        // the reduction runs after run_el restored g_el_parts, so it has to use
+        // the band count the scan actually wrote
         float mk = 0, mv = 0;
-        for (int t = 0; t < g_participants; ++t) {
+        for (int t = 0; t < g_el_last; ++t) {
             if (g_cv_mk[kv][t] > mk) mk = g_cv_mk[kv][t];
             if (g_cv_mv[kv][t] > mv) mv = g_cv_mv[kv][t];
         }
         const float sk = mk > 0 ? mk / 127.0f : 1.0f;
         const float sv = mv > 0 ? mv / 127.0f : 1.0f;
         g_k8isc[kv] = sk; g_v8isc[kv] = sv;
+        if (getenv("MEGA_SCL") && layer == 0)
+            fprintf(stderr, "  scl kv%d npos %lld sk %.9g sv %.9g\n", kv, (long long) npos, (double) sk, (double) sv);
         g_cv_ik[kv] = 1.0f / sk; g_cv_iv[kv] = 1.0f / sv;
     }
-    run(task_pfa_conv_q);
+    if (getenv("MEGA_NOEL_CONV")) run(task_pfa_conv_q); else run_el(task_pfa_conv_q);
+    if (getenv("MEGA_KVDDUMP") && layer == 0) {
+        FILE * fp = fopen(getenv("MEGA_KVDDUMP"), "wb");
+        fwrite(g_k8i, 1, (size_t) N_KV * g_k8i_npb * 8192, fp);
+        fwrite(g_v8i, 1, (size_t) N_KV * g_v8i_npb16 * 2048, fp);
+        fclose(fp);
+    }
     if (getenv("MEGA_TIME"))
         fprintf(stderr, "  conv L%d: max %.3f s, quant %.3f s\n", layer, _cm1 - _cm0, now_s() - _cm1);
 }
@@ -2954,15 +3026,27 @@ static void * sm_worker(void * arg) {
     const int id = (int) (intptr_t) arg;
     bind_cpu_x100(id);
     g_ready[8 + id].store(1, std::memory_order_release);
-    int gen = 0, xgen = 0;
+    int gen = 0, xgen = 0, egen = 0;
     for (;;) {
-        // Two kinds of work share these eight threads: softmax for the pipelined
-        // attention, and the column share of a prefill GEMM.
+        // Three kinds of work share these eight threads: elementwise bands
+        // (norm, quantiser, silu, KV conversion), softmax for the pipelined
+        // attention, and the column share of a prefill GEMM. The caller finishes
+        // each kind before starting the next, so the order here only has to be
+        // consistent, not clever.
+        const int e = g_el_gen.load(std::memory_order_acquire);
+        if (e != egen) {
+            egen = e;
+            g_el_fn(8 + id);
+            g_el_done.fetch_add(1, std::memory_order_release);
+            continue;
+        }
         while (g_pipe_gen.load(std::memory_order_acquire) == gen &&
                g_xg_gen.load(std::memory_order_acquire) == xgen) {
             if (g_quit.load(std::memory_order_acquire)) return nullptr;
+            if (g_el_gen.load(std::memory_order_acquire) != egen) break;
             sched_yield();
         }
+        if (g_el_gen.load(std::memory_order_acquire) != egen) continue;
         const int x = g_xg_gen.load(std::memory_order_acquire);
         if (x != xgen) {
             xgen = x;
@@ -3442,6 +3526,9 @@ static bool export_kv(int64_t npos) {
 
 static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     if (!g_i8w) { fprintf(stderr, "real prefill needs the int8 weight copy (-I)\n"); return false; }
+    // The X100 softmax threads are already spinning by the time prefill starts, so
+    // the elementwise passes can take sixteen bands instead of eight.
+    g_el_on = g_n_sm == 8 && !getenv("MEGA_NOEL");
     const int64_t NP = npref;
     g_a8_stride = (N_FF / 16) * 64 + (N_FF / A_BLK) * 16 + 64;
     // The vendor path lays a 4-row group out as [scale x4][sum x4][int8 4x32] per

@@ -325,3 +325,59 @@ inside the K map, `sv` per 16-position block in the V map) plus a per-block scal
 multiply in the QK epilogue and the PV accumulate. Blocks would then never need
 the prefix rescanned, and the conversion would be one pass per chunk by
 construction rather than by bookkeeping.
+### The prefill GEMM is issue-bound, not bandwidth-bound
+
+The obvious explanation for 47.7 GMAC/s per A100 core was weight streaming: a
+576 B B block serves 4 rows x 32 columns x 32 k, i.e. 0.14 B per MAC, so 41 s of
+10K GEMM reads ~275 GB per core. `MEGA_BHOT=1` replaces every column block with
+block 0, keeping 36 KB of B resident for the whole matrix: GEMM 41.06 s -> 40.60 s.
+The numbers are garbage but the timing is not, and it says B traffic costs 1%.
+
+Bigger row tiles point the same way. `-M 8` (32 rows per B pass) is 40.72 s,
+`-M 16` (64 rows) is 45.50 s and `-M 32` is 88.69 s, because the A record for the
+tile outgrows the 384 KB TCM at 390 KB and falls back to re-reading A from DRAM
+once per column block. So the 47.7 GMAC/s is the kernel's own issue rate
+(26 MAC/cycle at 1.8 GHz, i.e. one `vmadot` per ~19 cycles), and it is the same
+number attention sits at: QK 101.8 core-s over 4.5 TMAC is 44 GMAC/s.
+
+That puts the A-cluster floor for 10K prefill at ~61 s of MAC work
+(GEMM 41 + QK 20 + PV 14 measured at 47.7/44/42 GMAC/s), and the current 73.4 s is
+that floor plus conv, quant, norm, silu and softmax.
+
+### The X100 GEMM split was computing everything twice
+
+`-x100 P` hands the last P% of each matrix's columns to the X100 cluster, but
+`task_pf_gemm` sized its column loop from `g_pfj[j].n` and ignored
+`g_pfj[j].nlim`, so the A cluster kept computing every column. Both clusters then
+wrote the same C elements with different accumulation orders: GEMM 41.06 -> 44.82 s
+and a different token. Reading `nlim` gives GEMM 34.88 s and 10K prefill 69.16 s
+(148.1 tok/s) at P=30, but the short-prompt chain moves off `8181 33` and P=45
+already moves 10K token 0 off `5`. The X100 kernel applies one scale per row over
+the whole K while the hp kernel folds a scale per K32 block into an fp32
+accumulator, so the two paths cannot agree bit for bit; making the X100 path
+usable means giving it the hp A record and the same per-block fold, which is a
+kernel of its own. `-x100` therefore stays off by default.
+
+### The X100 cluster does pay for the KV int8 conversion
+
+Conv is a streaming pass over f16 K/V, so its cost follows thread count rather
+than per-thread speed: sixteen even bands give 6.41 s -> 4.38 s, while the
+weighted split that suits compute-bound work (4:1 in favour of the A cluster, an
+X100 core being roughly a quarter as fast at f32 vector work) gave 4.39 s for conv
+and made rmsnorm and silu *slower* than the plain eight-way split (silu
+1.52 -> 1.94 s). So conv runs on all sixteen, everything else stays on the A
+cluster. 10K prefill 75.70 -> 73.43 s (139.4 tok/s), first token `5` at 14.3568,
+short prompt `8181 33` unchanged -- the results are bit-identical because the
+bands only change which thread quantises which position.
+
+One hardware trap to keep: the 16-byte store in `conv16` must be a single
+sixteen-lane step (`e16m2` -> `e8m1`). Chunking it by `vsetvl_e16mf2`, which is
+correct on the A cluster, holds only eight lanes on an X100 core (VLEN=256), and
+the second half of every 16-byte block was silently left unwritten -- the 10K
+cache still looked plausible and only the generated token moved. The same applies
+to the max scan, which now walks the head dim in `vsetvl` chunks instead of
+assuming one `e16m4` register holds all 128 dims.
+
+Alignment evidence at 10K is still token 0 only: `llama-simple` has no `-c` and
+silently windows a 10K prompt down to its 512-token context, so the same-prompt
+reference continuation needs a driver that can set `n_ctx`.
