@@ -4730,6 +4730,7 @@ int main(int argc, char ** argv) {
         TICK();
         rmsnorm_par(g_xa, g_x, g_out_norm, N_EMBD);
         TOCK(S_NORM);
+        if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", 0, 'z', g_xa);
         quant_a(g_xa, N_EMBD);
         TICK();
         g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits };

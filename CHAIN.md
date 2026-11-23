@@ -444,3 +444,48 @@ decode blob drops from 1416 MB to 738 MB. Short-context decode goes 17.3 ->
 `refactor_scale` of 16) but skips `make_qkx2_quants`, so it is not the same file
 as `llama-quantize --pure`. It is a different quantisation, hence its own token
 trajectory; it needs its own reference run before it can be called aligned.
+
+## Layer 0, checked against exact fp32: our stack is faithful
+
+`layer0_ref.py` recomputes layer 0 from the same GGUF in float64 and diffs it
+against the megakernel's `MEGA_DUMP` output for the last prefilled row (31
+tokens, `-X`):
+
+| op | cosine vs exact | max abs diff |
+|---|---|---|
+| V projection | 0.999151 | 9.4e-3 |
+| Q after rope | 0.999981 | 8.5e-4 |
+| attention output (pre `wo`) | 0.999778 | 2.3e-3 |
+| post-attention residual | 0.999983 | 1.0e-3 |
+
+So rmsnorm, the Q4_0 K256 GEMM, the half-split rope, GQA attention and the
+output projection are all right; what is left is int8 activation/attention
+rounding at the 1e-3 level.
+
+Two traps this tool exists because of, both of which produced meaningless
+"mismatches" first:
+
+* GGUF tensor offsets are relative to the data section, not the file. Reading
+  them as file offsets turns the f16 block scales into header bytes and every
+  value becomes NaN.
+* The `-F` chain prefills `nt-1` ids and keeps the last as the decode anchor, so
+  the dumped row `cm-1` is the *second-to-last* id. Comparing it against the
+  last id shifts everything by one position and makes a perfect layer look like
+  cosine 0.46.
+
+## Why "match llama.cpp" needs a better target than its Q4_0
+
+Same 32-token prompt, comparing the final normed hidden state that both sides
+multiply by the output projection:
+
+| pair | cosine |
+|---|---|
+| llama.cpp F16 vs llama.cpp Q4_0 | 0.962 |
+| ours vs llama.cpp Q4_0 | 0.915 |
+| ours layer 0 vs exact fp32 | 0.99998 |
+
+llama.cpp's own Q4_0 runs 0.962 away from its F16 on a 32-token prompt, and the
+two disagree on the first greedy id of `"The capital of France is"`
+(`8181` = " Paris" for F16 and Q8_0, `285` = " a" for Q4_0). A token-level
+alignment contract with Q4_0 therefore pins us to one particular kernel's
+rounding, not to the model. The F16/Q8_0 trajectory is the one worth matching.

@@ -40,6 +40,11 @@ int main(int argc, char ** argv) {
     cp.n_batch = 2048;      // llama.cpp defaults; a single 10K decode asserts
     cp.n_ubatch = 512;
     cp.no_perf = true;
+    // Embeddings are off by default so the graph's output stays logits. When
+    // REF_EMB is set the final normed row is captured too, with no pooling so it
+    // is the last token's vector rather than a sequence mean.
+    cp.embeddings = getenv("REF_EMB") != nullptr;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
 
@@ -60,6 +65,21 @@ int main(int argc, char ** argv) {
     }
 
     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    // Optional hidden-state dump: with embeddings on, the graph's last node is the
+    // final normed row, so this is the same vector the head multiplies, before any
+    // quantisation of the head weights. Diffing it against the megakernel's own
+    // pre-head row says whether a logit mismatch is upstream or in the head.
+    const char * edump = getenv("REF_EMB");
+    if (edump) {
+        const float * e = llama_get_embeddings_ith(ctx, -1);
+        if (e) {
+            if (FILE * f = fopen(edump, "wb")) {
+                fwrite(e, sizeof(float), (size_t) llama_model_n_embd(model), f);
+                fclose(f);
+                fprintf(stderr, "emb -> %s\n", edump);
+            }
+        } else fprintf(stderr, "no embeddings\n");
+    }
     int pos = np - 1;
     printf("prompt %d\n", np);
     for (int s = 0; s < ngen; ++s) {
