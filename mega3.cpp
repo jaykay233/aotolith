@@ -1829,6 +1829,12 @@ static int8_t * g_q8i;                 // [(head*nqg + group)][8 ksteps][4 rows 
 static float *  g_q8isc;               // [rows][N_HEAD]
 static float g_k8isc[4], g_v8isc[4];
 static int64_t g_k8i_npb, g_v8i_npb16, g_q8i_nqg;
+// The int8 KV layout interleaves (head, 64-position block), so the block stride
+// depends on how many blocks exist. Deriving it from the current position count
+// moved every already-converted block whenever the prefix grew, which is why the
+// conversion used to rewrite the whole prefix each chunk. Fixing the stride at the
+// buffer capacity keeps old blocks in place, so a chunk only converts its own rows.
+static int64_t g_k8i_npb_cap, g_v8i_npb16_cap;
 static int g_pfa_i8 = 0;
 static int64_t g_pq_rows = 0;
 static int g_pfa_dbg1 = 0;
@@ -2257,9 +2263,12 @@ static void pv4(int8_t * const * acc, const int8_t * w8g, const int8_t * vblk, i
 static float g_cv_mk[N_KV][N_GPU], g_cv_mv[N_KV][N_GPU];
 static float g_cv_ik[N_KV], g_cv_iv[N_KV];
 
-static inline void cv_band(int tid, int64_t npos, int64_t * lo, int64_t * hi) {
-    *lo = npos * tid / g_participants;
-    *hi = npos * (tid + 1) / g_participants;
+static int64_t g_cv_lo;                     // first position this call converts
+
+static inline void cv_band(int tid, int64_t lo0, int64_t npos, int64_t * lo, int64_t * hi) {
+    const int64_t n = npos - lo0;
+    *lo = lo0 + n * tid / g_participants;
+    *hi = lo0 + n * (tid + 1) / g_participants;
 }
 
 // Both conv passes were scalar element loops: 2.36 s of a 58 s prefill, and all of
@@ -2275,7 +2284,7 @@ static inline void cv_band(int tid, int64_t npos, int64_t * lo, int64_t * hi) {
 // Rounding stays lrintf-compatible (vfcvt with the default round-to-nearest-even)
 // and the max pass stays exact because |f16| values are a subset of |f32|.
 static void task_pfa_conv_max(int tid) {
-    int64_t lo, hi; cv_band(tid, g_cv_npos, &lo, &hi);
+    int64_t lo, hi; cv_band(tid, g_cv_lo, g_cv_npos, &lo, &hi);
     const size_t vl = __riscv_vsetvl_e16m4(HEAD_DIM);
     for (int kv = 0; kv < N_KV; ++kv) {
         float mk = 0, mv = 0;
@@ -2311,7 +2320,7 @@ static inline void conv16(const _Float16 * src, int64_t stride_elems, float inv,
 }
 
 static void task_pfa_conv_q(int tid) {
-    int64_t lo, hi; cv_band(tid, g_cv_npos, &lo, &hi);
+    int64_t lo, hi; cv_band(tid, g_cv_lo, g_cv_npos, &lo, &hi);
     // whole 16-position V blocks only; lo/hi are position bounds, so round them
     // down to the block grid. A trailing partial block keeps the scalar loop that
     // this replaced -- writing a full 16-lane block past npos would walk off g_v8i.
@@ -2350,11 +2359,23 @@ static void task_pfa_conv_q(int tid) {
     }
 }
 
+// Every chunk reconverts the whole prefix: 20 chunks over 10240 rows is ~107k
+// position conversions per layer instead of 10k, 6.4 s of the 76 s prefill.
+// Converting only the new positions (one pass per chunk, rescaling the prefix when
+// a new maximum appears) leaves the same bytes in the cache at the end, but the
+// greedy chain follows the scale each position carried while prefill ran: at 10K
+// that version picks 11127 where the whole-prefix rewrite picks 5, so the rewrite
+// stays. The strides are still pinned to the buffer capacity, which keeps every
+// already-converted block at one address instead of moving it as the prefix grows.
 static void pfa_convert_kv_i8(int layer, int64_t npos) {
-    g_k8i_npb = (npos + 63) / 64;
-    g_v8i_npb16 = (npos + 15) / 16;
+    g_k8i_npb = g_k8i_npb_cap;
+    g_v8i_npb16 = g_v8i_npb16_cap;
     g_cv_layer = layer; g_cv_npos = npos;
+    if (npos <= 0) return;
+    const double _cm0 = now_s();
+    g_cv_lo = 0;
     run(task_pfa_conv_max);
+    const double _cm1 = now_s();
     for (int kv = 0; kv < N_KV; ++kv) {
         float mk = 0, mv = 0;
         for (int t = 0; t < g_participants; ++t) {
@@ -2367,6 +2388,8 @@ static void pfa_convert_kv_i8(int layer, int64_t npos) {
         g_cv_ik[kv] = 1.0f / sk; g_cv_iv[kv] = 1.0f / sv;
     }
     run(task_pfa_conv_q);
+    if (getenv("MEGA_TIME"))
+        fprintf(stderr, "  conv L%d: max %.3f s, quant %.3f s\n", layer, _cm1 - _cm0, now_s() - _cm1);
 }
 
 // One (row group, head) pack: max-scan the row, then scale to int8 into the
@@ -3436,6 +3459,8 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     g_pfv     = (float *) hugemem((size_t) R * N_KV * HEAD_DIM * 4);
     g_pq      = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
     g_pfa_out = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
+    g_k8i_npb_cap   = (NP + 63) / 64;
+    g_v8i_npb16_cap = (NP + 15) / 16;
     g_k8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 63) / 64) * 8192 + (2 << 20));
     g_v8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 15) / 16) * 2048 + (2 << 20));
     g_q8i     = (int8_t *) hugemem((size_t) N_HEAD * ((R + 3) / 4) * 512 + (2 << 20));
@@ -3669,6 +3694,14 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
         }
     }
     const double dt = now_s() - t0;
+    if (getenv("MEGA_KVHASH") && g_pfa_i8) {
+        uint64_t h1 = 1469598103934665603ull, h2 = 1469598103934665603ull;
+        const size_t n1 = (size_t) N_KV * g_k8i_npb_cap * 8192;
+        const size_t n2 = (size_t) N_KV * g_v8i_npb16_cap * 2048;
+        for (size_t i = 0; i < n1; ++i) { h1 ^= (uint8_t) g_k8i[i]; h1 *= 1099511628211ull; }
+        for (size_t i = 0; i < n2; ++i) { h2 ^= (uint8_t) g_v8i[i]; h2 *= 1099511628211ull; }
+        printf("kvhash K %016llx V %016llx\n", (unsigned long long) h1, (unsigned long long) h2);
+    }
     printf("prefill: %lld tokens in %.3f s (%.2f tok/s, %lld-row chunks)\n",
            (long long) npref, dt, (double) npref / dt, (long long) R);
     {   // per-cluster work, summed over threads: these are core-seconds
@@ -3716,6 +3749,8 @@ static void bench_prefill_attn(void) {
     }
 
     if (g_pfa_i8) {
+        g_k8i_npb_cap   = (ctx + rows + 63) / 64;
+        g_v8i_npb16_cap = (ctx + rows + 15) / 16;
         g_k8i = (int8_t *) hugemem((size_t) N_KV * ((ctx + rows + 63) / 64) * 8192 + (2 << 20));
         g_v8i = (int8_t *) hugemem((size_t) N_KV * ((ctx + rows + 15) / 16) * 2048 + (2 << 20));
         g_q8i = (int8_t *) hugemem((size_t) N_HEAD * ((rows + 3) / 4) * 512 + (2 << 20));

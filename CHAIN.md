@@ -300,3 +300,28 @@ count_m in the vendor GEMM is worth recording as a dead end: the dispatcher only
 checks `count_m >= 4`, the m4 kernel always computes 4 rows, and a benchmark that
 scales GMAC/s by count_m is measuring nothing - the wall time is flat from m=4 to
 m=128.
+### Converting only the new KV positions keeps the token, then loses it
+
+The chunked prefill reconverted the whole prefix in every chunk, so 20 chunks over
+10240 rows ran ~107k position conversions per layer, 6.4 s of the 76 s prefill.
+Two changes were tried against that:
+
+1. Pin the int8 map strides to the buffer capacity (`g_k8i_npb_cap`,
+   `g_v8i_npb16_cap`) instead of `(npos + 63) / 64`. This one is free and now in:
+   with the dynamic stride every already-converted block moved each time the
+   prefix grew, which was the real reason a chunk could not just convert its own
+   rows. Prefill time and the first token are unchanged (6.41 s conv, token 5).
+2. Convert only `[done, npos)` per chunk and rescale the prefix only when a new
+   maximum appears, with a final whole-prefix rewrite on the last chunk for good
+   measure. Conv 6.41 s -> 2.37 s, but 10K prefill then picks token 11127 (9.98)
+   instead of 5 (14.36). Toggling the final rewrite off and on changes nothing -
+   both give 11127 - so the difference is not the bytes the cache ends up with.
+   The greedy chain is following the scale each position carried *while* prefill
+   ran; per-chunk scales are numerically different from whole-prefix scales even
+   when the last chunk reconciles them. Reverted.
+
+The way to keep the 4 s would be a per-64-position-block scale (`sk` per block
+inside the K map, `sv` per 16-position block in the V map) plus a per-block scale
+multiply in the QK epilogue and the PV accumulate. Blocks would then never need
+the prefix rescanned, and the conversion would be one pass per chunk by
+construction rather than by bookkeeping.
