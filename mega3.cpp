@@ -522,6 +522,8 @@ static void task_mgemm(int tid) {
 // from DRAM and reused for every row group in the chunk: at m=1 the tile was
 // re-read per row, which is what kept prefill pinned to DRAM bandwidth.
 static int64_t g_pf_rows;
+static const char * g_pf_file = nullptr;   // prompt token ids, whitespace separated
+static int64_t g_pf_chunk = 512;
 static int64_t g_pf_nb = 1;          // n-blocks per gemm call
 static int g_pf_mt = 4;              // row groups (4 rows each) per shared-B tile
 static int g_pf_reps = 0;            // repeat q_proj to isolate compute peak
@@ -996,6 +998,21 @@ static inline vfloat32m2_t exp2f_poly_m2(vfloat32m2_t t, size_t vl) {
     return __riscv_vfmul_vv_f32m2(p, __riscv_vreinterpret_v_i32m2_f32m2(ex), vl);
 }
 
+static inline vfloat32m4_t exp2f_poly_m4(vfloat32m4_t t, size_t vl) {
+    vint32m4_t ie = __riscv_vfcvt_x_f_v_i32m4(t, vl);
+    const vfloat32m4_t f = __riscv_vfsub_vv_f32m4(t, __riscv_vfcvt_f_x_v_f32m4(ie, vl), vl);
+    vfloat32m4_t p = __riscv_vfmv_v_f_f32m4(0.00015403530f, vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(0.0013333558f, vl), vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(0.0096181291f, vl), vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(0.0555041087f, vl), vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(0.2402265070f, vl), vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(0.6931471806f, vl), vl);
+    p = __riscv_vfmadd_vv_f32m4(p, f, __riscv_vfmv_v_f_f32m4(1.0f, vl), vl);
+    vint32m4_t ex = __riscv_vadd_vx_i32m4(ie, 127, vl);
+    ex = __riscv_vsll_vx_i32m4(ex, 23, vl);
+    return __riscv_vfmul_vv_f32m4(p, __riscv_vreinterpret_v_i32m4_f32m4(ex), vl);
+}
+
 static void attn_exp_sum(int tid) {
     const int len = g_p1[tid] - g_p0[tid];
     if (len <= 0) return;
@@ -1242,7 +1259,19 @@ static float g_psa[N_GPU][PFA_ROWS][MAXCTX];    // per-thread scores (f16 path)
 // layer of writes plus 26.8 GB of reads, i.e. DRAM bound at ~11 GB/s. int16
 // halves that, and the max pass can run in the integer domain.
 static const float PSA_SC = 128.0f;
-static int16_t (*g_psa16)[I8_ROWS][MAXCTX];
+// Scores are stored in 64-byte blocks: four consecutive queries x eight
+// positions, in the lane order vmadot produces (query r, position c -> lane
+// r*8+c). One block is exactly one store, so the QK epilogue needs no slidedown,
+// and softmax can still walk positions in order because block i holds positions
+// 8i..8i+7 of all four rows of a group. probe_qk_epi.cpp on one A core: this
+// layout runs QK at 93.8 GMAC/s against a 101.4 vmadot ceiling, where the old
+// per-row shape manages 48.6 -- the four 8-lane slidedown+store pairs ate 53% of
+// the inner loop.
+static const int SC_NBLK = MAXCTX / 8;             // blocks per row group
+static const int SC_GSTRIDE = SC_NBLK * 32;        // int16 per row group
+static const int SC_TSTRIDE = I8_G * SC_GSTRIDE;   // int16 per tile
+static const int SC_SHIFT = 6;                     // raw >> 6 always fits int16
+static int16_t * g_psa16;
 static double g_pfa_qk[N_GPU], g_pfa_sm[N_GPU], g_pfa_pv[N_GPU];
 static double g_pfa_mx[N_GPU], g_pfa_ex[N_GPU];
 static double g_pfa_smb[8];
@@ -1362,8 +1391,11 @@ static float *  g_q8isc;               // [rows][N_HEAD]
 static float g_k8isc[4], g_v8isc[4];
 static int64_t g_k8i_npb, g_v8i_npb16, g_q8i_nqg;
 static int g_pfa_i8 = 0;
+static int64_t g_pq_rows = 0;
 static int g_pfa_dbg1 = 0;
 static int g_nostore = 0;   // diagnostic: park score stores in one L1 block
+static int g_gatemode = 0;  // correctness gate: emit only the generated token ids
+static int g_top5 = 0;      // with -g, also emit the top-5 logits per step
 static int g_dbg_h0 = 0, g_dbg_h0b = 0;
 
 static void qk4(int8_t * const * acc_out, const int8_t * q8g, const int8_t * kblk, int nks) {
@@ -1850,169 +1882,74 @@ static void pfa_convert_kv_i8(int layer, int64_t npos) {
     run(task_pfa_conv_q);
 }
 
-static void pfa_pack_q(int64_t rows) {
-    g_q8i_nqg = (rows + 3) / 4;
-    for (int64_t g = 0; g < g_q8i_nqg; ++g)
+// One (row group, head) pack: max-scan the row, then scale to int8 into the
+// 4-row x 16-dim block the QK dots read. Split across threads by group: the
+// whole loop used to run on one core and cost 2.4 s of a 60 s prefill.
+static void pfa_pack_q_band(int64_t lo, int64_t hi) {
+    for (int64_t g = lo; g < hi; ++g)
         for (int h = 0; h < N_HEAD; ++h) {
             int8_t * dst = g_q8i + ((h * g_q8i_nqg + g) * 8) * 64;
             for (int r = 0; r < 4; ++r) {
                 const int64_t qr = g * 4 + r;
-                if (qr >= rows) break;
+                if (qr >= g_pq_rows) break;
                 const float * q = g_pq + (qr * N_HEAD + h) * HEAD_DIM;
-                float mx = 0;
-                for (int d = 0; d < HEAD_DIM; ++d) mx = fmaxf(mx, fabsf(q[d]));
+                const size_t v16 = __riscv_vsetvl_e32m1(16);
+                vfloat32m1_t vmx = __riscv_vfmv_v_f_f32m1(0.0f, v16);
+                for (int d = 0; d < HEAD_DIM; d += 16)
+                    vmx = __riscv_vfmax_vv_f32m1(vmx,
+                        __riscv_vfabs_v_f32m1(__riscv_vle32_v_f32m1(q + d, v16), v16), v16);
+                const float mx = __riscv_vfmv_f_s_f32m1_f32(
+                    __riscv_vfredmax_vs_f32m1_f32m1(vmx, __riscv_vfmv_s_f_f32m1(0.0f, 1), v16));
                 const float s = mx > 0 ? mx / 127.0f : 1.0f;
                 g_q8isc[qr * N_HEAD + h] = s;
                 const float inv = 1.0f / s;
-                for (int d = 0; d < HEAD_DIM; ++d) {
-                    int v = (int) lrintf(q[d] * inv);
-                    if (v > 127) v = 127; if (v < -127) v = -127;
-                    dst[(d / 16) * 64 + r * 16 + (d % 16)] = (int8_t) v;
+                for (int d = 0; d < HEAD_DIM; d += 16) {
+                    vfloat32m1_t v = __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(q + d, v16), inv, v16);
+                    vint32m1_t iv = __riscv_vfcvt_x_f_v_i32m1(v, v16);
+                    iv = __riscv_vmax_vx_i32m1(iv, -127, v16);
+                    iv = __riscv_vmin_vx_i32m1(iv, 127, v16);
+                    __riscv_vse8_v_i8mf4(dst + (d / 16) * 64 + r * 16,
+                        __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(iv, v16), v16), v16);
                 }
             }
         }
 }
 
-// One tile of I8_ROWS queries of one head: QK over every position the tile can
-// see, exact causal masking, softmax, requantise the weights, then PV.
+static void pfa_pack_q(int64_t rows) {
+    g_q8i_nqg = (rows + 3) / 4;
+    g_pq_rows = rows;
+    parallel_for(g_q8i_nqg, pfa_pack_q_band);
+    g_pq_rows = 0;
+}
+
+// One tile of I8_ROWS queries of one head: QK, softmax, requantise the weights,
+// then PV. QK and softmax are shared with the pipelined path so both use the same
+// score layout and there is only one copy of that arithmetic to keep correct.
+static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc);
+static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc);
+
 static void pfa_head_i8(int layer, int h, int64_t qbase) {
     const int kv = h / NH_PER_KV;
     const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
     const int npb = (nn + 63) / 64;
-    const int8_t * q8g = g_q8i + ((h * g_q8i_nqg) + qbase / 4) * 8 * 64;
-    int16_t * row16[I8_ROWS];
-    for (int r = 0; r < I8_ROWS; ++r) row16[r] = &g_psa16[g_pfa_tid][r][0];
-
-    alignas(64) static __thread int32_t raw[8][32];
+    int16_t * sc = g_psa16 + (size_t) g_pfa_tid * SC_TSTRIDE;
     alignas(64) static __thread int8_t w8[I8_G * WBLK + 256];
     static __thread float wsc[I8_ROWS];
-
-    // Per-lane row scales, built once per tile: with VLMAX lanes the epilogue
-    // converts all four rows and all eight columns of one raw register in a
-    // single pass instead of four 8-lane passes.
-    alignas(64) static __thread float svt[I8_G][32];
-    for (int gg = 0; gg < I8_G; ++gg)
-        for (int r = 0; r < 4; ++r) {
-            const float s_r = g_q8isc[((qbase + gg * 4 + r) * N_HEAD + h)] * g_k8isc[kv] * PSA_SC;
-            for (int c = 0; c < 8; ++c) svt[gg][r * 8 + c] = s_r;
-        }
+    g_pfa_smid = g_pfa_tid & 7;
 
     const double _q = now_s();
-    for (int pb = 0; pb < npb; ++pb) {
-        const int8_t * kb = g_k8i + ((kv * g_k8i_npb + pb) * 8) * 1024;
-        for (int gg = 0; gg < I8_G; ++gg) {
-            int8_t * op[8];
-            for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
-            qk4(op, q8g + gg * 512, kb, HEAD_DIM / 16);
-            const size_t vl32 = __riscv_vsetvl_e32m1(32);
-            const vfloat32m1_t sv = __riscv_vle32_v_f32m1(svt[gg], vl32);
-            const size_t vl8 = __riscv_vsetvl_e16mf2(8);
-            for (int j = 0; j < 8; ++j) {
-                __riscv_vsetvl_e32m1(32);
-                const vint32m1_t a = __riscv_vle32_v_i32m1(raw[j], vl32);
-                const vfloat32m1_t f = __riscv_vfmul_vv_f32m1(
-                    __riscv_vfcvt_f_x_v_f32m1(a, vl32), sv, vl32);
-                const vint16mf2_t h16 = __riscv_vncvt_x_x_w_i16mf2(
-                    __riscv_vfcvt_x_f_v_i32m1(f, vl32), vl32);
-                for (int r = 0; r < 4; ++r) {
-                    const vint16mf2_t sl = r
-                        ? __riscv_vslidedown_vx_i16mf2(h16, (size_t) (r * 8), vl8) : h16;
-                    __riscv_vse16_v_i16mf2(g_nostore ? row16[0] : row16[gg * 4 + r] + pb * 64 + j * 8, sl, vl8);
-                }
-            }
-        }
-    }
+    pfa_qk_i8(h, qbase, sc);
     g_pfa_qk[g_pfa_tid] += now_s() - _q;
 
-    // Two-pass softmax. The largest probability is always exactly 1 (it is
-    // exp(mx-mx)), so the int8 weights use the fixed scale 1/127 and the 1/sum
-    // factor folds into the PV scale.
     const double _s = now_s();
-    const int wnb = (nn + 15) / 16;
-    for (int gg = 0; gg < I8_G; ++gg) memset(w8 + gg * WBLK, 0, (size_t) wnb * 64);
-    for (int rr = 0; rr < I8_ROWS; ++rr) {
-        int16_t * rw = row16[rr];
-        int8_t * wb = w8 + (rr / 4) * WBLK;
-        const int r = rr % 4;
-        const int len = (int) (g_pfa_ctx + qbase + rr + 1);
-        // max in the integer domain: the scale is positive, so it is order
-        // preserving and no conversion is needed on the pass that touches every
-        // score
-        int mx16 = -32768;
-        int i2 = 0;
-        const double _mx = now_s();
-        for (; i2 + 32 <= len; i2 += 32) {
-            const size_t vl = __riscv_vsetvl_e16m1(32);
-            const vint16m1_t v = __riscv_vle16_v_i16m1(rw + i2, vl);
-            const vint16m1_t m = __riscv_vredmax_vs_i16m1_i16m1(
-                v, __riscv_vmv_s_x_i16m1((int16_t) -32768, 1), vl);
-            const int t = (int) __riscv_vmv_x_s_i16m1_i16(m);
-            if (t > mx16) mx16 = t;
-        }
-        for (; i2 + 16 <= len; i2 += 16) {
-            const size_t vl = __riscv_vsetvl_e16m1(16);
-            const vint16m1_t v = __riscv_vle16_v_i16m1(rw + i2, vl);
-            const vint16m1_t m = __riscv_vredmax_vs_i16m1_i16m1(
-                v, __riscv_vmv_s_x_i16m1((int16_t) -32768, 1), vl);
-            const int t = (int) __riscv_vmv_x_s_i16m1_i16(m);
-            if (t > mx16) mx16 = t;
-        }
-        for (; i2 < len; ++i2) if (rw[i2] > mx16) mx16 = rw[i2];
-        g_pfa_mx[g_pfa_tid] += now_s() - _mx;
-        const float mx = (float) mx16 / PSA_SC;
-        const double _ex = now_s();
-        const size_t vlz = __riscv_vsetvl_e32m1(32);
-        vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, vlz);
-        int p = 0;
-        for (; p + 32 <= len; p += 32) {
-            const size_t vl = __riscv_vsetvl_e32m1(32);
-            const vint32m1_t ivs = __riscv_vsext_vf2_i32m1(
-                __riscv_vle16_v_i16mf2(rw + p, vl), vl);
-            vfloat32m1_t v = __riscv_vfmul_vf_f32m1(
-                __riscv_vfcvt_f_x_v_f32m1(ivs, vl), 1.0f / PSA_SC, vl);
-            v = __riscv_vfsub_vf_f32m1(v, mx, vl);
-            v = __riscv_vfmul_vf_f32m1(v, 1.4426950408889634f, vl);
-            v = exp2f_poly(__riscv_vfmax_vf_f32m1(v, -126.0f, vl), vl);
-            acc = __riscv_vfadd_vv_f32m1(acc, v, vl);
-            const vfloat32m1_t q = __riscv_vfmul_vf_f32m1(v, 127.0f, vl);
-            const vint32m1_t iv = __riscv_vfcvt_x_f_v_i32m1(q, vl);
-            const vint16mf2_t h16 = __riscv_vncvt_x_x_w_i16mf2(iv, vl);
-            const vint8mf4_t b8 = __riscv_vncvt_x_x_w_i8mf4(h16, vl);
-            const size_t vl16 = __riscv_vsetvl_e8mf4(16);
-            __riscv_vse8_v_i8mf4(wb + (p / 16) * 64 + r * 16, b8, vl16);
-            __riscv_vse8_v_i8mf4(wb + (p / 16 + 1) * 64 + r * 16,
-                                 __riscv_vslidedown_vx_i8mf4(b8, 16, vl16), vl16);
-        }
-        for (; p < len; p += 16) {
-            const int n = (len - p < 16) ? (len - p) : 16;
-            const size_t vl = __riscv_vsetvl_e32m1((size_t) n);
-            const vint32m1_t ivs = __riscv_vsext_vf2_i32m1(
-                __riscv_vle16_v_i16mf2(rw + p, vl), vl);
-            vfloat32m1_t v = __riscv_vfmul_vf_f32m1(
-                __riscv_vfcvt_f_x_v_f32m1(ivs, vl), 1.0f / PSA_SC, vl);
-            v = __riscv_vfsub_vf_f32m1(v, mx, vl);
-            v = __riscv_vfmul_vf_f32m1(v, 1.4426950408889634f, vl);
-            v = exp2f_poly(__riscv_vfmax_vf_f32m1(v, -126.0f, vl), vl);
-            // accumulate at vl, not the full length: lanes at or past the tail are
-            // not part of this row and would corrupt the normalisation sum
-            acc = __riscv_vfadd_vv_f32m1(acc, v, vl);
-            const vfloat32m1_t q = __riscv_vfmul_vf_f32m1(v, 127.0f, vl);
-            const vint32m1_t iv = __riscv_vfcvt_x_f_v_i32m1(q, vl);
-            const vint16mf2_t h16 = __riscv_vncvt_x_x_w_i16mf2(iv, vl);
-            const vint8mf4_t b8 = __riscv_vncvt_x_x_w_i8mf4(h16, vl);
-            __riscv_vse8_v_i8mf4(wb + (p / 16) * 64 + r * 16, b8, vl);
-        }
-        const float sum = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(
-            acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlz));
-        wsc[rr] = sum > 0 ? 1.0f / (127.0f * sum) : 0.0f;
-        g_pfa_ex[g_pfa_tid] += now_s() - _ex;
-    }
+    pfa_sm_i8(h, qbase, sc, w8, wsc);
     g_pfa_sm[g_pfa_tid] += now_s() - _s;
 
     // PV: two passes of 64 dims, contracting 16 positions per step. The four row
     // groups read the same V blocks, so they stay hot across the tile.
     const double _v = now_s();
     alignas(64) static __thread int32_t praw[8][32];
+    alignas(64) static __thread int32_t pacc[I8_G][8][32];
     const int nq = (nn + 15) / 16;
     for (int half = 0; half < 2; ++half) {
         const int8_t * vb = g_v8i + (kv * g_v8i_npb16 + half * g_v8i_npb16) * 1024;
@@ -2021,7 +1958,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
         for (int gg = 0; gg < I8_G; ++gg) {
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) praw[j];
-            pv4(op, w8 + gg * WBLK, vb, nq, 1024);
+            pv4(op, w8 + gg * WBLK, vb, (int) (g_pfa_ctx + qbase + gg * 4 + 4 + 15) / 16, 1024);
             if (half == 0 && gg == 0) {
                 g_dbg_h0 = praw[0][24]; g_dbg_h0b = praw[0][25];
                 if (g_pfa_dbg1 && layer == 0 && h == 0 && qbase == 0 && g_pfa_tid == 0) {
@@ -2114,7 +2051,7 @@ static const int I8_NSLOT = 24;
 static const int I8_INFLIGHT = 2;
 
 struct TileSlot {
-    int16_t scores[I8_ROWS][MAXCTX];
+    int16_t scores[SC_TSTRIDE];      // interleaved 4-row x 8-position blocks
     int8_t  w8[I8_G * WBLK + 4096];
     float   wsc[I8_ROWS];
 };
@@ -2131,112 +2068,179 @@ static int g_n_sm = 0;
 static int g_pipe = 0;
 static int g_pipe_layer = 0;
 
-// QK for one tile. row16[r] is where row r's scores go; it is slot memory here
-// and thread-local in the single-cluster path, so the body is shared.
-static void pfa_qk_i8(int h, int64_t qbase, int16_t (*row16)[MAXCTX]) {
+// QK for one tile. Scores land in the interleaved block layout described at
+// SC_NBLK above: the epilogue is one vnsra plus one 64-byte store per position
+// block. sc is slot memory in the pipelined path and thread-local in the
+// single-cluster one, so the body is shared.
+static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
     const int kv = h / NH_PER_KV;
     const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
     const int npb = (nn + 63) / 64;
     const int8_t * q8g = g_q8i + ((h * g_q8i_nqg) + qbase / 4) * 8 * 64;
     alignas(64) static __thread int32_t raw[8][32];
-    alignas(64) static __thread float svt[I8_G][32];
-    for (int gg = 0; gg < I8_G; ++gg)
-        for (int r = 0; r < 4; ++r) {
-            const float s_r = g_q8isc[((qbase + gg * 4 + r) * N_HEAD + h)] * g_k8isc[kv] * PSA_SC;
-            for (int c = 0; c < 8; ++c) svt[gg][r * 8 + c] = s_r;
-        }
+    const size_t vl32 = __riscv_vsetvl_e32m1(32);
+    const size_t vl16 = __riscv_vsetvl_e16mf2(32);
     for (int pb = 0; pb < npb; ++pb) {
         const int8_t * kb = g_k8i + ((kv * g_k8i_npb + pb) * 8) * 1024;
+        int16_t * blk = sc + (size_t) (pb * 8) * 32;
         for (int gg = 0; gg < I8_G; ++gg) {
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
             qk4(op, q8g + gg * 512, kb, HEAD_DIM / 16);
-            const size_t vl32 = __riscv_vsetvl_e32m1(32);
-            const vfloat32m1_t sv = __riscv_vle32_v_f32m1(svt[gg], vl32);
-            const size_t vl8 = __riscv_vsetvl_e16mf2(8);
+            int16_t * dst = blk + (size_t) gg * SC_GSTRIDE;
             for (int j = 0; j < 8; ++j) {
-                __riscv_vsetvl_e32m1(32);
                 const vint32m1_t a = __riscv_vle32_v_i32m1(raw[j], vl32);
-                const vfloat32m1_t f = __riscv_vfmul_vv_f32m1(
-                    __riscv_vfcvt_f_x_v_f32m1(a, vl32), sv, vl32);
-                const vint16mf2_t h16 = __riscv_vncvt_x_x_w_i16mf2(
-                    __riscv_vfcvt_x_f_v_i32m1(f, vl32), vl32);
-                for (int r = 0; r < 4; ++r) {
-                    const vint16mf2_t sl = r
-                        ? __riscv_vslidedown_vx_i16mf2(h16, (size_t) (r * 8), vl8) : h16;
-                    __riscv_vse16_v_i16mf2(row16[gg * 4 + r] + pb * 64 + j * 8, sl, vl8);
-                }
+                __riscv_vse16_v_i16mf2(dst + j * 32,
+                                       __riscv_vnsra_wx_i16mf2(a, SC_SHIFT, vl32), vl16);
             }
         }
     }
 }
 
-// Softmax + requantise. Two shapes, both correct on either cluster, but the loop
-// width matters a lot: with VLEN=256 the max pass wants e16m4 (64 scores per
-// vredmax, which is microcoded) and the exp pass wants e32m2 (16 positions,
-// exactly one 64-byte pv4 block, so no slidedown and no straddling).
-static void pfa_sm_i8(int64_t qbase, const int16_t (*row16)[MAXCTX],
-                      int8_t * w8, float * wsc) {
-    const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
-    const int wnb = (nn + 15) / 16;
-    for (int gg = 0; gg < I8_G; ++gg) memset(w8 + gg * WBLK, 0, (size_t) wnb * 64);
-    for (int rr = 0; rr < I8_ROWS; ++rr) {
-        const int16_t * rw = row16[rr];
-        int8_t * wb = w8 + (rr / 4) * WBLK;
-        const int r = rr % 4;
-        const int len = (int) (g_pfa_ctx + qbase + rr + 1);
+// Softmax + requantise, one row group at a time. The max pass is lane-wise over
+// blocks and needs a single cross-lane reduce per group, because lane r*8+c of
+// every block belongs to row r: only blocks 0..nb-1 are read, so the reduce
+// never sees memory QK has not written. The exp pass runs 32 lanes (four rows x
+// eight positions) per step; each row's eight weights go to its own slot of the
+// pv4 A layout, which is what the four slidedowns at the end are for.
+static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc) {
+    const int kv = h / NH_PER_KV;
+    const int L = (int) (g_pfa_ctx + qbase);
+    alignas(64) static __thread float kkl[I8_G][32], mml[I8_G][32];
+    alignas(64) static __thread int16_t mxs[I8_G][32];
+    alignas(64) static __thread float accs[I8_G][32];
+    const size_t vlz = __riscv_vsetvl_e16m2(32);
+    const size_t vl4 = __riscv_vsetvl_e32m4(32);
+
+    for (int gg = 0; gg < I8_G; ++gg) {
+        const int16_t * base = sc + (size_t) gg * SC_GSTRIDE;
+        int8_t * wb = w8 + (size_t) gg * WBLK;
+        const int nbv = (L + gg * 4 + 1) / 8;    // blocks all four rows of the group own
+        // PV reads this group's blocks up to and including the one holding row 3's
+        // last position, so the positions past each row's causal limit have to be
+        // zero. Only the group's own tail is involved: clearing all of w8 instead
+        // was 640 KB per tile against a few KB of real work.
+        const int wnb = (L + gg * 4 + 4 + 15) / 16;
+        const int zlo = (L + gg * 4 + 1) / 16;
+        if (zlo < wnb) memset(wb + (size_t) zlo * 64, 0, (size_t) (wnb - zlo) * 64);
+
+        // exponent scale per lane: score = S * 2^SC_SHIFT * q_scale * k_scale
+        for (int r = 0; r < 4; ++r) {
+            const float k = (float) (1 << SC_SHIFT) *
+                            g_q8isc[((qbase + gg * 4 + r) * N_HEAD + h)] * g_k8isc[kv] *
+                            1.4426950408889634f;
+            for (int c = 0; c < 8; ++c) kkl[gg][r * 8 + c] = k;
+        }
+
+        // Max over the blocks every row owns, then the last few positions of each
+        // row by hand: QK fills whole eight-position blocks, so the tail of this
+        // group still holds scores for positions past a row's own causal limit and
+        // letting them into the max would cost int8 resolution.
         const double _mx = now_s();
-        int mx16 = -32768;
-        int i2 = 0;
-        for (; i2 + 64 <= len; i2 += 64) {
-            const size_t vl = __riscv_vsetvl_e16m4(64);
-            const vint16m4_t v = __riscv_vle16_v_i16m4(rw + i2, vl);
-            const vint16m1_t m = __riscv_vredmax_vs_i16m4_i16m1(
-                v, __riscv_vmv_s_x_i16m1((int16_t) -32768, 1), vl);
-            const int t = (int) __riscv_vmv_x_s_i16m1_i16(m);
-            if (t > mx16) mx16 = t;
+        vint16m2_t vm = __riscv_vmv_v_x_i16m2((int16_t) -32768, vlz);
+        for (int i = 0; i < nbv; ++i) {
+            const size_t vl = __riscv_vsetvl_e16m2(32);
+            vm = __riscv_vmax_vv_i16m2(
+                vm, __riscv_vle16_v_i16m2(base + (size_t) i * 32, vl), vl);
         }
-        for (; i2 + 16 <= len; i2 += 16) {
-            const size_t vl = __riscv_vsetvl_e16m1(16);
-            const vint16m1_t v = __riscv_vle16_v_i16m1(rw + i2, vl);
-            const vint16m1_t m = __riscv_vredmax_vs_i16m1_i16m1(
-                v, __riscv_vmv_s_x_i16m1((int16_t) -32768, 1), vl);
-            const int t = (int) __riscv_vmv_x_s_i16m1_i16(m);
-            if (t > mx16) mx16 = t;
+        vm = __riscv_vmax_vv_i16m2(vm, __riscv_vslidedown_vx_i16m2(vm, 4, vlz), vlz);
+        vm = __riscv_vmax_vv_i16m2(vm, __riscv_vslidedown_vx_i16m2(vm, 2, vlz), vlz);
+        vm = __riscv_vmax_vv_i16m2(vm, __riscv_vslidedown_vx_i16m2(vm, 1, vlz), vlz);
+        __riscv_vse16_v_i16m2(mxs[gg], vm, vlz);
+        for (int r = 0; r < 4; ++r) {
+            const int len = L + gg * 4 + r + 1;
+            int m = mxs[gg][r * 8];
+            for (int p = nbv * 8; p < len; ++p) {
+                const int S = base[(size_t) (p / 8) * 32 + r * 8 + (p % 8)];
+                if (S > m) m = S;
+            }
+            mxs[gg][r * 8] = (int16_t) m;
         }
-        for (; i2 < len; ++i2) if (rw[i2] > mx16) mx16 = rw[i2];
         g_pfa_mxb[g_pfa_smid] += now_s() - _mx;
-        const float mx = (float) mx16 / PSA_SC;
+
         const double _ex = now_s();
-        const size_t vlz = __riscv_vsetvl_e32m2(16);
-        vfloat32m2_t acc = __riscv_vfmv_v_f_f32m2(0.0f, vlz);
-        int p = 0;
-        for (; p + 16 <= len; p += 16) {
-            const size_t vl = __riscv_vsetvl_e32m2(16);
-            const vint32m2_t ivs = __riscv_vsext_vf2_i32m2(
-                __riscv_vle16_v_i16m1(rw + p, vl), vl);
-            vfloat32m2_t v = __riscv_vfmul_vf_f32m2(
-                __riscv_vfcvt_f_x_v_f32m2(ivs, vl), 1.0f / PSA_SC, vl);
-            v = __riscv_vfsub_vf_f32m2(v, mx, vl);
-            v = __riscv_vfmul_vf_f32m2(v, 1.4426950408889634f, vl);
-            v = exp2f_poly_m2(__riscv_vfmax_vf_f32m2(v, -126.0f, vl), vl);
-            acc = __riscv_vfadd_vv_f32m2(acc, v, vl);
-            const vfloat32m2_t q = __riscv_vfmul_vf_f32m2(v, 127.0f, vl);
-            const vint32m2_t iv = __riscv_vfcvt_x_f_v_i32m2(q, vl);
-            const vint16m1_t h16 = __riscv_vncvt_x_x_w_i16m1(iv, vl);
-            const vint8mf2_t b8 = __riscv_vncvt_x_x_w_i8mf2(h16, vl);
-            __riscv_vse8_v_i8mf2(wb + (p / 16) * 64 + r * 16, b8, vl);
+        for (int r = 0; r < 4; ++r) {
+            const float mm = (float) mxs[gg][r * 8] * kkl[gg][r * 8];
+            for (int c = 0; c < 8; ++c) mml[gg][r * 8 + c] = mm;
         }
-        float tail = 0;
-        for (; p < len; ++p) {
-            const float v = exp2f(((float) rw[p] / PSA_SC - mx) * 1.4426950408889634f);
-            wb[(p / 16) * 64 + r * 16 + (p % 16)] = (int8_t) lrintf(v * 127.0f);
-            tail += v;
+        const vfloat32m4_t klane = __riscv_vle32_v_f32m4(kkl[gg], vl4);
+        const vfloat32m4_t mlane = __riscv_vle32_v_f32m4(mml[gg], vl4);
+        vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl4);
+        for (int i = 0; i < nbv; ++i) {
+            const size_t v16 = __riscv_vsetvl_e16m2(32);
+            const size_t vl = __riscv_vsetvl_e32m4(32);
+            const vint32m4_t s32 = __riscv_vsext_vf2_i32m4(
+                __riscv_vle16_v_i16m2(base + (size_t) i * 32, v16), vl);
+            vfloat32m4_t t = __riscv_vfmul_vv_f32m4(__riscv_vfcvt_f_x_v_f32m4(s32, vl), klane, vl);
+            t = exp2f_poly_m4(__riscv_vfmax_vf_f32m4(__riscv_vfsub_vv_f32m4(t, mlane, vl),
+                                                     -127.0f, vl), vl);
+            acc = __riscv_vfadd_vv_f32m4(acc, t, vl);
+            const vint32m4_t iv = __riscv_vfcvt_x_f_v_i32m4(__riscv_vfmul_vf_f32m4(t, 127.0f, vl), vl);
+            const vint8m1_t b8 = __riscv_vncvt_x_x_w_i8m1(
+                __riscv_vncvt_x_x_w_i16m2(iv, vl), vl);
+            const size_t v8 = __riscv_vsetvl_e8m1(8);
+            for (int r = 0; r < 4; ++r) {
+                const vint8m1_t part = r
+                    ? __riscv_vslidedown_vx_i8m1(b8, (size_t) (r * 8), vl) : b8;
+                __riscv_vse8_v_i8m1(wb + (size_t) (i / 2) * 64 + r * 16 + (i & 1) * 8, part, v8);
+            }
         }
-        const float sum = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(
-            acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlz)) + tail;
-        wsc[rr] = sum > 0 ? 1.0f / (127.0f * sum) : 0.0f;
+        // per-row sums: lanes r*8..r*8+7 of acc hold row r's partial sums
+        vfloat32m4_t sa = acc;
+        sa = __riscv_vfadd_vv_f32m4(sa, __riscv_vslidedown_vx_f32m4(sa, 4, vl4), vl4);
+        sa = __riscv_vfadd_vv_f32m4(sa, __riscv_vslidedown_vx_f32m4(sa, 2, vl4), vl4);
+        sa = __riscv_vfadd_vv_f32m4(sa, __riscv_vslidedown_vx_f32m4(sa, 1, vl4), vl4);
+        __riscv_vse32_v_f32m4(accs[gg], sa, vl4);
+
+        for (int r = 0; r < 4; ++r) {
+            const int len = L + gg * 4 + r + 1;
+            float sum = accs[gg][r * 8];
+            // positions the vector pass could not cover, and the causal mask past
+            // them: at most a couple of eight-position blocks
+            for (int p = nbv * 8; p < len; ++p) {
+                const int16_t S = base[(size_t) (p / 8) * 32 + r * 8 + (p % 8)];
+                const float v = exp2f(((float) S - (float) mxs[gg][r * 8]) * kkl[gg][r * 8]);
+                sum += v;
+                wb[(size_t) (p / 16) * 64 + r * 16 + (p % 16)] = (int8_t) lrintf(v * 127.0f);
+            }
+            wsc[gg * 4 + r] = sum > 0 ? 1.0f / (127.0f * sum) : 0.0f;
+        }
         g_pfa_exb[g_pfa_smid] += now_s() - _ex;
+        if (g_pfa_dbg1 && qbase == 0 && gg == 0 && h == 0) {
+            long sw = 0;
+            for (int i = 0; i < 256; ++i) sw += wb[i];
+            long ss = 0;
+            for (int i = 0; i < 64; ++i) ss += base[i];
+            printf("[dbg0] key=%d sw=%ld ss=%ld sc=%ld wsc0=%.6g wsc3=%.6g\n",
+                   (int) (g_pfa_ctx * 1000000), (int) sw, (int) ss,
+                   (long) sc[0], wsc[0], wsc[3]);
+        }
+        if (g_pfa_dbg1 && h == 0 && qbase == 1024 && gg == I8_G - 1) {
+            double wsum = 0, wref = 0;
+            for (int g2 = 0; g2 < I8_G; ++g2) {
+                const int16_t * bb = sc + (size_t) g2 * SC_GSTRIDE;
+                for (int r = 0; r < 4; ++r) {
+                    const int len = L + g2 * 4 + r + 1;
+                    int mxr = -32768;
+                    for (int p = 0; p < len; ++p) {
+                        const int16_t S = bb[(size_t) (p / 8) * 32 + r * 8 + (p % 8)];
+                        if (S > mxr) mxr = S;
+                    }
+                    double sr = 0;
+                    for (int p = 0; p < len; ++p) {
+                        const int16_t S = bb[(size_t) (p / 8) * 32 + r * 8 + (p % 8)];
+                        sr += exp2(((double) S - mxr) * (double) kkl[g2][r * 8]);
+                    }
+                    const double sv = 1.0 / ((double) wsc[g2 * 4 + r] * 127.0);
+                    wsum += sv; wref += sr;
+                    if (gg == I8_G - 1 && (fabs(sv - sr) > 1e-3 * sr || g2 < 2))
+                        printf("[smc] gg%d r%d vec %.6g ref %.6g ratio %.5f mx %d %d len %d\n",
+                               g2, r, sv, sr, sv / sr, (int) mxs[g2][r * 8], mxr, len);
+                }
+            }
+            printf("[smc] tile qbase=%lld sum vec %.6g ref %.6g\n", (long long) qbase, wsum, wref);
+            g_pfa_dbg1 = 0;
+        }
     }
 }
 
@@ -2245,85 +2249,80 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
                       const int8_t * w8, const float * wsc) {
     const int kv = h / NH_PER_KV;
     const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
-    const int nq = (nn + 15) / 16;
+    const int L = (int) (g_pfa_ctx + qbase);
+    // Row group gg never looks past position L+4gg+3, so its dots stop at the
+    // 16-position block holding that position. The weights past that point are
+    // zero by construction, so the truncation is exact and it removes just under
+    // half of PV's MACs over a full triangle.
     alignas(64) static __thread int32_t praw[8][32];
+    alignas(64) static __thread int32_t pacc[I8_G][8][32];
+    int nqg[I8_G];
+    for (int gg = 0; gg < I8_G; ++gg) nqg[gg] = (L + gg * 4 + 4 + 15) / 16;
+
     for (int half = 0; half < 2; ++half) {
         const int8_t * vb = g_v8i + (kv * g_v8i_npb16 + half * g_v8i_npb16) * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
-        // TCM staging: copy the V range this dot pass walks into the per-core
-        // scratchpad, then run the dots out of there. The dot loop is bound by the
-        // vector-load path itself (a 1 KB block that stays in L1 costs the same as
-        // a cold walk), so the one untried variable is whether TCM fetches take a
-        // different route into the register file.
-        uint8_t * tcm = g_tcmstage ? g_tcm[g_pfa_tid] : nullptr;
-        if (tcm && g_tcm_size >= 64 * 1024) {
-            for (int j = 0; j < 8; ++j) memset(praw[j], 0, sizeof praw[j]);
-            const int64_t stage = g_tcm_size / 1024;      // position blocks that fit
-            for (int64_t p0 = 0; p0 < nq; p0 += stage) {
-                const int n = (int) ((nq - p0 < stage) ? (nq - p0) : stage);
-                memcpy(tcm, vb + p0 * 1024, (size_t) n * 1024);
-                for (int gg = 0; gg < I8_G; ++gg) {
-                    int32_t * op[8];
-                    for (int j = 0; j < 8; ++j) op[j] = praw[j];
-                    pv4_acc(op, w8 + gg * WBLK + p0 * 64 + g_w8off,
-                            (const int8_t *) tcm, n);
-                }
+
+        if (g_hoist) {
+            // Per-group walk of V, kept for A/B: reads V's range sixteen times per
+            // tile, which is what made PV DRAM bound (131 core-s against 54 here).
+            for (int gg = 0; gg < I8_G; ++gg) {
+                int8_t * op[8];
+                for (int j = 0; j < 8; ++j) op[j] = (int8_t *) praw[j];
+                pv4_hoist(op, w8 + gg * WBLK + g_w8off, vb, nqg[gg]);
             }
-            if (layer != 0 || !g_pfa_out) continue;
-            const size_t vl8 = __riscv_vsetvl_e32m1(8);
+        } else {
+            // V block outer, row group inner. All sixteen groups' dots run against
+            // one fetch of a V block, so V is read once per tile instead of once per
+            // group, and the accumulators are the only thing that grows: sixteen
+            // sets of eight 32-lane registers, spilled to L1 between blocks.
             for (int gg = 0; gg < I8_G; ++gg)
-                for (int r = 0; r < 4; ++r) {
-                    const int rr = gg * 4 + r;
-                    const float s_r = wsc[rr] * g_v8isc[kv];
-                    float * dst = g_pfa_out + (((qbase + rr) * N_HEAD + h) * HEAD_DIM) + half * 64;
-                    for (int j = 0; j < 8; ++j) {
-                        const vint32m1_t a = __riscv_vle32_v_i32m1(&praw[j][r * 8], vl8);
-                        const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
-                            __riscv_vfcvt_f_x_v_f32m1(a, vl8), s_r, vl8);
-                        __riscv_vse32_v_f32m1(dst + j * 8, f, vl8);
+                for (int j = 0; j < 8; ++j) memset(pacc[gg][j], 0, 32 * 4);
+            uint8_t * tcm = g_tcmstage ? g_tcm[g_pfa_tid] : nullptr;
+            if (tcm && g_tcm_size >= 64 * 1024) {
+                const int64_t stage = g_tcm_size / 1024;   // position blocks that fit
+                const int nqmax = (nn + 15) / 16;
+                for (int64_t p0 = 0; p0 < nqmax; p0 += stage) {
+                    const int64_t left = nqmax - p0;
+                    const int n = (int) (left < stage ? left : stage);
+                    memcpy(tcm, vb + p0 * 1024, (size_t) n * 1024);
+                    for (int gg = 0; gg < I8_G; ++gg) {
+                        const int ns = nqg[gg] - (int) p0;
+                        if (ns <= 0) continue;
+                        int32_t * op[8];
+                        for (int j = 0; j < 8; ++j) op[j] = pacc[gg][j];
+                        pv4_acc(op, w8 + gg * WBLK + p0 * 64 + g_w8off,
+                                (const int8_t *) tcm, ns < n ? ns : n);
                     }
                 }
-            continue;
-        }
-        for (int gg = 0; gg < I8_G; ++gg) {
-            int8_t * op[8];
-            for (int j = 0; j < 8; ++j) op[j] = (int8_t *) praw[j];
-            if (g_hoist) pv4_hoist(op, w8 + gg * WBLK + g_w8off, vb, nq);
-            else if (g_pvchunk) {
-                // same total work, but the asm is entered once per g_pvchunk
-                // position blocks instead of once for all of nq, so the prologue
-                // and epilogue land on 8 dots x g_pvchunk instead of 8 x nq.
-                int32_t * opa[8];
-                for (int j = 0; j < 8; ++j) { opa[j] = praw[j]; memset(praw[j], 0, sizeof praw[j]); }
-                for (int p0 = 0; p0 < nq; p0 += g_pvchunk) {
-                    const int n = (nq - p0 < g_pvchunk) ? (nq - p0) : g_pvchunk;
-                    pv4_acc(opa, w8 + gg * WBLK + p0 * 64 + g_w8off, vb + p0 * 1024, n);
+            } else {
+                const int nqmax = (nn + 15) / 16;
+                for (int gg = 0; gg < I8_G; ++gg) {
+                    if (nqg[gg] <= 0) continue;
+                    int32_t * op[8];
+                    for (int j = 0; j < 8; ++j) op[j] = pacc[gg][j];
+                    pv4_acc(op, w8 + gg * WBLK + g_w8off, vb, nqg[gg]);
                 }
-            }
-            else if (g_le32) pv4_le32((int32_t * const *) op,
-                                      w8 + gg * WBLK + g_w8off, vb, nq);
-            else if (g_gstyle) pv4_gemmstyle(op, w8 + gg * WBLK + g_w8off, vb, nq);
-            else if (g_keepv) pv4_keepv(op, w8 + gg * WBLK + g_w8off, vb, nq);
-            else if (g_keepw) pv4_keepw(op, w8 + gg * WBLK + g_w8off, vb, nq);
-            else pv4(op, w8 + gg * WBLK + g_w8off, vb, nq, g_vsmall ? 0 : 1024);
-            if (layer != 0 || !g_pfa_out) continue;
-            const size_t vl8 = __riscv_vsetvl_e32m1(8);
-            for (int g2 = 0; g2 < 1; ++g2) {
-                const int32_t (*src)[32] = praw;
-                for (int r = 0; r < 4; ++r) {
-                    const int rr = (gg + g2) * 4 + r;
-                    const float s_r = wsc[rr] * g_v8isc[kv];
-                    float * dst = g_pfa_out + (((qbase + rr) * N_HEAD + h) * HEAD_DIM) + half * 64;
-                    for (int j = 0; j < 8; ++j) {
-                        const vint32m1_t a = __riscv_vle32_v_i32m1(&src[j][r * 8], vl8);
-                        const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
-                            __riscv_vfcvt_f_x_v_f32m1(a, vl8), s_r, vl8);
-                        __riscv_vse32_v_f32m1(dst + j * 8, f, vl8);
-                    }
-                }
+                (void) nqmax;
             }
         }
+
+        if (layer != 0 || !g_pfa_out) continue;
+        const size_t vl8 = __riscv_vsetvl_e32m1(8);
+        for (int gg = 0; gg < I8_G; ++gg)
+            for (int r = 0; r < 4; ++r) {
+                const int rr = gg * 4 + r;
+                const float s_r = wsc[rr] * g_v8isc[kv];
+                float * dst = g_pfa_out + (((qbase + rr) * N_HEAD + h) * HEAD_DIM) + half * 64;
+                for (int j = 0; j < 8; ++j) {
+                    const vint32m1_t a = __riscv_vle32_v_i32m1(
+                        g_hoist ? &praw[j][r * 8] : &pacc[gg][j][r * 8], vl8);
+                    const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+                        __riscv_vfcvt_f_x_v_f32m1(a, vl8), s_r, vl8);
+                    __riscv_vse32_v_f32m1(dst + j * 8, f, vl8);
+                }
+            }
     }
 }
 
@@ -2356,7 +2355,7 @@ static void task_pfa_pipe_A(int tid) {
         r.slot = slot;
         TileSlot & sl = g_tslot[slot];
         const double _q = now_s();
-        pfa_qk_i8(h, qb, (int16_t (*)[MAXCTX]) sl.scores);
+        pfa_qk_i8(h, qb, sl.scores);
         g_pfa_qk[tid] += now_s() - _q;
         r.st.store(1, std::memory_order_release);
         pend[npend++] = t;
@@ -2387,7 +2386,7 @@ static void task_pfa_pipe_B(int tid) {
         while (r.st.load(std::memory_order_acquire) < 1) sched_yield();
         TileSlot & sl = g_tslot[r.slot];
         const int64_t qb = tile_qb(t);
-        pfa_sm_i8(qb, (const int16_t (*)[MAXCTX]) sl.scores, sl.w8 + g_w8off, sl.wsc);
+        pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
         r.st.store(2, std::memory_order_release);
     }
     g_pfa_smb[tid] += now_s() - _s;
@@ -2396,14 +2395,20 @@ static void task_pfa_pipe_B(int tid) {
 static void * hugemem(size_t n);
 static void task_pfa(int tid);
 
+static int64_t g_tile_cap = 0;
 static void pfa_pipe_alloc(void) {
-    if (g_tslot) return;
+    // The tile count follows the row count, and prefill changes it per chunk. The
+    // counter used to be frozen at the first call, which silently left every later
+    // chunk with the wrong number of tiles.
     g_tile_n = (g_pfa_rows / I8_ROWS) * N_HEAD;
+    if (g_tslot && g_tile_n <= g_tile_cap) return;
     const size_t sn = (size_t) I8_NSLOT * sizeof(TileSlot);
-    const size_t tn = (size_t) g_tile_n * sizeof(TileRec) + (2 << 20);
-    g_tslot = (TileSlot *) hugemem(sn);
-    g_tile  = (TileRec *) hugemem(tn);
+    const int64_t want = g_tile_n > 0 ? g_tile_n : (MAXCTX / I8_ROWS) * N_HEAD;
+    const size_t tn = (size_t) want * sizeof(TileRec) + (2 << 20);
+    if (!g_tslot) g_tslot = (TileSlot *) hugemem(sn);
+    g_tile = (TileRec *) hugemem(tn);
     if (!g_tslot || !g_tile) { fprintf(stderr, "oom pipeline slots\n"); g_pipe = 0; return; }
+    g_tile_cap = want;
     // PV measured 115 vs 195 core-s on identical binaries, so the slot pages are
     // what decides it. Huge pages make the physical mapping contiguous and the
     // set distribution the same on every run instead of a lottery.
@@ -2440,6 +2445,7 @@ static void pfa_run(int L) {
     g_pfa_layer = L;
     if (!g_pfa_i8) { run(task_pfa); return; }
     if (!g_pipe)   { run(task_pfa_i8); return; }
+    pfa_pipe_alloc();   // keeps g_tile_n in step with g_pfa_rows
     for (int64_t t = 0; t < g_tile_n; ++t) g_tile[t].st.store(0, std::memory_order_relaxed);
     g_qk_next.store(0, std::memory_order_relaxed);
     g_sm_next.store(0, std::memory_order_relaxed);
@@ -2555,6 +2561,351 @@ static void * hugemem(size_t n) {
     return aligned_alloc(a, (n + a - 1) & ~(a - 1));
 }
 
+static const char * work_path(const char * name);
+// ---------------------------------------------------------------------------
+// Real prefill.
+//
+// The two benches above proved the kernels but fed them synthetic activations;
+// this drives the same int8 GEMM and int8 attention from a real prompt and
+// leaves the f16 KV cache populated for decode.
+//
+// Layer-major within a chunk: all of a layer's seven GEMMs see every chunk row,
+// so each weight matrix is streamed once per chunk. Chunking by rows keeps the
+// row buffers small; the price is that the weight blob is re-streamed once per
+// chunk, which is 20 passes of 1.27 GB at 10K.
+// ---------------------------------------------------------------------------
+static float * g_pfx, * g_pfxa, * g_pfgate, * g_pfup, * g_pfk, * g_pfv;
+
+// Same accumulation shape as rmsnorm_par (double partial sums) so prefill and
+// decode agree on the residual stream bit for bit where it matters. Rows are
+// handed to the thread pool: at 2048 rows a serial pass over 2048x2048 floats
+// twice per layer is tens of seconds, which is not a detail.
+static float * rn_rows_dst;
+static const float * rn_rows_src;
+static const float * rn_rows_src_c;
+static const float * rn_rows_w;
+static int64_t rn_rows_n;
+static void rn_rows_band(int64_t lo, int64_t hi) {
+    const float * src = rn_rows_src; float * dst = rn_rows_dst;
+    const float * w = rn_rows_w; (void) rn_rows_n;
+    for (int64_t r = lo; r < hi; ++r) {
+        const float * x = src + r * N_EMBD;
+        float * y = dst + r * N_EMBD;
+        double ss = 0;
+        for (int i = 0; i < N_EMBD; ++i) ss += (double) x[i] * x[i];
+        const float rn = 1.0f / sqrtf((float) (ss / N_EMBD) + RMS_EPS);
+        for (int i = 0; i < N_EMBD; ++i) y[i] = x[i] * rn * w[i];
+    }
+}
+static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows) {
+    rn_rows_dst = dst; rn_rows_src = src; rn_rows_w = w; rn_rows_n = rows;
+    parallel_for(rows, rn_rows_band);
+}
+static void rmsnorm_rows_serial(float * dst, const float * src, const float * w, int64_t rows) {
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * x = src + r * N_EMBD;
+        float * y = dst + r * N_EMBD;
+        double ss = 0;
+        for (int i = 0; i < N_EMBD; ++i) ss += (double) x[i] * x[i];
+        const float rn = 1.0f / sqrtf((float) (ss / N_EMBD) + RMS_EPS);
+        for (int i = 0; i < N_EMBD; ++i) y[i] = x[i] * rn * w[i];
+    }
+}
+
+static float * silu_rows_buf;
+static void silu_rows_band(int64_t lo, int64_t hi) {
+    for (int64_t r = lo; r < hi; ++r) {
+        float * p = silu_rows_buf + r * N_FF;
+        for (int i = 0; i < N_FF; ) {
+            const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_FF - i));
+            const vfloat32m2_t x = __riscv_vle32_v_f32m2(p + i, vl);
+            // silu(x) = x / (1 + exp(-x)); exp is the vectorised 2^(t*log2e)
+            // decomposition rather than a libm call, which was 14.5 s at 10K.
+            const vfloat32m2_t nx = __riscv_vfneg_v_f32m2(x, vl);
+            const vfloat32m2_t t = __riscv_vfmul_vf_f32m2(nx, 1.4426950408889634f, vl);
+            // round-to-nearest-even via the integer convert (there is no vfround)
+            const vint32m2_t ni = __riscv_vfcvt_x_f_v_i32m2(t, vl);
+            const vfloat32m2_t f = __riscv_vfsub_vv_f32m2(t, __riscv_vfcvt_f_x_v_f32m2(ni, vl), vl);
+            vfloat32m2_t q = __riscv_vfmv_v_f_f32m2(0.0013333558f, vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0096181291f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0555041087f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.2402265070f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.6931471806f, vl), vl);
+            q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
+            // 2^n by writing the exponent field directly
+            const vint32m2_t bits = __riscv_vsll_vx_i32m2(ni, 23, vl);
+            q = __riscv_vfmul_vv_f32m2(q, __riscv_vreinterpret_v_i32m2_f32m2(bits), vl);
+            const vfloat32m2_t den = __riscv_vfadd_vf_f32m2(q, 1.0f, vl);
+            __riscv_vse32_v_f32m2(p + i, __riscv_vfdiv_vv_f32m2(x, den, vl), vl);
+            i += (int) vl;
+        }
+    }
+}
+static void silu_rows(float * g, int64_t rows) {
+    silu_rows_buf = g;
+    parallel_for(rows, silu_rows_band);
+}
+
+static float * add_dst; static const float * add_src;
+static void add_rows_band(int64_t lo, int64_t hi) {
+    for (int64_t r = lo; r < hi; ++r) {
+        float * d = add_dst + r * N_EMBD;
+        const float * s = add_src + r * N_EMBD;
+        for (int i = 0; i < N_EMBD; ) {
+            const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_EMBD - i));
+            __riscv_vse32_v_f32m2(d + i,
+                __riscv_vfadd_vv_f32m2(__riscv_vle32_v_f32m2(d + i, vl),
+                                       __riscv_vle32_v_f32m2(s + i, vl), vl), vl);
+            i += (int) vl;
+        }
+    }
+}
+static void add_rows(float * dst, const float * src, int64_t rows) {
+    add_dst = dst; add_src = src;
+    parallel_for(rows, add_rows_band);
+}
+
+// Rotates one row's Q and K at its own position. Half-split pairing, the llama
+// convention: (x[i], x[i + HEAD_DIM/2]) share an angle. Q also carries the
+// 1/sqrt(head_dim) factor, because the caller packs it straight into the int8
+// attention operand.
+static void prefill_qk_row(float * q, float * k, int64_t pos) {
+    const float * cs = g_rope_tab + pos * 128;
+    const float inv = 1.0f / sqrtf((float) HEAD_DIM);
+    const int half = HEAD_DIM / 2;
+    for (int h = 0; h < N_HEAD + N_KV; ++h) {
+        float * x = (h < N_HEAD) ? (q + h * HEAD_DIM) : (k + (h - N_HEAD) * HEAD_DIM);
+        // Half-split rotation, vectorised: both halves are contiguous runs of 64
+        // floats, so one strided-free load of each side covers the whole head.
+        for (int i = 0; i < half; ) {
+            const size_t vl = __riscv_vsetvl_e32m2((size_t) (half - i));
+            const vfloat32m2_t c  = __riscv_vle32_v_f32m2(cs + i, vl);
+            const vfloat32m2_t sv = __riscv_vle32_v_f32m2(cs + 64 + i, vl);
+            const vfloat32m2_t x0 = __riscv_vle32_v_f32m2(x + i, vl);
+            const vfloat32m2_t x1 = __riscv_vle32_v_f32m2(x + half + i, vl);
+            __riscv_vse32_v_f32m2(x + i,
+                __riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(x0, c, vl),
+                                       __riscv_vfmul_vv_f32m2(x1, sv, vl), vl), vl);
+            __riscv_vse32_v_f32m2(x + half + i,
+                __riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(x0, sv, vl),
+                                       __riscv_vfmul_vv_f32m2(x1, c, vl), vl), vl);
+            i += (int) vl;
+        }
+        // q carries 1/sqrt(head_dim) so the int8 attention operand is pre-scaled
+        if (h < N_HEAD)
+            for (int i = 0; i < HEAD_DIM; ) {
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (HEAD_DIM - i));
+                __riscv_vse32_v_f32m2(x + i,
+                    __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(x + i, vl), inv, vl), vl);
+                i += (int) vl;
+            }
+    }
+}
+
+// The chunk's rotated K goes into the tiled f16 cache that attention reads, and
+// V into the position-major one. Both are the arrays decode uses as well.
+static void store_kv_rows(int L, int64_t base, int64_t rows) {
+    // V is position-major already, so it is a straight f32->f16 copy per position.
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t p = base + r;
+        const float * v = g_pfv + r * (N_KV * HEAD_DIM);
+        _Float16 * vb = g_vpos + (int64_t) L * KV_LAYER_STRIDE + p * N_KV * HEAD_DIM;
+        for (int i = 0; i < N_KV * HEAD_DIM; ) {
+            const size_t vl = __riscv_vsetvl_e32m1((size_t) (N_KV * HEAD_DIM - i));
+            __riscv_vse16_v_f16mf2(vb + i,
+                __riscv_vfncvt_f_f_w_f16mf2(__riscv_vle32_v_f32m1(v + i, vl), vl), vl);
+            i += (int) vl;
+        }
+    }
+    // K lives in a [dim][pos-in-tile] tile, so the old per-position store wrote one
+    // f16 every 64 bytes: 128 scattered lines per position. Walking whole tiles
+    // instead makes every store a contiguous 32-position run, and the gather from
+    // the row buffer is a single strided vector load per dim.
+    const ptrdiff_t kstep = (ptrdiff_t) (N_KV * HEAD_DIM * 4);   // bytes between rows
+    for (int64_t r = 0; r < rows; ) {
+        const int64_t p = base + r;
+        const int pblk = (int) (p / KT), pi = (int) (p % KT);
+        const int n = (int) ((KT - pi < rows - r) ? (KT - pi) : (rows - r));
+        for (int kv = 0; kv < N_KV; ++kv) {
+            _Float16 * kb = ktile(L, kv, pblk) + pi;
+            const float * src = g_pfk + r * (N_KV * HEAD_DIM) + kv * HEAD_DIM;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                const size_t vl = __riscv_vsetvl_e32m1((size_t) n);
+                const vfloat32m1_t vv = __riscv_vlse32_v_f32m1(src + d, kstep, vl);
+                __riscv_vse16_v_f16mf2(kb + (int64_t) d * KT,
+                    __riscv_vfncvt_f_f_w_f16mf2(vv, vl), vl);
+            }
+        }
+        r += n;
+    }
+}
+
+// Dumps the cache in the position-major layout the decode engine reads:
+// [layer][pos][kv][dim], f16, stride MAXCTX.
+static bool export_kv(int64_t npos) {
+    const size_t per = (size_t) MAXCTX * N_KV * HEAD_DIM * 2;
+    const size_t tot = (size_t) N_LAYER * per;
+    const char * kp = work_path("kv_k.bin");
+    const char * vp = work_path("kv_v.bin");
+    int fk = open(kp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fv = open(vp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fk < 0 || fv < 0) { perror("kv open"); return false; }
+    uint8_t * line = (uint8_t *) aligned_alloc(64, per);
+    if (!line) return false;
+    for (int L = 0; L < N_LAYER; ++L) {
+        // K: tiled -> position-major
+        memset(line, 0, per);
+        _Float16 * out = (_Float16 *) line;
+        for (int64_t p = 0; p < npos; ++p) {
+            const int pblk = (int) (p / KT), pi = (int) (p % KT);
+            for (int kv = 0; kv < N_KV; ++kv) {
+                const _Float16 * kb = ktile(L, kv, pblk);
+                for (int d = 0; d < HEAD_DIM; ++d)
+                    out[p * N_KV * HEAD_DIM + kv * HEAD_DIM + d] = kb[(int64_t) d * KT + pi];
+            }
+        }
+        if (write(fk, line, per) != (ssize_t) per) { perror("kv write k"); return false; }
+        // V is already position-major
+        const _Float16 * vsrc = g_vpos + (int64_t) L * KV_LAYER_STRIDE;
+        memset(line, 0, per);
+        memcpy(line, vsrc, (size_t) npos * N_KV * HEAD_DIM * 2);
+        if (write(fv, line, per) != (ssize_t) per) { perror("kv write v"); return false; }
+    }
+    close(fk); close(fv);
+    free(line);
+    printf("kv: %.0f MB x2 -> %s, %s (%lld positions)\n",
+           tot / 1e6, kp, vp, (long long) npos);
+    return true;
+}
+
+static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
+    if (!g_i8w) { fprintf(stderr, "real prefill needs the int8 weight copy (-I)\n"); return false; }
+    const int64_t NP = npref;
+    g_a8_stride = (N_FF / 16) * 64 + 128;
+    const int64_t mgmax = (R + 63) / 64 * 16;          // groups, rounded like the chunk
+    const size_t pfa_bytes = (size_t) 3 * mgmax * (size_t) g_a8_stride + (4 << 20);
+    g_pfa     = (uint8_t *) hugemem(pfa_bytes);
+    g_pfx     = (float *) hugemem((size_t) R * N_EMBD * 4);
+    g_pfxa    = (float *) hugemem((size_t) R * N_EMBD * 4);
+    g_pfgate  = (float *) hugemem((size_t) R * N_FF * 4);
+    g_pfup    = (float *) hugemem((size_t) R * N_FF * 4);
+    g_pfk     = (float *) hugemem((size_t) R * N_KV * HEAD_DIM * 4);
+    g_pfv     = (float *) hugemem((size_t) R * N_KV * HEAD_DIM * 4);
+    g_pq      = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
+    g_pfa_out = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
+    g_k8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 63) / 64) * 8192 + (2 << 20));
+    g_v8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 15) / 16) * 2048 + (2 << 20));
+    g_q8i     = (int8_t *) hugemem((size_t) N_HEAD * ((R + 3) / 4) * 512 + (2 << 20));
+    g_psa16   = (int16_t *) hugemem((size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
+    g_q8isc   = (float *) aligned_alloc(64, (size_t) R * N_HEAD * 4);
+    if (!g_pfa || !g_pfx || !g_pfxa || !g_pfgate || !g_pfup || !g_pfk || !g_pfv ||
+        !g_pq || !g_pfa_out || !g_k8i || !g_v8i || !g_q8i || !g_psa16 || !g_q8isc) {
+        fprintf(stderr, "oom prefill buffers\n");
+        return false;
+    }
+    use_huge(g_pfa, pfa_bytes);
+    use_huge(g_k8i, (size_t) N_KV * ((NP + 63) / 64) * 8192 + (2 << 20));
+    use_huge(g_v8i, (size_t) N_KV * ((NP + 15) / 16) * 2048 + (2 << 20));
+    use_huge(g_psa16, (size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
+    g_pfa_i8 = 1;
+    g_pfa_rows = R;              // pfa_pipe_alloc derives the tile count from this
+    if (g_pipe) pfa_pipe_alloc();
+
+    double t_norm=0,t_quant=0,t_gemm=0,t_attn=0,t_conv=0,t_misc=0,t_silu=0,t_packq=0;
+    double t_gqkv=0,t_go=0,t_ggu=0,t_gd=0;
+    const double t0 = now_s();
+    for (int64_t base = 0; base < npref; base += R) {
+        const int64_t cm = (npref - base < R) ? (npref - base) : R;
+        // attention tiles are whole 64-row groups, and the m4 GEMM wants whole
+        // four-row groups; 64 covers both
+        const int64_t C = (cm + 63) / 64 * 64;
+        g_pf_rows = C;
+
+        for (int64_t r = 0; r < cm; ++r) {
+            dequant_row(g_pfx + r * N_EMBD,
+                        g_emb->data + (int64_t) toks[base + r] * (N_EMBD / 32) * 18, N_EMBD);
+        }
+        for (int64_t r = cm; r < C; ++r) memset(g_pfx + r * N_EMBD, 0, (size_t) N_EMBD * 4);
+
+        for (int L = 0; L < N_LAYER; ++L) {
+            double _a=now_s();
+            rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
+            t_norm+=now_s()-_a; _a=now_s();
+            for (int j = 0; j < 3; ++j) quant_a_i8d(g_pfxa, C, N_EMBD, j);
+            t_quant+=now_s()-_a; _a=now_s();
+            for (int c = 0; c < 128; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
+            g_pfjn = 3;
+            g_pfj[0] = { g_wq[L].b8, g_wq[L].k, g_wq[L].n, g_pq,  N_HEAD * HEAD_DIM };
+            g_pfj[1] = { g_wk[L].b8, g_wk[L].k, g_wk[L].n, g_pfk, N_KV * HEAD_DIM };
+            g_pfj[2] = { g_wv[L].b8, g_wv[L].k, g_wv[L].n, g_pfv, N_KV * HEAD_DIM };
+            run(task_pf_gemm_i8);
+            { const double _g=now_s()-_a; t_gemm+=_g; t_gqkv+=_g; } _a=now_s();
+
+            for (int64_t r = 0; r < cm; ++r)
+                prefill_qk_row(g_pq + r * (N_HEAD * HEAD_DIM),
+                               g_pfk + r * (N_KV * HEAD_DIM), base + r);
+            store_kv_rows(L, base, cm);
+
+            t_misc+=now_s()-_a; _a=now_s();
+            pfa_convert_kv_i8(L, base + cm);
+            t_conv+=now_s()-_a; _a=now_s();
+            g_pfa_ctx = base;
+            g_pfa_rows = C;
+            double _p=now_s();
+            pfa_pack_q(C);
+            t_packq+=now_s()-_p; _p=now_s();
+            pfa_run(L);   // re-derives the tile count from g_pfa_rows
+            t_attn+=now_s()-_p; _a=now_s();
+
+            memset(g_pfa_out + cm * N_EMBD, 0, (size_t) (C - cm) * N_EMBD * 4);
+            quant_a_i8d(g_pfa_out, C, N_EMBD, 0);
+            for (int c = 0; c < 128; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
+            g_pfjn = 1;
+            g_pfj[0] = { g_wov[L].b8, g_wov[L].k, g_wov[L].n, g_pfxa, N_EMBD };
+            run(task_pf_gemm_i8);
+            { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
+            add_rows(g_pfx, g_pfxa, C);
+            t_misc+=now_s()-_a; _a=now_s();
+
+            rmsnorm_rows(g_pfxa, g_pfx, g_ffn_norm[L], C);
+            for (int j = 0; j < 2; ++j) quant_a_i8d(g_pfxa, C, N_EMBD, j);
+            for (int c = 0; c < 128; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
+            g_pfjn = 2;
+            g_pfj[0] = { g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF };
+            g_pfj[1] = { g_wu[L].b8, g_wu[L].k, g_wu[L].n, g_pfup,   N_FF };
+            run(task_pf_gemm_i8);
+            { const double _g=now_s()-_a; t_gemm+=_g; t_ggu+=_g; } _a=now_s();
+
+            double _s=now_s();
+            silu_rows(g_pfgate, C);
+            t_silu+=now_s()-_s; _s=now_s();
+            quant_a_i8d(g_pfgate, C, N_FF, 0);
+            t_quant+=now_s()-_s;
+            _a=now_s();   // else the next t_gemm also bills silu and this quant
+            for (int c = 0; c < 128; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
+            g_pfjn = 1;
+            g_pfj[0] = { g_wd[L].b8, g_wd[L].k, g_wd[L].n, g_pfxa, N_EMBD };
+            run(task_pf_gemm_i8);
+            { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
+            add_rows(g_pfx, g_pfxa, C);   // C rows, not C * N_EMBD: it takes a row count
+            t_misc+=now_s()-_a; _a=now_s();
+        }
+    }
+    const double dt = now_s() - t0;
+    printf("prefill: %lld tokens in %.3f s (%.2f tok/s, %lld-row chunks)\n",
+           (long long) npref, dt, (double) npref / dt, (long long) R);
+    {   // per-cluster work, summed over threads: these are core-seconds
+        double tq=0, ts=0, tv=0;
+        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[t]; ts += g_pfa_sm[t]; tv += g_pfa_pv[t]; }
+        printf("  attn work: qk %.1f  softmax %.1f  pv %.1f (core-s)\n", tq, ts, tv);
+    }
+    printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
+           t_norm, t_quant, t_silu, t_gemm, t_conv, t_packq, t_attn, t_misc);
+    printf("    gemm split: qkv %.2f  o %.2f  gate+up %.2f  down %.2f (s)\n",
+           t_gqkv, t_go, t_ggu, t_gd);
+    return export_kv(npref);
+}
+
 // Fill a KV cache of g_pfa_ctx positions, then run causal attention over
 // g_pfa_rows new rows and check one row against a scalar reference.
 static void bench_prefill_attn(void) {
@@ -2597,10 +2948,9 @@ static void bench_prefill_attn(void) {
         report_huge("int8 kv");
         g_q8isc = (float *) aligned_alloc(64, (size_t) rows * N_HEAD * 4);
         if (!g_k8i || !g_v8i || !g_q8i || !g_q8isc) { fprintf(stderr, "oom attn int8\n"); return; }
-        g_psa16 = (int16_t (*)[I8_ROWS][MAXCTX]) hugemem(
-            (size_t) N_GPU * sizeof(int16_t) * I8_ROWS * MAXCTX);
+        g_psa16 = (int16_t *) hugemem((size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
         if (!g_psa16) { fprintf(stderr, "oom scores\n"); return; }
-        use_huge(g_psa16, (size_t) N_GPU * sizeof(int16_t) * I8_ROWS * MAXCTX);
+        use_huge(g_psa16, (size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
         const double tq0 = now_s();
         pfa_pack_q(rows);
         printf("  int8 pack Q: %.3f s (%.1f MB)\n", now_s() - tq0,
@@ -2888,8 +3238,19 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-h0")) { g_headmajor = 0; g_tilefast = 1; }
         else if (!strcmp(argv[i], "-l0")) g_le32 = 0;
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_pf_tile = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-F") && i + 1 < argc) g_pf_file = argv[++i];
+        else if (!strcmp(argv[i], "-G") && i + 1 < argc) g_pf_chunk = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-g")) g_gatemode = 1;
+        else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
     }
 
+    // The prefill path is int8 attention, and that decision has to be visible
+    // before the X100 softmax workers are created below.
+    if (g_pf_file) {
+        g_i8w = 1; g_pfa_i8 = 1;
+        g_pipe = 1;        // cross-cluster: A cluster on QK, X100 on softmax
+        g_tcmstage = 1;    // -Q measured 49.71 -> 44.63 s on attn at 10K
+    }
     g_blk_bytes = g_bit3 ? Q3_BLK : 576;
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
@@ -2955,10 +3316,10 @@ int main(int argc, char ** argv) {
             const bool rope_pair = strstr(items[i].name, "attn_q.weight") ||
                                    strstr(items[i].name, "attn_k.weight");
             if (g_bit3) {
-                repack_b_q3(p, e->data, e->n, e->k, rope_pair ? g_perm : nullptr);
+                repack_b_q3(p, e->data, e->n, e->k, nullptr);
                 p += (size_t) (e->n / 32) * (e->k / Q3_K) * Q3_BLK;
             } else {
-                repack_b(p, e->data, e->n, e->k, rope_pair ? g_perm : nullptr);
+                repack_b(p, e->data, e->n, e->k, nullptr);
                 p += (size_t) (e->n / 32) * (e->k / 32) * 576;
             }
         }
@@ -3010,7 +3371,7 @@ int main(int argc, char ** argv) {
                 items[i].ref->b8 = p;
                 const bool rope_pair = strstr(items[i].name, "attn_q.weight") ||
                                        strstr(items[i].name, "attn_k.weight");
-                repack_b_i8(p, e->data, e->n, e->k, rope_pair ? g_perm : nullptr);
+                repack_b_i8(p, e->data, e->n, e->k, nullptr);
                 p += ((size_t) e->n * e->k + (size_t) e->n * 16 + 4095) & ~(size_t) 4095;
             }
             printf("weights: int8 copy in %.2f s (%.1f MB)\n", now_s() - t0, t8 / 1e6);
@@ -3084,6 +3445,40 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[dbg] threads up, participants=%d pf_rows=%lld\n", g_participants, (long long)g_pf_rows); fflush(stderr);
     tcm_attach(0);
     fprintf(stderr, "[tcm] size=%lld buf=%p\n", (long long) g_tcm_size, (void*) g_tcm[0]);
+    if (g_pf_file) {
+        FILE * f = fopen(g_pf_file, "rb");
+        if (!f) { fprintf(stderr, "prompt open %s\n", g_pf_file); return 1; }
+        fseek(f, 0, SEEK_END);
+        const long fsz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char * txt = (char *) malloc((size_t) fsz + 1);
+        int32_t * toks = (int32_t *) malloc((size_t) 1 << 24);
+        if (!txt || !toks) { fprintf(stderr, "oom prompt\n"); return 1; }
+        const size_t got = fread(txt, 1, (size_t) fsz, f);
+        txt[got] = 0;
+        fclose(f);
+        // Hand-rolled parse. fscanf("%d") here returned 1 for every token while
+        // leaving the destination untouched, so every id came back as leftover
+        // stack garbage and the first embedding lookup ran off the weight blob.
+        int64_t nt = 0;
+        const char * q = txt;
+        while (*q && nt < (1 << 22)) {
+            while (*q && (*q < '0' || *q > '9') && *q != '-') ++q;
+            if (!*q) break;
+            const bool neg = (*q == '-');
+            if (neg) ++q;
+            int32_t v = 0;
+            if (*q < '0' || *q > '9') continue;
+            while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+            toks[nt++] = neg ? -v : v;
+        }
+        free(txt);
+        printf("prompt: %lld tokens from %s\n", (long long) nt, g_pf_file);
+        // the last prompt token stays out: decode uses it as its first anchor
+        if (!real_prefill(toks, nt - 1, g_pf_chunk)) return 1;
+        free(toks);
+        return 0;
+    }
     if (g_pfa_rows > 0) { bench_prefill_attn(); return 0; }
     if (g_pf_rows > 0) { bench_prefill_gemm(g_pf_rows); return 0; }
 

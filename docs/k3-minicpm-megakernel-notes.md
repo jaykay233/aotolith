@@ -972,3 +972,78 @@ kv_tile 与 tile_rows / 各线程 vlenb"。在 `FA_PROF` 里加一组每线程�
 in-situ 真的慢（继续查 K/V 排序与 PV 交替的缓存交互）；若纯 x8 只有 28–30 µs，则
 `qk` 段里混进了别的活，按段补计时。
 
+
+## 9. QK 尾声重做、TCM 累加器串组、PV 循环序（2026-11-23）
+
+### 9.1 先把"QK 慢"定位到尾声，而不是点积
+
+`probe_qk_epi.cpp` 在板子上单独跑 8 组 `vmadot` 步（8 累加器 x 32 lane），只换尾声写法：
+
+| 变体 | GMAC/s | 时间 |
+|---|---|---|
+| A 原始（f32 → f32 缩放 → i16 + 3 次 slidedown + 每行 4 次 8-lane store） | 48.3 | 1.74 ms |
+| B `vnsra` + slidedown | 35.1 | 2.39 ms |
+| C 交错 4 行 x 8 位置块，单次 store | **93.8** | 0.89 ms |
+| D 无尾声（裸 store） | 101.4 | 0.83 ms |
+| E 交错 + 缩放 | 79.1 | 1.06 ms |
+| F `vrgather` 转成按行 | 71.9 | 1.17 ms |
+
+结论：点子积没问题（裸 store 101.4 就是单核天花板），是**尾声的转置**吃掉了 50%+。
+于是 `scores` 改成 `vmadot` 直出的交错布局（lane = 4 行 x 8 位置，块 64 B），
+尾声只剩一条 `vnsra.wx` + 一条 `vse16`：
+
+- `SC_NBLK = MAXCTX/8`，`SC_GSTRIDE = SC_NBLK*32`，`SC_TSTRIDE = I8_G*SC_GSTRIDE`，`SC_SHIFT = 6`
+- 软最大化改成按块 `vmax` 后 3 次 slidedown 折叠（只读 lane 0/8/16/24），exp 用 `exp2f_poly_m4`
+  一次算 4 行 x 8 位置
+- 清零只需从该组的因果边界 `(L+4g+1)/16` 开始，不再 memset 整块
+
+10K 因果 bench（`-A 10240 -x 0 -J -I -K`）：QK 128.7 → **101.8 core-s**。
+
+### 9.2 `-Q`（TCM staging）一直是错的
+
+`pfa_pv_i8` 的 TCM 分支把 16 个 row group 的 `vmadot` 累加器指到同一组 `praw`，
+于是每个输出都是 16 个组之和。bench 校验 `worst at dim 0: mine 3900.72`（参考 0.997），
+而**文件路径强制 `g_tcmstage = 1`**，所以每次真 prefill 的 attention 都是错的。
+改成每组一套 `pacc[I8_G][8][32]`（16 KB，线程私有）后 `worst at dim 84: mine 0.81087`，
+与非 TCM 路径逐位一致。
+
+代价：PV 从 44 → 58 core-s（累加器 1 KB → 16 KB 的 L1 往返）。这笔账是必须付的。
+
+### 9.3 PV 的循环顺序：按 K/V 块外、行组内
+
+原来 `for gg { pv4(整段 V) }`，即每个 tile 把 V 的范围走 16 遍。10K 上 V 是 1.28 MB/tile，
+16 遍 = 20 MB/tile，直接吃满 DRAM：PV 131 core-s。
+改成"V 块外、行组内"（16 组累加器落在 L1），并用每组自己的因果上界截断点积后：
+**PV 53.9 core-s**（`-y` 保留旧序做对照）。
+TCM staging（`-Q`）再加一次纯 memcpy 的流式搬运，从 130.9 降到 56.8；去掉 staging
+只改循环序是 130.9（说明问题在"点积里夹 1 KB 随机读"而不是读的总量）。
+
+### 9.4 两个非 attention 的坑
+
+- `pfa_pack_q` 是**单线程**，2.43 s/次 prefill。按 (row group, head) 用 `parallel_for`
+  切开后 0.34 s。10K prefill 直接少 2.1 s。
+- `fscanf(f, "%d", &v)` 在这块板子 + 这版 glibc 上**返回 1 但不写回**：解析 10000 个
+  token 全部拿到栈上残值（每次运行不同，例如 `1383359744`），第一次 embedding 查表就
+  SIGSEGV。改用自写的 strtol 式扫描后正常。任何以后新增的 prompt 解析都不要用 fscanf。
+
+### 9.5 现在的账（10K，`-F p10k.txt -G 10240`）
+
+| 项目 | 时间 |
+|---|---|
+| gemm | 25.56 s（qkv 2.99 / o 3.25 / gate+up 10.55 / down 8.76） |
+| attn | 22.08 s（qk 100.8 + pv 53.9 core-s；X100 softmax 只受等值约束） |
+| conv(K/V→int8) | 2.35 s |
+| misc | 3.08 s |
+| quant / silu / norm | 1.66 / 1.08 / 0.93 s |
+| packq | 0.34 s |
+| **合计** | **57.26 s → 174.6 tok/s**（改动前 165.5） |
+
+剩下的差距（到 200 tok/s 还差 7.3 s）：
+- 约 362 GB 的 attention DRAM 流量 / 实测单核 memcpy 只有 6.8 GB/s（读写合计 13 GB/s），
+  聚合到 16–17 GB/s 就顶住了。分数缓冲占其中 57%（写 68 GB + 读两遍 137 GB）。
+  要再快只能少搬字节：把 QK+max 融合（每个组块多 14 条向量指令，QK 会涨 70%，不划算）、
+  或在线最大值 + int32 累加器重缩放（要重写 PV）。
+- QK 还可以按"2 个 query tile 共享一次 K 读"把 K 流量砍半（16 个累加器 v16–v31，
+  2 个 Q 寄存器），预期再省 2 s 量级。
+- gemm 25.56 s 已经是 846 GMAC/s 聚合（106 GMAC/s/核），A 簇基本到顶；X100 在这段时间
+  空转，把 FFN 的一小部分行分给 X100（实测 625–652 GMAC/s）是唯一还没试的大块。
