@@ -289,16 +289,20 @@ status.
 
 | stage | ms/token | share |
 |---|---|---|
-| gemm | 54.49 | 59.3% |
-| attn | 30.78 | 33.5% |
-| embed | 3.26 | 3.5% |
-| silu / rope / misc | 1.17 | 1.3% |
-| **total** | **88.6** | → 10.88 tok/s |
+| gemm (includes the head) | 54.29 | 62.3% |
+| attn | 29.59 | 34.0% |
+| rmsnorm / silu / rope / misc | 1.80 | 2.1% |
+| embed + head argmax | 0.15 | 0.2% |
+| **total** | **87.2** | → 11.47 tok/s |
 
-GEMM is 1265 MB of Q4_0 weights in 54.49 ms, i.e. 23.2 GB/s against a measured
+GEMM is the Q4_0 weight stream in 54.29 ms, i.e. 23.3 GB/s against a measured
 ceiling just above that, so it is done. That fixes the single-row ceiling: a
 perfect attention at the 220 MB int8 K+V byte floor would be ~13 ms, giving
-54.5 + 13 + 4.5 ≈ 72 ms, or 13.9 tok/s. **Twenty tok/s is not reachable at one
+54.3 + 13 + 2 ≈ 69 ms, or 14.5 tok/s.
+
+(An earlier table here said embed 3.26 ms. That was an accounting leftover in an
+older binary; per-step timers put the dequant at 0.01 ms, and the current
+breakdown above is the one to use.) **Twenty tok/s is not reachable at one
 row per weight pass by any amount of kernel work**, which is why the speculator
 is not optional.
 
