@@ -497,7 +497,9 @@ two disagree on the first greedy id of `"The capital of France is"`
 alignment contract with Q4_0 therefore pins us to one particular kernel's
 rounding, not to the model. The F16/Q8_0 trajectory is the one worth matching.
 
-## The judge is exact fp32, and the megakernel is the side that agrees with itThe section above left one question open: when llama.cpp's Q4_0 and this chain
+## The judge is exact fp32, and the megakernel is the side that agrees with it
+
+The section above left one question open: when llama.cpp's Q4_0 and this chain
 disagree, which one is wrong? `ref_f32.py` answers it. It is a numpy float32
 forward pass over the same GGUF, one layer at a time, with no KV reuse and no
 sampling - each greedy step re-runs the whole prompt, so it cannot drift.
@@ -532,6 +534,14 @@ Consequences for the rest of this document:
   exact) or llama.cpp F16. Both are several hundred tokens of context per
   minute at best, so the practical protocol is: establish the fp32 trajectory
   once on a given prompt, then check candidate configurations against that.
+
+**The F16 half of that choice does not work on this board.** `refgreedy` against
+`MiniCPM5-2B-F16.gguf` at 512 tokens loads the 5.2 GB model, reports
+`sched_reserve: CPU compute buffer size = 283.02 MiB`, prints
+`[KPACK] publish roundtrip FAILED` for two participants and then exits after
+511 s having emitted no token at all. `ref_f32.py` covers the same role and is
+the only baseline of record: its 512-token trajectory `35 242 38 35` is already
+saved, and its per-layer dumps are what the layer-by-layer comparisons use.
 
 Two traps this cost, worth keeping:
 
