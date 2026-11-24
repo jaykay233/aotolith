@@ -3791,6 +3791,14 @@ static void * sm_worker(void * arg) {
 static void pfa_run(int L) {
     g_pfa_layer = L;
     if (!g_pfa_i8) { run(task_pfa); return; }
+    // Four rows is the decode shape and it has no tiles: one group per head, so it
+    // bypasses the tile machinery entirely (g_tile_n would be zero).
+    if (g_pfa_rows <= PFA_ROWS) {
+        g_i8g = 1;
+        run(task_pfa_i8_4);
+        g_i8g = I8_G;
+        return;
+    }
     if (!g_pipe)   { run(task_pfa_i8); return; }
     pfa_pipe_alloc();   // keeps g_tile_n in step with g_pfa_rows
     for (int64_t t = 0; t < g_tile_n; ++t) g_tile[t].st.store(0, std::memory_order_relaxed);
@@ -3837,7 +3845,7 @@ static void attn4_bench(int rounds, int64_t ctxmax) {
 static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
     if (ctx < 128) { printf("attn4: context %lld too short\n", (long long) ctx); return; }
     const bool four = rows == PFA_ROWS;
-    g_i8g = four ? 1 : I8_G;
+    (void) four;
     double best = 1e9;
     for (int r = 0; r < rounds; ++r) {
         for (int t = 0; t < N_GPU; ++t) g_pfa_qk[t] = g_pfa_sm[t] = g_pfa_pv[t] = 0;
@@ -3846,8 +3854,7 @@ static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
             g_pfa_ctx = ctx;
             g_pfa_rows = rows;
             pfa_pack_q(rows);
-            if (four) { g_pfa_layer = L; run(task_pfa_i8_4); }
-            else pfa_run(L);
+            pfa_run(L);
         }
         const double dt = now_s() - t0;
         if (dt < best) best = dt;

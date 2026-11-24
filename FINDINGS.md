@@ -222,13 +222,18 @@ per thread) and sets `g_i8g = 1`:
 
 | four rows, 9995 positions, 42 layers | attention | exp cost |
 |---|---|---|
-| 6-term polynomial (default) | 60.08 ms | - |
-| `-e 1`, three-instruction exp | **42.76 ms** | 6.15% max relative error |
+| 6-term polynomial (default) | 62.25 ms | - |
+| `-e 1`, three-instruction exp | **41.54 ms** | 6.15% max relative error |
 | `-e 2`, table-corrected exp | 105.30 ms | the `vrgather` is trap-emulated |
 
-So the projection below was right in magnitude: a four-row round is 42.8 ms of
-attention, not 312. The round is `54.5 (weights) + 42.8 (attention) + 4.4 (tail)
-= 102 ms`, which needs 2.03 accepted tokens to reach 20 tok/s; the short-context
+Correctness: `bench_prefill_attn` (`-x 512 -A 4 -J`) compares row 3 of head 0
+against a scalar fp32 reference and gives worst |diff| 6.889e-04, identical to
+what the 64-row tile produces, and `g_pfa_out` matches the 64-row run to the
+last bit. The tile change is exact; the int8 quantisation dominates the error.
+
+So the projection below was right in magnitude: a four-row round is 41.5 ms of
+attention, not 312. The round is `54.5 (weights) + 41.5 (attention) + 4.4 (tail)
+= 100 ms`, which needs 2.0 accepted tokens to reach 20 tok/s; the short-context
 measurement was 1.83 with three drafts, so this lands at 18-19 tok/s and the
 remaining gap is acceptance plus the softmax stage, not the dots.
 
@@ -483,7 +488,7 @@ above, it is no longer worth cracking.
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 139.4 (73.4 s) | 51.2 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. |
-| decode 20 tok/s @10K | 11.18 (Q4_0) | 50 ms | A four-row round is now measured at 102 ms: 54.5 GEMM (DRAM floor) + 42.8 attention (`MEGA_ATTN4_ROWS=4`, `-e 1`) + 4.4 tail. That needs 2.03 accepted tokens; short context gives 1.83 with three drafts, so it lands at 18-19 and the remaining gap is acceptance and the softmax stage (which is 49% of attention, not the dots). Next: m=4 in mega3's decode GEMM plus the dspark drafter, then cut softmax with the cross-cluster split at four rows. Byte arithmetic still rules out weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
+| decode 20 tok/s @10K | 11.18 (Q4_0) | 50 ms | A four-row round is now measured at 100 ms: 54.5 GEMM (DRAM floor) + 41.5 attention (`MEGA_ATTN4_ROWS=4`, `-e 1`) + 4.4 tail. That needs 2.0 accepted tokens; short context gives 1.83 with three drafts, so it lands at 18-19 and the remaining gap is acceptance and the softmax stage (which is the largest of the three, not the dots). Next: m=4 in mega3's decode GEMM plus the dspark drafter, then take softmax off the A-cluster critical path at four rows. Byte arithmetic still rules out weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
 | output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`) | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not
