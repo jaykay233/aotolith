@@ -953,6 +953,7 @@ rather than assumed equal — and it measures equal in practice.
 | 35 | 66.35 s | 150.70 | 16.26 | **10.30** |
 | 45 | 66.88 s | 149.52 | 15.08 | **12.60** |
 | 50 | 69.28 s | 144.33 | 15.80 | **14.06** |
+| 55 | 71.49 s | 139.87 | 16.83 | **14.80** |
 | **table** | **64.45 s** | **155.13** | — | — |
 
 `gate+up` keeps improving to 45% while `down` turns upward from 35%, so the two
