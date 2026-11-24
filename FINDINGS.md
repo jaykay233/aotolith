@@ -515,19 +515,23 @@ at the machine's dot speed and the headroom is in softmax.
 | vendor `i8i4` K32, Q4_0 exact | 93.8 s (109) | yes, margin 1.08 |
 | vendor `i8i4_hp_m4` K256 | 75.8 s (135) | **yes** (`8181 33`) |
 | + conv/quant/norm vectorisation | **73.4 s (139.4)** | yes |
+| + chunk 1024 | 71.63 s (139.59) | yes, 60/64 vs golden |
+| + X100 column offload (pct table) | **64.45 s (155.13)** | **yes, 60/64 vs golden** |
 | real Q3_K via int8 copy (vmadot) | 100.4 s (99.6) | unverified |
 
 | `prefill` 3-bit via the int8 copy (vmadot) | 10K 100.4 s, 99.6 tok/s | - | 40 tok/s slower than 4-bit prefill; closed by the quality result in section 7 |
 
 **The 174-178 tok/s figure is the unaligned row.** It is the vmadot path with
 per-row int8 activation scaling and A_BLK 256; it emits a different first token.
-The fastest configuration that matches the reference is 139.4 tok/s, and that is
-the number to compare against 200.
+The fastest configuration that matches the reference is **155.13 tok/s** (64.45 s,
+X100 offload, 60/64 against the golden set), and that is the number to compare
+against 200.
 
 The floor: GEMM 41 s + QK 20 s + PV 14 s of MAC work at the measured per-core
 rates is ~61 s, plus conv, quant, norm, silu and softmax. 200 tok/s needs 51.2 s,
-so **the A cluster alone cannot do it**; roughly 30-40% of the MACs have to move
-to X100.
+so **the A cluster alone cannot do it**; the X100 split is what closed 139.6 to
+155.1, and the remaining 14.5 s has to come from the GEMM kernel itself, since
+that is 31.7 s of the 64.45 s.
 
 ### The three-instruction exp is the softmax's whole cost, and it is now default
 
@@ -854,7 +858,7 @@ above, it is no longer worth cracking.
 
 | target | now | gap | next concrete step |
 |---|---|---|---|
-| prefill 200 tok/s @10K | 139.1 (71.9 s), base | 21 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. The X100 path measures faster but is not yet correct (section 4); its 153-158 tok/s figures are void. |
+| prefill 200 tok/s @10K | **155.1 (64.45 s)**, verified 60/64 against the golden set | 14.5 s | GEMM is now 31.7 s of 64.45 s and is the only lever left: attention is 22.4 s of which QK's 12.8 s wall is the K plane being walked 8 times per 512-row chunk, and 128-row tiles were measured to gain nothing. The X100 split is at its optimum with the per-projection table; flat shares 20-50% are all worse. |
 | decode 20 tok/s @10K | **11.95** over 300 rounds (`MEGA_SPEC=300`, 0.593 accepted drafts per 133.33 ms round); 16.71 at 2K | needs 2.67 emitted tokens/round at 133.33 ms (55.6% proposal acceptance) | Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so speculation is mandatory and acceptance is the whole problem. The 21.28 that was recorded here before the rope fix was measured on a degenerate looping stream and is void. |
 | output alignment | **exact to 1K context**: 40/40 tokens at 100, 20/20 at 256/512/1024; 2048 first differs at step 4 with cosine 0.9925 and the same argmax | the 2K+ drift is quantization noise, not layout | Do not "fix" the 2048 drift with a rope or exp change: `-e 0` and `-e 1` both first differ at the same step. The three rope implementations are now one function; keep it that way. |
 
@@ -892,27 +896,90 @@ Two facts this cost a day to establish, and they are cheap to forget:
   `12425 61485 50734 ...` where the same binary alone gives `220 5298 242 8647 ...`,
   and a megakernel beside `refgreedy` is just as bad.
 
-### `-x100` does not produce a correct result yet: the 153-158 tok/s figures are void
+### The X100 column offload works: 155.13 tok/s at 10K, 60/64 against the golden set
 
-The column offload to the X100 cluster looks like the answer to the prefill gap
-and measures well (GEMM 71.6 -> 64.3 s at 23%, -> 63.0 s at 40%), but **every
-token it emits is wrong**, starting at step 0 (`93979` against `220`, later
-`96761`). Two defects, in this order:
+| configuration | 10K prefill | tok/s | mean cosine | top-1 |
+|---|---|---|---|---|
+| `-G 1024` base | 71.63 s | 139.59 | 0.978702 | 60/64 |
+| `-G 1024 -x100` (pct table) | **64.45 s** | **155.13** | 0.977614 | 60/64 |
 
-1. The vendor quantiser (`quant_a_4row`, `g_pf_vendor == 2`) writes only the
-   A100 record. The X100 A copy exists solely in the vmadot quantiser, so X100
-   read untouched `hugemem`. `task_x8_quant` now builds it for the vendor path.
-2. With that fixed the output is still wrong at step 0, so the A layout or the
-   B packing or the epilogue is also mismatched. Not diagnosed.
+Teacher-forced over 64 steps against `refs/golden_10k_logits.bin`. The offload
+diverges at the same steps as the base (12, 14, 15, 57) and moves the mean cosine
+by 0.0011, which is inside the noise: moving 30-40% of the columns to X100 adds no
+new error source. Both of the misses that are genuine ties keep a margin ratio of
+0.0000.
 
-Independently of the bug, the X100 path quantises activations with **one scale
-per row** (`g_a8xs`, four floats per four-row group) where the A100 hp path uses
-**one scale per 256 k-elements**. That is a coarser step, not a byte permutation,
-so even a working X100 path would not be bit-identical and has to be scored
-against the golden set rather than assumed equal. `g_x100_pct_tab` (qkv 35, o 33,
-gate+up 37, down 28) encodes the equal-time split from rA ~486-509 GMAC/s against
-rX ~198 GMAC/s at k=6144 and ~287 at k=2048; a single 40 made `down` slower than a
-single 23 did.
+**Five defects had to be fixed together, and each one hid the next.** The measured
+speed was never wrong; the result was, which is why every one of these figures
+sat unusable for a day.
+
+1. The plain int8 copy (`g_blob8`, what `task_x8_pack_b` decodes) is skipped on
+   the vendor path (`g_i8w && g_src_type != 2`), because the A100 kernel reads the
+   compact i8i4 blob instead. X100 was therefore packing and reading untouched
+   `hugemem`. `-x100` now forces the copy to exist.
+2. The cached `mega-w8b.bin` was dated July and validated by size alone, so the
+   copy that did exist had stale contents. Rebuilding it took 33 s and is part of
+   why an earlier "-x100 is still wrong" reading was misleading.
+3. `task_pf_gemm_x100` wrote its outputs at `J.c + nb*16`, i.e. columns
+   `0..nx-1`, but the cluster owns the **tail** `nlim..n`. It overwrote the block
+   the A100 kernel had just finished, corrupting every column of every matrix.
+4. One `g_xchunk` counter served every job, and `x100_prepare` clears it once. Job
+   0 consumed all the units, so with `nj > 1` every later job found `u >= units`
+   and exited: qkv computed q and never k or v, leaving those columns holding the
+   previous layer's values. Now one counter per job.
+5. `-x100 N` was parsed and then ignored, because `x100_begin` read only
+   `g_x100_pct_tab`. Every explicit share in the earlier sweeps (23, 40) was
+   therefore running the same table, which is why they differed only by noise.
+
+The kernel itself was never at fault: `MEGA_XCHK` recomputes one 4x16 tile in
+scalar code from the same A and B records and matches the assembly 16/16. That
+exonerated the A layout, the B pack and the lane map and pointed at the
+integration, where all five defects lived.
+
+The X100 path quantises activations with **one scale per row** (`g_a8xs`, four
+floats per four-row group) where the A100 hp path uses **one scale per 256
+k-elements**. That is a coarser step, not a byte permutation, so it is scored
+rather than assumed equal — and it measures equal in practice.
+
+### A per-projection column share beats a flat one, and both beat going higher
+
+`g_x100_pct_tab` is qkv 35, o 33, gate+up 37, down 28. Flat shares, measured:
+
+| share | prefill | tok/s | gate+up | down |
+|---|---|---|---|---|
+| 20 | 68.82 s | 145.29 | 18.94 | 9.17 |
+| 25 | 67.32 s | 148.52 | 18.05 | 8.73 |
+| 30 | 65.98 s | 151.54 | 17.23 | 8.77 |
+| 35 | 66.35 s | 150.70 | 16.26 | **10.30** |
+| 45 | 66.88 s | 149.52 | 15.08 | **12.60** |
+| 50 | 69.28 s | 144.33 | 15.80 | **14.06** |
+| **table** | **64.45 s** | **155.13** | — | — |
+
+`gate+up` keeps improving to 45% while `down` turns upward from 35%, so the two
+want opposite shares: the table wins by 1.5 s over the best flat value. The
+turnaround is at the point where X100 stops being the faster cluster for that
+shape, which is what the per-shape rates predict (~198 GMAC/s at k=6144, ~287 at
+k=2048, against ~486-509 on the A cluster).
+
+### Falsified: 128-row attention tiles (`-DI8G=32`)
+
+Half the K-plane passes and 5.5 core-s off PV sound like a win; the wall clock
+says 71.37 s against 71.63 s, and attaching a step log crashes the run, so the
+buffer sizing at `I8_NSLOT = 24*16/I8_G` is wrong as well. Not worth repairing for
+0.26 s.
+
+### `-V0` (vmadot) is more accurate and 29 tok/s slower
+
+| configuration | tok/s | mean cosine | top-1 |
+|---|---|---|---|
+| `-V0`, no x100 | 110.62 | 0.983615 | 8/8 |
+| `-x100` (vendor hp) | 155.13 | 0.977614 | 60/64 |
+
+The vmadot path scores higher because both clusters then read the same int8 copy,
+but 110.62 against 155.13 closes it as a performance option. It was still useful:
+`-V0` with and without `-x100` (0.983615 against 0.303290 at the time) proved the
+int8 copy's column correspondence was fine and localised the defects to the X100
+path.
 
 ### llama.cpp cannot run at 16 threads on this board
 
@@ -928,8 +995,7 @@ every candidate against garbage.
 with the component times otherwise unchanged — the gain is all fixed cost, mostly
 `conv` 4.34 -> 2.24 s. `-G 2048` does not work: it runs past 8 minutes with 4.1 GB
 resident and never prints a result, so it exceeds a buffer's capacity rather than
-being slower. `-DI8G=32` (128-row attention tiles, half the K-plane passes) is
-wired up and builds; it has not been run.
+being slower.
 
 ---
 
