@@ -4138,6 +4138,16 @@ static void add4_fn(int64_t lo, int64_t hi) {
 // predict if the drafts before them had been right, which is what the acceptance
 // test consumes.
 static const bool M4DUMP = getenv("MEGA_M4DUMP") != nullptr;
+static const bool M4TIME = getenv("MEGA_M4TIME") != nullptr;
+static double g_m4t[8];   // gemm, attn, norm, silu, rope+kv, quant, argmax, other
+static void m4_report(void) {
+    static const char * nm[8] = { "gemm", "attn", "norm", "silu", "rope+kv",
+                                 "quant", "argmax", "other" };
+    printf("m4dec: ");
+    for (int i = 0; i < 8; ++i) printf("%s %.2f  ", nm[i], g_m4t[i] * 1e3);
+    printf("(ms)\n");
+    for (int i = 0; i < 8; ++i) g_m4t[i] = 0;
+}
 static const bool M4ARGMAX_ONE = getenv("MEGA_M4AX2") != nullptr;
 // Four-row argmax: one band per thread over 4 x VOCAB, four running maxima each.
 static int   g_m4b_i[N_GPU][4];
@@ -4170,16 +4180,21 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
     for (int L = 0; L < N_LAYER; ++L) {
         g_layer = L;
         if (M4DUMP && L < 2) dump_row("m4", L, 'e', g_x4);
+        double _n = now_s();
         for (int r = 0; r < 4; ++r)
             rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
                         g_attn_norm[L], N_EMBD);
+        if (M4TIME) g_m4t[2] += now_s() - _n;
         if (M4DUMP && L < 2) dump_row("m4", L, 'n', g_xa4);
+        double _t = now_s();
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
+        if (M4TIME) { g_m4t[5] += now_s() - _t; _t = now_s(); }
         g_mjn = 3;
         g_mj[0] = { g_wq[L].b, g_wq[L].k, g_wq[L].n, g_q4 };
         g_mj[1] = { g_wk[L].b, g_wk[L].k, g_wk[L].n, g_k4 };
         g_mj[2] = { g_wv[L].b, g_wv[L].k, g_wv[L].n, g_v4 };
         run(task_mgemm_m4);
+        if (M4TIME) { g_m4t[0] += now_s() - _t; _t = now_s(); }
         // q/k/v each own a buffer: ldc is the matrix width, so pointing all three
         // at one buffer makes k and v overwrite q's first rows.
 
@@ -4199,6 +4214,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             dump_n("m4", L, 'v', g_v4, N_KV * HEAD_DIM);
         }
         conv_kv8_inc(L, p0, 4);
+        if (M4TIME) { g_m4t[4] += now_s() - _t; _t = now_s(); }
 
         g_pq = g_q4;
         g_pfa_ctx = p0;
@@ -4213,31 +4229,38 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             g_v8isc[kv] = g_v8i_sc[L * N_KV + kv];
         }
         pfa_run(L);
+        if (M4TIME) { g_m4t[1] += now_s() - _t; _t = now_s(); }
         if (M4DUMP && L < 2) dump_row("m4", L, 'a', g_pfa_out);
 
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_pfa_out, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, g_xa4 };
         run(task_mgemm_m4);
+        if (M4TIME) { g_m4t[0] += now_s() - _t; _t = now_s(); }
         if (M4DUMP && L < 2) dump_row("m4", L, 'o', g_xa4);
         parallel_for(4 * N_EMBD, add4_fn);
         if (M4DUMP && L < 2) dump_row("m4", L, 'r', g_x4);
 
+        double _n2 = now_s();
         for (int r = 0; r < 4; ++r)
             rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
                         g_ffn_norm[L], N_EMBD);
+        if (M4TIME) g_m4t[2] += now_s() - _n2;
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 2;
         g_mj[0] = { g_wg[L].b, g_wg[L].k, g_wg[L].n, g_gate4 };
         g_mj[1] = { g_wu[L].b, g_wu[L].k, g_wu[L].n, g_up4 };
         run(task_mgemm_m4);
+        if (M4TIME) { g_m4t[0] += now_s() - _t; _t = now_s(); }
         if (M4DUMP && L < 2) {
             dump_n("m4", L, 'g', g_gate4, N_FF);
             dump_n("m4", L, 'u', g_up4, N_FF);
         }
         parallel_for(4 * N_FF, silu4_fn);
+        if (M4TIME) { g_m4t[3] += now_s() - _t; _t = now_s(); }
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_gate4, (size_t) N_FF, m4_aq(N_FF));
         g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, g_xa4 };
         run(task_mgemm_m4);
+        if (M4TIME) { g_m4t[0] += now_s() - _t; _t = now_s(); }
         parallel_for(4 * N_EMBD, add4_fn);
     }
 
@@ -4304,6 +4327,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             g_logits = keep;
         }
     }
+    if (M4TIME) m4_report();
     return true;
 }
 
