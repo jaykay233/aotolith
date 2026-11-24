@@ -381,3 +381,51 @@ eight accumulators.
 The ceiling that implies: 51.6 ms of weights + 8.6 ms of KV + 6.4 ms of tail is
 66.6 ms per round, which at the 1.83 accepted tokens three drafts measured at
 short context is 27.5 tok/s, with no further loss of precision.
+
+### Sharing the K stream across heads does not pay (measured, then reverted)
+
+Eight GQA heads of a kv head read the same K and V plane, so the obvious next
+move is to walk positions outside and heads inside and let one fetch feed all
+eight. `MEGA_A4S` implements that: a thread owns one kv head and a quarter of the
+positions, and `a4s_qk_blk` reuses the fetched K block across the heads.
+
+| variant | qk | pv | softmax | attention wall | round |
+|---|---|---|---|---|---|
+| `MEGA_ATTN4P=1` (per-head QK, X100 softmax) | 0.127 | 0.085 | 0.106 | **29.88** | **96.05** |
+| `MEGA_A4S=1` (two same-kv heads per thread) | 0.100 | 0.075 | 0.091 | 37.29 | 104.65 |
+| `MEGA_A4S=2` (same, softmax back on the A cores) | 0.103 | 0.082 | 0.208 | 52.72 | 122.70 |
+
+Core-seconds, 10K, four rows: the top row is qk+pv+softmax = 0.318 / 8 = 39.8 ms
+serial, yet it measures 29.88 ms of wall — it overlaps. The shared-K variant
+totals less work (0.266) and takes 37.29 ms, because softmax for a head cannot
+start until every position of that head is scored, and the block-outer walk
+completes all of a thread's heads at once. **Reuse and per-head handoff are
+mutually exclusive in this shape, and the handoff is worth more than the reuse.**
+
+Two things worth recording from the third row:
+
+- Softmax on an A core costs 0.208 core-s against 0.106 on an X100 core. The
+  X100's narrower vector shape runs the three-instruction `exp2` better at four
+  rows, so "the A cores are twice as fast per element" (true for the 64-row
+  prefill tile) does not carry over to this shape.
+- Putting PV on a position range instead of a head made it worse, 0.095 -> 0.239
+  core-s: `pv4_acc` holds one head's eight `int32m1` accumulators, so four threads
+  over one range still fetch that range's V once per head, and the shorter blocks
+  only add prologue and epilogue. PV's reuse needs a TCM staging pass over V, not
+  a position split.
+
+`MEGA_A4S` stays in the tree behind its flag; `MEGA_ATTN4P=1` is the configuration
+to use.
+
+### The round is at 96 ms
+
+`MEGA_ATTN4P=1 MEGA_M4AX2=1`, best round of two, 10K:
+
+    gemm 53.24  attn 29.88  norm 2.32  silu 0.86  rope+kv 2.30  quant 0.61
+    argmax 0.00  other 0.99  ->  96.05 ms
+
+Both large slices now match their isolated benchmarks (50.59 and 29.34), so what
+is left is the 6.1 ms tail. Round 0 of a run is consistently 10-15 ms slower than
+round 1 because the score and weight buffers are cold after prefill; steady state
+is round 1 onward. At the 1.83 accepted tokens three drafts measured at short
+context this is 19.1 tok/s, against the 91.5 ms a round needs for 20.

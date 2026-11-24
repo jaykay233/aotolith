@@ -3943,6 +3943,160 @@ static void task_attn4_sm(int id) {
     }
 }
 
+// ---------------------------------- four-row attention, one pass per KV block
+// The two functions above give each head its own walk over the KV plane, and the
+// eight heads of a kv head read the same bytes. Measured at 10K, QK costs 0.144
+// core-s and PV 0.095 for 215 MB of unique K and V: that is 47 GB/s of traffic for
+// a cache that can only serve it because most of the repeats hit L2.
+//
+// Here a thread owns one kv head and a quarter of the positions, walking positions
+// outside and heads inside, so each 1 KB block of K or V is fetched once and feeds
+// all eight heads. Softmax stays full range on the X100 cluster -- it is the one
+// stage that cannot be split, because the max and the sum span every position --
+// and PV's partial sums over disjoint position ranges simply add, so no rescaling
+// or second max pass is needed anywhere.
+static float * g_o4part = nullptr;          // 8 threads x 8 heads x 4 rows x 128
+static int g_a4s = 0;                       // -MEGA_A4S
+
+static void a4s_alloc(void) {
+    if (g_o4part) return;
+    const size_t n = (size_t) 8 * NH_PER_KV * PFA_ROWS * HEAD_DIM * 4;
+    g_o4part = (float *) hugemem(n + (2 << 20));
+    if (!g_o4part) { fprintf(stderr, "oom a4s\n"); g_a4s = 0; return; }
+    use_huge(g_o4part, n + (2 << 20));
+}
+
+// One 64-position block of one head's scores, with the K block already fetched.
+static void a4s_qk_blk(int h, int64_t pb, const int8_t * kb, int16_t * sc) {
+    const int8_t * q8g = g_q8i + (size_t) h * g_q8i_nqg * 8 * 64;
+    alignas(64) int32_t raw[8][32];
+    const size_t vl32 = __riscv_vsetvl_e32m1(32);
+    const size_t vl16 = __riscv_vsetvl_e16mf2(32);
+    int8_t * op[8];
+    for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
+    qk4(op, q8g, kb, HEAD_DIM / 16);
+    int16_t * dst = sc + (size_t) (pb * 8) * 32;
+    for (int j = 0; j < 8; ++j) {
+        const vint32m1_t a = __riscv_vle32_v_i32m1(raw[j], vl32);
+        __riscv_vse16_v_i16mf2(dst + j * 32, __riscv_vnsra_wx_i16mf2(a, SC_SHIFT, vl32), vl16);
+    }
+}
+
+// PV over one thread's position range. The weights are already normalised, so the
+// four range outputs add directly; the only thing the range changes is where the
+// V block walk starts, and both w8 and the V plane advance one block per sixteen
+// positions, so a single offset moves both.
+static void a4s_pv_range(int layer, int h, const int8_t * w8, const float * wsc,
+                         int64_t q_lo, int64_t q_hi, float * dst) {
+    const int kv = h / NH_PER_KV;
+    alignas(64) int32_t pacc[8][32];
+    const int64_t nqmax = (g_pfa_ctx + PFA_ROWS + 15) / 16;
+    int64_t n = (q_hi < nqmax ? q_hi : nqmax) - q_lo;
+    if (n < 0) n = 0;
+    for (int half = 0; half < 2; ++half) {
+        const int8_t * vb = v8i_base(layer) + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
+        for (int j = 0; j < 8; ++j) memset(pacc[j], 0, 32 * 4);
+        if (n > 0) {
+            int32_t * op[8];
+            for (int j = 0; j < 8; ++j) op[j] = pacc[j];
+            pv4_acc(op, w8 + q_lo * 64, vb + q_lo * 1024, (int) n);
+        }
+        const size_t vl8 = __riscv_vsetvl_e32m1(8);
+        for (int r = 0; r < PFA_ROWS; ++r) {
+            const float s_r = wsc[r] * g_v8isc[kv];
+            float * d = dst + (size_t) r * HEAD_DIM + half * 64;
+            for (int j = 0; j < 8; ++j) {
+                const vint32m1_t a = __riscv_vle32_v_i32m1(&pacc[j][r * 8], vl8);
+                const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+                    __riscv_vfcvt_f_x_v_f32m1(a, vl8), s_r, vl8);
+                __riscv_vse32_v_f32m1(d + j * 8, f, vl8);
+            }
+        }
+    }
+}
+
+// Two heads per thread, both from the same kv head. Sixteen heads over eight A
+// cores is two each whatever the split, but taking the two from one kv head means
+// the K block a thread has just fetched feeds both of its heads, so the plane is
+// read four times per layer instead of eight. Packing both heads into one
+// position-outer walk is what keeps that reuse; publishing after the walk keeps the
+// per-head handoff to softmax, which is what lets the X100 cluster overlap.
+static void task_attn4s(int tid) {
+    g_pfa_tid = tid;
+    const int gen = g_a4_gen.load(std::memory_order_acquire);
+    const int kv = tid / 4;
+    const int h0 = kv * NH_PER_KV + (tid % 4) * 2;
+    const int64_t npb = (g_pfa_ctx + PFA_ROWS + 63) / 64;
+
+    const double _q = now_s();
+    const int8_t * kplane = k8i_base(g_pfa_layer);
+    int16_t * sc0 = g_sc4 + (size_t) h0 * SC_GSTRIDE;
+    for (int64_t pb = 0; pb < npb; ++pb) {
+        const int8_t * kb = kplane + ((kv * g_k8i_npb + pb) * 8) * 1024;
+        a4s_qk_blk(h0,     pb, kb, sc0);
+        a4s_qk_blk(h0 + 1, pb, kb, sc0 + SC_GSTRIDE);
+    }
+    g_pfa_qk[tid] += now_s() - _q;
+
+    // MEGA_A4S=2 keeps the softmax on this cluster. The handoff to the X100 cores
+    // costs more than it saves at four rows: the A cores are idle for the whole
+    // softmax and it cannot start until every position of a head is scored, so the
+    // layer costs qk + sm + pv rather than overlapping them. Softmax is 2.24 ns per
+    // element here against 4.5 on an X100, so running it in place is cheaper than
+    // waiting for it elsewhere.
+    const bool sm_here = (g_a4s == 2);
+    if (sm_here) {
+        g_pfa_smid = tid & 7;
+        for (int i = 0; i < 2; ++i) {
+            const int h = h0 + i;
+            const double _s = now_s();
+            pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE,
+                      g_w4 + (size_t) h * WBLK, g_wsc4 + (size_t) h * I8_ROWS);
+            g_pfa_sm[tid] += now_s() - _s;
+        }
+    } else {
+        g_a4_qk[h0].store(gen, std::memory_order_release);
+        g_a4_qk[h0 + 1].store(gen, std::memory_order_release);
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        const int h = h0 + i;
+        if (!sm_here) while (g_a4_sm[h].load(std::memory_order_acquire) != gen) sched_yield();
+        const double _v = now_s();
+        pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
+                  g_wsc4 + (size_t) h * I8_ROWS);
+        g_pfa_pv[tid] += now_s() - _v;
+    }
+    (void) gen;
+}
+
+// The four quarters' partial outputs add: the softmax weights are already global.
+static void task_attn4s_fin(int tid) {
+    const size_t vl = __riscv_vsetvl_e32m1(8);
+    const int64_t tstride = (int64_t) NH_PER_KV * PFA_ROWS * HEAD_DIM;
+    for (int it = tid; it < N_HEAD * PFA_ROWS; it += g_participants) {
+        const int h = it / PFA_ROWS, r = it % PFA_ROWS;
+        const int kv = h / NH_PER_KV, i = h % NH_PER_KV;
+        float * dst = g_pfa_out + ((size_t) r * N_HEAD + h) * HEAD_DIM;
+        const float * base = g_o4part + (size_t) (kv * 4) * tstride
+                           + (size_t) i * PFA_ROWS * HEAD_DIM + (size_t) r * HEAD_DIM;
+        for (int d = 0; d < HEAD_DIM; d += 8) {
+            vfloat32m1_t a = __riscv_vle32_v_f32m1(base + d, vl);
+            for (int q = 1; q < 4; ++q)
+                a = __riscv_vfadd_vv_f32m1(a, __riscv_vle32_v_f32m1(base + q * tstride + d, vl), vl);
+            __riscv_vse32_v_f32m1(dst + d, a, vl);
+        }
+    }
+}
+
+static void a4s_run(int L) {
+    g_pfa_layer = L;
+    g_i8g = 1;
+    g_a4_gen.fetch_add(1, std::memory_order_acq_rel);
+    run(task_attn4s);
+    g_i8g = I8_G;
+}
+
 static void attn4p_run(int L) {
     g_pfa_layer = L;
     g_i8g = 1;
@@ -4015,7 +4169,9 @@ static void pfa_run(int L) {
     // bypasses the tile machinery entirely (g_tile_n would be zero).
     if (g_pfa_rows <= PFA_ROWS) {
         g_i8g = 1;
-        if (g_a4p && g_sc4 && g_n_sm == 8) attn4p_run(L);
+        if (g_a4s == 2 && g_w4) a4s_run(L);
+        else if (g_a4s == 1 && g_o4part && g_n_sm == 8) a4s_run(L);
+        else if (g_a4p && g_sc4 && g_n_sm == 8) attn4p_run(L);
         else run(task_pfa_i8_4);
         g_i8g = I8_G;
         return;
@@ -4074,6 +4230,7 @@ static void m4dec_alloc(void) {
     }
     m4_alloc();
     if (g_a4p) attn4p_alloc();
+    if (g_a4s) a4s_alloc();
     printf("m4dec: %.1f MB scratch, four rows per round\n",
            (double) (4 * N_EMBD * 2 + 4 * N_FF * 2 + 4 * VOCAB) * 4 / 1e6);
 }
@@ -4329,7 +4486,23 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             g_logits = keep;
         }
     }
-    if (M4TIME) m4_report();
+    if (M4TIME) {
+        // qk/pv are A-cluster core-s, sm is X100 core-s: the split says whether the
+        // round's attention is dot-bound or bound by the KV stream.
+        // qk/pv are per A thread, sm per X100 thread; both index 0..7.
+        double qk = 0, sm = 0, pv = 0, mx = 0, ex = 0;
+        for (int t = 0; t < N_GPU; ++t) {
+            qk += g_pfa_qk[t]; sm += g_pfa_sm[t]; pv += g_pfa_pv[t];
+            mx += g_pfa_mxb[t]; ex += g_pfa_exb[t];
+        }
+        printf("m4dec: attn core-s qk %.3f + pv %.3f on 8, sm %.3f (max %.3f exp %.3f) on %d\n",
+               qk, pv, sm, mx, ex, g_n_sm);
+        for (int t = 0; t < N_GPU; ++t) {
+            g_pfa_qk[t] = 0; g_pfa_pv[t] = 0; g_pfa_sm[t] = 0;
+            g_pfa_smb[t] = 0; g_pfa_mxb[t] = 0; g_pfa_exb[t] = 0;
+        }
+        m4_report();
+    }
     return true;
 }
 
@@ -4339,6 +4512,12 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
 static bool m4dec_run(int64_t p0, int anchor, int rounds) {
     m4dec_alloc();
     if (!g_x4) return false;
+    // These counters are shared with prefill's attention, and a 10K prefill leaves
+    // several hundred core-s in them. Clear them or the round reports prefill work.
+    for (int t = 0; t < N_GPU; ++t) {
+        g_pfa_qk[t] = 0; g_pfa_pv[t] = 0; g_pfa_sm[t] = 0;
+        g_pfa_smb[t] = 0; g_pfa_mxb[t] = 0; g_pfa_exb[t] = 0;
+    }
     if (!g_a4p) { fprintf(stderr, "m4dec needs the four-row attention (MEGA_ATTN4P=1)\n"); }
     int tok[4] = { anchor, anchor, anchor, anchor };
     int * out = g_m4out;
@@ -4364,6 +4543,7 @@ static void attn4_bench(int rounds, int64_t ctxmax) {
     // tile, which the head-major loop drives one group at a time. Anything between
     // the two is not a shape the kernel has.
     if (g_a4p) attn4p_alloc();
+    if (g_a4s) a4s_alloc();
     int64_t rows = getenv("MEGA_ATTN4_ROWS") ? atoll(getenv("MEGA_ATTN4_ROWS")) : I8_ROWS;
     if (rows != PFA_ROWS) {
         rows = rows < I8_ROWS ? I8_ROWS : rows;
@@ -5707,6 +5887,7 @@ int main(int argc, char ** argv) {
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
     if (getenv("MEGA_M4DEC")) { g_m4dec = atoi(getenv("MEGA_M4DEC")); g_attn4 = 1; }
     if (getenv("MEGA_ATTN4P")) g_a4p = atoi(getenv("MEGA_ATTN4P"));
+    if (getenv("MEGA_A4S")) g_a4s = atoi(getenv("MEGA_A4S"));
     // The vendor prefill helper for 3-bit weights is a one-row kernel, and the
     // 4-row K256 kernel it would otherwise call is 4-bit. Prefill therefore runs
     // on the int8 copy, which repack_b_i8_q3 builds from this same 3-bit blob.
