@@ -1031,3 +1031,55 @@ misleading verdict, which is itself worth remembering: `probe_q3grp` first
 summed across groups and printed `WRONG` for a correct walk, and `layer0_ref`'s
 first version read GGUF offsets as file offsets.
 
+
+### The GEMM kernel is at its engine rate, measured with the stream removed
+
+`probe_hp_peak.cpp` feeds `gemm_kernel_i8i4_hp_m4` the same A record prefill builds
+and varies only the B working set, so the number it prints is the IME2 engine's own
+issue rate rather than the memory behind it:
+
+| K | N | B size | G | threads | GMAC/s |
+|---|---|---|---|---|---|
+| 2048 | 32 | 36 KB (L1) | 1 | 1 | 47.0 |
+| 2048 | 1024 | 1.2 MB (L2) | 1 | 1 | 47.8 |
+| 2048 | 6144 | 7 MB (DRAM) | 1 | 1 | **47.9** |
+| 2048 | 6144 | | 4 | 1 | 42.3 |
+| 2048 | 6144 | | 1 | 8 | **338.5** |
+| 2048 | 6144 | | 4 | 8 | 320.9 |
+| 6144 | 6144 | | 1 | 8 | **226.9** |
+
+47.9 GMAC/s at N=32 where B is 36 KB and L1-resident, 47.8 at N=1024, 47.9 at
+N=6144: the kernel does not care how big B is. That is the engine, and the
+production number matches it — 34.4 s for 19.8 TMAC of 10K prefill GEMM is
+576 GMAC/s over both clusters against a measured ceiling of 338.5 (A) + ~260
+(X100) = 600, i.e. **96% of what the hardware issues**. There is no kernel
+rewrite inside this budget; the only way GEMM gets faster is a format with
+fewer MACs, and 3-bit already measured 100.4 s on the prefill path.
+
+The vmadot comparison in the same probe explains why `-V0` loses in production
+even though its hot rate is higher: 153.5 GMAC/s per core at N=64 (B in L1),
+87.1 at N=6144 with eight row groups reusing each column block, 362.2 across
+eight threads, and 141.7 at K=6144. Its B copy is 128 KB per 64 columns against
+Q4_0's 73.7 KB, 1.74x the bytes, so at the production shape the extra density is
+paid back in traffic.
+
+### Where the 10K time actually goes: QK streams K, and it is 19x off the dot rate
+
+| configuration | 10K prefill | tok/s | attn | qk (core-s) | pv (core-s) |
+|---|---|---|---|---|---|
+| `-x100` (the standing) | 66.61 s | 150.12 | 23.15 | 103.2 | 58.7 |
+| `-D` (score stores parked in one L1 block) | 64.49 s | 155.05 | 21.05 | 96.7 | 55.1 |
+| `-0` (PV skipped) | **61.62 s** | 162.28 | 18.53 | 74.4 | 2.7 |
+| `-h0` (legal, head-fast tiles) | 66.41 s | 150.56 | 23.32 | 105.7 | 59.5 |
+
+Two things follow. PV's wall is only **4.6 s** (66.61 - 61.62 + the QK relief it
+gives), and the score buffer's write traffic is **1.9 s** — both already small.
+QK plus softmax is 18.5 s and is nearly all of attention.
+
+QK does 1.02 TMAC at 10K (16 heads x 9999 rows x ~5000 positions x 128 dims), so
+18.5 s over eight cores is **6.9 GMAC/s per core**, against the 131.7 the same
+`qk4` loop measures with K hot in `probe_qk_real`. The loop is not short of dot
+issue rate; it is waiting on K. That is the same conclusion the earlier 128-row
+tile experiment produced from the other direction: making the tile taller cut
+the pass count and bought 0.26 s, so the traffic is being served by L2 already
+and a taller tile only changes which cache does the serving.
