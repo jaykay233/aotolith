@@ -134,14 +134,17 @@ So the drafter cannot make the output wrong. It can only lower the acceptance ra
 
 ## What is left
 
-1. **Understand the 10K acceptance.** 0.11-0.25 per round against 1.26 at short
-   context. This is the number that decides whether the drafter is worth having at
-   all; everything below is cheaper than the round it feeds.
-2. **The draft's attention cost at 10K.** 190 ms of a 96 ms round is not a tuning
+1. **The draft's attention cost at 10K.** 190 ms of a 96 ms round is not a tuning
    problem. It is fp32, O(context), 64 (slot, head) units. int8 `vmadot` and four
-   rows shared across slots is ~4x; a sliding window on the draft's own cache is
-   the larger lever, and the draft cache is only 31.5 MB at 12K so a window costs
-   nothing in memory.
+   rows sharing each K block is ~4x, which is the same change the target's own
+   attention already went through; a sliding window on the draft's cache is the
+   larger lever, and the cache is only 31.5 MB at 12K so a window costs nothing in
+   memory. The drafter is lossy-tolerant: it can only change which drafts are
+   offered, never what is emitted.
+2. **Then more drafts per round.** 1.93 tokens/round at 10K against 3.35 at short
+   context. m=4 is the kernel's sweet spot, but block_size is 7, so a two-group
+   round (anchor + 6 masks) is the natural next size and costs a second weight
+   pass only if the two groups cannot share one.
 3. Confidence-gated `K`: `conf_proj` is loaded and unused. Trimming to the number
    of drafts likely to survive saves verification rows, but with 0.2 accepted per
    round it would trim to zero.
@@ -152,23 +155,21 @@ So the drafter cannot make the output wrong. It can only lower the acceptance ra
 draft 3 / verify 4 rows / commit the matching prefix. The same KV cache carries
 over, so there is one binary and no replay scaffolding.
 
-Short context, 101-token prompt:
+40 rounds, which is where acceptance stops rising. Fewer rounds than that measures
+the cold start, not the drafter.
 
-| | accepted/round | ms/round | tok/s |
-|---|---|---|---|
-| four rows, no drafter | - | 96 | 10.4 |
-| dspark, 3 drafts | 0.278 | 106 | 17.3 |
-
-10K:
-
-| | accepted/round | ms/round | tok/s |
-|---|---|---|---|
-| four rows, no drafter | - | 96 | 10.4 |
-| dspark, 3 drafts | 0.111 | 310 | 4.3 |
-| dspark, 8 rounds | 0.250 | 299 | 5.6 |
+| context | accepted/round | tokens/round | ms/round | tok/s |
+|---|---|---|---|---|
+| 101 tokens, no drafter | - | 1.00 | 96 | 10.4 |
+| 101 tokens, 3 drafts | 0.783 | 3.35 | 104 | **32.1** |
+| 10K, no drafter | - | 1.00 | 96 | 10.4 |
+| 10K, 3 drafts | 0.308 | 1.93 | 305 | 6.3 |
+| 101 tokens, 3 drafts, 6 rounds | 0.278 | 1.28 | 106 | 17.3 (cold) |
 
 The drafter alone is 24-26 ms per round at 101 tokens and 190-196 ms at 10K. It
-adds 3.4 s to a 79 s prefill (4%), which is fine; the per-round cost is not.
+adds 3.4 s to a 79 s prefill (4%), which is fine; the per-round cost is not. That
+195 ms is the entire 10K gap: fp32, O(context), 64 (slot, head) units, no int8 and
+no four-row sharing.
 
 ### The four bugs that had to go
 
@@ -188,12 +189,27 @@ A-record arena has to exist before prefill runs.
 |---|---|---|
 | adjacent-pair rope (default) | 0.278 | keep |
 | halves-rotate rope (`MEGA_DSROPE=half`) | 0.111 | falsified: the draft does not use the target's rope layout |
-| `target_layers` 1-based (`MEGA_DSL1`) | 0.292 | indistinguishable from 0.250 |
 | encoder/output norms swapped (`MEGA_DSSWAPNORM`) | 0.000 | `enc.output_norm` is the encoder's |
 | interleaved feature layout (`MEGA_DSINTER`) | 0.000 | the fused vector is layer-major |
 | tanh on the rank-256 gather (`MEGA_DSTANH`) | 0.292 | no effect; this is the plain markov variant |
 | encoder features zeroed (`MEGA_DSZERO`) | 0.125 | zeroing the committed prefix only halves acceptance |
-| markov bias dropped (`MEGA_DSNOBIAS`) | 0.000 | base alone is worse, so the markov head helps |
+| markov bias dropped, 10K, 40 rounds | 0.133 | the markov chain is load-bearing: base alone is under half |
+
+The layer shift was settled with cosine rather than acceptance, which cannot
+resolve it:
+
+| capture shift (`MEGA_DSSL`) | mean cos |
+|---|---|
+| 0, layer L's output (default) | 0.274 |
+| 1 | 0.240 |
+| 2 | 0.191 |
+
+The capture site is after the layer body, so `target_layers` means "after these
+layers" for this export. Also confirmed against the reference: `rope.freq_base` is
+5e6 and the code agrees, `mask_token_id` is 75982 and the code agrees, and
+llama.cpp's `block_uniform` makes all block positions reuse the anchor's mask row
+(prefix + anchor) -- which is already what the four slots do, so there is no
+cross-attention between mask slots to add.
 
 The zero-feature control is the informative one: if the prefix reached the draft
 properly, removing it should cost nearly everything. It costs half, so the drafts

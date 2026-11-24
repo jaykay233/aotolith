@@ -165,24 +165,33 @@ n rounds of draft 3 / verify 4 rows / accept the matching prefix. There is no
 second binary and no replay scaffolding; the accepted prefix advances the same
 KV cache the prefill wrote.
 
+**Eight rounds is not enough to measure this.** The first rounds are cold: the
+draft's cache has only prefill positions and its own committed tokens are still
+few, so early acceptance is a third of steady state. The numbers below are 40
+rounds, which is where acceptance stops rising.
+
 Short context (101-token prompt), 3 drafts:
 
-| | accepted/round | ms/round (mean) | tok/s |
-|---|---|---|---|
-| four rows, no drafter | - | 96 | 10.4 |
-| dspark | 0.278 | 106 | **17.3** |
-| dspark, 10K | 0.111 | 310 | 4.3 |
-| dspark, 10K (8 rounds) | 0.250 | 299 | 5.6 |
-| four rows, no drafter, 10K | - | 96 | **10.4** |
+| | accepted/round | tokens/round | ms/round (mean) | tok/s |
+|---|---|---|---|---|
+| four rows, no drafter | - | 1.00 | 96 | 10.4 |
+| dspark, 6 rounds | 0.278 | 1.28 | 106 | 17.3 |
+| dspark, 40 rounds | 0.783 | 3.35 | 104 | **32.1** |
+| dspark, 10K, 40 rounds | 0.308 | 1.93 | 305 | 6.3 |
+| four rows, no drafter, 10K | - | 1.00 | 96 | **10.4** |
 
-So speculation is worth 1.7x at a hundred tokens and costs 2x at ten thousand.
-Both halves of that are measured, not modelled:
+So speculation is 3.1x at a hundred tokens and 0.6x at ten thousand. The short
+context decode target of 20 tok/s is cleared by 32.1. Both halves of that
+disparity are measured, not modelled:
 
 * The drafter itself is 24-26 ms per round at 101 tokens and **190-196 ms at
   10K**. Its attention is fp32, O(context), over 64 (slot, head) units, which is
-  the same shape that costs the target 30 ms for four rows.
-* Acceptance collapses from 0.28 to 0.11-0.25 per round. The 1.26/round that
-  `mega_decode` measures at short context does not survive to 10K.
+  the same shape that costs the target 30 ms for four rows. This is the whole
+  gap: at 40 rounds the 10K round is 305 ms against 104 ms short-context, and the
+  200 ms difference is the drafter's attention.
+* Acceptance itself holds up better than the round does: 0.783/round short
+  context against 0.308/round at 10K, so the tokens per round only fall from 3.35
+  to 1.93. At 96+190 ms that is still under one pass per weight stream.
 
 The drafter costs ~3.4 s of a 79 s 10K prefill (4%), which is acceptable; the
 per-round cost and the acceptance are not.
@@ -213,24 +222,67 @@ so the A-record arena has to exist before prefill, not at the first decode round
 | interleaved feature layout (`MEGA_DSINTER`) | 0.000 | confirms layer-major; the fused vector is 5 x 2048 in layer order |
 | tanh on the rank-256 gather (`MEGA_DSTANH`) | 0.292 | no effect: this variant is the plain markov, as `dspark_joint_proj` being absent implies |
 | encoder features zeroed (`MEGA_DSZERO`) | 0.125 | **the control that matters**: zeroing the entire committed prefix only halves acceptance |
-| markov bias dropped (`MEGA_DSNOBIAS`) | 0.000 | the base logits alone are worse than base + bias, so the markov head is helping |
+| markov bias dropped, short context | 0.000 | 4 rounds only; superseded by the 40-round 10K row below |
+| markov bias dropped, 10K, 40 rounds | 0.133 | the base argmax alone is *half* of base + bias (0.308); the markov chain is doing real work |
 
 The zero-feature control is the sharpest number here. If the prefix reached the
 draft properly, removing it should cost almost everything. It costs half, which
 says the drafts are being driven mostly by the anchor token and the mask block's
 own self-attention rather than by the injected context.
 
+### Cosine to the target's own row, and what it settles
+
+Acceptance is a 0/1 summary of a comparison that is really between two whole
+distributions. `MEGA_DSCOS` takes that comparison directly: the draft's slot-0
+base logit row answers exactly the question the target's anchor row answers (what
+follows the anchor), so their cosine is the honest measure, together with where
+the target's argmax lands in the draft's ranking.
+
+| | mean cos | target argmax at draft rank 0 | within 8 |
+|---|---|---|---|
+| 101 tokens, 40 rounds | 0.179 | 11/40 | 28/40 |
+| 10K, 40 rounds | 0.353 | 21/40 | 36/40 |
+
+The 10K cosine is *higher* and its rank-0 rate is *higher*, while acceptance per
+round is lower. Both are real: a long context makes both distributions flatter
+and more alike, and it also makes the target harder to match token for token. So
+"the draft is looking at the wrong thing" is not what the cosine says at 10K --
+36 of 40 rounds put the right token in the draft's top eight, which is what makes
+a block of 3 drafts worth more than 1 token.
+
+The layer-shift sweep used the same metric, because cosine resolves differences
+that acceptance buries in noise:
+
+| capture shift (`MEGA_DSSL`) | mean cos |
+|---|---|
+| 0 (layer L's output, the default) | 0.274 |
+| 1 (layer L-1's output) | 0.240 |
+| 2 | 0.191 |
+
+The capture site sits after the layer body, so it holds layer L's output; the
+metadata's `target_layers` therefore means "after these layers" for this export,
+not llama.cpp's `t_layer_inp[il]` (layer il's input). The sweep is what decides
+that, since both readings accept drafts at about the same rate.
+
+Also confirmed against the reference rather than by argument:
+
+- `dflash.rope.freq_base = 5000000` and the code already uses 5e6.
+- `tokenizer.ggml.mask_token_id = 75982`, which is the hard-coded default.
+- The block mask: llama.cpp's `block_uniform` makes every block position reuse
+  the first one's mask row, i.e. prefix plus anchor, which is what the four slots
+  already do. There is no cross-attention between mask slots to add.
+
 ### What is left for decode
 
-- The primary decode number is **0.11-0.25 accepted/round at 10K, not 1.8**.
-  Nothing about the arithmetic changes until that is understood: at 96 ms per
-  verification round even 2.5 accepted tokens per round only reaches 25 tok/s,
-  and the round would have to pay for a drafter that currently costs twice what
-  it saves.
-- The sharper probe than acceptance is the distribution itself: the draft's base
-  logit row at a position where the target's own row is known, correlated
-  against it. Acceptance is a 0/1 summary of a comparison that should be a
-  cosine.
+- **The 10K decode number is 6.3 tok/s and the drafter's attention is the entire
+  gap.** 305 ms per round against 104 ms short-context, and ~195 ms of it is one
+  fp32 O(context) pass over 64 (slot, head) units. Acceptance is fine (1.93
+  tokens/round); the thing that produces it is too expensive.
+- Cutting that attention to the target's own 30 ms would make the round 126 ms
+  and the rate 15.3 tok/s. The target is reached by doing both: drafter attention
+  to ~30 ms *and* 2.5 tokens/round, which is 20.8 tok/s at 120 ms.
+- The drafter's cache is 31.5 MB at 12K, so a window is nearly free in memory.
+  That is the one lever that changes the asymptotics instead of the constant.
 - Attention at 10K is 32.1 ms of the 89.5 ms token: 9 TMAC of it is QK/PV, and
   the loop stalls on 32-byte granular loads rather than hitting FMA issue.
   Running QK and PV as int8 `vmadot` GEMMs is the fix with precedent in this tree.

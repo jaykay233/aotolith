@@ -4390,6 +4390,7 @@ static float * g_dsx, * g_dsxa, * g_dsq, * g_dsk, * g_dsv, * g_dsgate, * g_dsup;
 static float * g_dslog, * g_dsbias, * g_dsfeat, * g_dsatt, * g_dsenc;
 static float * g_dssc;               // [thread][MAXCTX] scores
 static int g_ds = 0, g_ds_ready = 0, g_ds_hidrow = 0;
+static const bool g_dscos = getenv("MEGA_DSCOS") != nullptr;
 static const bool g_dsdbg2 = getenv("MEGA_DSDBG2") != nullptr;
 static int g_ds_pending = 0;         // slots of hidden state waiting to be injected
 static int64_t g_ds_pend_p0 = 0;
@@ -4704,11 +4705,19 @@ static void ds_inject4(int64_t p0, int64_t row0, int n) {
 
 // The target's residual stream at the five layers the encoder reads. Captured
 // inside the layer loops of both the prefill chunk and the four-row round.
-static int g_ds_l1 = -1;
+// The capture site sits after the layer body, so what it holds is layer L's output
+// -- the input to layer L+1. llama.cpp's t_layer_inp[il] is layer il's *input*, so
+// the metadata index has to be shifted by one to mean the same tensor. MEGA_DSSL
+// overrides the shift outright so the alternatives can be scored rather than argued.
+static int g_ds_lsh = -999;
 static inline int ds_target_slot(int L) {
-    if (g_ds_l1 < 0) g_ds_l1 = getenv("MEGA_DSL1") ? 1 : 0;
+    if (g_ds_lsh == -999) {
+        const char * e = getenv("MEGA_DSSL");
+        if (e) g_ds_lsh = atoi(e);
+        else g_ds_lsh = getenv("MEGA_DSL1") ? 1 : 0;
+    }
     for (int k = 0; k < DS_LAYER; ++k)
-        if (DS_TARGET_LAYER[k] - g_ds_l1 == L) return k;
+        if (DS_TARGET_LAYER[k] - g_ds_lsh == L) return k;
     return -1;
 }
 
@@ -4954,6 +4963,7 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
     if (K < 1) K = 1;
     if (K > DS_SLOT - 1) K = DS_SLOT - 1;
     int32_t * const dr = g_spec_dr;
+    double cos_sum = 0.0; int cos_n = 0, top1_hit = 0, top8_hit = 0;
     long long acc = 0, total = 0;
     double best = 1e9, tot = 0;
     int shown = 0;
@@ -4967,6 +4977,35 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
         for (int i = K + 1; i < DS_SLOT; ++i) tok[i] = dr[K - 1];
 
         if (!m4_round(p0, tok, g_m4out)) return false;
+
+        // Acceptance is a 0/1 summary of a comparison that is really a whole
+        // distribution. Row 0 of the round is the anchor, so its logit row is the
+        // target's answer to exactly the question the draft's slot 0 answered:
+        // what follows the anchor. Cosine between the two, and where the target's
+        // own argmax lands in the draft's ranking, says whether the draft is
+        // slightly wrong (a near miss the markov head could fix) or looking at a
+        // different context (which it cannot).
+        if (g_dscos) {
+            const float * a = g_dslog;               // draft slot 0
+            const float * b = g_logits4;             // target, anchor row
+            double ab = 0, aa = 0, bb = 0;
+            for (int v = 0; v < VOCAB; ++v) {
+                ab += (double) a[v] * b[v];
+                aa += (double) a[v] * a[v];
+                bb += (double) b[v] * b[v];
+            }
+            const double cs = (aa > 0 && bb > 0) ? ab / sqrt(aa * bb) : 0.0;
+            // rank of the target's argmax inside the draft's own ranking
+            const int want = g_m4out[0];
+            int rank = 0;
+            for (int v = 0; v < VOCAB; ++v) if (a[v] > a[want]) ++rank;
+            cos_sum += cs; cos_n += 1;
+            if (rank == 0) top1_hit += 1;
+            if (rank < 8) top8_hit += 1;
+            if (cos_n <= 12)
+                fprintf(stderr, "  [cos] p=%lld cos=%.4f  target argmax %d at draft rank %d\n",
+                        (long long) p0, cs, want, rank);
+        }
 
         int n = 0;
         while (n < K && g_m4out[n] == dr[n]) ++n;
@@ -4996,6 +5035,10 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
     printf("spec: best %.2f ms/round, mean %.2f ms/round -> %.2f tok/s "
            "(%.2f with no draft accepted)\n",
            best * 1e3, tot / rounds * 1e3, emit / tot, (double) rounds / tot);
+    if (cos_n)
+        printf("spec: draft vs target logits: mean cos %.4f, target argmax at draft rank 0 "
+               "in %d/%d rounds (%d/%d within 8)\n",
+               cos_sum / cos_n, top1_hit, cos_n, top8_hit, cos_n);
     printf("spec: inject %.2f s total\n", g_ds_t_inj);
     return true;
 }

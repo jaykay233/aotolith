@@ -680,8 +680,13 @@ wrote. There is no second binary and no replay path.
 The drafter is 3.4 s of a 79 s prefill (4%), which is acceptable. The per-round
 cost is not: 24-26 ms at 101 tokens, and **190-196 ms at 10K**, because its
 attention is fp32 and O(context). That is twice the 96 ms round it exists to feed,
-so at 10K speculation measures 4.3-5.6 tok/s against 10.4 without it. Short context
-is the other way round: 17.3 against 10.4.
+so at 10K speculation measures 6.3 tok/s against 10.4 without it.
+
+Short context is the other way round, and it clears the decode target by a wide
+margin: **32.1 tok/s** over 40 rounds, 0.783 accepted per round, 3.35 tokens per
+round. Anything under about 20 rounds measures the cold start instead -- acceptance
+triples from round 6 to round 40, so a 6-round run reports 17.3 and looks like the
+target is out of reach when it is already passed.
 
 Drafts do not affect correctness: a token is only emitted after the target
 reproduces it, and the token that breaks the match is the target's own answer.

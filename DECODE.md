@@ -457,28 +457,38 @@ prefill wrote. One binary, no replay scaffolding.
     drafter alone   per round     190-196 ms at 10K, 24-26 ms at 101 tokens
     round           4 rows        96 ms (unchanged; the drafter runs before it)
 
-| context | accepted/round | ms/round | tok/s |
-|---|---|---|---|
-| 101 tokens, no drafter | - | 96 | 10.4 |
-| 101 tokens, 3 drafts | 0.278 | 106 | **17.3** |
-| 10K, no drafter | - | 96 | **10.4** |
-| 10K, 3 drafts | 0.111 | 310 | 4.3 |
-| 10K, 8 rounds | 0.250 | 299 | 5.6 |
+| context | rounds | accepted/round | tokens/round | ms/round | tok/s |
+|---|---|---|---|---|---|
+| 101 tokens, no drafter | - | - | 1.00 | 96 | 10.4 |
+| 101 tokens, 3 drafts | 6 | 0.278 | 1.28 | 106 | 17.3 |
+| 101 tokens, 3 drafts | 40 | 0.783 | 3.35 | 104 | **32.1** |
+| 10K, no drafter | - | - | 1.00 | 96 | **10.4** |
+| 10K, 3 drafts | 40 | 0.308 | 1.93 | 305 | 6.3 |
 
-Speculation is 1.7x at a hundred tokens and 0.4x at ten thousand. Two causes, both
-measured: the drafter's own attention is fp32 and O(context) over 64 (slot, head)
-units, so it costs twice what the round it feeds costs; and acceptance falls from
-0.278 to 0.11-0.25 per round.
+**The 6-round rows are cold-start artifacts and must not be compared.** Acceptance
+roughly triples between round 6 and round 40, because the draft's cache starts with
+prefill positions only and its own committed tokens accumulate as the run goes. The
+short-context decode target of 20 tok/s is cleared by 32.1; the 10K target is not,
+and the reason is a single slice.
 
-That second number is the one to chase. The four-row round is 96 ms and near its
-bandwidth floor, so at 1.83 accepted tokens it would be 19.1 tok/s and at 2.0 it
-would be 20.8 -- the round is not the problem. The 1.83 came from short context and
-does not hold at 10K.
+At 10K the round is 305 ms against 104 ms short-context, and ~195 ms of that
+difference is the drafter's attention: fp32, O(context), 64 (slot, head) units. It
+is the same shape that costs the target 30 ms for four rows, and the drafter runs it
+without int8, without the four-row sharing, and on one cluster. Acceptance is not the
+problem -- 1.93 tokens per round is 1.93x -- so every remaining millisecond of the
+gap is in that attention.
 
-The sharp probe is not acceptance, which is a 0/1 summary: it is the draft's base
-logit row correlated against the target's own row at the same position. `MEGA_DSDBG`
-prints the draft's top three base logits and the target's top two, and
-`MEGA_DSZERO` zeroes the encoder features -- that control only halves acceptance
-(0.250 -> 0.125), which says the committed prefix is reaching the draft weakly and
-the drafts are mostly the anchor token. `FINDINGS.md` section 2 has the full variant
-table and the four port bugs.
+    drafter attention  195 -> 30 ms gives 126 ms/round and 15.3 tok/s
+    195 -> 30 ms and 2.5 tokens/round gives 20.8 tok/s at 120 ms
+
+The sharper probe than acceptance is the draft's base logit row against the target's
+own row for the same question. `MEGA_DSCOS` prints mean cosine and where the target's
+argmax lands in the draft's ranking: 0.179 / rank-0 in 11 of 40 rounds at 101 tokens,
+0.353 / 21 of 40 at 10K. The 10K cosine is higher *and* the acceptance lower, which is
+consistent -- long context flattens both distributions and also makes the target
+harder to match token for token -- so "the draft is reading the wrong context" is not
+the diagnosis. 36 of 40 rounds put the right token in the draft's top eight.
+`MEGA_DSZERO` (encoder features zeroed) still halves acceptance, and `MEGA_DSNOBIAS`
+drops 10K acceptance to 0.133, so both the injected prefix and the markov chain are
+load-bearing. `FINDINGS.md` section 2 has the variant table, the layer-shift sweep and
+the four port bugs.
