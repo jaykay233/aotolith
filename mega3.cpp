@@ -4219,7 +4219,9 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         g_pq = g_q4;
         g_pfa_ctx = p0;
         g_pfa_rows = 4;
+        double _pq = now_s();
         pfa_pack_q(4);
+        if (M4TIME) { g_m4t[7] += now_s() - _pq; }
         // pfa_sm_i8 and pfa_pv_i8 dequantise with the globals g_k8isc/g_v8isc,
         // which prefill only keeps valid for the layer it just converted. Decode
         // appends to every layer's plane up front, so this round has to restore
