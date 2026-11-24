@@ -199,25 +199,42 @@ non-int8 path.
 `pfa_pv_i8`, i.e. the same `qk4` dots) after prefill, when the int8 K/V caches
 already cover the whole prompt. That is exactly a multi-row verification round,
 so it answers whether speculation can pay at 10K. 42 layers, `-X -K`, 64-row
-tile (the kernel's granularity, `I8_ROWS = I8_G * PFA_ROWS = 16 * 4`):
+tile (the prefill granularity, `I8_ROWS = I8_G * PFA_ROWS = 16 * 4`):
 
-| rows | ctx | attention | GMAC/s |
+| rows | ctx | attention | stage split (core-s) qk / sm / pv |
 |---|---|---|---|
-| 64 | 1024 | 38.6 ms | 7.0 |
-| 64 | 5120 | 161.6 ms | 8.3 |
-| 64 | 9995 | 312.1 ms | 8.4 |
-| 128 | 9995 | 642.5 ms | 8.2 |
-| 64 | 9995, single cluster (`-J`) | 332.7 ms | 7.9 |
+| 64 | 1024 | 38.6 ms | - |
+| 64 | 5120 | 161.6 ms | - |
+| 64 | 9995 | 312.1 ms | 1.2 / 1.7 / 0.6 |
+| 128 | 9995 | 642.5 ms | - |
+| 64 | 9995, single cluster (`-J`) | 332.7 ms | 1.2 / 1.7 / 0.6 |
 
-Two things follow. The cross-cluster softmax pipeline is worth only 6% (312 vs
-333), so the A-cluster dots really are the cost. And doubling the rows doubles
-the time with the rate flat: **the K plane is re-read once per four-row group, so
-there is no amortisation across rows at all.** Each of the 16 row-groups in a
-64-row tile walks the same 1.28 MB K plane.
+Doubling the rows doubles the time with the aggregate rate flat, and the stage
+split says why: **softmax is the largest of the three** (1.7 of 3.5 core-s, 49%),
+QK is 34% and PV 17%, and all three scale with the group count. The K stream is
+not the limit at this size -- a 64-row tile does 16x the arithmetic of a four-row
+one against the same reads.
 
-`probe_qkload.cpp` is the check that the dots themselves are fine. Same
-operands, same eight `vmadot`, same 8 KiB of K per call, only the K load changes,
-everything L1-resident:
+That is the whole argument for a four-row tile: at four rows the bytes stay at
+215 MB of int8 K+V (the DRAM floor is ~11 ms) while the arithmetic drops 16x.
+Measured with `MEGA_ATTN4_ROWS=4`, which drives `task_pfa_i8_4` (one group, head
+per thread) and sets `g_i8g = 1`:
+
+| four rows, 9995 positions, 42 layers | attention | exp cost |
+|---|---|---|
+| 6-term polynomial (default) | 60.08 ms | - |
+| `-e 1`, three-instruction exp | **42.76 ms** | 6.15% max relative error |
+| `-e 2`, table-corrected exp | 105.30 ms | the `vrgather` is trap-emulated |
+
+So the projection below was right in magnitude: a four-row round is 42.8 ms of
+attention, not 312. The round is `54.5 (weights) + 42.8 (attention) + 4.4 (tail)
+= 102 ms`, which needs 2.03 accepted tokens to reach 20 tok/s; the short-context
+measurement was 1.83 with three drafts, so this lands at 18-19 tok/s and the
+remaining gap is acceptance plus the softmax stage, not the dots.
+
+`probe_qkload.cpp` is the check that the dots are not the problem. Same operands,
+same eight `vmadot`, same 8 KiB of K per call, only the K load changes, all
+L1-resident:
 
 | K load | ns/call | GMAC/s |
 |---|---|---|
@@ -225,20 +242,10 @@ everything L1-resident:
 | `vl8re32.v` (what `qk4` does) | 238.1 | 137.6 |
 | 8x `vle32.v` | 242.7 | 135.0 |
 
-So `vl8re32.v` is not trap-emulated (the strided-gather trap does not extend to
-whole-register loads), and the dot loop reaches 137.6 GMAC/s per core when K is
-hot. Production gets 8.3 GMAC/s aggregate, ~1.0 per core: the gap is entirely
-the K stream, not the arithmetic.
-
-The consequence for speculation is arithmetic, not a guess. `qk4`'s A record is
-four rows, so its ratio is fixed at 4 MAC per K byte; that puts the
-single-row-group round at the DRAM floor for 220 MB of int8 K+V, i.e. ~13 ms.
-A four-row round therefore costs `54.5 (weights) + ~15 (attention) + 5 (tail) ≈
-75 ms`, and at the measured 2.26 accepted tokens per round that is **28-30
-tok/s**. The 312 ms number above is not the four-row cost: it is the cost of
-padding four rows up to the kernel's 64-row tile with the K plane read sixteen
-times. The concrete step is a four-row decode tile (`I8_G = 1`) that walks the
-K block once, then dspark on top of it.
+`vl8re32.v` is not trap-emulated (the strided-gather trap does not extend to
+whole-register loads), and the dot loop reaches 137.6 GMAC/s per core with K hot.
+In production QK runs at 45 GMAC/s per core, i.e. the GEMM rate, so QK is already
+at the machine's dot speed and the headroom is in softmax.
 
 ---
 
@@ -476,7 +483,7 @@ above, it is no longer worth cracking.
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 139.4 (73.4 s) | 51.2 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. |
-| decode 20 tok/s @10K | 11.18 (Q4_0) | 50 ms | dspark at 3 drafts, but the round only pays after attention stops re-reading K per four-row group. Measured: a 64-row int8 vmadot round at 10K is 312 ms (8.4 GMAC/s) because the K plane is walked sixteen times; the qk4 dots themselves reach 137.6 GMAC/s per core with K hot (`probe_qkload.cpp`). Step one is a four-row tile (`I8_G = 1`) that walks each K block once, which puts a round at 54.5 + ~15 + 5 ms and 2.26 accepted tokens at **28-30 tok/s**. Byte arithmetic still says 20 is out of reach by weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
+| decode 20 tok/s @10K | 11.18 (Q4_0) | 50 ms | A four-row round is now measured at 102 ms: 54.5 GEMM (DRAM floor) + 42.8 attention (`MEGA_ATTN4_ROWS=4`, `-e 1`) + 4.4 tail. That needs 2.03 accepted tokens; short context gives 1.83 with three drafts, so it lands at 18-19 and the remaining gap is acceptance and the softmax stage (which is 49% of attention, not the dots). Next: m=4 in mega3's decode GEMM plus the dspark drafter, then cut softmax with the cross-cluster split at four rows. Byte arithmetic still rules out weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
 | output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`) | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not

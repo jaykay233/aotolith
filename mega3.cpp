@@ -2442,6 +2442,12 @@ static const int PFA_ROWS = 4;
 // left QK bandwidth starved at ~0.4 GB/s of useful traffic.
 static const int I8_G = 16;
 static const int I8_ROWS = I8_G * PFA_ROWS;
+// Number of four-row groups a tile actually computes. Prefill batches sixteen of
+// them so a 64-row chunk walks each K block once; a decode step has four rows and
+// wants one, because every stage -- QK, softmax, PV -- scales with the group count
+// and a single-row tile is read-limited anyway (220 MB of int8 K+V is the floor).
+// Buffers and strides stay sized for I8_G groups and only the loop bound moves.
+static int g_i8g = I8_G;
 static const int WBLK = (MAXCTX / 16) * 64;    // int8 attention weights per row group
 static int64_t g_pfa_rows, g_pfa_ctx;
 static float * g_pq;                        // [rows][N_HEAD][HEAD_DIM]
@@ -3221,7 +3227,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
 
 static void pfa_head_i8(int layer, int h, int64_t qbase) {
     const int kv = h / NH_PER_KV;
-    const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
+    const int nn = (int) (g_pfa_ctx + qbase + PFA_ROWS * g_i8g);
     const int npb = (nn + 63) / 64;
     int16_t * sc = g_psa16 + (size_t) g_pfa_tid * SC_TSTRIDE;
     alignas(64) static __thread int8_t w8[I8_G * WBLK + 256];
@@ -3249,7 +3255,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
         const int8_t * vb = g_v8i + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
-        for (int gg = 0; gg < I8_G; ++gg) {
+        for (int gg = 0; gg < g_i8g; ++gg) {
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) praw[j];
             pv4(op, w8 + gg * WBLK, vb, (int) (g_pfa_ctx + qbase + gg * 4 + 4 + 15) / 16, 1024);
@@ -3312,6 +3318,17 @@ static void task_pfa_i8(int tid) {
             pfa_head_i8(g_pfa_layer, h, qb);
 }
 
+// Decode: one four-row group per head, every position in the cache. Head-major
+// over the eight A cores, two heads each. The tile is four rows rather than
+// I8_ROWS because at this size the cost is the KV stream, not the dots: QK,
+// softmax and PV all scale with the group count while the bytes do not, so
+// sixteen groups would do sixteen times the arithmetic for the same reads.
+static void task_pfa_i8_4(int tid) {
+    g_pfa_tid = tid;
+    for (int h = tid; h < N_HEAD; h += g_participants)
+        pfa_head_i8(g_pfa_layer, h, 0);
+}
+
 // ------------------------------------------ cross-cluster softmax pipeline
 // QK and PV need `vmadot`, which only the A100 cluster implements (VLEN=1024,
 // 512 MAC per instruction). The softmax between them is plain RVV: at 10K it
@@ -3368,7 +3385,7 @@ static int g_pipe_layer = 0;
 // single-cluster one, so the body is shared.
 static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
     const int kv = h / NH_PER_KV;
-    const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
+    const int nn = (int) (g_pfa_ctx + qbase + PFA_ROWS * g_i8g);
     const int npb = (nn + 63) / 64;
     const int8_t * q8g = g_q8i + ((h * g_q8i_nqg) + qbase / 4) * 8 * 64;
     alignas(64) static __thread int32_t raw[8][32];
@@ -3377,7 +3394,7 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
     for (int pb = 0; pb < npb; ++pb) {
         const int8_t * kb = g_k8i + ((kv * g_k8i_npb + pb) * 8) * 1024;
         int16_t * blk = sc + (size_t) (pb * 8) * 32;
-        for (int gg = 0; gg < I8_G; ++gg) {
+        for (int gg = 0; gg < g_i8g; ++gg) {
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
             qk4(op, q8g + gg * 512, kb, HEAD_DIM / 16);
@@ -3409,7 +3426,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
     const size_t vlz = __riscv_vsetvl_e16m2(32);
     const size_t vl4 = __riscv_vsetvl_e32m4(32);
 
-    for (int gg = 0; gg < I8_G; ++gg) {
+    for (int gg = 0; gg < g_i8g; ++gg) {
         const int16_t * base = sc + (size_t) gg * SC_GSTRIDE;
         int8_t * wb = w8 + (size_t) gg * WBLK;
         const int nbv = (L + gg * 4 + 1) / 8;    // blocks all four rows of the group own
@@ -3545,7 +3562,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
 static void pfa_pv_i8(int layer, int h, int64_t qbase,
                       const int8_t * w8, const float * wsc) {
     const int kv = h / NH_PER_KV;
-    const int nn = (int) (g_pfa_ctx + qbase + I8_ROWS);
+    const int nn = (int) (g_pfa_ctx + qbase + PFA_ROWS * g_i8g);
     const int L = (int) (g_pfa_ctx + qbase);
     // Row group gg never looks past position L+4gg+3, so its dots stop at the
     // 16-position block holding that position. The weights past that point are
@@ -3554,7 +3571,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
     alignas(64) static __thread int32_t praw[8][32];
     alignas(64) static __thread int32_t pacc[I8_G][8][32];
     int nqg[I8_G];
-    for (int gg = 0; gg < I8_G; ++gg) nqg[gg] = (L + gg * 4 + 4 + 15) / 16;
+    for (int gg = 0; gg < g_i8g; ++gg) nqg[gg] = (L + gg * 4 + 4 + 15) / 16;
 
     for (int half = 0; half < 2; ++half) {
         // Each kv head owns two 64-dim halves, i.e. 2 * npb16 blocks of 1024 B.
@@ -3567,7 +3584,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
         if (g_hoist) {
             // Per-group walk of V, kept for A/B: reads V's range sixteen times per
             // tile, which is what made PV DRAM bound (131 core-s against 54 here).
-            for (int gg = 0; gg < I8_G; ++gg) {
+            for (int gg = 0; gg < g_i8g; ++gg) {
                 int8_t * op[8];
                 for (int j = 0; j < 8; ++j) op[j] = (int8_t *) praw[j];
                 pv4_hoist(op, w8 + gg * WBLK + g_w8off, vb, nqg[gg]);
@@ -3577,7 +3594,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
             // one fetch of a V block, so V is read once per tile instead of once per
             // group, and the accumulators are the only thing that grows: sixteen
             // sets of eight 32-lane registers, spilled to L1 between blocks.
-            for (int gg = 0; gg < I8_G; ++gg)
+            for (int gg = 0; gg < g_i8g; ++gg)
                 for (int j = 0; j < 8; ++j) memset(pacc[gg][j], 0, 32 * 4);
             uint8_t * tcm = g_tcmstage ? g_tcm[g_pfa_tid] : nullptr;
             if (tcm && g_tcm_size >= 64 * 1024) {
@@ -3587,7 +3604,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
                     const int64_t left = nqmax - p0;
                     const int n = (int) (left < stage ? left : stage);
                     memcpy(tcm, vb + p0 * 1024, (size_t) n * 1024);
-                    for (int gg = 0; gg < I8_G; ++gg) {
+                    for (int gg = 0; gg < g_i8g; ++gg) {
                         const int ns = nqg[gg] - (int) p0;
                         if (ns <= 0) continue;
                         int32_t * op[8];
@@ -3598,7 +3615,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
                 }
             } else {
                 const int nqmax = (nn + 15) / 16;
-                for (int gg = 0; gg < I8_G; ++gg) {
+                for (int gg = 0; gg < g_i8g; ++gg) {
                     if (nqg[gg] <= 0) continue;
                     int32_t * op[8];
                     for (int j = 0; j < 8; ++j) op[j] = pacc[gg][j];
@@ -3610,7 +3627,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
 
         if (!g_pfa_out) continue;
         const size_t vl8 = __riscv_vsetvl_e32m1(8);
-        for (int gg = 0; gg < I8_G; ++gg)
+        for (int gg = 0; gg < g_i8g; ++gg)
             for (int r = 0; r < 4; ++r) {
                 const int rr = gg * 4 + r;
                 const float s_r = wsc[rr] * g_v8isc[kv];
@@ -3692,7 +3709,9 @@ static void task_pfa_pipe_B(int tid) {
         while (r.st.load(std::memory_order_acquire) < 1) sched_yield();
         TileSlot & sl = g_tslot[r.slot];
         const int64_t qb = tile_qb(t);
+        const double _sm = now_s();
         pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
+        g_pfa_sm[tid] += now_s() - _sm;
         r.st.store(2, std::memory_order_release);
     }
     g_pfa_smb[tid] += now_s() - _s;
@@ -3791,11 +3810,14 @@ static void pfa_run(int L) {
 // other half costs when the four rows share it.
 static void attn4_run(int rounds, int64_t ctx, int64_t rows);
 static void attn4_bench(int rounds, int64_t ctxmax) {
-    // I8_ROWS = I8_G * PFA_ROWS is the kernel's row tile, so fewer rows than that
-    // round down to zero tiles and measure nothing. Default to the tile height and
-    // divide the result by the number of four-row groups it actually did.
+    // I8_ROWS = I8_G * PFA_ROWS is the prefill row tile; four rows is the decode
+    // tile, which the head-major loop drives one group at a time. Anything between
+    // the two is not a shape the kernel has.
     int64_t rows = getenv("MEGA_ATTN4_ROWS") ? atoll(getenv("MEGA_ATTN4_ROWS")) : I8_ROWS;
-    if (rows < I8_ROWS || rows % I8_ROWS) rows = I8_ROWS;
+    if (rows != PFA_ROWS) {
+        rows = rows < I8_ROWS ? I8_ROWS : rows;
+        if (rows % I8_ROWS) rows = I8_ROWS;
+    }
     for (int64_t i = 0; i < rows * N_HEAD * HEAD_DIM; ++i)
         g_pq[i] = 0.01f * (float) ((i * 37) % 101) - 0.5f;
     // Same caches, several context lengths: if the cost is not linear in the
@@ -3814,23 +3836,36 @@ static void attn4_bench(int rounds, int64_t ctxmax) {
 
 static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
     if (ctx < 128) { printf("attn4: context %lld too short\n", (long long) ctx); return; }
+    const bool four = rows == PFA_ROWS;
+    g_i8g = four ? 1 : I8_G;
     double best = 1e9;
     for (int r = 0; r < rounds; ++r) {
+        for (int t = 0; t < N_GPU; ++t) g_pfa_qk[t] = g_pfa_sm[t] = g_pfa_pv[t] = 0;
         const double t0 = now_s();
         for (int L = 0; L < N_LAYER; ++L) {
             g_pfa_ctx = ctx;
             g_pfa_rows = rows;
             pfa_pack_q(rows);
-            pfa_run(L);
+            if (four) { g_pfa_layer = L; run(task_pfa_i8_4); }
+            else pfa_run(L);
         }
         const double dt = now_s() - t0;
         if (dt < best) best = dt;
-        printf("attn4: round %d %.2f ms (%.2f ms/layer, ctx %lld, %s)\n", r, dt * 1e3,
-               dt * 1e3 / N_LAYER, (long long) ctx, g_pipe ? "qk/pv A100 + softmax X100" : "single cluster");
+        double tq = 0, ts = 0, tv = 0;
+        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[t]; ts += g_pfa_sm[t]; tv += g_pfa_pv[t]; }
+        // The four-row round's total MAC count is rows*heads*dim*ctx*2 over all
+        // layers; dividing by the wall time gives aggregate GMAC/s, so it must
+        // carry the layer count or it reads 42x low.
+        const double mac = 2.0 * (double) rows * N_HEAD * HEAD_DIM * (double) ctx * N_LAYER;
+        printf("attn4: round %d %.2f ms (%.2f ms/layer, ctx %lld, %s)\n"
+               "       work qk %.1f  sm %.1f  pv %.1f (core-s)  -> %.1f GMAC/s aggregate\n",
+               r, dt * 1e3, dt * 1e3 / N_LAYER, (long long) ctx,
+               g_pipe ? "qk/pv A100 + softmax X100" : "single cluster",
+               tq, ts, tv, mac / dt / 1e9);
     }
-    printf("attn4: best %.2f ms for %d layers, %lld rows x %lld pos (%.3f ms/layer, %.1f GMAC/s)\n",
-           best * 1e3, N_LAYER, (long long) rows, (long long) ctx, best * 1e3 / N_LAYER,
-           2.0 * (double) rows * N_HEAD * HEAD_DIM * (double) ctx / best / 1e9);
+    printf("attn4: best %.2f ms for %d layers, %lld rows x %lld pos (%.3f ms/layer)\n",
+           best * 1e3, N_LAYER, (long long) rows, (long long) ctx, best * 1e3 / N_LAYER);
+    g_i8g = I8_G;
 }
 
 static void pfa_head(int layer, int h, int64_t qbase) {

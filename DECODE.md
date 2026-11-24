@@ -303,9 +303,13 @@ row per weight pass by any amount of kernel work**, which is why the speculator
 is not optional.
 
 Attention is 30.78 ms for 220 MB, i.e. 7.1 GB/s, so it is nowhere near its own
-byte floor. Section 3 of `FINDINGS.md` has the measurement that says why: the
-int8 `vmadot` path re-reads the whole K plane once per four-row group, so rows do
-not share the stream and a 64-row tile costs 312 ms at 10K. The dots are fine
-(137.6 GMAC/s per core with K hot, `probe_qkload.cpp`); the stream is the
-problem. A four-row tile that walks each K block once is the change that makes
-the speculator pay.
+byte floor. Section 3 of `FINDINGS.md` has the measurement: the four-row int8
+`vmadot` tile (`MEGA_ATTN4_ROWS=4`) costs 42.76 ms at 10K with the three-
+instruction exp, and its stage split is qk 0.1 / sm 0.1 / pv 0.1 core-s, i.e.
+softmax-led rather than dot-led. So a four-row speculator round is
+
+    54.5 (weights, unchanged: m4 reuses each B column tile) + 42.8 + 4.4 = 102 ms
+
+which clears 20 tok/s at 2.03 accepted tokens per round. Short context measured
+1.83 with three drafts, so the chain lands at 18-19 and the next two levers are
+acceptance and taking the softmax off the critical path.
