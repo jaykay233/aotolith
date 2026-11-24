@@ -360,3 +360,24 @@ Three bugs had to go, and each one is a trap worth naming:
 Budget against the measurement: 50.6 of GEMM + 29.3 of attention leaves ~19 ms of
 tail in a 99 ms round, against the ~6 ms the budget assumed for four rows of
 norm, silu, quantise, rope and the KV append. That tail is the next target.
+
+**Where the remaining 20 ms lives (measured, `MEGA_M4TIME`).** The four-row tail
+is 6.4 ms — norm 2.17, silu 1.00, rope plus the KV append 2.50, activation
+quantisation 0.77 — so it matches the 6 ms the budget allowed and is not the
+problem. The round's two big slices are 59.9 ms of GEMM and 34.7 ms of attention,
+and both run slower inside the round than in their isolated benchmarks (50.6 and
+29.3). GEMM is at 24 GB/s against the 25 GB/s stream ceiling, so its gap is
+context, not kernel.
+
+Attention's gap is worth more. A four-row round walks each layer's int8 K and V
+planes: 2.56 MB of K and 2.56 MB of V at 10K. Eight GQA heads share one kv head,
+and today each of them reads that plane separately, so the round moves 8x the
+bytes it needs — 1721 MB instead of 215 MB, i.e. 68.8 ms against 8.6 ms at the
+measured 25 GB/s. The measured 34.7 ms means the A cluster's cache absorbs about
+half the repeats. Holding four rows by eight heads of Q at once is 4 KB — four
+rows times eight heads times 128 int8 dims — so one pass over a K block can feed
+eight accumulators.
+
+The ceiling that implies: 51.6 ms of weights + 8.6 ms of KV + 6.4 ms of tail is
+66.6 ms per round, which at the 1.83 accepted tokens three drafts measured at
+short context is 27.5 tok/s, with no further loss of precision.
