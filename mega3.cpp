@@ -1931,6 +1931,71 @@ static void attn_pv(int tid) {
     g_aw[2] += now_s() - _w;
 }
 
+// PV, one pass over V per kv head, vectorised over the head dimension at m4.
+//
+// The m1 version above walks the position range once per (kv, half) pair, so it
+// touches four passes over the same KV plane and each pass reads a 128-byte
+// quarter of every 512-byte position stride. It measures 23.9 ms at 10K for
+// 215 MB of V, i.e. 9.0 GB/s, against 17.7 GB/s for a plain sequential stream.
+// Eight m4 accumulators hold all 128 dims of a kv head, so one 128-byte load and
+// eight FMAs per position cover what the old loop needed four passes to do.
+//
+// Measured: it is 2.4x slower (4K pv 9.84 -> 23.29 ms). Wide-LMUL FMA on this
+// core costs far more per MAC than m1 -- the same effect that made m2 the wrong
+// choice above, an order of magnitude worse at m4 -- so the 4-pass m1 loop stays
+// despite its stride. Kept behind -P4 as the record of that.
+static int g_pvm4 = 0;
+
+static inline vfloat32m4_t ld_i8_f32_m4(const int8_t * p, size_t vl) {
+    const vint8m1_t b = __riscv_vle8_v_i8m1(p, vl);
+    return __riscv_vfcvt_f_x_v_f32m4(
+        __riscv_vwcvt_x_x_v_i32m4(__riscv_vwcvt_x_x_v_i16m2(b, vl), vl), vl);
+}
+static inline vfloat32m4_t ld_f16_f32_m4(const _Float16 * p, size_t vl) {
+    return __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(p, vl), vl);
+}
+
+static void attn_pv_m4(int tid) {
+    const int p0 = g_p0[tid], p1 = g_p1[tid];
+    if (p0 >= p1) return;
+    const double _w = now_s();
+    const int len = p1 - p0;
+    const float * sa = &g_sa[tid][0][0];
+    const _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE;
+    const int8_t * vb8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE;
+    const size_t vl = __riscv_vsetvl_e32m4(HEAD_DIM);
+    for (int kv = 0; kv < N_KV; ++kv) {
+        vfloat32m4_t a0 = __riscv_vfmv_v_f_f32m4(0.0f, vl), a1 = a0, a2 = a0, a3 = a0;
+        vfloat32m4_t a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        const _Float16 * base = vb + (int64_t) kv * HEAD_DIM;
+        const int8_t * base8 = vb8 + (int64_t) kv * HEAD_DIM;
+        const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
+        for (int p = 0; p < len; ++p) {
+            const int64_t off = (int64_t) (p0 + p) * N_KV * HEAD_DIM;
+            const vfloat32m4_t v = g_k8dec ? ld_i8_f32_m4(base8 + off, vl)
+                                           : ld_f16_f32_m4(base + off, vl);
+            a0 = __riscv_vfmacc_vf_f32m4(a0, wk[0 * SMAX + p], v, vl);
+            a1 = __riscv_vfmacc_vf_f32m4(a1, wk[1 * SMAX + p], v, vl);
+            a2 = __riscv_vfmacc_vf_f32m4(a2, wk[2 * SMAX + p], v, vl);
+            a3 = __riscv_vfmacc_vf_f32m4(a3, wk[3 * SMAX + p], v, vl);
+            a4 = __riscv_vfmacc_vf_f32m4(a4, wk[4 * SMAX + p], v, vl);
+            a5 = __riscv_vfmacc_vf_f32m4(a5, wk[5 * SMAX + p], v, vl);
+            a6 = __riscv_vfmacc_vf_f32m4(a6, wk[6 * SMAX + p], v, vl);
+            a7 = __riscv_vfmacc_vf_f32m4(a7, wk[7 * SMAX + p], v, vl);
+        }
+        float * gp = g_acc[tid][kv * NH_PER_KV];
+        __riscv_vse32_v_f32m4(gp + 0 * HEAD_DIM, a0, vl);
+        __riscv_vse32_v_f32m4(gp + 1 * HEAD_DIM, a1, vl);
+        __riscv_vse32_v_f32m4(gp + 2 * HEAD_DIM, a2, vl);
+        __riscv_vse32_v_f32m4(gp + 3 * HEAD_DIM, a3, vl);
+        __riscv_vse32_v_f32m4(gp + 4 * HEAD_DIM, a4, vl);
+        __riscv_vse32_v_f32m4(gp + 5 * HEAD_DIM, a5, vl);
+        __riscv_vse32_v_f32m4(gp + 6 * HEAD_DIM, a6, vl);
+        __riscv_vse32_v_f32m4(gp + 7 * HEAD_DIM, a7, vl);
+    }
+    g_aw[2] += now_s() - _w;
+}
+
 // ---- rope. Two changes make this cheap:
 //  * cos/sin come from a table built once for all positions, so no libm in the loop.
 //  * q_proj/k_proj rows are repacked in rotation-pair order (even dims, then odd),
@@ -2035,7 +2100,7 @@ static void attention(void) {
     g_at[1] += now_s() - _a; _a = now_s();
     run(attn_exp_sum);
     g_at[3] += now_s() - _a; _a = now_s();
-    run(attn_pv);
+    run(g_pvm4 ? attn_pv_m4 : attn_pv);
     g_at[4] += now_s() - _a; _a = now_s();
     run(attn_combine);
     g_at[5] += now_s() - _a;
@@ -4591,6 +4656,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-q2")) g_bit2 = 1;
         else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
         else if (!strcmp(argv[i], "-K8")) g_k8dec = 1;
+        else if (!strcmp(argv[i], "-P4")) g_pvm4 = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-N") && i + 1 < argc) g_pf_nb = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) g_participants = atoi(argv[++i]);
@@ -4920,8 +4986,8 @@ int main(int argc, char ** argv) {
     // Say which optional paths are live. A flag that silently fails to parse
     // (one `-X` used to swallow the argument after it) turns a whole A/B into
     // two runs of the same code, and the identical timings look like a result.
-    printf("decode path: int8kv %d  bit3 %d  bit2 %d  hpdec %d  vendor %d  win %d\n",
-           g_k8dec, g_bit3, g_bit2, g_hpdec, g_pf_vendor, g_win);
+    printf("decode path: int8kv %d  bit3 %d  bit2 %d  hpdec %d  vendor %d  win %d  pv %s\n",
+           g_k8dec, g_bit3, g_bit2, g_hpdec, g_pf_vendor, g_win, g_pvm4 ? "m4" : "m1");
     if (g_win) printf("attention window: last %d positions\n", g_win);
     printf("decode: %d tokens from %d\n", ngen, prompt);
     if (pos0 + ngen > MAXCTX) {

@@ -621,3 +621,37 @@ neither at the memory ceiling nor at the FMA issue ceiling; it is stalling on th
 already uses: run QK and PV as int8 `vmadot` GEMMs (scores are a 16x32 by 128
 GEMM, the output is a 16x128 by 32 GEMM), which is 512 products per instruction
 instead of 32.
+
+### Why PV is the slow half, and it is not the arithmetic
+
+`bwprobe.cpp` with `MEGA_STRIDE=n`, which reads one 128-byte block out of every
+n*128 and reports only the bytes it used, 2 GB buffer, 8 threads:
+
+| pattern | useful GB/s |
+|---|---|
+| contiguous | 17.3 |
+| 1 of every 2 blocks | 10.8 |
+| 1 of every 4 blocks | 9.0 |
+| 1 of every 8 blocks | 7.8 |
+
+PV measures 23.9 ms for 215 MB of f16 V at 10K, which is **9.0 GB/s** — the
+stride-4 number to the digit. The reason is structural: PV's inner loop is over
+positions with the head dimension fixed, so for a given (kv, half) it reads the
+128-byte quarter of every 512-byte position stride, and it makes four such passes
+to cover both kv heads and both halves. The accumulators force it: 16 f32m1
+registers is the most that fits alongside the V loads and the scale broadcast, so
+two dimension chunks is the widest a pass can go, which leaves the four-way
+split.
+
+The obvious fix, one pass per kv at m4, was written and measured: **2.4x slower**
+(4K PV 9.84 -> 23.29 ms). Wide-LMUL FMA on these cores is far more expensive per
+MAC than m1, the same property that had already ruled out m2. So the four-pass m1
+loop wins on this core and the stride has to be fixed in the data layout instead:
+store V as four contiguous planes `[kv][half][pos][32]` so each pass streams
+instead of striding. That is a writer-side change in the conv and in the decode
+append, with every existing reader either migrated or left on a second plane.
+
+QK, for contrast, is already at 15.4 GB/s because its K plane is stored blocked
+`[kv][pos_blk][dim][32]` and each block is 8 KB of contiguous memory. That is the
+layout PV needs, and the difference between the two is most of the attention
+split: qk 14.0 ms against pv 23.9 ms for the same number of bytes.

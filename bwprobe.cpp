@@ -45,10 +45,18 @@ static void * worker(void * arg) {
     const int64_t lo = per * id;
     const int64_t hi = (id == g_nt - 1) ? g_bytes : per * (id + 1);
     vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, 32);
+    // MEGA_STRIDE=N reads N*32 bytes out of every N*128 bytes: the decode PV loop
+    // walks V as 128 useful bytes of each 512-byte position, so this isolates
+    // whether the stride, rather than the byte count, is what costs bandwidth.
+    const int st = getenv("MEGA_STRIDE") ? atoi(getenv("MEGA_STRIDE")) : 0;
     const double t0 = now_s();
     for (int rep = 0; rep < 3; ++rep)
         for (int64_t i = lo; i < hi; i += 4096)
             for (int j = 0; j < 4096; j += 128) {
+                if (st) {
+                    const int q = j / 128;
+                    if ((q & (st - 1)) != 0) continue;
+                }
                 const size_t vl = __riscv_vsetvl_e32m4((size_t) 32);
                 acc = __riscv_vfadd_vv_f32m4(acc,
                     __riscv_vle32_v_f32m4((const float *) (g_buf + i + j), vl), vl);
@@ -87,7 +95,8 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < g_nt; ++i) pthread_create(&th[i], nullptr, worker, (void *) (intptr_t) i);
     for (int i = 0; i < g_nt; ++i) pthread_join(th[i], nullptr);
     const double dt = now_s() - t0;
-    printf("  nt=%-2d  %d MB in %.3f s  ->  %.1f GB/s (aggregate, 3 passes)\n",
-           g_nt, mb, dt, (double) g_bytes * 3 / dt / 1e9);
+    const int st = getenv("MEGA_STRIDE") ? atoi(getenv("MEGA_STRIDE")) : 1;
+    printf("  nt=%-2d stride %d  %d MB in %.3f s  ->  %.1f GB/s used (aggregate, 3 passes)\n",
+           g_nt, st, mb, dt, (double) g_bytes * 3 / st / dt / 1e9);
     return 0;
 }
