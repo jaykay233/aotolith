@@ -81,7 +81,10 @@ def main():
     # The megakernel prefills all but the last id and keeps the last as the decode
     # anchor, so row cm-1 is the second-to-last id; drop it or every comparison is
     # shifted by one position.
-    ids = ids[:-1]
+    # PF=dc compares the decode step, which does consume the last id (as the
+    # anchor), so only the prefill comparison drops it.
+    if os.environ.get('PF') != 'dc':
+        ids = ids[:-1]
     f, T, data = load_gguf(path)
     T = {k: (v[0], v[1], data + v[2]) for k, v in T.items()}
     n = len(ids)
@@ -177,6 +180,18 @@ def main():
     print('tokens %d' % n)
     # The V dump is the first row of the chunk (dump_n writes g_pfv from index 0)
     # while the o/a dumps are row cm-1, so the two families take different rows.
+    # MEGA_DUMP=1 on the decode path writes the same quantities under dc_*, for
+    # the single row the decode step runs. Point PF at the prefix to compare the
+    # decode kernel against the same numpy reference as prefill's.
+    pf = os.environ.get('PF', 'pf')
+    if pf == 'dc':
+        cmp('emb', x[-1], '/tmp/dc_00e.bin')
+        cmp('norm', xn[-1], '/tmp/dc_00n.bin')
+        cmp('V(proj)', v[-1], '/tmp/dc_00v.bin')
+        cmp('K(rope)', k[-1], '/tmp/dc_00k.bin')
+        cmp('attn-raw', ao[-1], '/tmp/dc_00i.bin')
+        cmp('resid', resid[-1], '/tmp/dc_00a.bin')
+        return
     cmp('V(proj)', v[0], '/tmp/pf_00v.bin')
     cmp('Q(rope)', q[0], '/tmp/pf_q.bin', row=0)
     cmp('attn-raw', ao[-1], '/tmp/pf_00o.bin')

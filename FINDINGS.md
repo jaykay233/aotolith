@@ -455,6 +455,68 @@ rates is ~61 s, plus conv, quant, norm, silu and softmax. 200 tok/s needs 51.2 s
 so **the A cluster alone cannot do it**; roughly 30-40% of the MACs have to move
 to X100.
 
+### The three-instruction exp is the softmax's whole cost, and it is now default
+
+At 10K the softmax slice was 153.9 core-s, i.e. one element per ~6 cycles on a
+32-lane thread, which is the exp-and-not-the-loads rate. `-e 1` (`exp2f_e`, the
+magic-add plus mantissa estimate, 6.15% maximum relative error, always an
+overestimate) takes it to **118.9 core-s** and prefill from 75.5 to **74.15 s
+(134.85 tok/s)**. `-e 2` (same, then a table gather on the top three mantissa
+bits) does not pay for its gather.
+
+`g_exp3` now defaults to 1. The check that matters is that the 6.15% error is a
+uniform overestimate in the same direction for every position in a row, so it
+cannot reorder the softmax: ten greedy steps off a 100-token prompt are
+`35 242 38 35 242 38 35 242 38 35` with exact exp and with `-e 1`, token for token.
+
+What is left is 118.9 core-s of exp over 8e8 elements, and it does not close a
+25 s gap on its own, so the remaining prefill work is the X100 MAC split below.
+
+### A block-buffered single-pass softmax is slower: do not retry
+
+The three passes look wasteful (max pass, exp pass that reads and writes, then a
+normalise pass that reads and writes). Copying the row into a 4 KB per-thread
+block and doing max/exp/normalise out of the block in f32m4 granules was measured
+and is **slower than the three passes**: the row is 40 KB and stays hot between
+consecutive passes, so the block copy is a fifth transfer that buys nothing. The
+exp is the cost, not the traffic, which is what `-e` addresses.
+
+### The forward pass is verified against exact fp32, layer by layer
+
+This is the audit that says the speed numbers above are numbers on a correct
+kernel rather than on a fast wrong one, and it is cheap to repeat:
+
+- `PF=dc python3 layer0_ref.py mc-q4o.gguf ids.txt` compares the *decode* step's
+  layer 0 against numpy: embedding 1.000000, post-norm 1.000000, V 0.999213,
+  K-after-rope 0.999999, attention output 0.999467, residual 0.999943. The same
+  six numbers on the prefill path are 0.999151 / 0.999981 / 0.999531 / 0.999948.
+  Both paths are the same maths to f16-KV precision, so prefill's attention and
+  the decode step's attention are not two different models.
+- `ref_f32.py` dumps `/tmp/rf_LL{a,f}.bin` per layer; the decode step dumps
+  `/tmp/dc_LLf.bin`. Across **all 42 layers** the residual cosine goes
+  0.999958 (L0) to 0.995609 (L41) with no step drop, which is Q4_0 quantisation
+  accumulating, not a broken layer.
+- Three-way logits on the same 10-token prompt: m3 vs `ref_f32.py` **0.99790,
+  same top-1 (18119, 11.963 vs 11.982)**; m3 vs llama.cpp Q4_0 0.86412;
+  `ref_f32.py` vs llama.cpp Q4_0 0.86879. The megakernel and the float32
+  reference agree; llama.cpp is the outlier.
+
+**What llama.cpp's Q4_0 does differently, characterised.** It is not the head.
+Recomputing the logits from `rf_41f.bin` with one final norm reproduces numpy
+(cos 0.8688 against llama.cpp, top-1 18119); two norms gives 0.8451 and no norm
+0.4019, so the norm is not misplaced. What llama.cpp does is *raise the tail*:
+its top six span 11.97..10.76 while numpy's span 11.98..8.84, the same peak with
+the middle of the distribution lifted ~1.5. That is an additive floor from its
+Q8 activation quantisation in the Q4_0 dot, and it is why it picks `47` (11.973)
+over `18119` (11.963) purely on a 0.01 margin while numpy has a 2.43 gap to
+second place. It also agrees with the megakernel at 2 positions (`1232` both
+sides) and splits from 3 positions on, which is where several attention outputs
+start accumulating into the shared residual.
+
+The consequence is a decision rather than a bug: llama.cpp Q4_0 is 0.87 cosine
+from its own model in fp32, so "align with llama.cpp greedy" and "be correct" are
+different targets. `ref_f32.py` is the judge the rest of this document uses.
+
 ### The X100 cluster, what it is good for
 
 - **Conv: yes.** 16 even bands, 6.41 -> 4.38 s, bit-identical output (bands only
@@ -676,9 +738,9 @@ above, it is no longer worth cracking.
 
 | target | now | gap | next concrete step |
 |---|---|---|---|
-| prefill 200 tok/s @10K | 139.4 (73.4 s) | 51.2 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. |
+| prefill 200 tok/s @10K | 134.9 (74.15 s) | 23 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. |
 | decode 20 tok/s @10K | 11.47 single row; four-row round now ~90 ms | 50 ms | 54.3 GEMM (DRAM floor) + 29.3 attention (`MEGA_ATTN4_ROWS=4 -e 1 MEGA_ATTN4P=1`) + ~6 four rows of tail. That clears 20 tok/s at 1.84 accepted tokens per round and short context measured 1.83, so the chain sits on the line. Remaining work is integration, not kernels: m=4 in mega3's decode GEMM, the dspark drafter, and the four-row attention hooked to the live decode KV. Then measure 10K acceptance, and it is acceptance rather than kernel speed that decides. Byte arithmetic still rules out weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
-| output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`) | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
+| output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`); per-layer residual 0.9956 at L41 and layer 0 exact on both paths | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not
 llama.cpp Q4_0 (0.66 cosine from fp32) and not llama.cpp F16 (which does not run

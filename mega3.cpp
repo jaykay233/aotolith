@@ -2121,7 +2121,11 @@ static inline vfloat32m4_t exp2f_poly_m4(vfloat32m4_t t, size_t vl) {
 //
 // The table has to fit one f32m1 register on the narrow cluster (VLMAX 8), so
 // eight buckets, not thirty-two -- a 32-entry gather reads zeros there.
-static int g_exp3 = 0;
+// Mode 1 is the default now. At 10K it cuts the prefill softmax from 153.9 to
+// 119.0 core-s and the whole prefill from 75.5 to 74.0 s, and twelve greedy steps
+// off a 100-token prompt are identical token for token, so the 6.15% exp error
+// does not move the argmax here. Mode 2 buys nothing back for its extra gather.
+static int g_exp3 = 1;
 static float g_exp3_tab[32];
 static void exp3_init(void) {
     for (int k = 0; k < 8; ++k) {
@@ -2597,10 +2601,16 @@ static const int SC_GSTRIDE = SC_NBLK * 32;        // int16 per row group
 static const int SC_TSTRIDE = I8_G * SC_GSTRIDE;   // int16 per tile
 static const int SC_SHIFT = 6;                     // raw >> 6 always fits int16
 static int16_t * g_psa16;
-static double g_pfa_qk[N_GPU], g_pfa_sm[N_GPU], g_pfa_pv[N_GPU];
-static double g_pfa_mx[N_GPU], g_pfa_ex[N_GPU];
-static double g_pfa_smb[8];
-static double g_pfa_mxb[8], g_pfa_exb[8];
+// Each thread's timers get a cache line of their own. These are incremented once
+// per attention row -- 6.7 M rows at 10K -- and with eight cores sharing one line
+// the increment alone measured 160 core-s of the softmax slice, i.e. 24 us per row
+// for a 5000-element row. Stride 8 doubles == one 64-byte line.
+static const int PFA_TSTRIDE = 8;
+static double g_pfa_qk[N_GPU * PFA_TSTRIDE], g_pfa_sm[N_GPU * PFA_TSTRIDE],
+              g_pfa_pv[N_GPU * PFA_TSTRIDE];
+static double g_pfa_mx[N_GPU * PFA_TSTRIDE], g_pfa_ex[N_GPU * PFA_TSTRIDE];
+static double g_pfa_smb[8 * PFA_TSTRIDE];
+static double g_pfa_mxb[8 * PFA_TSTRIDE], g_pfa_exb[8 * PFA_TSTRIDE];
 static thread_local int g_pfa_smid;
 static thread_local int g_pfa_tid;
 static float * g_kf;                        // [kv][pblk][dim][32] f32, one layer
@@ -2610,10 +2620,20 @@ static inline float * kftile(int kv, int pblk) {
 }
 static float * g_vf;                        // [kv][pos][dim] f32, one layer
 static int g_pfa_f32 = 0;
-static float g_pfa_dbg_sum[4], g_pfa_dbg_mx[4];
+// Per-thread, and written only when MEGA_PFADBG is set: these were global and
+// stored on every attention row, which is the same false-sharing trap as the
+// timers -- eight cores writing one 64-byte line 6.7 M times.
+static const bool g_pfa_dbg_on = getenv("MEGA_PFADBG") != nullptr;
+static float g_pfa_dbg_sum[N_GPU * 8], g_pfa_dbg_mx[N_GPU * 8];
 
 __attribute__((optimize("no-tree-vectorize")))
 static void pfa_softmax_row(float * row, int len, double * t_sm) {
+    // Measured: a block-buffered single-pass version (copy the row into a 4 KB
+    // scratch, max and exp and normalise out of it) is SLOWER at 10K, because the
+    // row is already hot when the three passes run back to back and the copy adds a
+    // transfer of its own. Three passes over a hot 40 KB row beat one pass plus a
+    // copy. What the passes cost is the exp itself, and that is what -e changes:
+    // 152 -> 118 core-s for the three-instruction form, worth 1.5 s of prefill.
     const double _w = now_s();
     vfloat32m1_t m = __riscv_vfmv_v_f_f32m1(-INFINITY, 32);
     int i = 0;
@@ -2639,8 +2659,10 @@ static void pfa_softmax_row(float * row, int len, double * t_sm) {
     for (i = 0; i + 32 <= len; i += 32)
         __riscv_vse32_v_f32m1(row + i, __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), inv, 32), 32);
     for (; i < len; ++i) row[i] *= inv;
-    g_pfa_dbg_sum[0] = sum;
-    g_pfa_dbg_mx[0] = mx;
+    if (g_pfa_dbg_on) {
+        g_pfa_dbg_sum[g_pfa_tid * 8] = sum;
+        g_pfa_dbg_mx[g_pfa_tid * 8] = mx;
+    }
     *t_sm += now_s() - _w;
 }
 
@@ -3375,11 +3397,11 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
 
     const double _q = now_s();
     pfa_qk_i8(h, qbase, sc);
-    g_pfa_qk[g_pfa_tid] += now_s() - _q;
+    g_pfa_qk[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _q;
 
     const double _s = now_s();
     pfa_sm_i8(h, qbase, sc, w8, wsc);
-    g_pfa_sm[g_pfa_tid] += now_s() - _s;
+    g_pfa_sm[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _s;
 
     // PV: two passes of 64 dims, contracting 16 positions per step. The four row
     // groups read the same V blocks, so they stay hot across the tile.
@@ -3426,7 +3448,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
             }
         }
     }
-    g_pfa_pv[g_pfa_tid] += now_s() - _v;
+    g_pfa_pv[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _v;
     if (g_pfa_dbg1 && layer == 0 && h == 0 && qbase == 0 && g_pfa_tid == 0) {
         g_pfa_dbg1 = 0;
         printf("[i8 dbg] nn=%d npb=%d nq=%d wsc=%.6g %.6g %.6g %.6g ksc=%.6g vsc=%.6g\n",
@@ -3609,7 +3631,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
             }
             mxs[gg][r * 8] = (int16_t) m;
         }
-        g_pfa_mxb[g_pfa_smid] += now_s() - _mx;
+        g_pfa_mxb[(g_pfa_smid) * PFA_TSTRIDE] += now_s() - _mx;
 
         const double _ex = now_s();
         for (int r = 0; r < 4; ++r) {
@@ -3658,7 +3680,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
             }
             wsc[gg * 4 + r] = sum > 0 ? 1.0f / (127.0f * sum) : 0.0f;
         }
-        g_pfa_exb[g_pfa_smid] += now_s() - _ex;
+        g_pfa_exb[(g_pfa_smid) * PFA_TSTRIDE] += now_s() - _ex;
         if (g_pfa_dbg1 && qbase == 0 && gg == 0 && h == 0) {
             long sw = 0;
             for (int i = 0; i < 256; ++i) sw += wb[i];
@@ -3803,7 +3825,7 @@ static void task_pfa_pipe_A(int tid) {
             const int64_t qb = tile_qb(old);
             const double _v = now_s();
             if (!g_nopv) pfa_pv_i8(g_pipe_layer, tile_h(old), qb, sl.w8 + g_w8off, sl.wsc);
-            g_pfa_pv[tid] += now_s() - _v;
+            g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
             pend[0] = pend[1];
             --npend;
         }
@@ -3816,7 +3838,7 @@ static void task_pfa_pipe_A(int tid) {
         const double _q = now_s();
         pfa_qk_i8(h, qb, sl.scores);
         const double _qq = now_s() - _q;
-        g_pfa_qk[tid] += _qq;
+        g_pfa_qk[(tid) * PFA_TSTRIDE] += _qq;
         if (g_qk_trace && qb + I8_ROWS + (int64_t) g_pfa_ctx > 10100)
             fprintf(stderr, "[qk] ctx=%lld qb=%lld npb=%lld %.3f ms -> %.1f GMAC/s\n",
                     (long long) g_pfa_ctx, (long long) qb,
@@ -3833,7 +3855,7 @@ static void task_pfa_pipe_A(int tid) {
         const int64_t qb = tile_qb(old);
         const double _v = now_s();
         pfa_pv_i8(g_pipe_layer, tile_h(old), qb, sl.w8 + g_w8off, sl.wsc);
-        g_pfa_pv[tid] += now_s() - _v;
+        g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
         pend[0] = pend[1];
         --npend;
     }
@@ -3853,10 +3875,10 @@ static void task_pfa_pipe_B(int tid) {
         const int64_t qb = tile_qb(t);
         const double _sm = now_s();
         pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
-        g_pfa_sm[tid] += now_s() - _sm;
+        g_pfa_sm[(tid) * PFA_TSTRIDE] += now_s() - _sm;
         r.st.store(2, std::memory_order_release);
     }
-    g_pfa_smb[tid] += now_s() - _s;
+    g_pfa_smb[(tid) * PFA_TSTRIDE] += now_s() - _s;
 }
 
 static void * hugemem(size_t n);
@@ -3928,7 +3950,7 @@ static void task_attn4_a(int tid) {
     for (int h = tid; h < N_HEAD; h += g_participants) {
         const double _q = now_s();
         pfa_qk_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE);
-        g_pfa_qk[tid] += now_s() - _q;
+        g_pfa_qk[(tid) * PFA_TSTRIDE] += now_s() - _q;
         g_a4_qk[h].store(gen, std::memory_order_release);
         hs[n++] = h;
     }
@@ -3938,7 +3960,7 @@ static void task_attn4_a(int tid) {
         const double _v = now_s();
         pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
                   g_wsc4 + (size_t) h * I8_ROWS);
-        g_pfa_pv[tid] += now_s() - _v;
+        g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
     }
 }
 
@@ -3954,7 +3976,7 @@ static void task_attn4_sm(int id) {
         float   * wsc = g_wsc4 + (size_t) h * I8_ROWS;
         const double _s = now_s();
         pfa_sm_i8(h, 0, sc, w8, wsc);
-        g_pfa_sm[id] += now_s() - _s;
+        g_pfa_sm[(id) * PFA_TSTRIDE] += now_s() - _s;
         g_a4_sm[h].store(gen, std::memory_order_release);
     }
 }
@@ -4052,7 +4074,7 @@ static void task_attn4s(int tid) {
         a4s_qk_blk(h0,     pb, kb, sc0);
         a4s_qk_blk(h0 + 1, pb, kb, sc0 + SC_GSTRIDE);
     }
-    g_pfa_qk[tid] += now_s() - _q;
+    g_pfa_qk[(tid) * PFA_TSTRIDE] += now_s() - _q;
 
     // MEGA_A4S=2 keeps the softmax on this cluster. The handoff to the X100 cores
     // costs more than it saves at four rows: the A cores are idle for the whole
@@ -4068,7 +4090,7 @@ static void task_attn4s(int tid) {
             const double _s = now_s();
             pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE,
                       g_w4 + (size_t) h * WBLK, g_wsc4 + (size_t) h * I8_ROWS);
-            g_pfa_sm[tid] += now_s() - _s;
+            g_pfa_sm[(tid) * PFA_TSTRIDE] += now_s() - _s;
         }
     } else {
         g_a4_qk[h0].store(gen, std::memory_order_release);
@@ -4081,7 +4103,7 @@ static void task_attn4s(int tid) {
         const double _v = now_s();
         pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
                   g_wsc4 + (size_t) h * I8_ROWS);
-        g_pfa_pv[tid] += now_s() - _v;
+        g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
     }
     (void) gen;
 }
@@ -5382,14 +5404,14 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         // qk/pv are per A thread, sm per X100 thread; both index 0..7.
         double qk = 0, sm = 0, pv = 0, mx = 0, ex = 0;
         for (int t = 0; t < N_GPU; ++t) {
-            qk += g_pfa_qk[t]; sm += g_pfa_sm[t]; pv += g_pfa_pv[t];
-            mx += g_pfa_mxb[t]; ex += g_pfa_exb[t];
+            qk += g_pfa_qk[(t) * PFA_TSTRIDE]; sm += g_pfa_sm[(t) * PFA_TSTRIDE]; pv += g_pfa_pv[(t) * PFA_TSTRIDE];
+            mx += g_pfa_mxb[(t) * PFA_TSTRIDE]; ex += g_pfa_exb[(t) * PFA_TSTRIDE];
         }
         printf("m4dec: attn core-s qk %.3f + pv %.3f on 8, sm %.3f (max %.3f exp %.3f) on %d\n",
                qk, pv, sm, mx, ex, g_n_sm);
         for (int t = 0; t < N_GPU; ++t) {
-            g_pfa_qk[t] = 0; g_pfa_pv[t] = 0; g_pfa_sm[t] = 0;
-            g_pfa_smb[t] = 0; g_pfa_mxb[t] = 0; g_pfa_exb[t] = 0;
+            g_pfa_qk[(t) * PFA_TSTRIDE] = 0; g_pfa_pv[(t) * PFA_TSTRIDE] = 0; g_pfa_sm[(t) * PFA_TSTRIDE] = 0;
+            g_pfa_smb[(t) * PFA_TSTRIDE] = 0; g_pfa_mxb[(t) * PFA_TSTRIDE] = 0; g_pfa_exb[(t) * PFA_TSTRIDE] = 0;
         }
         m4_report();
     }
@@ -5405,8 +5427,8 @@ static bool m4dec_run(int64_t p0, int anchor, int rounds) {
     // These counters are shared with prefill's attention, and a 10K prefill leaves
     // several hundred core-s in them. Clear them or the round reports prefill work.
     for (int t = 0; t < N_GPU; ++t) {
-        g_pfa_qk[t] = 0; g_pfa_pv[t] = 0; g_pfa_sm[t] = 0;
-        g_pfa_smb[t] = 0; g_pfa_mxb[t] = 0; g_pfa_exb[t] = 0;
+        g_pfa_qk[(t) * PFA_TSTRIDE] = 0; g_pfa_pv[(t) * PFA_TSTRIDE] = 0; g_pfa_sm[(t) * PFA_TSTRIDE] = 0;
+        g_pfa_smb[(t) * PFA_TSTRIDE] = 0; g_pfa_mxb[(t) * PFA_TSTRIDE] = 0; g_pfa_exb[(t) * PFA_TSTRIDE] = 0;
     }
     if (!g_a4p) { fprintf(stderr, "m4dec needs the four-row attention (MEGA_ATTN4P=1)\n"); }
     int tok[4] = { anchor, anchor, anchor, anchor };
@@ -5461,7 +5483,7 @@ static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
     (void) four;
     double best = 1e9;
     for (int r = 0; r < rounds; ++r) {
-        for (int t = 0; t < N_GPU; ++t) g_pfa_qk[t] = g_pfa_sm[t] = g_pfa_pv[t] = 0;
+        for (int t = 0; t < N_GPU; ++t) g_pfa_qk[(t) * PFA_TSTRIDE] = g_pfa_sm[(t) * PFA_TSTRIDE] = g_pfa_pv[(t) * PFA_TSTRIDE] = 0;
         const double t0 = now_s();
         for (int L = 0; L < N_LAYER; ++L) {
             g_pfa_ctx = ctx;
@@ -5472,7 +5494,7 @@ static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
         const double dt = now_s() - t0;
         if (dt < best) best = dt;
         double tq = 0, ts = 0, tv = 0;
-        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[t]; ts += g_pfa_sm[t]; tv += g_pfa_pv[t]; }
+        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[(t) * PFA_TSTRIDE]; ts += g_pfa_sm[(t) * PFA_TSTRIDE]; tv += g_pfa_pv[(t) * PFA_TSTRIDE]; }
         // The four-row round's total MAC count is rows*heads*dim*ctx*2 over all
         // layers; dividing by the wall time gives aggregate GMAC/s, so it must
         // carry the layer count or it reads 42x low.
@@ -5534,14 +5556,14 @@ static void pfa_head(int layer, int h, int64_t qbase) {
         __riscv_vse32_v_f32m1(g_psa[g_pfa_tid][3] + pb, a3, vl);
     }
 #undef PFA_ACC
-    g_pfa_qk[g_pfa_tid] += now_s() - _q;
+    g_pfa_qk[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _q;
 
     // causal trim + softmax, one row at a time
     for (int r = 0; r < PFA_ROWS; ++r) {
         float * row = g_psa[g_pfa_tid][r];
         const int len = (int) (g_pfa_ctx + qbase + r + 1);
         for (int i = len; i < len_max; ++i) row[i] = -INFINITY;
-        pfa_softmax_row(row, len, &g_pfa_sm[g_pfa_tid]);
+        pfa_softmax_row(row, len, &g_pfa_sm[(g_pfa_tid) * PFA_TSTRIDE]);
         for (int i = len; i < len_max; ++i) row[i] = 0.0f;
     }
 
@@ -5581,7 +5603,7 @@ static void pfa_head(int layer, int h, int64_t qbase) {
     dst += (int64_t) N_HEAD * HEAD_DIM;
     __riscv_vse32_v_f32m1(dst + 0, o30, 32);  __riscv_vse32_v_f32m1(dst + 32, o31, 32);
     __riscv_vse32_v_f32m1(dst + 64, o32, 32); __riscv_vse32_v_f32m1(dst + 96, o33, 32);
-    g_pfa_pv[g_pfa_tid] += now_s() - _v;
+    g_pfa_pv[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _v;
 }
 
 static void task_pfa(int tid) {
@@ -6396,7 +6418,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
            (long long) npref, dt, (double) npref / dt, (long long) R);
     {   // per-cluster work, summed over threads: these are core-seconds
         double tq=0, ts=0, tv=0;
-        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[t]; ts += g_pfa_sm[t]; tv += g_pfa_pv[t]; }
+        for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[(t) * PFA_TSTRIDE]; ts += g_pfa_sm[(t) * PFA_TSTRIDE]; tv += g_pfa_pv[(t) * PFA_TSTRIDE]; }
         printf("  attn work: qk %.1f  softmax %.1f  pv %.1f (core-s)\n", tq, ts, tv);
     }
     printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
@@ -6465,9 +6487,9 @@ static void bench_prefill_attn(void) {
 
     if (g_pfa_i8 && g_pipe) pfa_pipe_alloc();
 
-    for (int t = 0; t < N_GPU; ++t) g_pfa_qk[t] = g_pfa_sm[t] = g_pfa_pv[t] = 0;
-    for (int t = 0; t < N_GPU; ++t) g_pfa_mx[t] = g_pfa_ex[t] = 0;
-    for (int t = 0; t < 8; ++t) g_pfa_smb[t] = 0;
+    for (int t = 0; t < N_GPU; ++t) g_pfa_qk[(t) * PFA_TSTRIDE] = g_pfa_sm[(t) * PFA_TSTRIDE] = g_pfa_pv[(t) * PFA_TSTRIDE] = 0;
+    for (int t = 0; t < N_GPU; ++t) g_pfa_mx[(t) * PFA_TSTRIDE] = g_pfa_ex[(t) * PFA_TSTRIDE] = 0;
+    for (int t = 0; t < 8; ++t) g_pfa_smb[(t) * PFA_TSTRIDE] = 0;
     const double t0 = now_s();
     for (int L = 0; L < N_LAYER; ++L) {
         if (g_pfa_i8) pfa_convert_kv_i8(L, ctx + rows);
@@ -6490,14 +6512,14 @@ static void bench_prefill_attn(void) {
         for (int r = 0; r < tile; ++r) macs += (double) (ctx + qb + r + 1) * HEAD_DIM * 2.0;
     macs *= (double) N_LAYER * N_HEAD;
     double tq = 0, ts = 0, tv = 0, tmx = 0, tex = 0;
-    for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[t]; ts += g_pfa_sm[t]; tv += g_pfa_pv[t]; tmx += g_pfa_mx[t]; tex += g_pfa_ex[t]; }
+    for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[(t) * PFA_TSTRIDE]; ts += g_pfa_sm[(t) * PFA_TSTRIDE]; tv += g_pfa_pv[(t) * PFA_TSTRIDE]; tmx += g_pfa_mx[(t) * PFA_TSTRIDE]; tex += g_pfa_ex[(t) * PFA_TSTRIDE]; }
     printf("  %.3f s -> %.1f GMAC/s (%.1f per core)  [qk %.2f sm %.2f pv %.2f s]\n",
            dt, macs / dt / 1e9, macs / dt / 1e9 / g_participants, tq, ts, tv);
     printf("  softmax split: max %.2f s, exp+quant %.2f s, other %.2f s\n",
            tmx, tex, ts - tmx - tex);
     if (g_pfa_i8 && g_pipe) {
         double tb = 0, tmxb = 0, texb = 0;
-        for (int t = 0; t < 8; ++t) { tb += g_pfa_smb[t]; tmxb += g_pfa_mxb[t]; texb += g_pfa_exb[t]; }
+        for (int t = 0; t < 8; ++t) { tb += g_pfa_smb[(t) * PFA_TSTRIDE]; tmxb += g_pfa_mxb[(t) * PFA_TSTRIDE]; texb += g_pfa_exb[(t) * PFA_TSTRIDE]; }
         printf("  pipeline: A-cluster qk %.2f + pv %.2f = %.2f core-s over 8; "
                "X100 softmax %.2f core-s over %d (max %.2f / exp %.2f)\n",
                tq, tv, tq + tv, tb, g_n_sm, tmxb, texb);
