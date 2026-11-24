@@ -1707,8 +1707,12 @@ static void task_pf_gemm_i8(int tid) {
 // 40 made `down` slower than a single 23 did (10.68 s against 8.92 s) because
 // X100 became its critical path.
 static int g_x100_pct = 23;     // X100 takes this share of the columns
+static int g_xpct_explicit = 0; // -x100 N was given, so it wins over the table
 static int g_x100_pct_tab[4] = { 35, 33, 37, 28 };   // qkv, o, gate+up, down
 static int g_xpct_j[4] = { 23, 23, 23, 23 };         // per-job share for x100_prepare
+// Weight source for the X100 columns: the plain int8 copy, not the vendor record
+// the A100 kernel reads. x100_prepare repacks it into X100 order.
+static const uint8_t * g_xsrc[4];
 
 static void task_pf_gemm_x100(int id);
 static void * hugemem(size_t n);
@@ -1716,15 +1720,16 @@ static void * hugemem(size_t n);
 
 struct XJ {
     const int8_t * b;           // packed weights for this matrix's X100 columns
-    int64_t nsteps, nb, ldc, ja;
+    int64_t nsteps, nb, ldc, ja, c0;   // c0 = first output column this cluster owns
     float * c;
     const float * bsc;          // nb * 32 pre-duplicated column scales
 };
 static XJ g_xj[8];
 static int g_xjn;
-static std::atomic<int64_t> g_xchunk{0};
+static std::atomic<int64_t> g_xchunk[4];
 static std::atomic<int> g_xg_gen{0}, g_xg_done{0};
 static int g_x_nt = 0;
+static int g_xchk = 0;
 static int32_t g_xc[16][64];
 static const int64_t XTILE = 256;   // 4-row groups per scheduling tile
 
@@ -1864,7 +1869,11 @@ static void x100_prepare(const PfJob * js, int nj) {
             g_xb_cap[j] = g_xb[j] ? need : 0;
             if (!g_xb[j]) { fprintf(stderr, "oom x100 B\n"); g_x100 = 0; return; }
         }
-        g_xp_src = (int8_t *) (uintptr_t) js[j].b; g_xp_k = js[j].k; g_xp_n = js[j].n;
+        // task_x8_pack_b decodes the plain int8 copy (payload plus per-8-column
+        // float scales), not the vendor i8i4 record the A100 kernel reads: the two
+        // blobs describe the same Q4_0 weights with different byte layouts. Feeding
+        // it js[j].b was why -x100 emitted a wrong token from step 0.
+        g_xp_src = (int8_t *) (uintptr_t) g_xsrc[j]; g_xp_k = js[j].k; g_xp_n = js[j].n;
         g_xp_c0 = js[j].n - nx;      // X100 takes the tail columns
         g_xp_nb = nb; g_xp_dst = g_xb[j];
         g_xp_bsc = (float *) (g_xb[j] + (size_t) nx * js[j].k);
@@ -1874,12 +1883,16 @@ static void x100_prepare(const PfJob * js, int nj) {
         g_xj[g_xjn].nb = nb;
         g_xj[g_xjn].ldc = js[j].ldc;
         g_xj[g_xjn].c = js[j].c;
+        // The X100 cluster owns the tail columns, so its outputs start at nlim --
+        // not at 0. Omitting this offset wrote its results over the block the A100
+        // kernel had just finished, which corrupted every column of the matrix.
+        g_xj[g_xjn].c0 = js[j].n - nx;
         g_xj[g_xjn].bsc = g_xp_bsc;
         g_xj[g_xjn].ja = 0;
         ++g_xjn;
     }
     g_xt_pack = now_s() - _tp;
-    g_xchunk.store(0, std::memory_order_relaxed);
+    for (int j = 0; j < 4; ++j) g_xchunk[j].store(0, std::memory_order_relaxed);
     g_xg_done.store(0, std::memory_order_relaxed);
     g_xg_gen.fetch_add(1, std::memory_order_release);
 }
@@ -1891,10 +1904,14 @@ static void x100_wait(void) {
 }
 
 // Sets the column split for one projection's jobs and prepares the X100 side.
-// phase: 0 qkv, 1 o, 2 gate+up, 3 down.
-static void x100_begin(int phase, PfJob * js, int nj) {
-    const int pct = g_x100_pct_tab[phase & 3];
+// phase: 0 qkv, 1 o, 2 gate+up, 3 down. srcs are the int8-copy pointers for the
+// same matrices; a null entry disables the offload for that job rather than
+// silently reading the wrong blob.
+static void x100_begin(int phase, PfJob * js, int nj, const uint8_t * const * srcs) {
+    const int pct = g_xpct_explicit ? g_x100_pct : g_x100_pct_tab[phase & 3];
     for (int j = 0; j < nj; ++j) {
+        if (!srcs[j]) { g_x100 = 0; fprintf(stderr, "x100: no int8 copy for job %d\n", j); return; }
+        g_xsrc[j] = srcs[j];
         g_xpct_j[j] = pct;
         js[j].nlim = js[j].n - ((js[j].n * pct / 100) & ~(int64_t) 63);
     }
@@ -1907,8 +1924,11 @@ static void task_pf_gemm_x100(int id) {
         const XJ & J = g_xj[j];
         const int64_t ntiles = (ng + XTILE - 1) / XTILE;
         const int64_t units = ntiles * J.nb;
+        // One counter per job. A single shared counter was already past job 1's
+        // unit count when job 0 finished, so with nj > 1 every job after the first
+        // was skipped and its columns kept whatever the last layer left there.
         for (;;) {
-            const int64_t u = g_xchunk.fetch_add(1, std::memory_order_relaxed);
+            const int64_t u = g_xchunk[j].fetch_add(1, std::memory_order_relaxed);
             if (u >= units) break;
             const int64_t tile = u / J.nb, nb = u % J.nb;
             int64_t g0 = tile * XTILE, g1 = g0 + XTILE;
@@ -1918,9 +1938,33 @@ static void task_pf_gemm_x100(int id) {
             (void) amg;
             const int8_t * bp = J.b + nb * J.nsteps * 128;
             const float * bsc = J.bsc + nb * 32;
-            float * crow = J.c + nb * 16;
+            float * crow = J.c + J.c0 + nb * 16;
             for (int64_t g = g0; g < g1; ++g) {
                 x100_gemm_4x16(g_xc[id], g_a8x + g * g_x_rowstride, bp, J.nsteps);
+                // MEGA_XCHK: recompute one four-row by sixteen-column tile in
+                // scalar code from the same records the kernel reads. A mismatch
+                // here is a layout bug in the A copy, the B pack or the lane map;
+                // a match means the error is downstream in the epilogue.
+                if (g_xchk && g == g0 && nb == 0) {
+                    // g_xc is [row pair][column group][8 lanes], and within a lane
+                    // vector 0..3 is the pair's first row and 4..7 the second, so
+                    // row r column c sits at (r/2)*32 + (c/4)*8 + (r%2)*4 + (c%4).
+                    for (int r = 0; r < 4; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            int32_t acc = 0;
+                            for (int64_t s = 0; s < J.nsteps; ++s) {
+                                const int8_t * ap = g_a8x + g * g_x_rowstride + s * 32 + r * 8;
+                                const int8_t * bq = bp + s * 128 + c * 8;
+                                for (int i = 0; i < 8; ++i) acc += (int32_t) ap[i] * (int32_t) bq[i];
+                            }
+                            const int idx = (r / 2) * 32 + (c / 4) * 8 + (r % 2) * 4 + (c % 4);
+                            printf("xchk g%lld r%d c%d kernel %d scalar %d %s\n",
+                                   (long long) g, r, c, (int) g_xc[id][idx], (int) acc,
+                                   g_xc[id][idx] == acc ? "OK" : "MISMATCH");
+                        }
+                    }
+                    g_xchk = 0;
+                }
                 const float * as = g_a8xs + g * 4;
                 float av[2][8];
                 for (int t = 0; t < 4; ++t) {
@@ -6325,7 +6369,10 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             g_pfj[0] = { g_pf_vendor ? g_wq[L].b : g_wq[L].b8, g_wq[L].k, g_wq[L].n, g_pq,  N_HEAD * HEAD_DIM, 0 };
             g_pfj[1] = { g_pf_vendor ? g_wk[L].b : g_wk[L].b8, g_wk[L].k, g_wk[L].n, g_pfk, N_KV * HEAD_DIM, 0 };
             g_pfj[2] = { g_pf_vendor ? g_wv[L].b : g_wv[L].b8, g_wv[L].k, g_wv[L].n, g_pfv, N_KV * HEAD_DIM, 0 };
-            if (g_x100) x100_begin(0, g_pfj, 3);
+            if (g_x100) {
+                const uint8_t * xs[3] = { g_wq[L].b8, g_wk[L].b8, g_wv[L].b8 };
+                x100_begin(0, g_pfj, 3, xs);
+            }
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gqkv+=_g; } _a=now_s();
@@ -6477,7 +6524,10 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
             g_pfj[0] = { g_pf_vendor ? g_wov[L].b : g_wov[L].b8, g_wov[L].k, g_wov[L].n, g_pfxa, N_EMBD, 0 };
-            if (g_x100) x100_begin(1, g_pfj, 1);
+            if (g_x100) {
+                const uint8_t * xs[1] = { g_wov[L].b8 };
+                x100_begin(1, g_pfj, 1, xs);
+            }
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
@@ -6494,7 +6544,10 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             g_pfjn = 2;
             g_pfj[0] = { g_pf_vendor ? g_wg[L].b : g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF, 0 };
             g_pfj[1] = { g_pf_vendor ? g_wu[L].b : g_wu[L].b8, g_wu[L].k, g_wu[L].n, g_pfup,   N_FF, 0 };
-            if (g_x100) x100_begin(2, g_pfj, 2);
+            if (g_x100) {
+                const uint8_t * xs[2] = { g_wg[L].b8, g_wu[L].b8 };
+                x100_begin(2, g_pfj, 2, xs);
+            }
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_ggu+=_g; } _a=now_s();
@@ -6520,7 +6573,10 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
             g_pfj[0] = { g_pf_vendor ? g_wd[L].b : g_wd[L].b8, g_wd[L].k, g_wd[L].n, g_pfxa, N_EMBD, 0 };
-            if (g_x100) x100_begin(3, g_pfj, 1);
+            if (g_x100) {
+                const uint8_t * xs[1] = { g_wd[L].b8 };
+                x100_begin(3, g_pfj, 1, xs);
+            }
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
@@ -6963,8 +7019,11 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-g")) g_gatemode = 1;
         else if (!strcmp(argv[i], "-x100")) {
             g_x100 = 1;
-            if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9')
+            g_xchk = getenv("MEGA_XCHK") != nullptr;
+            if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9') {
                 g_x100_pct = atoi(argv[++i]);
+                g_xpct_explicit = 1;
+            }
         }
         else if (!strcmp(argv[i], "-pp")) g_pvprobe = 1;
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
@@ -7129,7 +7188,11 @@ int main(int argc, char ** argv) {
     // Optional int8 copy for prefill. Kept separate from the compact format
     // because decode streams every byte and wants the smallest representation,
     // while prefill is compute bound and wants the densest instruction.
-    if (g_i8w && g_src_type != 2 && !g_bit3) {
+    //
+    // -x100 needs it too even when the A100 side reads the compact blob: the X100
+    // repacker consumes this layout, and without it the offload had no weights to
+    // read at all.
+    if (g_i8w && g_src_type != 2 && !g_bit3 && !g_x100) {
         // The int8 prefill copy is a re-encoding of Q4_0 rows; a K-quant source
         // skips it because the K256 vendor kernel reads the compact blob itself.
         // g_i8w stays set, since that is what gates the vendor path.
