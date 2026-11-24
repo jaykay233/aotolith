@@ -429,3 +429,21 @@ is left is the 6.1 ms tail. Round 0 of a run is consistently 10-15 ms slower tha
 round 1 because the score and weight buffers are cold after prefill; steady state
 is round 1 onward. At the 1.83 accepted tokens three drafts measured at short
 context this is 19.1 tok/s, against the 91.5 ms a round needs for 20.
+
+### Tail: 6.2 -> 5.5 ms
+
+Two changes, both in `m4_round`:
+
+- The three four-row norms ran as four `rmsnorm_par` calls, each of which is two
+  pool passes, so 168 calls per round carried 336 barriers. `rmsnorm_rows` hands
+  one row to each thread instead: 2.32 -> 1.89 ms.
+- rope and the f16 KV store ran as four serial `rope_all` calls per layer. The f16
+  K tile is `[dim][position]`, so a single position's store touches 128 different
+  cache lines per kv head. `m4_rope_band` gives each pool thread one (row, kv)
+  unit -- eight jobs, and Q's sixteen heads split exactly eight per kv head -- with
+  the 1/sqrt(d) scale folded into the same store, which is the same arithmetic in
+  the same order: 2.74 -> 2.04 ms.
+
+Measured stage spread across runs of one binary is about 3 ms on GEMM (53.5-56.1)
+and 1 ms on attention, so the round is 96-99 ms and single runs should not be
+compared to each other. The tail itself is stable at 5.5 ms.

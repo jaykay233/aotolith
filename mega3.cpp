@@ -4326,6 +4326,86 @@ static void argmax4_fn(int64_t lo, int64_t hi) {
 static void dump_row(const char * tag, int layer, char when, const float * row);
 static void dump_n(const char * tag, int layer, char when, const float * row, int64_t n);
 
+// One row per thread from the pool, no internal barrier. Four rows through
+// rmsnorm_par costs four barriers per call and 168 calls per round.
+static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows);
+
+// ------------------------------------ four rows of rope and KV, spread over the pool
+// rope_all is written against one position on one core, so four rows is four
+// serial calls per layer, 168 per round. Inside it the f16 K tile write is 128
+// strided stores per kv head -- the tile is [dim][position], so each store lands in
+// a different cache line. One (row, kv) unit per pool thread makes eight
+// independent jobs, and Q's sixteen heads split exactly eight per kv head.
+static int64_t g_m4rope_p0;
+
+static inline void m4_rope_apply(float * x, vfloat32m1_t c0, vfloat32m1_t c1,
+                                 vfloat32m1_t s0, vfloat32m1_t s1, float post) {
+    const vfloat32m1_t e0 = __riscv_vle32_v_f32m1(x, 32);
+    const vfloat32m1_t e1 = __riscv_vle32_v_f32m1(x + 32, 32);
+    const vfloat32m1_t o0 = __riscv_vle32_v_f32m1(x + 64, 32);
+    const vfloat32m1_t o1 = __riscv_vle32_v_f32m1(x + 96, 32);
+    vfloat32m1_t r0 = __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, c0, 32),
+                                             __riscv_vfmul_vv_f32m1(o0, s0, 32), 32);
+    vfloat32m1_t r1 = __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, c1, 32),
+                                             __riscv_vfmul_vv_f32m1(o1, s1, 32), 32);
+    vfloat32m1_t r2 = __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, s0, 32),
+                                             __riscv_vfmul_vv_f32m1(o0, c0, 32), 32);
+    vfloat32m1_t r3 = __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, s1, 32),
+                                             __riscv_vfmul_vv_f32m1(o1, c1, 32), 32);
+    if (post != 1.0f) {
+        // Same order as rope_all: the rotation result, then the 1/sqrt(d) scale.
+        r0 = __riscv_vfmul_vf_f32m1(r0, post, 32);
+        r1 = __riscv_vfmul_vf_f32m1(r1, post, 32);
+        r2 = __riscv_vfmul_vf_f32m1(r2, post, 32);
+        r3 = __riscv_vfmul_vf_f32m1(r3, post, 32);
+    }
+    __riscv_vse32_v_f32m1(x, r0, 32);
+    __riscv_vse32_v_f32m1(x + 32, r1, 32);
+    __riscv_vse32_v_f32m1(x + 64, r2, 32);
+    __riscv_vse32_v_f32m1(x + 96, r3, 32);
+}
+
+static void m4_rope_item(int r, int kv) {
+    const int pos = (int) (g_m4rope_p0 + r);
+    float * q = g_q4 + (int64_t) r * N_EMBD;
+    float * k = g_k4 + (int64_t) r * (N_KV * HEAD_DIM);
+    const float * v = g_v4 + (int64_t) r * (N_KV * HEAD_DIM);
+    const float * cs = g_rope_tab + (int64_t) pos * 128;
+    const vfloat32m1_t c0 = __riscv_vle32_v_f32m1(cs, 32);
+    const vfloat32m1_t c1 = __riscv_vle32_v_f32m1(cs + 32, 32);
+    const vfloat32m1_t s0 = __riscv_vle32_v_f32m1(cs + 64, 32);
+    const vfloat32m1_t s1 = __riscv_vle32_v_f32m1(cs + 96, 32);
+    const float inv = 1.0f / sqrtf((float) HEAD_DIM);
+
+    for (int i = 0; i < NH_PER_KV; ++i)
+        m4_rope_apply(q + (kv * NH_PER_KV + i) * HEAD_DIM, c0, c1, s0, s1, inv);
+    m4_rope_apply(k + kv * HEAD_DIM, c0, c1, s0, s1, 1.0f);
+
+    const int pblk = pos / KT, pi = pos % KT;
+    _Float16 * kb16 = ktile(g_layer, kv, pblk);
+    _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE
+                 + (int64_t) pos * N_KV * HEAD_DIM;
+    if (g_k8dec) {
+        int8_t * k8base = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE;
+        int8_t * kb8 = k8base + (((int64_t) kv * NKT + pblk) * HEAD_DIM) * KT;
+        const float ik = g_k8dsc[g_layer][kv] > 0 ? 1.0f / g_k8dsc[g_layer][kv] : 1.0f;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            int b = (int) lrintf(k[kv * HEAD_DIM + d] * ik);
+            if (b > 127) b = 127;
+            if (b < -127) b = -127;
+            kb8[(int64_t) d * KT + pi] = (int8_t) b;
+        }
+    }
+    for (int d = 0; d < HEAD_DIM; ++d) kb16[(int64_t) d * KT + pi] = (_Float16) k[kv * HEAD_DIM + d];
+    for (int d = 0; d < HEAD_DIM; d += 32)
+        __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d,
+                               __riscv_vfncvt_f_f_w_f16mf2(__riscv_vle32_v_f32m1(v + kv * HEAD_DIM + d, 32), 32), 32);
+}
+
+static void m4_rope_band(int64_t lo, int64_t hi) {
+    for (int64_t i = lo; i < hi; ++i) m4_rope_item((int) (i / N_KV), (int) (i % N_KV));
+}
+
 static bool m4_round(int64_t p0, const int * toks, int * out) {
     if (!g_x4) { m4dec_alloc(); if (!g_x4) return false; }
     if (p0 + 4 > MAXCTX) return false;
@@ -4338,9 +4418,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         g_layer = L;
         if (M4DUMP && L < 2) dump_row("m4", L, 'e', g_x4);
         double _n = now_s();
-        for (int r = 0; r < 4; ++r)
-            rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
-                        g_attn_norm[L], N_EMBD);
+        rmsnorm_rows(g_xa4, g_x4, g_attn_norm[L], 4);
         if (M4TIME) g_m4t[2] += now_s() - _n;
         if (M4DUMP && L < 2) dump_row("m4", L, 'n', g_xa4);
         double _t = now_s();
@@ -4355,15 +4433,9 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         // q/k/v each own a buffer: ldc is the matrix width, so pointing all three
         // at one buffer makes k and v overwrite q's first rows.
 
-        // rope and the KV append are per row: they are written against one
-        // position at a time and the f16 cache is indexed by g_pos.
-        for (int r = 0; r < 4; ++r) {
-            g_q = g_q4 + (int64_t) r * N_EMBD;
-            g_k = g_k4 + (int64_t) r * (N_KV * HEAD_DIM);
-            g_v = g_v4 + (int64_t) r * (N_KV * HEAD_DIM);
-            g_pos = (int) (p0 + r);
-            rope_all();
-        }
+        // rope and the f16 KV store, one (row, kv) unit per pool thread.
+        g_m4rope_p0 = p0;
+        parallel_for(4 * N_KV, m4_rope_band);
         // After rope, so the K/V here are comparable with the single-row dump.
         if (M4DUMP && L < 2) {
             dump_row("m4", L, 'q', g_q4);
@@ -4400,9 +4472,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         if (M4DUMP && L < 2) dump_row("m4", L, 'r', g_x4);
 
         double _n2 = now_s();
-        for (int r = 0; r < 4; ++r)
-            rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
-                        g_ffn_norm[L], N_EMBD);
+        rmsnorm_rows(g_xa4, g_x4, g_ffn_norm[L], 4);
         if (M4TIME) g_m4t[2] += now_s() - _n2;
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 2;
@@ -4423,9 +4493,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         parallel_for(4 * N_EMBD, add4_fn);
     }
 
-    for (int r = 0; r < 4; ++r)
-        rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
-                    g_out_norm, N_EMBD);
+    rmsnorm_rows(g_xa4, g_x4, g_out_norm, 4);
     spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
     g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits4 };
     run(task_mgemm_m4);
