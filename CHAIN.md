@@ -1,5 +1,7 @@
 # The end-to-end chain: prompt text in, tokens out
 
+> Index of conclusions, including every falsified attempt: `FINDINGS.md`.
+
 `mega_decode` used to start from a bare token id (`-p 692`) at position 0 and call
 that a decode benchmark. That is not a chain: no tokenizer, no prompt, no context,
 no weights provenance. This note records what the chain is now, what it measures,

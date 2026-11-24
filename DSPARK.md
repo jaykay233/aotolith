@@ -1,5 +1,7 @@
 # dspark: what the draft model is, and what it will cost
 
+> Index of conclusions, including every falsified attempt: `FINDINGS.md`.
+
 The drafter for speculative decode is `MiniCPM5 2.6B DSpark` at
 `/home/bianbu/models/dspark/dspark-bf16.gguf`, a 324M-parameter head over the target.
 Architecture tag is `dflash`; the variant is DSpark, distinguished in llama.cpp by the

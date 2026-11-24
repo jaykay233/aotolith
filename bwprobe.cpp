@@ -44,7 +44,9 @@ static void * worker(void * arg) {
     const int64_t per = g_bytes / g_nt;
     const int64_t lo = per * id;
     const int64_t hi = (id == g_nt - 1) ? g_bytes : per * (id + 1);
-    vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, 32);
+    // Four independent accumulator chains, 128 bytes per load: one chain with a
+    // loop-carried add is latency bound and reports ~half the real ceiling.
+    vfloat32m1_t acc0 = __riscv_vfmv_v_f_f32m1(0.0f, 32), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     // MEGA_STRIDE=N reads N*32 bytes out of every N*128 bytes: the decode PV loop
     // walks V as 128 useful bytes of each 512-byte position, so this isolates
     // whether the stride, rather than the byte count, is what costs bandwidth.
@@ -52,17 +54,23 @@ static void * worker(void * arg) {
     const double t0 = now_s();
     for (int rep = 0; rep < 3; ++rep)
         for (int64_t i = lo; i < hi; i += 4096)
-            for (int j = 0; j < 4096; j += 128) {
+            for (int j = 0; j < 4096; j += 512) {
                 if (st) {
                     const int q = j / 128;
                     if ((q & (st - 1)) != 0) continue;
                 }
-                const size_t vl = __riscv_vsetvl_e32m4((size_t) 32);
-                acc = __riscv_vfadd_vv_f32m4(acc,
-                    __riscv_vle32_v_f32m4((const float *) (g_buf + i + j), vl), vl);
+                const size_t vl = __riscv_vsetvl_e32m1((size_t) 32);
+                const float * p = (const float *) (g_buf + i + j);
+                acc0 = __riscv_vfadd_vv_f32m1(acc0, __riscv_vle32_v_f32m1(p, vl), vl);
+                acc1 = __riscv_vfadd_vv_f32m1(acc1, __riscv_vle32_v_f32m1(p + 32, vl), vl);
+                acc2 = __riscv_vfadd_vv_f32m1(acc2, __riscv_vle32_v_f32m1(p + 64, vl), vl);
+                acc3 = __riscv_vfadd_vv_f32m1(acc3, __riscv_vle32_v_f32m1(p + 96, vl), vl);
             }
     g_t[id] = now_s() - t0;
-    g_sink[id] = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(acc, __riscv_vfmv_v_f_f32m1(0.0f, 1), 32));
+    const vfloat32m1_t s01 = __riscv_vfadd_vv_f32m1(acc0, acc1, 32);
+    g_sink[id] = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(
+        __riscv_vfadd_vv_f32m1(s01, __riscv_vfadd_vv_f32m1(acc2, acc3, 32), 32),
+        __riscv_vfmv_v_f_f32m1(0.0f, 1), 32));
     return nullptr;
 }
 

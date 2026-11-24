@@ -1,5 +1,7 @@
 # Decode: measured state
 
+> Index of conclusions, including every falsified attempt: `FINDINGS.md`.
+
 Numbers below are from `./bench_decode.sh` on the board (16.4 GB RAM, `/dev/shm`
 7.9 GB), Q4_0 weights, greedy, `-O1`.
 

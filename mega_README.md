@@ -1,5 +1,10 @@
 # MiniCPM5-2B megakernel on SpacemiT K3
 
+> Two lineages live in this repo. This file covers the ggml-backend runners
+> (`mega_minicpm_pf` / `_spec`). The standalone megakernel (`mega3`,
+> `mega_decode`) and its measured findings are in `FINDINGS.md`, with
+> `CHAIN.md` / `DECODE.md` / `DSPARK.md` as the detail notes.
+
 ## Deliverables
 
 - `mega_minicpm_pf.cpp` -> `mega_minicpm_pf` - whole-model single-graph runner:
