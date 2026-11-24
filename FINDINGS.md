@@ -1076,10 +1076,20 @@ Two things follow. PV's wall is only **4.6 s** (66.61 - 61.62 + the QK relief it
 gives), and the score buffer's write traffic is **1.9 s** — both already small.
 QK plus softmax is 18.5 s and is nearly all of attention.
 
-QK does 1.02 TMAC at 10K (16 heads x 9999 rows x ~5000 positions x 128 dims), so
-18.5 s over eight cores is **6.9 GMAC/s per core**, against the 131.7 the same
-`qk4` loop measures with K hot in `probe_qk_real`. The loop is not short of dot
-issue rate; it is waiting on K. That is the same conclusion the earlier 128-row
-tile experiment produced from the other direction: making the tile taller cut
-the pass count and bought 0.26 s, so the traffic is being served by L2 already
-and a taller tile only changes which cache does the serving.
+The contraction is **4.30 TMAC** for QK and the same for PV at 10K
+(`sum_p (p+1) x 16 heads x 128 dims x 42 layers`, counted against the real
+1024-row chunking). Against the measured core-seconds that is **41.4 GMAC/s per
+core for QK** and 72.6 for PV; attention as a whole is 8.60 TMAC in 185 core-s,
+i.e. 46.4 GMAC/s per core.
+
+The same `qk4` loop reaches **131.7 GMAC/s per core** in `probe_qk_real` with the
+K plane hot and nothing else running, so production QK runs at 3.1x off its own
+dot rate. Two of the three candidates are already excluded: parking the score
+stores in L1 (`-D`) recovers 1.9 s of 23, and halving the K pass count with
+128-row tiles (`-DI8G=32`) recovered 0.26 s, so neither the stores nor the K
+traffic per pass is the limit.
+
+What is left is contention, and `-0` measures it: skipping PV entirely drops QK's
+own core-seconds from 103.8 to **74.4** for identical work, i.e. PV's V stream
+makes QK 1.4x more expensive while both run. Even with PV gone QK is at
+57.8 GMAC/s per core, 2.3x off hot, so contention is part of it and not all of it.
