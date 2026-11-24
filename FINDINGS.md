@@ -335,6 +335,20 @@ reason.
 
 ### Harness
 
+0. **A four-row tile in a 64-row kernel measures nothing.** `I8_ROWS = I8_G *
+   PFA_ROWS = 64`, and `g_tile_n = (rows / I8_ROWS) * N_HEAD` rounds a 4-row
+   request down to zero tiles. The first `MEGA_ATTN4_ROWS=4` run reported 1.2 ms
+   for a full 10K attention pass that was not happening. The tell: 512, 2048,
+   5120 and 9995 positions all cost the same 1.19 ms. A timing that does not move
+   with the input it is supposed to read is not a timing.
+
+0b. **The stage table's embed line reads 3.26 ms and the dequant is 0.01.** The
+   per-token summary divides `g_stage[i]` by the token count, and some stages are
+   also touched outside the decode loop. `MEGA_STEPS=1` prints per-step deltas:
+   `embed 0.01 rmsnorm 0.62 gemm 54.29 attn 29.59` at 10K. An early budget table
+   in this tree copied the 3.26 and made a 2% tail look like 3.5%. When a stage's
+   number is surprising relative to the bytes it moves, read the per-step line.
+
 1. **`-X` used to eat the next argument.** `-X` did `g_dbg = atoi(argv[++i])`, so
    `-X -K8` consumed `-K8` as `-8` and left `g_k8dec = 0`. Every "int8 KV" run
    with `-X` before this was the f16 binary. Now `-X` only consumes a digit and
