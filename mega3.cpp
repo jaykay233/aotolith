@@ -4584,7 +4584,8 @@ static bool ds_alloc(void) {
     // four rows of bias, because the four-row kernel writes ldc = n per row and the
     // markov head runs through that same kernel to stay on one code path
     g_dsbias = (float *) hugemem((size_t) DS_SLOT * VOCAB * 4 + (2 << 20));
-    g_dssc   = (float *) hugemem((size_t) N_GPU * MAXCTX * 4 + (2 << 20));
+    // four slots' score rows per thread: the four-row draft pass shares one K stream
+    g_dssc   = (float *) hugemem((size_t) N_GPU * DS_SLOT * MAXCTX * 4 + (2 << 20));
     if (!g_dskc || !g_dsvc || !g_dshid || !g_dsx || !g_dsxa || !g_dsq || !g_dsatt ||
         !g_dsk || !g_dsv || !g_dsgate || !g_dsup || !g_dsfeat || !g_dsenc ||
         !g_dslog || !g_dsbias || !g_dssc) {
@@ -4727,6 +4728,90 @@ static inline int ds_target_slot(int L) {
 // make this ~4x cheaper, but acceptance does not depend on speed, so it waits until
 // there is a measured acceptance rate that justifies it.
 static int g_ds_np;
+static const bool g_ds_attn4 = getenv("MEGA_DSATTN4") != nullptr;
+
+// One unit per (kv head, query head), all four slots inside it. The four slots ask
+// their questions of the same prefix, so walking positions once and fanning the
+// loaded K and V out to four accumulators cuts the stream fourfold -- and the
+// stream is what this loop was spending its time on (4.3 GB/s measured against
+// 17.5 available, one full pass over 164 MB of K per layer).
+static void ds_attn4_band(int64_t lo, int64_t hi) {
+    const size_t vl = __riscv_vsetvl_e32m1(32);
+    const size_t vl16 = __riscv_vsetvl_e16mf2(32);
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    for (int64_t t = lo; t < hi; ++t) {
+        // one unit per query head; the kv head follows the same 8:1 grouping the
+        // target uses, which is what makes the four slots share a stream at all
+        const int h = (int) t;
+        const int kv = h / NH_PER_KV;
+        const _Float16 * kb = g_dskc + (int64_t) g_ds_layer * KV_LAYER_STRIDE
+                            + (int64_t) kv * HEAD_DIM;
+        const _Float16 * vb = g_dsvc + (int64_t) g_ds_layer * KV_LAYER_STRIDE
+                            + (int64_t) kv * HEAD_DIM;
+        const int64_t kstride = N_KV * HEAD_DIM;
+        // sc[r] is this slot's score row; the four are adjacent so the hot one stays
+        // in cache while the other three are written.
+        float * sc0 = g_dssc + (int64_t) g_pf_tid * DS_SLOT * MAXCTX;
+        float * q0 = g_dsq + h * HEAD_DIM;
+        float * o0 = g_dsatt + h * HEAD_DIM;
+
+        float mx[DS_SLOT];
+        for (int r = 0; r < DS_SLOT; ++r) mx[r] = -INFINITY;
+
+        for (int64_t i = 0; i < g_ds_np; ++i) {
+            const _Float16 * kp = kb + i * kstride;
+            for (int d = 0; d < HEAD_DIM; d += 32) {
+                const vfloat32m1_t kd =
+                    __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kp + d, vl16), vl);
+                for (int r = 0; r < DS_SLOT; ++r) {
+                    const vfloat32m1_t qd = __riscv_vle32_v_f32m1(
+                        q0 + (int64_t) r * N_EMBD + d, vl);
+                    const vfloat32m1_t acc = __riscv_vfmul_vv_f32m1(kd, qd, vl);
+                    const vfloat32m1_t z = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+                    const float v = __riscv_vfmv_f_s_f32m1_f32(
+                        __riscv_vfredusum_vs_f32m1_f32m1(acc, z, vl)) * scale;
+                    if (d == 0) sc0[(int64_t) r * MAXCTX + i] = v;
+                    else        sc0[(int64_t) r * MAXCTX + i] += v;
+                }
+            }
+            for (int r = 0; r < DS_SLOT; ++r) {
+                const float v = sc0[(int64_t) r * MAXCTX + i];
+                if (v > mx[r]) mx[r] = v;
+            }
+        }
+
+        float sum[DS_SLOT];
+        for (int r = 0; r < DS_SLOT; ++r) {
+            float * sc = sc0 + (int64_t) r * MAXCTX;
+            float sm = 0.0f;
+            for (int64_t i = 0; i < g_ds_np; ++i) {
+                const float e = expf(sc[i] - mx[r]);
+                sc[i] = e; sm += e;
+            }
+            sum[r] = sm > 0.0f ? 1.0f / sm : 0.0f;
+        }
+
+        // PV over the same stream: one V load feeds four weighted accumulations.
+        for (int r = 0; r < DS_SLOT; ++r)
+            for (int d = 0; d < HEAD_DIM; d += 32)
+                __riscv_vse32_v_f32m1(o0 + (int64_t) r * N_EMBD + d,
+                                      __riscv_vfmv_v_f_f32m1(0.0f, vl), vl);
+        for (int64_t i = 0; i < g_ds_np; ++i) {
+            const _Float16 * vp = vb + i * kstride;
+            for (int d = 0; d < HEAD_DIM; d += 32) {
+                const vfloat32m1_t vd =
+                    __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + d, vl16), vl);
+                for (int r = 0; r < DS_SLOT; ++r) {
+                    const float w = sc0[(int64_t) r * MAXCTX + i] * sum[r];
+                    float * op = o0 + (int64_t) r * N_EMBD + d;
+                    __riscv_vse32_v_f32m1(op, __riscv_vfmacc_vf_f32m1(
+                        __riscv_vle32_v_f32m1(op, vl), w, vd, vl), vl);
+                }
+            }
+        }
+    }
+}
+
 static void ds_attn_band(int64_t lo, int64_t hi) {
     const size_t vl = __riscv_vsetvl_e32m1(32);
     const size_t vl16 = __riscv_vsetvl_e16mf2(32);
@@ -4855,7 +4940,13 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
                 vc[i] = (_Float16) g_dsv[(int64_t) r * (N_KV * HEAD_DIM) + i];
             }
         }
-        parallel_for((int64_t) DS_SLOT * N_HEAD, ds_attn_band);
+        // Measured at 10K: 338 ms/round against 305 for the per-slot band, so the
+        // default stays per-slot. Sharing the stream cannot pay while the inner loop
+        // issues one vector reduction per (position, slot) and reads K in 32-byte
+        // granules across a 512-byte position stride; the fix is a dim-major tile,
+        // which is the same conclusion the target's own attention reached.
+        if (g_ds_attn4) parallel_for((int64_t) N_HEAD, ds_attn4_band);
+        else parallel_for((int64_t) DS_SLOT * N_HEAD, ds_attn_band);
 
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsatt, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 1; g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, g_dsxa };

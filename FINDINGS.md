@@ -283,6 +283,30 @@ Also confirmed against the reference rather than by argument:
   to ~30 ms *and* 2.5 tokens/round, which is 20.8 tok/s at 120 ms.
 - The drafter's cache is 31.5 MB at 12K, so a window is nearly free in memory.
   That is the one lever that changes the asymptotics instead of the constant.
+
+### Sharing the drafter's K stream across its four slots: measured, and it loses
+
+The obvious move is the one that worked for the target: the four draft slots ask
+their questions of the same prefix, so walk positions once and fan each loaded K
+and V out to four accumulators (`MEGA_DSATTN4`). It cuts the unit count from 64 to
+16 and the K/V traffic fourfold. Written, measured, gated off:
+
+| 10K, 40 rounds | ms/round | tok/s |
+|---|---|---|
+| per-slot band (default) | 305 | 6.31 |
+| four slots sharing the stream | 338 | 5.47 |
+
+Short context is the same or a hair worse (104 -> 107 ms), and the token stream is
+identical, so it is not a numerics bug: the reordering is exact (0.783 accepted per
+round either way, cos 0.1784 against 0.1785).
+
+The reason it cannot pay here is the same reason the target's own attention needed
+a layout change rather than a loop change: the inner loop issues one vector
+reduction per (position, slot), and it reads K in 32-byte granules across a
+512-byte position stride. Cutting the *number of readers* does not reduce the bytes
+those readers touch, because each of them already walked the whole line. What it
+needs is dim-major tiles so a position block is contiguous and the reduction
+happens once over a block of positions instead of once per position.
 - Attention at 10K is 32.1 ms of the 89.5 ms token: 9 TMAC of it is QK/PV, and
   the loop stalls on 32-byte granular loads rather than hitting FMA issue.
   Running QK and PV as int8 `vmadot` GEMMs is the fix with precedent in this tree.

@@ -140,7 +140,11 @@ So the drafter cannot make the output wrong. It can only lower the acceptance ra
    attention already went through; a sliding window on the draft's cache is the
    larger lever, and the cache is only 31.5 MB at 12K so a window costs nothing in
    memory. The drafter is lossy-tolerant: it can only change which drafts are
-   offered, never what is emitted.
+   offered, never what is emitted. Note the cheap version of this -- sharing one K
+   stream across the four slots (`MEGA_DSATTN4`) -- is **measured and loses**:
+   338 ms/round at 10K against 305. The reduction per (position, slot) and the
+   32-byte granules across a 512-byte stride are what cost, so this needs a
+   dim-major tile rather than a loop reorder.
 2. **Then more drafts per round.** 1.93 tokens/round at 10K against 3.35 at short
    context. m=4 is the kernel's sweet spot, but block_size is 7, so a two-group
    round (anchor + 6 masks) is the natural next size and costs a second weight
