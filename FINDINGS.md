@@ -328,6 +328,7 @@ Over 300 rounds, with `MEGA_ATTN4P=1`, sweeping the window on the 10K prompt:
 |---|---|---|---|
 | W = 512 | 113.48 | 0.916 | 33.02 |
 | W = 256 | 110.88 | 0.929 | 34.15 |
+| W = 256, both defaults | 105.43 | 0.929 | 35.92 |
 
 **The last three rows are a benchmark artifact and 256 is where the default stops.**
 The 10K prompt's greedy stream is degenerate: it falls into `944 242 39 944 242 39`
@@ -339,7 +340,8 @@ both context lengths without leaning on the cycle, and 256 is better at both.
 
 Both levers are defaults now, and the pure-default configuration (only `MEGA_SPEC=300`
 set, no other environment) measures **21.28 tok/s over 300 rounds: 555/900 drafts,
-0.617 per round, 2.85 tokens per 133.95 ms round, best round 119.99 ms**.
+0.617 per round, 2.85 tokens per 133.95 ms round, best round 119.99 ms**. The same
+configuration at 2K is **35.92 tok/s** (0.929 per round, 105.43 ms).
 
 The hard bound that remains holds and is now the only thing keeping this honest:
 plain decode at 10K is 97 ms/token, and 54.3 ms of that is streaming the weights
