@@ -668,6 +668,12 @@ static int g_pos, g_layer;
 // own max-abs scan, so decode adds no rescaling pass.
 static int8_t * g_k8d = nullptr;
 static int8_t * g_v8d = nullptr;
+// The quantisation grid of each layer's int8 K/V plane. A four-row decode round
+// appends positions to those planes, and prefill's own attention dequantises with
+// the globals g_k8isc/g_v8isc, so the grid has to be recorded while prefill runs
+// rather than looked up afterwards. Fixed size: two kv heads per layer.
+static float g_k8i_sc[N_LAYER * N_KV];
+static float g_v8i_sc[N_LAYER * N_KV];
 // int8 V is stored in PV order, [layer][kv][half][pos][64], not [layer][pos][kv][128].
 // PV's inner loop is over positions with the head dimension fixed, so the old
 // pos-major layout made it read the 128-byte half of every 512-byte position
@@ -2689,6 +2695,18 @@ static void pfa_convert_kv(int layer, int64_t npos) {
 // block) as 16 registers of 8 dims x 16 positions.
 static int g_pfa_layer;
 static int8_t * g_k8i, * g_v8i;
+// Prefill converts layer L, attends over it, then converts layer L+1 into the same
+// planes: one layer's worth of int8 KV is scratch that gets overwritten. A decode
+// round needs every layer's plane to survive, so when -MEGA_ATTN4 keeps the run
+// going into four-row rounds these per-layer copies are what attention reads.
+static int8_t * g_k8i_l = nullptr, * g_v8i_l = nullptr;
+static int64_t g_k8i_lsz = 0, g_v8i_lsz = 0;
+static inline int8_t * k8i_base(int layer) {
+    return g_k8i_l ? g_k8i_l + (int64_t) layer * g_k8i_lsz : g_k8i;
+}
+static inline int8_t * v8i_base(int layer) {
+    return g_v8i_l ? g_v8i_l + (int64_t) layer * g_v8i_lsz : g_v8i;
+}
 static int8_t * g_q8i;                 // [(head*nqg + group)][8 ksteps][4 rows x 16]
 static float *  g_q8isc;               // [rows][N_HEAD]
 static float g_k8isc[4], g_v8isc[4];
@@ -3205,11 +3223,12 @@ static void task_pfa_conv_q(int tid) {
     if (vhi > g_cv_npos) vhi = g_cv_npos & ~(int64_t) 15;
     for (int kv = 0; kv < N_KV; ++kv) {
         const float ik = g_cv_ik[kv], iv = g_cv_iv[kv];
-        int8_t * vbase = g_v8i + kv * g_v8i_npb16 * 2048;
+        int8_t * vbase = v8i_base(g_cv_layer) + kv * g_v8i_npb16 * 2048;
         // K: per position, 16 dims at a time, all contiguous this position's lane
         for (int64_t p = lo; p < hi; ++p) {
             const _Float16 * kb = ktile(g_cv_layer, kv, (int) (p / KT));
-            int8_t * kdst = g_k8i + ((kv * g_k8i_npb + p / 64) * 8) * 1024 + (p % 64) * 16;
+            int8_t * kdst = k8i_base(g_cv_layer) + ((kv * g_k8i_npb + p / 64) * 8) * 1024
+                          + (p % 64) * 16;
             for (int dg = 0; dg < HEAD_DIM / 16; ++dg)
                 conv16(kb + dg * 16 * KT + (p % KT), KT, ik, kdst + dg * 1024);
         }
@@ -3263,6 +3282,11 @@ static void pfa_convert_kv_i8(int layer, int64_t npos) {
         const float sk = mk > 0 ? mk / 127.0f : 1.0f;
         const float sv = mv > 0 ? mv / 127.0f : 1.0f;
         g_k8isc[kv] = sk; g_v8isc[kv] = sv;
+        // A four-row decode appends positions to these planes one row at a time,
+        // and each appended position has to land on the grid the prefix already
+        // uses. This is the last conversion of this layer, so it is also the one
+        // whose bytes survive.
+        g_k8i_sc[layer * N_KV + kv] = sk; g_v8i_sc[layer * N_KV + kv] = sv;
         if (getenv("MEGA_SCL") && layer == 0)
             fprintf(stderr, "  scl kv%d npos %lld sk %.9g sv %.9g\n", kv, (long long) npos, (double) sk, (double) sv);
         g_cv_ik[kv] = 1.0f / sk; g_cv_iv[kv] = 1.0f / sv;
@@ -3351,7 +3375,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
         // Each kv head owns two 64-dim halves, i.e. 2 * npb16 blocks of 1024 B.
         // Adding only half*npb16 put kv 1's first half on kv 0's second half, so
         // heads 8..15 attended over the wrong V.
-        const int8_t * vb = g_v8i + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
+        const int8_t * vb = v8i_base(layer) + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
         for (int gg = 0; gg < g_i8g; ++gg) {
@@ -3491,7 +3515,7 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
     const size_t vl32 = __riscv_vsetvl_e32m1(32);
     const size_t vl16 = __riscv_vsetvl_e16mf2(32);
     for (int pb = 0; pb < npb; ++pb) {
-        const int8_t * kb = g_k8i + ((kv * g_k8i_npb + pb) * 8) * 1024;
+        const int8_t * kb = k8i_base(g_pfa_layer) + ((kv * g_k8i_npb + pb) * 8) * 1024;
         int16_t * blk = sc + (size_t) (pb * 8) * 32;
         for (int gg = 0; gg < g_i8g; ++gg) {
             int8_t * op[8];
@@ -3676,7 +3700,7 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
         // Each kv head owns two 64-dim halves, i.e. 2 * npb16 blocks of 1024 B.
         // Adding only half*npb16 put kv 1's first half on kv 0's second half, so
         // heads 8..15 attended over the wrong V.
-        const int8_t * vb = g_v8i + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
+        const int8_t * vb = v8i_base(layer) + ((int64_t) kv * 2 + half) * g_v8i_npb16 * 1024;
         if (g_vsrc == 1) vb = (const int8_t *) g_wblob + (size_t) half * 65536;
         if (g_vsrc == 2) vb = g_k8i + (kv * g_k8i_npb + half * 8) * 1024;
 
@@ -4008,11 +4032,306 @@ static void pfa_run(int L) {
     while (g_sm_done.load(std::memory_order_acquire) < g_n_sm) sched_yield();
 }
 
-// Time four-row attention rounds at the full prompt length on the prefill int8
-// vmadot path. Decode's own attention costs time per position rather than per
-// byte, so this is the number that says whether four-row verification can pay:
-// the round's weight stream is paid once (54.5 ms at 10K), and this is what the
-// other half costs when the four rows share it.
+// ------------------------------------------------------ four-row decode round
+// A speculation round is four rows through one weight stream. Every piece is
+// already proven somewhere else: the GEMM is the hp_m4 kernel with prefill's A
+// record, the attention is what attn4p_run times at 10K, and the int8 K/V planes
+// are the ones prefill filled for the whole prompt. What is new is that the four
+// rows advance position by position instead of chunk by chunk.
+static float * g_x4 = nullptr;      // 4 x N_EMBD residual stream
+static float * g_xa4 = nullptr;     // 4 x N_EMBD: normed in, GEMM out
+static float * g_q4 = nullptr;      // 4 x N_EMBD; also the packed Q attention reads
+static float * g_k4 = nullptr;      // 4 x N_KV*HEAD_DIM
+static float * g_v4 = nullptr;
+static float * g_gate4 = nullptr;   // 4 x N_FF
+static float * g_up4 = nullptr;
+static float * g_logits4 = nullptr; // 4 x VOCAB
+static int g_m4dec = 0;             // -MEGA_M4DEC=n: rounds of four rows
+static int64_t g_m4p0 = -1;         // MEGA_M4P0: aim the round at a prompt position
+static int32_t g_m4tok[4] = { 0, 0, 0, 0 };
+// The four answers, file-scope rather than a caller-stack array: m4_round inlines
+// a lot and a caller-stack array came back with stale words after the round.
+static int g_m4out[4];
+
+static void m4dec_alloc(void) {
+    if (g_x4) return;
+    const size_t xe = (size_t) 4 * N_EMBD * 4 + (2 << 20);
+    const size_t fe = (size_t) 4 * N_FF * 4 + (2 << 20);
+    const size_t ke = (size_t) 4 * N_KV * HEAD_DIM * 4 + 4096;
+    g_x4      = (float *) hugemem(xe);
+    g_xa4     = (float *) hugemem(xe);
+    g_q4      = (float *) hugemem(xe);
+    g_gate4   = (float *) hugemem(fe);
+    g_up4     = (float *) hugemem(fe);
+    g_k4      = (float *) hugemem(ke);
+    g_v4      = (float *) hugemem(ke);
+    g_logits4 = (float *) hugemem((size_t) 4 * VOCAB * 4 + (2 << 20));
+    if (!g_x4 || !g_xa4 || !g_q4 || !g_gate4 || !g_up4 || !g_k4 || !g_v4 ||
+        !g_logits4) {
+        fprintf(stderr, "oom four-row decode\n");
+        g_x4 = nullptr;
+        return;
+    }
+    m4_alloc();
+    if (g_a4p) attn4p_alloc();
+    printf("m4dec: %.1f MB scratch, four rows per round\n",
+           (double) (4 * N_EMBD * 2 + 4 * N_FF * 2 + 4 * VOCAB) * 4 / 1e6);
+}
+
+// Append one layer's new positions to the int8 K/V planes. The prefix was
+// quantised over the whole prompt with one scale per layer per kv, so a new
+// position is another sample on that grid and nothing already written moves.
+// K: one position's 16 dims fill one lane of a 64-position block, so a 16-lane
+// conversion is exactly one position. V: a 16-position block interleaves
+// positions, so a single new position is a byte store per dim.
+static void conv_kv8_inc(int layer, int64_t p0, int nrows) {
+    for (int kv = 0; kv < N_KV; ++kv) {
+        const float sk = g_k8i_sc[layer * N_KV + kv];
+        const float sv = g_v8i_sc[layer * N_KV + kv];
+        const float ik = sk > 0 ? 1.0f / sk : 1.0f;
+        const float iv = sv > 0 ? 1.0f / sv : 1.0f;
+        int8_t * vbase = v8i_base(layer) + (int64_t) kv * g_v8i_npb16 * 2048;
+        for (int64_t p = p0; p < p0 + nrows; ++p) {
+            const _Float16 * kb = ktile(layer, kv, (int) (p / KT));
+            int8_t * kdst = k8i_base(layer) + ((int64_t) (kv * g_k8i_npb + p / 64) * 8) * 1024
+                          + (p % 64) * 16;
+            for (int dg = 0; dg < HEAD_DIM / 16; ++dg)
+                conv16(kb + dg * 16 * KT + (int) (p % KT), KT, ik, kdst + dg * 1024);
+            const _Float16 * vb = g_vpos + (int64_t) layer * KV_LAYER_STRIDE
+                                + p * N_KV * HEAD_DIM + kv * HEAD_DIM;
+            int8_t * vdst = vbase + (p / 16) * 1024 + (p % 16);
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                int b = (int) lrintf((float) vb[d] * iv);
+                if (b > 127) b = 127;
+                if (b < -127) b = -127;
+                vdst[((d / 64) * g_v8i_npb16) * 1024 + (d % 64) * 16] = (int8_t) b;
+            }
+        }
+    }
+}
+
+static void silu4_fn(int64_t lo, int64_t hi) {
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i));
+        const vfloat32m1_t x = __riscv_vle32_v_f32m1(g_gate4 + i, vl);
+        const vfloat32m1_t u = __riscv_vle32_v_f32m1(g_up4 + i, vl);
+        vfloat32m1_t t = __riscv_vfmul_vf_f32m1(x, -1.4426950408889634f, vl);
+        t = __riscv_vfmax_vf_f32m1(t, -126.0f, vl);
+        t = __riscv_vfmin_vf_f32m1(t,  126.0f, vl);
+        const vfloat32m1_t den = __riscv_vfadd_vf_f32m1(exp2f_e(t, vl), 1.0f, vl);
+        __riscv_vse32_v_f32m1(g_gate4 + i,
+            __riscv_vfmul_vv_f32m1(__riscv_vfdiv_vv_f32m1(x, den, vl), u, vl), vl);
+    }
+}
+
+static void add4_fn(int64_t lo, int64_t hi) {
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i < 32 ? hi - i : 32));
+        const vfloat32m1_t a = __riscv_vle32_v_f32m1(g_x4 + i, vl);
+        const vfloat32m1_t b = __riscv_vle32_v_f32m1(g_xa4 + i, vl);
+        __riscv_vse32_v_f32m1(g_x4 + i, __riscv_vfadd_vv_f32m1(a, b, vl), vl);
+    }
+}
+
+// One round: four candidate tokens at positions p0..p0+3, one argmax per row in
+// out[]. Row 0's answer is the real next token; rows 1..3 are what the model would
+// predict if the drafts before them had been right, which is what the acceptance
+// test consumes.
+static const bool M4DUMP = getenv("MEGA_M4DUMP") != nullptr;
+static const bool M4ARGMAX_ONE = getenv("MEGA_M4AX2") != nullptr;
+// Four-row argmax: one band per thread over 4 x VOCAB, four running maxima each.
+static int   g_m4b_i[N_GPU][4];
+static float g_m4b_v[N_GPU][4];
+static void task_argmax4_init(int tid) {
+    for (int r = 0; r < 4; ++r) { g_m4b_i[tid][r] = -1; g_m4b_v[tid][r] = -INFINITY; }
+}
+static void argmax4_fn(int64_t lo, int64_t hi) {
+    const int t = g_pf_tid;
+    for (int64_t i = lo; i < hi; ++i) {
+        const int r = (int) (i / VOCAB);
+        const float v = g_logits4[i];
+        if (v > g_m4b_v[t][r] || (v == g_m4b_v[t][r] && g_m4b_i[t][r] < 0)) {
+            g_m4b_v[t][r] = v;
+            g_m4b_i[t][r] = (int) (i - (int64_t) r * VOCAB);
+        }
+    }
+}
+static void dump_row(const char * tag, int layer, char when, const float * row);
+static void dump_n(const char * tag, int layer, char when, const float * row, int64_t n);
+
+static bool m4_round(int64_t p0, const int * toks, int * out) {
+    if (!g_x4) { m4dec_alloc(); if (!g_x4) return false; }
+    if (p0 + 4 > MAXCTX) return false;
+    for (int r = 0; r < 4; ++r)
+        dequant_row_t(g_x4 + (int64_t) r * N_EMBD,
+                      g_emb->data + (int64_t) toks[r] * src_row_bytes_t(N_EMBD, (int) g_emb->type),
+                      N_EMBD, (int) g_emb->type);
+
+    for (int L = 0; L < N_LAYER; ++L) {
+        g_layer = L;
+        if (M4DUMP && L < 2) dump_row("m4", L, 'e', g_x4);
+        for (int r = 0; r < 4; ++r)
+            rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
+                        g_attn_norm[L], N_EMBD);
+        if (M4DUMP && L < 2) dump_row("m4", L, 'n', g_xa4);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 3;
+        g_mj[0] = { g_wq[L].b, g_wq[L].k, g_wq[L].n, g_q4 };
+        g_mj[1] = { g_wk[L].b, g_wk[L].k, g_wk[L].n, g_k4 };
+        g_mj[2] = { g_wv[L].b, g_wv[L].k, g_wv[L].n, g_v4 };
+        run(task_mgemm_m4);
+        // q/k/v each own a buffer: ldc is the matrix width, so pointing all three
+        // at one buffer makes k and v overwrite q's first rows.
+
+        // rope and the KV append are per row: they are written against one
+        // position at a time and the f16 cache is indexed by g_pos.
+        for (int r = 0; r < 4; ++r) {
+            g_q = g_q4 + (int64_t) r * N_EMBD;
+            g_k = g_k4 + (int64_t) r * (N_KV * HEAD_DIM);
+            g_v = g_v4 + (int64_t) r * (N_KV * HEAD_DIM);
+            g_pos = (int) (p0 + r);
+            rope_all();
+        }
+        // After rope, so the K/V here are comparable with the single-row dump.
+        if (M4DUMP && L < 2) {
+            dump_row("m4", L, 'q', g_q4);
+            dump_n("m4", L, 'k', g_k4, N_KV * HEAD_DIM);
+            dump_n("m4", L, 'v', g_v4, N_KV * HEAD_DIM);
+        }
+        conv_kv8_inc(L, p0, 4);
+
+        g_pq = g_q4;
+        g_pfa_ctx = p0;
+        g_pfa_rows = 4;
+        pfa_pack_q(4);
+        // pfa_sm_i8 and pfa_pv_i8 dequantise with the globals g_k8isc/g_v8isc,
+        // which prefill only keeps valid for the layer it just converted. Decode
+        // appends to every layer's plane up front, so this round has to restore
+        // this layer's own grid or every layer dequantises with layer 41's scale.
+        for (int kv = 0; kv < N_KV; ++kv) {
+            g_k8isc[kv] = g_k8i_sc[L * N_KV + kv];
+            g_v8isc[kv] = g_v8i_sc[L * N_KV + kv];
+        }
+        pfa_run(L);
+        if (M4DUMP && L < 2) dump_row("m4", L, 'a', g_pfa_out);
+
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_pfa_out, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, g_xa4 };
+        run(task_mgemm_m4);
+        if (M4DUMP && L < 2) dump_row("m4", L, 'o', g_xa4);
+        parallel_for(4 * N_EMBD, add4_fn);
+        if (M4DUMP && L < 2) dump_row("m4", L, 'r', g_x4);
+
+        for (int r = 0; r < 4; ++r)
+            rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
+                        g_ffn_norm[L], N_EMBD);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 2;
+        g_mj[0] = { g_wg[L].b, g_wg[L].k, g_wg[L].n, g_gate4 };
+        g_mj[1] = { g_wu[L].b, g_wu[L].k, g_wu[L].n, g_up4 };
+        run(task_mgemm_m4);
+        if (M4DUMP && L < 2) {
+            dump_n("m4", L, 'g', g_gate4, N_FF);
+            dump_n("m4", L, 'u', g_up4, N_FF);
+        }
+        parallel_for(4 * N_FF, silu4_fn);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_gate4, (size_t) N_FF, m4_aq(N_FF));
+        g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, g_xa4 };
+        run(task_mgemm_m4);
+        parallel_for(4 * N_EMBD, add4_fn);
+    }
+
+    for (int r = 0; r < 4; ++r)
+        rmsnorm_par(g_xa4 + (int64_t) r * N_EMBD, g_x4 + (int64_t) r * N_EMBD,
+                    g_out_norm, N_EMBD);
+    spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
+    g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits4 };
+    run(task_mgemm_m4);
+    // task_argmax reads g_logits, so the four heads are taken one row at a time.
+    // Ties go to the lower index exactly as the single-row path does.
+    if (const char * ld = getenv("MEGA_M4LOGD")) {
+        // Same dump the single-row path writes with MEGA_LOGD, so the two argmax
+        // decisions can be compared over the whole vocabulary instead of by id.
+        if (FILE * f = fopen(ld, "wb")) { fwrite(g_logits4, 4, VOCAB, f); fclose(f); }
+        int idx[5] = { -1, -1, -1, -1, -1 };
+        for (int j = 0; j < 5; ++j)
+            for (int v = 0; v < VOCAB; ++v) {
+                bool used = false;
+                for (int q2 = 0; q2 < j; ++q2) if (idx[q2] == v) used = true;
+                if (used) continue;
+                if (idx[j] < 0 || g_logits4[v] > g_logits4[idx[j]]) idx[j] = v;
+            }
+        printf("m4dec: row0 top5");
+        for (int j = 0; j < 5; ++j) printf(" %d:%.3f", idx[j], (double) g_logits4[idx[j]]);
+        printf("\n");
+        unsetenv("MEGA_M4LOGD");
+    }
+    // One pass over all four rows instead of four passes over g_logits: the rows
+    // are contiguous, so a band per thread covers them naturally and each thread
+    // keeps four running maxima. Scanning in increasing index with a strict ">"
+    // keeps ties on the lower id, which is what the single-row path does.
+    {
+        if (M4ARGMAX_ONE) {
+            run(task_argmax4_init);
+            parallel_for(4 * VOCAB, argmax4_fn);
+            for (int r = 0; r < 4; ++r) {
+                int best = g_m4b_i[0][r];
+                float bv = g_m4b_v[0][r];
+                for (int t = 1; t < g_participants; ++t)
+                    if (g_m4b_v[t][r] > bv || (g_m4b_v[t][r] == bv && g_m4b_i[t][r] < best)) {
+                        bv = g_m4b_v[t][r]; best = g_m4b_i[t][r];
+                    }
+                out[r] = best;
+                if (M4DUMP && r == 0)
+                    printf("m4dec: ax2 row0 idx %d val %.4f\n", best, (double) bv);
+            }
+        } else {
+            float * keep = g_logits;
+            for (int r = 0; r < 4; ++r) {
+                g_logits = g_logits4 + (int64_t) r * VOCAB;
+                run(task_argmax);
+                int best = g_am_idx[0];
+                float bv = g_am_val[0];
+                for (int t = 1; t < g_participants; ++t)
+                    if (g_am_val[t] > bv || (g_am_val[t] == bv && g_am_idx[t] < best)) {
+                        bv = g_am_val[t]; best = g_am_idx[t];
+                    }
+                out[r] = best;
+                if (M4DUMP && r == 0)
+                    printf("m4dec: per-row argmax row0 idx %d val %.4f (am0 %.4f idx0 %d)\n",
+                           best, (double) bv, (double) g_am_val[0], g_am_idx[0]);
+            }
+            g_logits = keep;
+        }
+    }
+    return true;
+}
+
+// Repeat-the-anchor driver. Four identical rows at four positions is the
+// cheapest round whose answer is known: row 0 must emit the token the single-row
+// chain emits at the same position, and rows 1..3 must be a stable fixpoint.
+static bool m4dec_run(int64_t p0, int anchor, int rounds) {
+    m4dec_alloc();
+    if (!g_x4) return false;
+    if (!g_a4p) { fprintf(stderr, "m4dec needs the four-row attention (MEGA_ATTN4P=1)\n"); }
+    int tok[4] = { anchor, anchor, anchor, anchor };
+    int * out = g_m4out;
+    if (g_m4p0 >= 0) { p0 = g_m4p0; for (int i = 0; i < 4; ++i) tok[i] = g_m4tok[i]; }
+    double best = 1e9;
+    for (int it = 0; it < rounds; ++it) {        const double t0 = now_s();
+        if (!m4_round(p0, tok, out)) return false;
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+        printf("m4dec: round %d at pos %lld  %.2f ms  rows -> %d %d %d %d\n",
+               it, (long long) p0, dt * 1e3, out[0], out[1], out[2], out[3]);
+        p0 += 4;
+    }
+    printf("m4dec: best %.2f ms/round -> %.2f tok/s at 4/round, %.2f at 3/4 accepted\n",
+           best * 1e3, 4.0 / best, 3.0 / best);
+    return true;
+}
+
+
 static void attn4_run(int rounds, int64_t ctx, int64_t rows);
 static void attn4_bench(int rounds, int64_t ctxmax) {
     // I8_ROWS = I8_G * PFA_ROWS is the prefill row tile; four rows is the decode
@@ -4657,21 +4976,43 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     g_pfv     = (float *) hugemem((size_t) R * N_KV * HEAD_DIM * 4);
     g_pq      = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
     g_pfa_out = (float *) hugemem((size_t) R * N_HEAD * HEAD_DIM * 4);
-    g_k8i_npb_cap   = (NP + 63) / 64;
-    g_v8i_npb16_cap = (NP + 15) / 16;
-    g_k8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 63) / 64) * 8192 + (2 << 20));
-    g_v8i     = (int8_t *) hugemem((size_t) N_KV * ((NP + 15) / 16) * 2048 + (2 << 20));
+    // A run that turns into a four-row decode keeps these planes and appends one
+    // position per row, so cover the whole context from the start: a position's
+    // block index is part of the plane address, and growing it later would move
+    // every byte already written.
+    const int64_t npz = g_attn4 ? MAXCTX : NP;
+    g_k8i_npb_cap   = (npz + 63) / 64;
+    g_v8i_npb16_cap = (npz + 15) / 16;
+    g_k8i     = (int8_t *) hugemem((size_t) N_KV * ((npz + 63) / 64) * 8192 + (2 << 20));
+    g_v8i     = (int8_t *) hugemem((size_t) N_KV * ((npz + 15) / 16) * 2048 + (2 << 20));
     g_q8i     = (int8_t *) hugemem((size_t) N_HEAD * ((R + 3) / 4) * 512 + (2 << 20));
     g_psa16   = (int16_t *) hugemem((size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
     g_q8isc   = (float *) aligned_alloc(64, (size_t) R * N_HEAD * 4);
+    if (g_attn4) {
+        // Prefill converts one layer into the shared planes, attends, then converts
+        // the next layer over the top. A decode round reads every layer's plane, so
+        // each layer gets its own: 42 x 6.3 MB at 12K, against the 528 MB f16 cache
+        // those planes are the int8 copy of.
+        g_k8i_lsz = (int64_t) N_KV * ((npz + 63) / 64) * 8192;
+        g_v8i_lsz = (int64_t) N_KV * ((npz + 15) / 16) * 2048;
+        const size_t ktot = (size_t) N_LAYER * g_k8i_lsz + (2 << 20);
+        const size_t vtot = (size_t) N_LAYER * g_v8i_lsz + (2 << 20);
+        g_k8i_l = (int8_t *) hugemem(ktot);
+        g_v8i_l = (int8_t *) hugemem(vtot);
+        if (!g_k8i_l || !g_v8i_l) { fprintf(stderr, "oom per-layer int8 kv\n"); return false; }
+        use_huge(g_k8i_l, ktot);
+        use_huge(g_v8i_l, vtot);
+        printf("prefill: per-layer int8 kv %.0f MB (four-row decode)\n",
+               (double) (ktot + vtot) / 1e6);
+    }
     if (!g_pfa || !g_pfx || !g_pfxa || !g_pfgate || !g_pfup || !g_pfk || !g_pfv ||
         !g_pq || !g_pfa_out || !g_k8i || !g_v8i || !g_q8i || !g_psa16 || !g_q8isc) {
         fprintf(stderr, "oom prefill buffers\n");
         return false;
     }
     use_huge(g_pfa, pfa_bytes);
-    use_huge(g_k8i, (size_t) N_KV * ((NP + 63) / 64) * 8192 + (2 << 20));
-    use_huge(g_v8i, (size_t) N_KV * ((NP + 15) / 16) * 2048 + (2 << 20));
+    use_huge(g_k8i, (size_t) N_KV * ((npz + 63) / 64) * 8192 + (2 << 20));
+    use_huge(g_v8i, (size_t) N_KV * ((npz + 15) / 16) * 2048 + (2 << 20));
     use_huge(g_psa16, (size_t) N_GPU * sizeof(int16_t) * SC_TSTRIDE);
     g_pfa_i8 = 1;
     g_pfa_rows = R;              // pfa_pipe_alloc derives the tile count from this
@@ -4823,6 +5164,25 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             t_attn+=now_s()-_p; _a=now_s();
             if (getenv("MEGA_PROBE")) printf("probe L%d v8sc %.6g %.6g k8sc %.6g %.6g\n",
                                              L, g_v8isc[0], g_v8isc[1], g_k8isc[0], g_k8isc[1]);
+            // The last chunk's attention output at a chosen layer: four real prompt
+            // positions, so a four-row decode round over those same positions has an
+            // exact reference produced by the same int8 kernel.
+            if (const char * pf = getenv("MEGA_PFDUMP")) {
+                if (base + cm >= npref && L == atoi(pf)) {
+                    FILE * fp = fopen("/tmp/pf_last.bin", "wb");
+                    if (fp) { fwrite(g_pfa_out, 4, (size_t) (C * N_EMBD), fp); fclose(fp); }
+                    fp = fopen("/tmp/pf_q.bin", "wb");
+                    if (fp) { fwrite(g_pq, 4, (size_t) (C * N_EMBD), fp); fclose(fp); }
+                    fp = fopen("/tmp/pf_w8.bin", "wb");   // group 66 = rows 264..267
+                    if (fp) {
+                        fwrite(g_q8i + 66 * 512, 1, 512, fp);
+                        fclose(fp);
+                    }
+                    printf("pf_last: L=%d base=%lld cm=%lld C=%lld\n", L,
+                           (long long) base, (long long) cm, (long long) C);
+                    unsetenv("MEGA_PFDUMP");
+                }
+            }
             if (L == 0 && getenv("MEGA_DUMP")) {
                 FILE * fp = fopen("/tmp/pf_oall.bin", "wb");
                 fwrite(g_pfa_out, 4, (size_t) (C * N_EMBD), fp); fclose(fp);
@@ -4968,16 +5328,17 @@ static void bench_prefill_attn(void) {
     }
 
     if (g_pfa_i8) {
-        g_k8i_npb_cap   = (ctx + rows + 63) / 64;
-        g_v8i_npb16_cap = (ctx + rows + 15) / 16;
-        g_k8i = (int8_t *) hugemem((size_t) N_KV * ((ctx + rows + 63) / 64) * 8192 + (2 << 20));
-        g_v8i = (int8_t *) hugemem((size_t) N_KV * ((ctx + rows + 15) / 16) * 2048 + (2 << 20));
-        g_q8i = (int8_t *) hugemem((size_t) N_HEAD * ((rows + 3) / 4) * 512 + (2 << 20));
+        const int64_t npz = ctx + rows;
+        g_k8i_npb_cap   = (npz + 63) / 64;
+        g_v8i_npb16_cap = (npz + 15) / 16;
+        g_k8i     = (int8_t *) hugemem((size_t) N_KV * ((npz + 63) / 64) * 8192 + (2 << 20));
+        g_v8i     = (int8_t *) hugemem((size_t) N_KV * ((npz + 15) / 16) * 2048 + (2 << 20));
+        g_q8i     = (int8_t *) hugemem((size_t) N_HEAD * ((rows + 3) / 4) * 512 + (2 << 20));
         // PV walks the whole V range for every row group (16 passes per tile), so
         // V's physical layout decides whether those passes hit cache. Give the KV
         // planes huge pages like the weight blob already has.
-        use_huge(g_k8i, (size_t) N_KV * ((ctx + rows + 63) / 64) * 8192 + (2 << 20));
-        use_huge(g_v8i, (size_t) N_KV * ((ctx + rows + 15) / 16) * 2048 + (2 << 20));
+        use_huge(g_k8i, (size_t) N_KV * ((npz + 63) / 64) * 8192 + (2 << 20));
+        use_huge(g_v8i, (size_t) N_KV * ((npz + 15) / 16) * 2048 + (2 << 20));
         use_huge(g_q8i, (size_t) N_HEAD * ((rows + 3) / 4) * 512 + (2 << 20));
         report_huge("int8 kv");
         g_q8isc = (float *) aligned_alloc(64, (size_t) rows * N_HEAD * 4);
@@ -5318,6 +5679,7 @@ int main(int argc, char ** argv) {
     if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = atoi(getenv("MEGA_VENDOR"));
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
+    if (getenv("MEGA_M4DEC")) { g_m4dec = atoi(getenv("MEGA_M4DEC")); g_attn4 = 1; }
     if (getenv("MEGA_ATTN4P")) g_a4p = atoi(getenv("MEGA_ATTN4P"));
     // The vendor prefill helper for 3-bit weights is a one-row kernel, and the
     // 4-row K256 kernel it would otherwise call is 4-bit. Prefill therefore runs
@@ -5627,14 +5989,24 @@ int main(int argc, char ** argv) {
         const int64_t np = nt - 1;
         const int32_t anchor = toks[np];
         if (!real_prefill(toks, np, g_pf_chunk)) return 1;
+        if (const char * m4p = getenv("MEGA_M4P0")) {
+            // Aim the round at four positions prefill already attended over, with the
+            // real prompt tokens. Row r then has to reproduce the prefill attention
+            // output for position p0+r, which is the same kernel on the same bytes.
+            g_m4p0 = atoll(m4p);
+            for (int i = 0; i < 4; ++i) g_m4tok[i] = toks[g_m4p0 + i];
+            printf("m4p0: positions %lld..%lld tokens %d %d %d %d\n", (long long) g_m4p0,
+                   (long long) (g_m4p0 + 3), g_m4tok[0], g_m4tok[1], g_m4tok[2], g_m4tok[3]);
+        }
         free(toks);
         // The prefill just wrote positions 0..np-1 into the same f16 KV cache
         // decode reads, so generation continues from the last prompt token at
         // position np instead of starting from an empty context.
         prefill_release();
-        if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
         prompt = anchor;
         pos0 = np;
+        if (g_attn4 && g_m4dec) { m4dec_run(pos0, prompt, g_m4dec); return 0; }
+        if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
         printf("chain: decode starts at position %lld (anchor %d)\n",
                (long long) pos0, prompt);
     }
@@ -5644,6 +6016,9 @@ int main(int argc, char ** argv) {
     if (getenv("MEGA_M4GEMM")) { m4_gemm_bench(atoi(getenv("MEGA_M4GEMM"))); return 0; }
     if (!pos0 && g_pf_rows > 0) { bench_prefill_gemm(g_pf_rows); return 0; }
 
+    // Unbuffered: several paths end in the pre-existing -O2 exit fault and a
+    // buffered tail would lose every line printed before it.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     int tok = prompt;
     const double t_start = now_s();
     report_huge("decode");
@@ -5715,6 +6090,7 @@ int main(int argc, char ** argv) {
                 for (int d = 0; d < HEAD_DIM; ++d) g_attn_out[h * HEAD_DIM + d] = 0;
             attention();
             TOCK(S_ATTN);
+            if (step == 0 && getenv("MEGA_DUMP")) dump_row("dc", L, 'i', g_attn_out);
 
             quant_a(g_attn_out, N_EMBD);
             TICK();

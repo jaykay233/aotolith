@@ -320,3 +320,43 @@ the split is bit-identical to the non-split run. So a four-row speculator round 
 which clears 20 tok/s at 1.84 accepted tokens per round. Short context measured
 1.83 with three drafts, so the chain sits on the line and the next lever is
 acceptance.
+
+### The four-row round runs at 10K, and it is correct
+
+`MEGA_M4DEC=n` drives `m4_round` in `mega3.cpp`: four rows, one weight pass, the
+int8 KV planes prefill already built, and the X100 softmax split. Measured on
+`m3c.a4 -m mc-q4o.gguf -F /tmp/p10k.txt -n 0` with `MEGA_ATTN4P=1 MEGA_M4DEC=1
+MEGA_M4AX2=1`:
+
+| round | latency | row 0 answer |
+|---|---|---|
+| 0 (pos 9999) | 106.73 ms | 220 |
+| 1 (pos 10003) | 98.94 ms | 220 |
+| 2 (pos 10007) | 139.72 ms | 220 |
+
+The single-row chain at position 9999 emits 220 (`step 0 -> 220 (18.4918)`), so
+the round reproduces the reference token. Its logit is 17.21 rather than 18.49:
+that is int8 attention against the single-row path's f16 KV, and greedy decoding
+does not care. Row 0's attention output agrees with the prefill int8 attention for
+the same position at cosine 0.999998, which is the check that says the round is
+not merely producing a plausible token.
+
+Three bugs had to go, and each one is a trap worth naming:
+
+1. **q, k and v shared one output buffer.** The m4 kernel writes rows at stride
+   `ldc = n`, so pointing all three jobs at one buffer let k and v overwrite q's
+   first rows and the attention ran on a k that was really v.
+2. **The int8 KV planes are per-layer scratch in prefill, not storage.** Prefill
+   converts layer L, attends over it, then converts L+1 over the top of the same
+   planes. A decode round reads every layer, so it has to keep 42 planes: 268 MB
+   at 12K, allocated only when `-MEGA_ATTN4` means the run continues into decode.
+   Without this every layer attended over layer 41's K and V.
+3. **`g_k8isc`/`g_v8isc` are per-layer globals too.** `pfa_sm_i8` and `pfa_pv_i8`
+   dequantise with them, and prefill only keeps them valid for the layer it just
+   converted. The round restores this layer's grid from the recorded scales before
+   each `pfa_run`. Using layer 41's scales everywhere scaled the attention output
+   by about 60x.
+
+Budget against the measurement: 50.6 of GEMM + 29.3 of attention leaves ~19 ms of
+tail in a 99 ms round, against the ~6 ms the budget assumed for four rows of
+norm, silu, quantise, rope and the KV append. That tail is the next target.
