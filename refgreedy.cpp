@@ -82,11 +82,19 @@ int main(int argc, char ** argv) {
     }
     int pos = np - 1;
     printf("prompt %d\n", np);
+    const char * ldump = getenv("REF_LOG");
     for (int s = 0; s < ngen; ++s) {
         const float * lg = llama_get_logits_ith(ctx, -1);
         int best = 0;
         float bv = lg[0];
         for (int v = 1; v < nv; ++v) if (lg[v] > bv) { bv = lg[v]; best = v; }
+        if (ldump && s == 0) {
+            if (FILE * f = fopen(ldump, "wb")) {
+                fwrite(lg, sizeof(float), (size_t) nv, f);
+                fclose(f);
+                fprintf(stderr, "logits -> %s\n", ldump);
+            }
+        }
         printf("  step %d -> %d (%.4f)\n", s, best, bv);
         fflush(stdout);
         if (s + 1 == ngen) break;

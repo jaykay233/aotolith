@@ -88,6 +88,13 @@ Both divergences are a single near-tie at a comma. That is the expected shape of
 remaining f32/f16 accumulation-order differences, not a structural error — but it
 is not yet "exactly llama.cpp", and the objective asks for exact.
 
+**Correction, after the fp32 judge was built (see the section further down):**
+matching llama.cpp Q4_0 is not the objective and was never achievable as stated,
+because llama.cpp's own Q4_0 is 0.66 cosine away from exact fp32 on a 64-token
+prompt. On a 512-token prompt the two stacks are `35 242 38 35` for exact fp32
+and this chain, and `35 1415 26 242` for llama.cpp Q4_0. The chain is on the
+right side of that comparison.
+
 ## What is standing between this and the objective
 
 1. **Prefill GEMM is 230 GMAC/s, not 822.** `mega_decode` streams Q4_0 weights
@@ -489,3 +496,128 @@ two disagree on the first greedy id of `"The capital of France is"`
 (`8181` = " Paris" for F16 and Q8_0, `285` = " a" for Q4_0). A token-level
 alignment contract with Q4_0 therefore pins us to one particular kernel's
 rounding, not to the model. The F16/Q8_0 trajectory is the one worth matching.
+
+## The judge is exact fp32, and the megakernel is the side that agrees with itThe section above left one question open: when llama.cpp's Q4_0 and this chain
+disagree, which one is wrong? `ref_f32.py` answers it. It is a numpy float32
+forward pass over the same GGUF, one layer at a time, with no KV reuse and no
+sampling - each greedy step re-runs the whole prompt, so it cannot drift.
+
+512-token prompt, greedy, four tokens:
+
+| stack | ids |
+|---|---|
+| exact fp32 (numpy, whole prompt recomputed per step) | `35 242 38 35` |
+| **this megakernel** (`-X`, Q4_0 exact weights) | `35 242 38 35` |
+| llama.cpp Q4_0 (`refgreedy`, same GGUF, same ids) | `35 1415 26 242` |
+
+Full logit rows, 64-token prompt, last prompt position:
+
+| pair | cosine | rms diff | top-1 |
+|---|---|---|---|
+| megakernel vs exact fp32 | **0.999002** | 0.108 | `65401` vs `22354`, gap 0.13 |
+| llama.cpp Q4_0 vs exact fp32 | 0.6636 | 1.93 | `22354` vs `22354` |
+
+So the chain is faithful to the model and llama.cpp's Q4_0 is not: 20x the rms
+error, and its top-8 order is scrambled (`3371` at rank 11, `318` at rank 1).
+The two tokens that separate them are a genuine quantisation artifact of
+llama.cpp's own Q4_0 kernel, not of ours.
+
+Consequences for the rest of this document:
+
+* "Aligned with llama.cpp Q4_0" is no longer the acceptance test and never was
+  a meaningful one. `-q2` and `-q3` were rejected in the 2-bit section partly
+  because they fork from llama.cpp on the first token; the fork is not evidence,
+  since llama.cpp Q4_0 forks from exact fp32 on the same prompt.
+* What an alignment run has to compare against now is `ref_f32.py` (slow but
+  exact) or llama.cpp F16. Both are several hundred tokens of context per
+  minute at best, so the practical protocol is: establish the fp32 trajectory
+  once on a given prompt, then check candidate configurations against that.
+
+Two traps this cost, worth keeping:
+
+* **Never run two megakernels, or a megakernel and `refgreedy`, at the same
+  time.** They take the same TCM blocks from `/dev/tcm_sync_mem`. Running them
+  concurrently produced a 244 s prefill, a first token of `100312` instead of
+  `220`, and a "non-deterministic prefill" scare that evaporated once the runs
+  were serialised: two clean back-to-back 10K runs hash the int8 KV cache
+  identically (`K aa4d3369bd72773e`, `V 4a9ac7dc14d233e0`) and agree on the
+  first two tokens.
+* **`-F` prefills `n-1` ids.** The dumped last row belongs to the second-to-last
+  id. A row-for-row diff has to account for it or a perfect layer looks like
+  cosine 0.46.
+## The 10K decode ceiling: bytes, not kernels
+
+Measured on a quiet board, one run at a time, 10K prompt, greedy, 12 tokens.
+Every row prints `decode path:` first so a flag the parser swallowed cannot pass
+for a failed optimisation (that had already happened once, see the `-X` note in
+`docs/k3-minicpm-megakernel-notes.md`).
+
+| config | GEMM ms | attn ms | decode tok/s |
+|---|---|---|---|
+| Q4_0, f16 KV | 52.3 | 40.3 | 10.29 |
+| Q4_0, int8 KV | 53.8 | 32.9 | **11.18** |
+| `-q3` (homemade), int8 KV | 40.8 | 32.8 | 12.86 |
+| `-q3`, int8 KV, 4096 window | 42.8 | 15.1 | 16.50 |
+| `-q2` (homemade), int8 KV | 36.0 | 32.8 | 13.90 |
+
+Bytes per token for the Q4_0 + int8 KV row: 1265 MB of weights plus 215 MB of
+int8 K and V, i.e. 1480 MB in 89.5 ms = **16.5 GB/s**. A plain contiguous stream
+with huge pages measures 17.7 GB/s at 8 threads and 19.8 at 16 (`bwprobe.cpp`,
+2 GB buffer, three passes), so the decode loop is already at ~85% of what the
+memory system will give.
+
+That is the whole story of the 10K number: it is a byte-count problem.
+20 tok/s is 50 ms, which at 17 GB/s allows 850 MB per token. Q4_0 weights alone
+are 1265 MB, so **no amount of kernel tuning reaches the target while the weights
+stay 4-bit.** The two ways to cut bytes are a coarser weight format or fewer
+weight reads per token (speculative decoding).
+
+### A coarser weight format is not available at acceptable quality
+
+The logit row for the last prompt position, 64-token prompt, against exact fp32
+(`ref_f32.py`):
+
+| weights | cosine vs fp32 | rms diff | first id |
+|---|---|---|---|
+| Q4_0 (`-X`, vendor K256 hp) | **0.999002** | 0.108 | `65401` (fp32 `22354`, gap 0.13) |
+| `-q3`, 1001.6 MB | 0.176614 | 3.53 | `97761` |
+| `-q2`, 738 MB | 0.010577 | 3.60 | `117223` |
+
+The in-tree `-q3` / `-q2` packers requantise the *dequantised Q4_0* weights
+per k16 and the result is not 3-bit quality, it is noise: cosine 0.18 and 0.01.
+Their 12.9 and 13.9 tok/s are therefore speeds for a different, broken model.
+This closes the question the earlier "2-bit" section left open: the cliff is not
+at 2 bits specifically, it is that these two packers do not preserve anything.
+
+The vendor `gemm_kernel_i8i3k` / `i8i2k` kernels are fine and worthwhile; what is
+missing is real Q3_K weights from `llama-quantize` (`MiniCPM5-2B-Q3KM.gguf` is on
+the board, PPL 26.63 against Q8_0's 21.86) instead of a repack of Q4_0. Feeding
+that file through the existing Q3_K decode branch is the next quality-correct
+step, but note the arithmetic it buys: 1001.6 MB + 215 MB of int8 KV is 1216 MB,
+which is 74 ms at 16.5 GB/s, i.e. **13.5 tok/s**. Still short of 20.
+
+### Speculative decoding is the only lever left with the required size
+
+Reusing the weight read across several tokens is what breaks the byte wall: a
+round that verifies four rows still streams the weights once. At 1 accepted draft
+per round the bytes per emitted token halve (1480 MB / 2 rows = 740 MB = 45 ms =
+22 tok/s); the measured drafter accepts 1.26 on short context.
+
+The catch, which the short-context numbers hide: at 10K one four-row round cost
+2.3x a one-row round on a 21-token context (56.9 -> 131.3 ms), and that factor
+came from the GEMM being bandwidth bound. At 10K attention is 37% of the round
+and is *not* bandwidth bound: qk takes 14.0 ms for 215 MB of f16 K, and 14.8 ms
+for 108 MB of int8 K, i.e. the same time for half the bytes. So four rows will
+cost close to 4x on the attention half, and a round lands near
+54 + 131 = 185 ms for 2.26 tokens = 12 tok/s. Speculation alone does not get
+there either; the attention kernel has to stop being time-per-position bound
+first.
+
+Where attention really sits: qk 14.0 ms and pv 23.9 ms for 215 MB each (f16),
+which is 15.4 and 9.0 GB/s, and neither number moves when the width halves. The
+loop issues 4 loads plus 32 FMAs per 4 dims per 32-position block, so it is
+neither at the memory ceiling nor at the FMA issue ceiling; it is stalling on the
+32-byte granular loads. The fix with precedent in this tree is the one prefill
+already uses: run QK and PV as int8 `vmadot` GEMMs (scores are a 16x32 by 128
+GEMM, the output is a 16x128 by 32 GEMM), which is 512 products per instruction
+instead of 32.

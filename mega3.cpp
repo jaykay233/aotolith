@@ -104,6 +104,21 @@ static __attribute__((noinline)) double now_s(void) {
 
 static void use_huge(void * p, size_t n) { if (p) madvise(p, n, MADV_HUGEPAGE); }
 
+// THP collapse: madvise(MADV_HUGEPAGE) only makes an area eligible, and the
+// kernel splits 2 MB pages back into 4 KB ones when memory gets tight (the 2.2
+// GB int8 weight copy did exactly that). A 1 GB streaming read at 4 KB pages
+// loses about a quarter of its bandwidth to TLB misses, which is why the same
+// blob measured 42 ms and 54 ms per token on different runs. Collapsing after
+// the big temporary is gone makes the number repeatable.
+static void huge_collapse(void * p, size_t n) {
+    if (!p || !n) return;
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+    for (size_t off = 0; off < n; off += (2 << 20))
+        madvise((uint8_t *) p + off, (2 << 20) < n - off ? (2 << 20) : n - off, MADV_COLLAPSE);
+}
+
 static void report_huge(const char * tag) {
     FILE * f = fopen("/proc/self/smaps_rollup", "r");
     if (!f) return;
@@ -312,6 +327,66 @@ static void repack_b_q3(uint8_t * dst, const uint8_t * src, int64_t rows, int64_
 // multiplier is ns*d with no 1/16 anywhere: the vendor kernel's factor_scale of
 // 1/16 is undone by its refactor_scale of 16 in the epilogue.
 __attribute__((noinline))
+// Least-squares (scale, min, levels) for one 16-element group: a port of
+// llama.cpp's make_qkx2_quants as quantize_row_q2_K_ref calls it. The max/min
+// split this replaces spent the whole 4-bit scale range on one outlier and left
+// the rest of the group on two levels; the fit walks sixteen (rmin, rdelta) probes
+// and keeps the closed-form least-squares solution with the lowest |x|-weighted
+// absolute error. That is what puts llama.cpp's own Q2_K within a few tokens of
+// its Q4_0 continuation, which our first attempt was nowhere near.
+static float qkx2_16(const float * x, uint8_t * L, float * the_min) {
+    float w[16], min = x[0], max = x[0], sum_w = 0, sum_x = 0;
+    for (int i = 0; i < 16; ++i) {
+        w[i] = fabsf(x[i]);
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+        sum_w += w[i];
+        sum_x += w[i] * x[i];
+    }
+    if (min > 0) min = 0;
+    if (max == min) {
+        for (int i = 0; i < 16; ++i) L[i] = 0;
+        *the_min = -min;
+        return 0.0f;
+    }
+    float iscale = 3.0f / (max - min);
+    float scale = 1.0f / iscale;
+    float best_error = 0;
+    for (int i = 0; i < 16; ++i) {
+        int l = (int) lrintf(iscale * (x[i] - min));
+        if (l < 0) l = 0; if (l > 3) l = 3;
+        L[i] = (uint8_t) l;
+        best_error += w[i] * fabsf(scale * l + min - x[i]);
+    }
+    for (int is = 0; is <= 15; ++is) {
+        iscale = (-0.5f + 0.1f * (float) is + 3.0f) / (max - min);
+        uint8_t Laux[16];
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        for (int i = 0; i < 16; ++i) {
+            int l = (int) lrintf(iscale * (x[i] - min));
+            if (l < 0) l = 0; if (l > 3) l = 3;
+            Laux[i] = (uint8_t) l;
+            sum_l += w[i] * l; sum_l2 += w[i] * l * l; sum_xl += w[i] * l * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0) {
+            float ts = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float tm = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (tm > 0) { tm = 0; ts = sum_xl / sum_l2; }
+            float ce = 0;
+            for (int i = 0; i < 16; ++i) ce += w[i] * fabsf(ts * Laux[i] + tm - x[i]);
+            if (ce < best_error) {
+                memcpy(L, Laux, 16);
+                best_error = ce;
+                scale = ts;
+                min = tm;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
 static void repack_b_q2(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k, const int * perm) {
     const int64_t nb = k / 32, rs = nb * 18, nsup = k / Q2_K;
     static float tile[32][Q2_K];
@@ -329,36 +404,40 @@ static void repack_b_q2(uint8_t * dst, const uint8_t * src, int64_t rows, int64_
                 dequant_row(tile[i], src + sr * rs + sup * 8 * 18, Q2_K);
             }
             for (int i = 0; i < 32; ++i) {
+                uint8_t L[Q2_K];
                 float step[16], zoff[16], smax = 0, zmax = 0;
                 for (int j = 0; j < 16; ++j) {
-                    float mn = tile[i][j * 16], mx = mn;
-                    for (int b2 = 1; b2 < 16; ++b2) {
-                        const float v = tile[i][j * 16 + b2];
-                        if (v < mn) mn = v;
-                        if (v > mx) mx = v;
-                    }
-                    if (mn > 0) mn = 0;
-                    if (mx < 0) mx = 0;
-                    step[j] = (mx - mn) / 3.0f;
-                    zoff[j] = -mn;
+                    step[j] = qkx2_16(tile[i] + j * 16, L + j * 16, &zoff[j]);
                     if (step[j] > smax) smax = step[j];
                     if (zoff[j] > zmax) zmax = zoff[j];
                 }
-                const float d  = smax > 0 ? smax / 15.0f : 0.0f;
-                const float dm = zmax > 0 ? zmax / 15.0f : 0.0f;
-                s16[i] = (_Float16) d;
-                z16[i] = (_Float16) dm;
+                s16[i] = (_Float16) (smax > 0 ? smax / 15.0f : 0.0f);
+                z16[i] = (_Float16) (zmax > 0 ? zmax / 15.0f : 0.0f);
+                // Re-derive the levels from the scale the kernel will actually
+                // reconstruct (fp16 d times the 4-bit nibble), not from the ideal
+                // fit: the nibble rounding is up to a third of a step on the small
+                // groups, and leaving it out of the requantisation is a per-group
+                // gain error that compounds over 42 layers.
+                const float d  = (float) s16[i];
+                const float dm = (float) z16[i];
                 for (int j = 0; j < 16; ++j) {
-                    int ns = d  > 0 ? (int) lrintf(step[j] / d)  : 0;
-                    int nz = dm > 0 ? (int) lrintf(zoff[j] / dm) : 0;
+                    int ns = smax > 0 ? (int) lrintf(step[j] / (smax / 15.0f)) : 0;
+                    int nz = zmax > 0 ? (int) lrintf(zoff[j] / (zmax / 15.0f)) : 0;
                     if (ns < 0) ns = 0; if (ns > 15) ns = 15;
                     if (nz < 0) nz = 0; if (nz > 15) nz = 15;
-                    scl[j * 32 + i]   |= (uint8_t) ns;
-                    scl[16 * i + j]   |= (uint8_t) (nz << 4);
-                    const float eff = step[j];   // value = q * ns*d - nz*dm, and ns*d ~ step
+                    // The vendor's 512-byte scale plane is two overlapping
+                    // permutations of the same bytes, not two separate arrays:
+                    // scale nibbles column-major by sub-block (scales[j*32+i] low
+                    // half) and zero points row-major (scales[16*i+j] high half).
+                    // probe_q2pack.cpp measures the packed block against a rebuild
+                    // from the same bytes: this layout lands at 0.07% and every
+                    // other arrangement is off by 30% or more.
+                    scl[j * 32 + i] |= (uint8_t) ns;
+                    scl[16 * i + j] |= (uint8_t) (nz << 4);
+                    const float dq = d * (float) ns;
+                    const float dmq = dm * (float) nz;
                     for (int b2 = 0; b2 < 16; ++b2) {
-                        const float v = tile[i][j * 16 + b2] + zoff[j];
-                        int q2 = eff > 0 ? (int) lrintf(v / eff) : 0;
+                        int q2 = dq > 0 ? (int) lrintf((tile[i][j * 16 + b2] + dmq) / dq) : 0;
                         if (q2 < 0) q2 = 0;
                         if (q2 > 3) q2 = 3;
                         uint8_t * byte = blk + 512 + (int64_t) (j / 4) * 32 * 16 + i * 16 + b2;
@@ -542,6 +621,7 @@ static inline void band_w(const int * W, int tid, int64_t n, int64_t * lo, int64
 
 // ---------------------------------------------------------------- model buffers
 static uint8_t * g_wblob;
+static size_t g_wblob_sz = 0;
 struct WRef { const uint8_t * b; int64_t k, n; const uint8_t * b8; };
 static WRef g_wo, g_wq[N_LAYER], g_wk[N_LAYER], g_wv[N_LAYER], g_wov[N_LAYER];
 static WRef g_wg[N_LAYER], g_wu[N_LAYER], g_wd[N_LAYER];
@@ -557,6 +637,16 @@ static float * g_rope_tab;                      // [pos][2][64] cos,sin
 static int   g_perm[N_EMBD];                    // planar rotation-pair order
 
 static int g_pos, g_layer;
+
+// Int8 copies of both decode caches, same layouts and strides as the f16 ones so
+// the attention loops keep their access shape and only the load width changes.
+// Decode reads every KV byte once per token, so the halved width is the whole
+// point; the scales are one float per layer per kv head, taken from prefill's
+// own max-abs scan, so decode adds no rescaling pass.
+static int8_t * g_k8d = nullptr;
+static int8_t * g_v8d = nullptr;
+static float g_k8dsc[N_LAYER][N_KV], g_v8dsc[N_LAYER][N_KV];
+static int g_k8dec = 0;
 
 static const int64_t KV_LAYER_STRIDE = (int64_t) N_KV * HEAD_DIM * MAXCTX;   // V: pos-major
 // K is tiled [kv][pos_blk][dim][32]. A dim-major K with a MAXCTX stride put each
@@ -655,10 +745,16 @@ static void task_mgemm(int tid) {
             if (a >= n1[j]) continue;
             int64_t b2 = a + g_kstep; if (b2 > n1[j]) b2 = n1[j];
             const int64_t kb = g_mj[j].k / (g_bit3 || g_bit2 ? Q3_K : g_hpdec ? 256 : 32);
-            // The Q4_0 blob is 576 B per (32 columns x 32 k) whatever superblock the
-            // kernel reads, so the column-tile offset always strides by 32 k blocks;
-            // only the k_blks argument changes with the kernel's block length.
-            const uint8_t * bp = g_mj[j].b + a * (g_mj[j].k / 32) * g_blk_bytes;
+            // A column tile is one packed block per output-column group, so its byte
+            // stride is (number of blocks along k) * block size. That is k/32 for the
+            // Q4_0 blob (576 B per 32 columns x 32 k, and the hp kernel reads the same
+            // blob), but k/256 for the q2/q3 blobs, whose block spans a whole
+            // superblock. Striding those by k/32 walked eight times too far and read
+            // zeroed padding, which is why every -q2/-q3 run produced near-zero
+            // logits while thread 0's a=0 tile looked fine.
+            const uint8_t * bp = g_mj[j].b + a *
+                ((g_bit3 || g_bit2) ? (g_mj[j].k / Q2_K) * g_blk_bytes
+                                    : (g_mj[j].k / 32) * g_blk_bytes);
             if (g_bit2)
                 spacemit_kernels::ime2::gemm_kernel_i8i2k(
                     Q2_K, g_aq, bp, nullptr, g_mj[j].c + a * 32,
@@ -815,6 +911,7 @@ static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
 // The destination must be an even register, so 8 accumulators / 64 columns is
 // the hard ceiling and 4 rows x 64 cols is the widest shape available.
 static int g_i8w = 0;                        // prefill uses int8 weights
+static uint8_t * g_blob8 = nullptr;          // the 2.2 GB int8 copy, prefill only
 static int64_t g_i8_blk(int64_t k) { return k / 16; }
 
 static void repack_b_i8(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k, const int * perm) {
@@ -1468,14 +1565,21 @@ static void quant_a(const float * a, int64_t k) {
 // chosen so the whole set stays in the 32 vector registers.
 static int g_p0[N_GPU], g_p1[N_GPU];
 
+// -W n caps attention to the last n positions. Nothing else changes: the causal
+// mask already ends at g_pos, so dropping the old end is just a shorter range.
+// At 10K the attention pass is compute bound at ~1 B/cycle/thread, so the cost
+// is linear in the window and the prompt beyond it is simply not read.
+static int g_win = 0;
+
 static void attn_ranges(void) {
     const int nb = g_pos + 1;
-    const int nt = (nb + KT - 1) / KT;
+    const int lo = (g_win > 0 && nb > g_win) ? ((nb - g_win) / KT) * KT : 0;
+    const int nt = (nb - lo + KT - 1) / KT;
     const int per = (nt + g_participants - 1) / g_participants;
     for (int t = 0; t < g_participants; ++t) {
         const int t0 = per * t, t1 = (t == g_participants - 1) ? nt : per * (t + 1);
-        g_p0[t] = (t0 * KT > nb) ? nb : t0 * KT;
-        g_p1[t] = (t1 * KT > nb) ? nb : t1 * KT;
+        g_p0[t] = lo + ((t0 * KT > nb - lo) ? nb - lo : t0 * KT);
+        g_p1[t] = lo + ((t1 * KT > nb - lo) ? nb - lo : t1 * KT);
     }
 }
 
@@ -1533,6 +1637,14 @@ static void task_argmax(int tid) {
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 2], k2, vl); \
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 3], k3, vl);
 
+// 32 int8 lanes -> 32 f32 lanes. e8mf4 holds exactly the bytes a 32-lane f32m1
+// result consumes, so the load needs no masking and the widening is in-register.
+static inline vfloat32m1_t ld_i8_f32(const int8_t * p, size_t vl) {
+    const vint8mf4_t b = __riscv_vle8_v_i8mf4(p, vl);
+    return __riscv_vfcvt_f_x_v_f32m1(
+        __riscv_vwcvt_x_x_v_i32m1(__riscv_vwcvt_x_x_v_i16mf2(b, vl), vl), vl);
+}
+
 static void attn_qk(int tid) {
     const int p0 = g_p0[tid], p1 = g_p1[tid];
     if (p0 >= p1) return;
@@ -1543,14 +1655,27 @@ static void attn_qk(int tid) {
         const float * qb = g_q + (int64_t) kv * NH_PER_KV * HEAD_DIM;
         for (int pb = 0; pb < len; pb += KT) {
             const _Float16 * kb = ktile(g_layer, kv, (p0 + pb) / KT);
+            const int8_t * kb8 = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE +
+                                 (((int64_t) kv * NKT + (p0 + pb) / KT) * HEAD_DIM) * KT;
             const size_t vl = __riscv_vsetvl_e32m1((size_t) (len - pb < KT ? len - pb : KT));
             vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
             vfloat32m1_t a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
             for (int d = 0; d < HEAD_DIM; d += 4) {
-                const vfloat32m1_t k0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 0) * KT, vl), vl);
-                const vfloat32m1_t k1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 1) * KT, vl), vl);
-                const vfloat32m1_t k2 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 2) * KT, vl), vl);
-                const vfloat32m1_t k3 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 3) * KT, vl), vl);
+                vfloat32m1_t k0, k1, k2, k3;
+                if (g_k8dec) {
+                    // int8 -> int16 -> int32 -> f32 is three conversions against the
+                    // one widening a f16 load needs, but QK is memory bound at 10K
+                    // (the whole dot loop is ~2 ms of the 40) so the trade is free.
+                    k0 = ld_i8_f32(kb8 + (int64_t) (d + 0) * KT, vl);
+                    k1 = ld_i8_f32(kb8 + (int64_t) (d + 1) * KT, vl);
+                    k2 = ld_i8_f32(kb8 + (int64_t) (d + 2) * KT, vl);
+                    k3 = ld_i8_f32(kb8 + (int64_t) (d + 3) * KT, vl);
+                } else {
+                    k0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 0) * KT, vl), vl);
+                    k1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 1) * KT, vl), vl);
+                    k2 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 2) * KT, vl), vl);
+                    k3 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 3) * KT, vl), vl);
+                }
                 QK_ACC(0) QK_ACC(1) QK_ACC(2) QK_ACC(3)
                 QK_ACC(4) QK_ACC(5) QK_ACC(6) QK_ACC(7)
             }
@@ -1694,13 +1819,18 @@ static void attn_exp_sum(int tid) {
     for (int h = 0; h < N_HEAD; ++h) {
         float * row = sa + (int64_t) h * SMAX;
         const float mx = gmax[h];
+        // int8 K leaves the scores unscaled, and a positive factor commutes with the
+        // max subtraction: (s*ks - max*ks) = ks*(s - max). So the whole adjustment
+        // is the log2(e) constant gaining the per-kv K scale.
+        const float l2e = 1.4426950408889634f *
+                          (g_k8dec ? g_k8dsc[g_layer][h / NH_PER_KV] : 1.0f);
         vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 32);
         int i = 0;
         for (; i + 64 <= len; i += 64) {
             const vfloat32m1_t t0 = __riscv_vfmul_vf_f32m1(
-                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), 1.4426950408889634f, 32);
+                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), l2e, 32);
             const vfloat32m1_t t1 = __riscv_vfmul_vf_f32m1(
-                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i + 32, 32), mx, 32), 1.4426950408889634f, 32);
+                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i + 32, 32), mx, 32), l2e, 32);
             const vfloat32m1_t e0 = exp2f_e(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
             const vfloat32m1_t e1 = exp2f_e(__riscv_vfmax_vf_f32m1(t1, -126.0f, 32), 32);
             __riscv_vse32_v_f32m1(row + i, e0, 32);
@@ -1709,7 +1839,7 @@ static void attn_exp_sum(int tid) {
         }
         for (; i + 32 <= len; i += 32) {
             const vfloat32m1_t t0 = __riscv_vfmul_vf_f32m1(
-                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), 1.4426950408889634f, 32);
+                __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), l2e, 32);
             const vfloat32m1_t e0 = exp2f_e(__riscv_vfmax_vf_f32m1(t0, -126.0f, 32), 32);
             __riscv_vse32_v_f32m1(row + i, e0, 32);
             vs = __riscv_vfadd_vv_f32m1(vs, e0, 32);
@@ -1739,11 +1869,20 @@ static void attn_pv(int tid) {
             vfloat32m1_t a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00;
             vfloat32m1_t a40 = a00, a41 = a00, a50 = a00, a51 = a00, a60 = a00, a61 = a00, a70 = a00, a71 = a00;
             const _Float16 * base = vb + (int64_t) kv * HEAD_DIM + half * 64;
+            const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
+                                   (int64_t) kv * HEAD_DIM + half * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
             for (int p = 0; p < len; ++p) {
                 const _Float16 * vp = base + (int64_t) (p0 + p) * N_KV * HEAD_DIM;
-                const vfloat32m1_t v0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp, 32), 32);
-                const vfloat32m1_t v1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + 32, 32), 32);
+                const int8_t * vp8 = base8 + (int64_t) (p0 + p) * N_KV * HEAD_DIM;
+                vfloat32m1_t v0, v1;
+                if (g_k8dec) {
+                    v0 = ld_i8_f32(vp8, 32);
+                    v1 = ld_i8_f32(vp8 + 32, 32);
+                } else {
+                    v0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp, 32), 32);
+                    v1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + 32, 32), 32);
+                }
                 // MEGA_PVPROBE drops the eight scattered weight loads (one per
                 // 10.5 KB score row, so eight pages per position) to separate the
                 // V stream from the score reads. Results are garbage.
@@ -1829,8 +1968,35 @@ static void rope_all(void) {
     const double _tb = now_s();
     const int pblk = g_pos / KT, pi = g_pos % KT;
     _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE + (int64_t) g_pos * N_KV * HEAD_DIM;
+    int8_t * k8base = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE;
+    int8_t * v8base = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE + (int64_t) g_pos * N_KV * HEAD_DIM;
     for (int kv = 0; kv < N_KV; ++kv) {
         _Float16 * kb = ktile(g_layer, kv, pblk);
+        int8_t * kb8 = k8base + (((int64_t) kv * NKT + pblk) * HEAD_DIM) * KT;
+        if (g_k8dec) {
+            // Same scale as every already-cached position, so the new token is just
+            // another sample of one fixed grid. A value past the grid clips at 127
+            // rather than triggering a rescale, which would have to rewrite the
+            // whole history and would move every earlier token's score.
+            const float ik = g_k8dsc[g_layer][kv] > 0 ? 1.0f / g_k8dsc[g_layer][kv] : 1.0f;
+            const float iv = g_v8dsc[g_layer][kv] > 0 ? 1.0f / g_v8dsc[g_layer][kv] : 1.0f;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                int q = (int) lrintf(g_k[kv * HEAD_DIM + d] * ik);
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                kb8[(int64_t) d * KT + pi] = (int8_t) q;
+            }
+            for (int d = 0; d < HEAD_DIM; d += 32) {
+                const size_t vl = __riscv_vsetvl_e32m1(32);
+                const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+                    __riscv_vle32_v_f32m1(g_v + kv * HEAD_DIM + d, 32), iv, vl);
+                vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
+                q = __riscv_vmax_vx_i32m1(q, -127, vl);
+                q = __riscv_vmin_vx_i32m1(q, 127, vl);
+                __riscv_vse8_v_i8mf4(v8base + kv * HEAD_DIM + d,
+                                     __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+            }
+        }
         for (int d = 0; d < HEAD_DIM; ++d) kb[(int64_t) d * KT + pi] = (_Float16) g_k[kv * HEAD_DIM + d];
         for (int d = 0; d < HEAD_DIM; d += 32)
             __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d,
@@ -1846,7 +2012,11 @@ static void attn_combine(int tid) {
     float gsum[N_HEAD];
     compute_gsum(gsum);
     for (int hh = tid * 2; hh < tid * 2 + 2 && hh < N_HEAD; ++hh) {
-        const float inv = 1.0f / gsum[hh];
+        // The int8 V path never scales its operands, so the per-head V scale rides
+        // along with the softmax denominator here: one multiply per output vector
+        // instead of sixteen per position block inside PV.
+        const float inv = (1.0f / gsum[hh]) *
+                          (g_k8dec ? g_v8dsc[g_layer][hh / NH_PER_KV] : 1.0f);
         for (int d = 0; d < HEAD_DIM; d += 32) {
             vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, 32);
             for (int t = 0; t < g_participants; ++t)
@@ -3378,9 +3548,97 @@ static float * g_pfx, * g_pfxa, * g_pfgate, * g_pfup, * g_pfk, * g_pfv;
 // Prefill scratch is sized for a whole 10K chunk (hundreds of MB) and decode
 // needs none of it. Releasing it before decode keeps the working set of the
 // generation loop inside the cache the attention pass cares about.
+// f16 cache -> int8 cache for one layer, using the scale prefill's own max-abs
+// scan produced for that layer. Called from the prefill layer loop, where the
+// bytes are still in cache from the attention that just read them.
+static float g_cv8_ik, g_cv8_iv;
+// Per-kv-head reciprocals of the prefill scale. One cache-wide scale is wrong:
+// the two kv heads have different max-abs, and decode restores each head with
+// its own scale, so a shared conversion factor is a silent per-head gain.
+static float g_cv8_ik_arr[N_KV], g_cv8_iv_arr[N_KV];
+static void conv_kv8_band(int64_t lo, int64_t hi) {
+    const int64_t L = g_layer;
+    int8_t * k8 = g_k8d + L * K_LAYER_STRIDE;
+    const _Float16 * k16 = g_kdim + L * K_LAYER_STRIDE;
+    // The K cache is [kv][pos block][d][32 lanes], so a 32-byte step never
+    // crosses a kv head; the scale for the head that owns this block is picked
+    // per block. Using kv head 0's scale for the whole cache left head 1
+    // multiplied by s1/s0, which is invisible at 512 positions and turns the
+    // 10K first token from 8181 into 220.
+    const int64_t kvsz = (int64_t) NKT * HEAD_DIM * KT;
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i < 32 ? hi - i : 32));
+        const float ik = g_cv8_ik_arr[i / kvsz];
+        const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+            __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(k16 + i, vl), vl), ik, vl);
+        vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
+        q = __riscv_vmax_vx_i32m1(q, -127, vl);
+        q = __riscv_vmin_vx_i32m1(q, 127, vl);
+        __riscv_vse8_v_i8mf4(k8 + i,
+                             __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+    }
+}
+static void conv_kv8_v_band(int64_t lo, int64_t hi) {
+    const int64_t L = g_layer;
+    int8_t * v8 = g_v8d + L * KV_LAYER_STRIDE;
+    const _Float16 * v16 = g_vpos + L * KV_LAYER_STRIDE;
+    // V is [pos][kv][d]; 32 divides HEAD_DIM, so a block sits inside one head.
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i < 32 ? hi - i : 32));
+        const float iv = g_cv8_iv_arr[(i / HEAD_DIM) % N_KV];
+        const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+            __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(v16 + i, vl), vl), iv, vl);
+        vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
+        q = __riscv_vmax_vx_i32m1(q, -127, vl);
+        q = __riscv_vmin_vx_i32m1(q, 127, vl);
+        __riscv_vse8_v_i8mf4(v8 + i,
+                             __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+    }
+}
+// Quantises positions [0, npos) of every layer from the f16 caches. Only used
+// when the int8 cache is wanted but prefill did not fill it layer by layer.
+static void conv_kv8_all(int64_t npos) {
+    const int64_t nk = (int64_t) N_KV * NKT * HEAD_DIM * KT;
+    const int64_t nv = npos * N_KV * HEAD_DIM;
+    for (int L = 0; L < N_LAYER; ++L) {
+        g_layer = L;
+        for (int kv = 0; kv < N_KV; ++kv) {
+            g_cv8_ik_arr[kv] = g_k8dsc[L][kv] > 0 ? 1.0f / g_k8dsc[L][kv] : 1.0f;
+            g_cv8_iv_arr[kv] = g_v8dsc[L][kv] > 0 ? 1.0f / g_v8dsc[L][kv] : 1.0f;
+        }
+        g_cv8_ik = g_cv8_ik_arr[0];
+        g_cv8_iv = g_cv8_iv_arr[0];
+        (void) nk;
+        parallel_for(nv, conv_kv8_v_band);
+        parallel_for((int64_t) N_KV * NKT * HEAD_DIM * KT, conv_kv8_band);
+    }
+}
+
 static void prefill_release(void) {
-    free(g_pfa);     g_pfa = nullptr;
-    free(g_pfx);     g_pfx = nullptr;
+    // The int8 weight copy is prefill-only: decode reads the bit-packed blob.
+    // Freeing it before generation hands 2.2 GB back to the page cache and
+    // stops the two weight streams from evicting each other.
+    if (g_blob8) {
+        for (int L = 0; L < N_LAYER; ++L) {
+            g_wq[L].b8 = g_wk[L].b8 = g_wv[L].b8 = nullptr;
+            g_wov[L].b8 = g_wg[L].b8 = g_wu[L].b8 = g_wd[L].b8 = nullptr;
+        }
+        g_wo.b8 = nullptr;
+        free(g_blob8);
+        g_blob8 = nullptr;
+        g_i8w = 0;
+        printf("prefill: int8 weight copy released\n");
+        // Now that the big temporary is gone, put the decode working set back
+        // on 2 MB pages: the weight blob, the two KV caches, and the int8 KV.
+        report_huge("before collapse");
+        huge_collapse(g_wblob, g_wblob_sz);
+        huge_collapse(g_kdim, (size_t) N_LAYER * K_LAYER_STRIDE * 2);
+        huge_collapse(g_vpos, (size_t) N_LAYER * KV_LAYER_STRIDE * 2);
+        huge_collapse(g_k8d, (size_t) N_LAYER * K_LAYER_STRIDE);
+        huge_collapse(g_v8d, (size_t) N_LAYER * KV_LAYER_STRIDE);
+        report_huge("after collapse");
+    }
+    free(g_pfa);     g_pfa = nullptr;    free(g_pfx);     g_pfx = nullptr;
     free(g_pfxa);    g_pfxa = nullptr;
     free(g_pfgate);  g_pfgate = nullptr;
     free(g_pfup);    g_pfup = nullptr;
@@ -3856,6 +4114,26 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_ZV")) memset(g_v8i, 0, (size_t) N_KV * ((base + cm + 15) / 16) * 2048);
             pfa_convert_kv_i8(L, base + cm);
+            // Prefill's per-layer max-abs scales are the ones decode has to keep using,
+            // and the f16 bytes are hot here, so the decode int8 cache is filled in the
+            // same pass instead of a second sweep over 440 MB at the end. Only the last
+            // chunk counts: its scale is the max over the whole prefix, so any earlier
+            // chunk would write a cache the next chunk immediately overwrites.
+            if (g_k8dec && base + cm >= npref) {
+                for (int kv = 0; kv < N_KV; ++kv) {
+                    g_k8dsc[L][kv] = g_k8isc[kv];
+                    g_v8dsc[L][kv] = g_v8isc[kv];
+                }
+                g_layer = L;
+                for (int kv = 0; kv < N_KV; ++kv) {
+                    g_cv8_ik_arr[kv] = g_k8isc[kv] > 0 ? 1.0f / g_k8isc[kv] : 1.0f;
+                    g_cv8_iv_arr[kv] = g_v8isc[kv] > 0 ? 1.0f / g_v8isc[kv] : 1.0f;
+                }
+                g_cv8_ik = g_cv8_ik_arr[0];
+                g_cv8_iv = g_cv8_iv_arr[0];
+                parallel_for((int64_t) (base + cm) * N_KV * HEAD_DIM, conv_kv8_v_band);
+                parallel_for((int64_t) N_KV * NKT * HEAD_DIM * KT, conv_kv8_band);
+            }
             t_conv+=now_s()-_a; _a=now_s();
             g_pfa_ctx = base;
             g_pfa_rows = C;
@@ -4307,10 +4585,12 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) ngen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-X") && i + 1 < argc) g_dbg = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-X") && i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+            g_dbg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q3")) g_bit3 = 1;
         else if (!strcmp(argv[i], "-q2")) g_bit2 = 1;
         else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
+        else if (!strcmp(argv[i], "-K8")) g_k8dec = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-N") && i + 1 < argc) g_pf_nb = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) g_participants = atoi(argv[++i]);
@@ -4354,7 +4634,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-pp")) g_pvprobe = 1;
         else if (!strcmp(argv[i], "-gg")) { g_gatemode = 1; g_top5 = 1; }
         else if (!strcmp(argv[i], "-W")) g_pf_vendor = 1;
-        else if (!strcmp(argv[i], "-X")) g_pf_vendor = 2;   // K256 hp m4, the default
+        else if (!strcmp(argv[i], "-Z") && i + 1 < argc) g_win = atoi(argv[++i]);        else if (!strcmp(argv[i], "-X")) g_pf_vendor = 2;   // K256 hp m4, the default
         else if (!strcmp(argv[i], "-V0")) g_pf_vendor = 0;
     }
 
@@ -4413,11 +4693,15 @@ int main(int argc, char ** argv) {
                              : g_bit3 ? (e->k / Q3_K) * Q3_BLK : (e->k / 32) * 576);
     }
     const size_t tot_pad = (total + 4096 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
-    const char * cache = work_path(g_bit2 ? "mega-w2.bin" : g_bit3 ? "mega-w3.bin" : "mega-w.bin");
+    // v2: the q2 packer's scale plane was wrong until probe_q2pack.cpp pinned it
+    // down, and a same-named cache kept serving the broken bytes through several
+    // rebuilds. Any change to a packer bumps this suffix.
+    const char * cache = work_path(g_bit2 ? "mega-w2v3.bin" : g_bit3 ? "mega-w3.bin" : "mega-w.bin");
     struct stat cs;
     bool loaded = false;
     g_wblob = (uint8_t *) hugemem(tot_pad);
     if (!g_wblob) { fprintf(stderr, "oom weights\n"); return 1; }
+    g_wblob_sz = tot_pad;
     use_huge(g_wblob, tot_pad);
     if (stat(cache, &cs) == 0 && (size_t) cs.st_size == total) {
         int cf = open(cache, O_RDONLY);
@@ -4469,8 +4753,8 @@ int main(int argc, char ** argv) {
         const size_t pad8 = (t8 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
         uint8_t * blob8 = (uint8_t *) hugemem(pad8);
         if (!blob8) { fprintf(stderr, "oom int8 weights\n"); return 1; }
-        use_huge(blob8, pad8);
-        const char * c8 = work_path(g_bit2 ? "mega-w8b-q2.bin" : "mega-w8b.bin");
+        g_blob8 = blob8;        use_huge(blob8, pad8);
+        const char * c8 = work_path(g_bit2 ? "mega-w8b-q2v3.bin" : "mega-w8b.bin");
         struct stat cs8;
         bool l8 = false;
         if (stat(c8, &cs8) == 0 && (size_t) cs8.st_size == t8) {
@@ -4532,6 +4816,17 @@ int main(int argc, char ** argv) {
     if (!g_kdim || !g_vpos) { fprintf(stderr, "oom kv\n"); return 1; }
     use_huge(g_kdim, kbytes);
     use_huge(g_vpos, vbytes);
+    if (g_k8dec) {
+        const size_t k8b = (size_t) N_LAYER * K_LAYER_STRIDE;
+        const size_t v8b = (size_t) N_LAYER * KV_LAYER_STRIDE;
+        g_k8d = (int8_t *) hugemem(k8b);
+        g_v8d = (int8_t *) hugemem(v8b);
+        if (!g_k8d || !g_v8d) { fprintf(stderr, "oom int8 kv\n"); return 1; }
+        use_huge(g_k8d, k8b);
+        use_huge(g_v8d, v8b);
+        for (int L = 0; L < N_LAYER; ++L)
+            for (int kv = 0; kv < N_KV; ++kv) { g_k8dsc[L][kv] = 0; g_v8dsc[L][kv] = 0; }
+    }
     printf("kv: K %.0f MB (tiled), V %.0f MB (pos-major), f16\n", kbytes / 1e6, vbytes / 1e6);
 
     // Attention scratch has a 10.5 KB row stride, so without huge pages every
@@ -4621,14 +4916,28 @@ int main(int argc, char ** argv) {
 
     int tok = prompt;
     const double t_start = now_s();
+    report_huge("decode");
+    // Say which optional paths are live. A flag that silently fails to parse
+    // (one `-X` used to swallow the argument after it) turns a whole A/B into
+    // two runs of the same code, and the identical timings look like a result.
+    printf("decode path: int8kv %d  bit3 %d  bit2 %d  hpdec %d  vendor %d  win %d\n",
+           g_k8dec, g_bit3, g_bit2, g_hpdec, g_pf_vendor, g_win);
+    if (g_win) printf("attention window: last %d positions\n", g_win);
     printf("decode: %d tokens from %d\n", ngen, prompt);
     if (pos0 + ngen > MAXCTX) {
         fprintf(stderr, "context overflow: %lld prompt + %d generated exceeds %d\n",
                 (long long) pos0, ngen, MAXCTX);
         return 1;
     }
+    // MEGA_STEPS=1 prints the per-step stage deltas: the running average hides
+    // whether a step is slow once or every time, which is the difference
+    // between a first-touch cost and a steady-state one.
+    const bool stepdbg = getenv("MEGA_STEPS") != nullptr;
+    double prev_stage[S_NSTAGE];
+    volatile double * vstage = g_stage;   // plain memcpy was folded away by -O2
     for (int step = 0; step < ngen; ++step) {
         TICK_DECL;
+        if (stepdbg) for (int i = 0; i < S_NSTAGE; ++i) prev_stage[i] = vstage[i];
         if (step == ngen - 1) {
             memcpy(g_snap, g_stage, sizeof g_snap);
             g_snap_rope[0] = g_t_rope_math;
@@ -4736,6 +5045,16 @@ int main(int argc, char ** argv) {
         g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits };
         run(task_mgemm);
         TOCK(S_GEMM);
+        if (step == 0 && getenv("MEGA_LOGD")) {
+            // Same row llama.cpp's REF_LOG dumps: the logits for the last prompt
+            // token, before any sampling. Comparing the two says whether a token
+            // mismatch is upstream of the head or in it.
+            if (FILE * f = fopen(getenv("MEGA_LOGD"), "wb")) {
+                fwrite(g_logits, 4, VOCAB, f);
+                fclose(f);
+                printf("logits -> %s\n", getenv("MEGA_LOGD"));
+            }
+        }
         TICK();
         run(task_argmax);
         {   // combine the per-thread maxima in vocabulary order so ties keep the
@@ -4768,6 +5087,15 @@ int main(int argc, char ** argv) {
             tok = best;
         }
         TOCK(S_HEAD);
+        if (stepdbg) {
+            printf("  [step %2d]", step);
+            for (int i = 0; i < S_NSTAGE; ++i) {
+                const double d = g_stage[i] - prev_stage[i];
+                if (d > 0) printf(" %s %.1f", g_stage_name[i], d * 1e3);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
     }
     if (getenv("MEGA_EXPKV")) export_kv(pos0 + ngen);   // TEMP: dump the cache this path built
     const double dt = now_s() - t_start;

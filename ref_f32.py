@@ -130,6 +130,8 @@ for lo in range(0, 130560, CH):
     W = deq_row("output.weight", lo, min(lo + CH, 130560))
     scores[lo:lo + len(W)] = W @ last
 top = np.argsort(-scores)[:8]
+if os.environ.get("RF_LOG"):
+    open(os.environ["RF_LOG"], "wb").write(scores.astype("<f4").tobytes())
 print("f32 reference top-8 (last position):")
 for t in top:
     print("   %6d  %+.5f" % (t, scores[t]))
