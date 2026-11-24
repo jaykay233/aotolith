@@ -40,6 +40,10 @@ int main(int argc, char ** argv) {
     cp.n_batch = 2048;      // llama.cpp defaults; a single 10K decode asserts
     cp.n_ubatch = 512;
     cp.no_perf = true;
+    // llama.cpp picks a conservative thread count here, and a 10K prefill on 4
+    // cores takes minutes. REF_TH sets it explicitly.
+    if (const char * th = getenv("REF_TH")) cp.n_threads = atoi(th);
+    if (const char * tb = getenv("REF_TB")) cp.n_threads_batch = atoi(tb);
     // Embeddings are off by default so the graph's output stays logits. When
     // REF_EMB is set the final normed row is captured too, with no pooling so it
     // is the last token's vector rather than a sequence mean.
@@ -83,6 +87,13 @@ int main(int argc, char ** argv) {
     int pos = np - 1;
     printf("prompt %d\n", np);
     const char * ldump = getenv("REF_LOG");
+    // Per-step logit rows, concatenated: [step][vocab] f32. This is what a
+    // teacher-forced megakernel run is scored against, one row per position.
+    FILE * steplog = nullptr;
+    if (const char * sp = getenv("REF_STEPLOG")) {
+        steplog = fopen(sp, "wb");
+        if (steplog) fprintf(stderr, "steplog -> %s (%d rows of %d)\n", sp, ngen, nv);
+    }
     for (int s = 0; s < ngen; ++s) {
         const float * lg = llama_get_logits_ith(ctx, -1);
         int best = 0;
@@ -95,6 +106,7 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "logits -> %s\n", ldump);
             }
         }
+        if (steplog) { fwrite(lg, sizeof(float), (size_t) nv, steplog); fflush(steplog); }
         printf("  step %d -> %d (%.4f)\n", s, best, bv);
         fflush(stdout);
         if (s + 1 == ngen) break;

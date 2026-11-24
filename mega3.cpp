@@ -1507,9 +1507,70 @@ static inline void quant_a_i8d(const float * a, int64_t rows, int64_t k, int64_t
 // per-row scale, which measured 2.0% on q/k/v and 9.9% on the activation side,
 // and a four-row chunk then drifted 17.8% away from the f32 reference by layer
 // 41 -- enough to move the argmax. Exactness first, then win the speed back.
+// The vendor hp quantiser writes only the A100 record, so the X100 A copy needs
+// its own pass. Layout is the one x100_gemm_4x16 reads (probe_x100_map): row r of
+// a four-row group lands at r*8 within each 64-byte step, and the 16 k values of
+// one step split into two 8-byte halves at +0 and +32.
+static const float * g_xq_src;
+static int64_t g_xq_k, g_xq_rows;
+static void task_x8_quant(int tid) {
+    const int64_t k = g_xq_k, kst = k / 16, mg = g_xq_rows / 4;
+    for (int64_t g = tid; g < mg; g += g_participants) {
+        float rowsc[4];
+        for (int r = 0; r < 4; ++r) {
+            const float * a = g_xq_src + (g * 4 + r) * k;
+            float mx = 0;
+            for (int64_t i = 0; i < k; ) {
+                const size_t vm = __riscv_vsetvl_e32m4((size_t) (k - i));
+                const vfloat32m4_t v =
+                    __riscv_vfabs_v_f32m4(__riscv_vle32_v_f32m4(a + i, vm), vm);
+                const vfloat32m1_t red = __riscv_vfredmax_vs_f32m4_f32m1(
+                    v, __riscv_vfmv_s_f_f32m1(0.0f, 1), vm);
+                const float m = __riscv_vfmv_f_s_f32m1_f32(red);
+                if (m > mx) mx = m;
+                i += (int64_t) vm;
+            }
+            rowsc[r] = mx > 0 ? mx / 127.0f : 1.0f;
+            g_a8xs[g * 4 + r] = rowsc[r];
+        }
+        int8_t * xbase = g_a8x + g * g_x_rowstride;
+        for (int r = 0; r < 4; ++r) {
+            const float * a = g_xq_src + (g * 4 + r) * k;
+            const float xr = 1.0f / rowsc[r];
+            for (int64_t t = 0; t < kst; ++t) {
+                const size_t vl = __riscv_vsetvl_e32m1(16);
+                vfloat32m1_t v = __riscv_vle32_v_f32m1(a + t * 16, vl);
+                vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(__riscv_vfmul_vf_f32m1(v, xr, vl), vl);
+                q = __riscv_vmax_vx_i32m1(q, -127, vl);
+                q = __riscv_vmin_vx_i32m1(q, 127, vl);
+                const vint8mf4_t b8 =
+                    __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl);
+                const size_t v8 = __riscv_vsetvl_e8mf4(8);
+                int8_t * xo = xbase + t * 64 + r * 8;
+                __riscv_vse8_v_i8mf4(xo, b8, v8);
+                __riscv_vse8_v_i8mf4(xo + 32,
+                    __riscv_vslidedown_vx_i8mf4(b8, 8, (size_t) 16), v8);
+                __riscv_vsetvl_e32m1(16);
+            }
+        }
+    }
+}
+static void x100_quant_a(const float * a, int64_t rows, int64_t k) {
+    g_xq_src = a; g_xq_k = k; g_xq_rows = rows;
+    run(task_x8_quant);
+}
+
 static inline void pf_quant(const float * a, int64_t rows, int64_t k, int64_t j) {
+    // set here -- on the single thread that dispatches -- rather than in
+    // x100_prepare, which ran after the quantiser and left the first layer writing
+    // every row group through a stale (zero) stride.
+    if (g_x8_want) g_x_rowstride = 4 * k;
     if (g_pf_vendor) quant_a_4row(a, rows, k, j);
     else quant_a_i8d(a, rows, k, j);
+    // The vendor quantiser emits only the A100 record; the vmadot one already
+    // writes the X100 copy inline. Building it here for the vendor path is what
+    // makes -x100 produce a result at all -- it used to read untouched hugemem.
+    if (g_x8_want && j == 0 && g_pf_vendor) x100_quant_a(a, rows, k);
 }
 
 
@@ -1639,7 +1700,15 @@ static void task_pf_gemm_i8(int tid) {
 // introducing a second quantisation scheme.
 // g_x100 is declared above the prefill GEMM (it decides how many columns the A
 // cluster runs); -Y turns it on.
+// One percentage shared by every matrix is the wrong shape. X100's own rate
+// depends on k (measured ~198 GMAC/s at k=6144, ~287 at k=2048) while the A100
+// cluster holds ~486-509 on all four, so the equal-time split is a different
+// column share for each projection: qkv 35, o 33, gate+up 37, down 28. A single
+// 40 made `down` slower than a single 23 did (10.68 s against 8.92 s) because
+// X100 became its critical path.
 static int g_x100_pct = 23;     // X100 takes this share of the columns
+static int g_x100_pct_tab[4] = { 35, 33, 37, 28 };   // qkv, o, gate+up, down
+static int g_xpct_j[4] = { 23, 23, 23, 23 };         // per-job share for x100_prepare
 
 static void task_pf_gemm_x100(int id);
 static void * hugemem(size_t n);
@@ -1785,7 +1854,7 @@ static void x100_prepare(const PfJob * js, int nj) {
     g_x_rowstride = 4 * js[0].k;
     g_xjn = 0;
     for (int j = 0; j < nj; ++j) {
-        const int64_t nx = (js[j].n * g_x100_pct / 100) & ~(int64_t) 63;
+        const int64_t nx = (js[j].n * g_xpct_j[j] / 100) & ~(int64_t) 63;
         if (nx <= 0) continue;
         const int64_t nb = nx / 16;
         const size_t need = (size_t) nx * js[j].k + 4096;
@@ -1819,6 +1888,17 @@ static void x100_wait(void) {
     const double _t = now_s();
     while (g_xg_done.load(std::memory_order_acquire) < g_x_nt) sched_yield();
     g_xt_run = now_s() - _t;
+}
+
+// Sets the column split for one projection's jobs and prepares the X100 side.
+// phase: 0 qkv, 1 o, 2 gate+up, 3 down.
+static void x100_begin(int phase, PfJob * js, int nj) {
+    const int pct = g_x100_pct_tab[phase & 3];
+    for (int j = 0; j < nj; ++j) {
+        g_xpct_j[j] = pct;
+        js[j].nlim = js[j].n - ((js[j].n * pct / 100) & ~(int64_t) 63);
+    }
+    x100_prepare(js, nj);
 }
 
 static void task_pf_gemm_x100(int id) {
@@ -2594,7 +2674,16 @@ static const int PFA_ROWS = 4;
 // consume the same K and V blocks. One K block is 8 KB and stays in L1 across
 // the tile; at 4-row tiles every group streamed its own copy from DRAM, which
 // left QK bandwidth starved at ~0.4 GB/s of useful traffic.
-static const int I8_G = 16;
+//
+// I8_G is overrideable at compile time (-DI8G=32) because the tile height sets how
+// many times a 512-row prefill chunk walks the K plane: 64 rows is 8 passes, 128
+// rows is 4. Which of the two is faster is a measurement, and the rows in a tile
+// only decide co-residency -- each row's own dot products and their order are
+// unchanged, so the scores are bit-identical either way.
+#ifndef I8G
+#define I8G 16
+#endif
+static const int I8_G = I8G;
 static const int I8_ROWS = I8_G * PFA_ROWS;
 // Number of four-row groups a tile actually computes. Prefill batches sixteen of
 // them so a 64-row chunk walks each K block once; a decode step has four rows and
@@ -3548,7 +3637,10 @@ static inline int64_t tile_qb(int64_t t) {
     return (t % nqb) * I8_ROWS;
 }
 
-static const int I8_NSLOT = 24;
+// Slot count trades memory against pipelining depth. A slot holds one tile's
+// scores (I8_G groups) plus its requantised weights, so the size follows I8_G;
+// the product stays near the 56.7 MB measured at I8_G=16 and I8_NSLOT=24.
+static const int I8_NSLOT = 24 * 16 / I8_G;
 static const int I8_INFLIGHT = 2;
 
 struct TileSlot {
@@ -4929,9 +5021,21 @@ static void ds_attn_band(int64_t lo, int64_t hi) {
         }
         const float rs = sum > 0.0f ? 1.0f / sum : 0.0f;
         if (g_dsdbg2 && r == 0 && h == 0) {
-            fprintf(stderr, "  [attn] L%d np=%d win=%lld w0=%.4f w1=%.4f wmid=%.4f wlast=%.4f max=%.3f\n",
-                    g_ds_layer, g_ds_np, (long long) (n - wlo), sc[0] * rs, cnt > 1 ? sc[1] * rs : 0.0f,
-                    sc[cnt / 2] * rs, sc[cnt - 1] * rs, mx);
+            // Which position owns the mass, and how big the injected keys are. A
+            // single huge score means one key vector is out of scale; that shows up
+            // as an argmax pinned to the same position across layers.
+            float wmx = -1.0f; int64_t pmx = -1;
+            for (int64_t i = 0; i < cnt; ++i) if (sc[i] > wmx) { wmx = sc[i]; pmx = wlo + i; }
+            double kn = 0, kn0 = 0;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                const float a = (float) kb[(int64_t) pmx * kstride + d];
+                const float b = (float) kb[d];
+                kn += (double) a * a; kn0 += (double) b * b;
+            }
+            fprintf(stderr, "  [attn] L%d np=%d win=%lld w0=%.4f wlast=%.4f max=%.3f "
+                    "argmax_p=%lld w=%.4f |K@argmax|=%.3f |K@wlo|=%.3f\n",
+                    g_ds_layer, g_ds_np, (long long) (n - wlo), sc[0] * rs, sc[cnt - 1] * rs, mx,
+                    (long long) pmx, wmx * rs, sqrt(kn), sqrt(kn0));
         }
         for (int d = 0; d < HEAD_DIM; d += 32)
             __riscv_vse32_v_f32m1(out + d, __riscv_vfmv_v_f_f32m1(0.0f, vl), vl);
@@ -4970,11 +5074,33 @@ static void ds_markov_bias(int prev, float * bias) {
 }
 
 // The block: four slots at pos0..pos0+3, drafts out[0..K-1] after the markov chain.
+// One-shot dumps for the float32 reference (ref_dspark.py). They capture the exact
+// inputs and outputs of the draft forward -- the five captured target residuals,
+// then the four logit rows and the markov bias -- so the reference can be fed
+// bit-identical features and any mismatch is the draft model's own arithmetic
+// rather than a disagreement about what the features were.
+static void ds_dump_once(int anchor, int64_t pos0, int npref) {
+    if (const char * hp = getenv("MEGA_DSHID")) {
+        if (FILE * f = fopen(hp, "wb")) {
+            // header: layers, rows, width, then the anchor/pos0/npref triple
+            int32_t hdr[6] = { DS_LAYER, npref, N_EMBD, anchor, (int32_t) pos0, npref };
+            fwrite(hdr, 4, 6, f);
+            for (int L = 0; L < DS_LAYER; ++L)
+                fwrite(g_dshid + (int64_t) L * g_ds_cap * N_EMBD, 4, (size_t) npref * N_EMBD, f);
+            fclose(f);
+            printf("dspark: features -> %s (%d rows x %d)\n", hp, npref, N_EMBD);
+        }
+    }
+}
+
 static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     for (int i = 0; i < K; ++i) drafts[i] = anchor;
     if (!g_ds_ready) return;
     const bool dbg = getenv("MEGA_DSDBG") != nullptr;
     const double _t0 = now_s();
+    static int dumped = 0;
+    if (!dumped && getenv("MEGA_DSHID")) { dumped = 1; ds_dump_once(anchor, pos0, (int) pos0); }
+    static int logd = 0;
 
     static float mask_emb[N_EMBD];
     static int mask_done = 0;
@@ -5057,11 +5183,33 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     run(task_mgemm_m4);
 
     if (dbg) fprintf(stderr, "  [ds] layers done %.2f ms\n", (now_s() - _t0) * 1e3);
+    if (const char * lp = getenv("MEGA_DSLOGD")) {
+        if (!logd) {
+            logd = 1;
+            if (FILE * f = fopen(lp, "wb")) {
+                fwrite(g_dslog, 4, (size_t) DS_SLOT * VOCAB, f);
+                fclose(f);
+                printf("dspark: logits -> %s\n", lp);
+            }
+        }
+    }
     const bool nobias = getenv("MEGA_DSNOBIAS") != nullptr;
     int prev = anchor;
     for (int i = 0; i < K; ++i) {
         if (nobias) memset(g_dsbias, 0, (size_t) VOCAB * 4);
         else ds_markov_bias(prev, g_dsbias);
+        if (i == 0) {
+            if (const char * bp = getenv("MEGA_DSBIASD")) {
+                // The markov bias for the first position, so the reference can add
+                // the same 130560-wide row to its own base logits.
+                if (FILE * f = fopen(bp, "wb")) {
+                    int32_t hdr[2] = { prev, anchor };
+                    fwrite(hdr, 4, 2, f);
+                    fwrite(g_dsbias, 4, VOCAB, f);
+                    fclose(f);
+                }
+            }
+        }
         const float * lg = g_dslog + (int64_t) i * VOCAB;
         int best = 0;
         float bv = lg[0] + g_dsbias[0];
@@ -5198,8 +5346,9 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
         if (dt < best) best = dt;
     }
     const double emit = (double) rounds + (double) acc;
-    printf("spec: %d rounds, %lld/%lld drafts accepted (%.3f/round), %lld tokens\n",
-           rounds, acc, total, total ? (double) acc / total : 0.0, (long long) emit);
+    printf("spec: %d rounds, %lld/%lld drafts accepted (%.3f fraction, %.3f accepted/round), %lld tokens\n",
+           rounds, acc, total, total ? (double) acc / total : 0.0,
+           rounds ? (double) acc / rounds : 0.0, (long long) emit);
     // Round 0 is cold (score and weight buffers after prefill), which is why `best`
     // is reported next to the mean, and the second rate is what the same rounds
     // would give if no draft ever matched.
@@ -6176,11 +6325,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             g_pfj[0] = { g_pf_vendor ? g_wq[L].b : g_wq[L].b8, g_wq[L].k, g_wq[L].n, g_pq,  N_HEAD * HEAD_DIM, 0 };
             g_pfj[1] = { g_pf_vendor ? g_wk[L].b : g_wk[L].b8, g_wk[L].k, g_wk[L].n, g_pfk, N_KV * HEAD_DIM, 0 };
             g_pfj[2] = { g_pf_vendor ? g_wv[L].b : g_wv[L].b8, g_wv[L].k, g_wv[L].n, g_pfv, N_KV * HEAD_DIM, 0 };
-            for (int j = 0; j < 3; ++j) {
-                const int64_t nx = (g_pfj[j].n * g_x100_pct / 100) & ~(int64_t) 63;
-                if (g_x100) g_pfj[j].nlim = g_pfj[j].n - nx;
-            }
-            if (g_x100) x100_prepare(g_pfj, 3);
+            if (g_x100) x100_begin(0, g_pfj, 3);
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gqkv+=_g; } _a=now_s();
@@ -6332,11 +6477,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
             g_pfj[0] = { g_pf_vendor ? g_wov[L].b : g_wov[L].b8, g_wov[L].k, g_wov[L].n, g_pfxa, N_EMBD, 0 };
-            if (g_x100) {
-                const int64_t nx = (g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63;
-                g_pfj[0].nlim = g_pfj[0].n - nx;
-                x100_prepare(g_pfj, 1);
-            }
+            if (g_x100) x100_begin(1, g_pfj, 1);
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
@@ -6353,11 +6494,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             g_pfjn = 2;
             g_pfj[0] = { g_pf_vendor ? g_wg[L].b : g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF, 0 };
             g_pfj[1] = { g_pf_vendor ? g_wu[L].b : g_wu[L].b8, g_wu[L].k, g_wu[L].n, g_pfup,   N_FF, 0 };
-            if (g_x100) {
-                g_pfj[0].nlim = g_pfj[0].n - ((g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63);
-                g_pfj[1].nlim = g_pfj[1].n - ((g_pfj[1].n * g_x100_pct / 100) & ~(int64_t) 63);
-                x100_prepare(g_pfj, 2);
-            }
+            if (g_x100) x100_begin(2, g_pfj, 2);
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_ggu+=_g; } _a=now_s();
@@ -6383,10 +6520,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
             g_pfj[0] = { g_pf_vendor ? g_wd[L].b : g_wd[L].b8, g_wd[L].k, g_wd[L].n, g_pfxa, N_EMBD, 0 };
-            if (g_x100) {
-                g_pfj[0].nlim = g_pfj[0].n - ((g_pfj[0].n * g_x100_pct / 100) & ~(int64_t) 63);
-                x100_prepare(g_pfj, 1);
-            }
+            if (g_x100) x100_begin(3, g_pfj, 1);
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
@@ -6749,6 +6883,28 @@ static void abort_bt(int) {
     _exit(134);
 }
 
+// Reference-locked decoding for precision checks. `-force refs/golden_10k.txt`
+// walks the reference's token chain so every step scores the same prefix the
+// reference scored; MEGA_STEPLOG appends one full logit row per step so those rows
+// can be compared position by position.
+static int   g_force_tok[4096];
+static int   g_force_n = 0;
+static FILE * g_steplog = nullptr;
+
+static void force_load(const char * path) {
+    FILE * f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open force file %s\n", path); return; }
+    // Accepts both the "  step N -> ID (val)" log format and one id per line.
+    char line[512];
+    while (fgets(line, sizeof line, f) && g_force_n < (int) (sizeof g_force_tok / sizeof g_force_tok[0])) {
+        const char * arrow = strstr(line, "->");
+        long v = arrow ? strtol(arrow + 2, nullptr, 10) : strtol(line, nullptr, 10);
+        if (v > 0) g_force_tok[g_force_n++] = (int) v;
+    }
+    fclose(f);
+    printf("force: %d reference tokens from %s\n", g_force_n, path);
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     exp3_init();
@@ -6759,6 +6915,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) ngen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-force") && i + 1 < argc) force_load(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) g_kstep = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-X") && i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -6817,6 +6974,12 @@ int main(int argc, char ** argv) {
     }
 
     if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = atoi(getenv("MEGA_VENDOR"));
+    // One logit row per decode step, for scoring against the reference's own rows.
+    if (const char * sp = getenv("MEGA_STEPLOG")) {
+        g_steplog = fopen(sp, "wb");
+        if (!g_steplog) fprintf(stderr, "cannot open steplog %s\n", sp);
+        else printf("steplog -> %s (%d f32 per step)\n", sp, VOCAB);
+    }
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
     if (getenv("MEGA_M4DEC")) { g_m4dec = atoi(getenv("MEGA_M4DEC")); g_attn4 = 1; }
@@ -7313,14 +7476,22 @@ int main(int argc, char ** argv) {
         g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits };
         run(task_mgemm);
         TOCK(S_GEMM);
-        if (step == 0 && getenv("MEGA_LOGD")) {
+        {
             // Same row llama.cpp's REF_LOG dumps: the logits for the last prompt
             // token, before any sampling. Comparing the two says whether a token
             // mismatch is upstream of the head or in it.
-            if (FILE * f = fopen(getenv("MEGA_LOGD"), "wb")) {
-                fwrite(g_logits, 4, VOCAB, f);
-                fclose(f);
-                printf("logits -> %s\n", getenv("MEGA_LOGD"));
+            if (step == 0 && getenv("MEGA_LOGD")) {
+                if (FILE * f = fopen(getenv("MEGA_LOGD"), "wb")) {
+                    fwrite(g_logits, 4, VOCAB, f);
+                    fclose(f);
+                    printf("logits -> %s\n", getenv("MEGA_LOGD"));
+                }
+            }
+            // One row per step, concatenated, so a forced run can be scored against
+            // the reference at every position rather than at step 0 only.
+            if (g_steplog) {
+                fwrite(g_logits, 4, VOCAB, g_steplog);
+                fflush(g_steplog);
             }
         }
         TICK();
@@ -7337,7 +7508,11 @@ int main(int argc, char ** argv) {
             // Print enough of the stream to diff a whole aligned run against the
             // reference rather than a prefix of one.
             if (step < 64) printf("  step %d -> %d (%.4f)\n", step, best, bv);
-            if (step == 0 && getenv("MEGA_TOP")) {
+            // MEGA_TOPSTEP picks which step the top-8 dump covers (default 0). The
+            // margin between rank 0 and rank 1 at a chosen step is what separates
+            // "resolved a near tie differently" from "lost accuracy".
+            static const int topstep = getenv("MEGA_TOPSTEP") ? atoi(getenv("MEGA_TOPSTEP")) : 0;
+            if (step == topstep && getenv("MEGA_TOP")) {
                 // top-8 straight off the head, so the gap to the f32 reference
                 // (8181 at 10.83, 280 at 9.65) is visible instead of hidden
                 // behind a single argmax
@@ -7355,6 +7530,15 @@ int main(int argc, char ** argv) {
                 printf("\n");
             }
             tok = best;
+            // Teacher forcing: walk the reference's token chain instead of our own
+            // argmax. Without it a single near-tie splits the two chains and every
+            // later step compares different prefixes, so the logits cannot be
+            // scored against the reference at all.
+            if (g_force_n > 0) {
+                const int ft = step < g_force_n ? g_force_tok[step] : best;
+                if (step < g_force_n && ft != best) printf("  forced step %d: our %d, ref %d\n", step, best, ft);
+                tok = ft;
+            }
         }
         TOCK(S_HEAD);
         if (stepdbg) {

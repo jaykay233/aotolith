@@ -315,13 +315,13 @@ is a property of the stream, not of the configuration. Every acceptance number i
 this section that came from 40 rounds is a lower bound on a bad stretch.
 
 Over 300 rounds, with `MEGA_ATTN4P=1`, sweeping the window on the 10K prompt:
-| 10K, 300 rounds | ms/round | accepted/round | tok/s |
+| 10K, 300 rounds | ms/round | accepted / proposed | tok/s |
 |---|---|---|---|
 | W = 1024 | 143.75 | 0.136 | 9.79 |
 | W = 512 | 136.63 | 0.208 | 11.88 |
 | W = 256 (**default**) | 133.33 | 0.198 | **11.95** |
 
-| 2K, 300 rounds | ms/round | accepted/round | tok/s |
+| 2K, 300 rounds | ms/round | accepted / proposed | tok/s |
 |---|---|---|---|
 | W = 256 | 110.30 | 0.281 | 16.71 |
 
@@ -341,12 +341,22 @@ did not survive is the claim that the decode target was met.
 The hard bound is unchanged: plain decode at 10K is 97 ms/token, and 54.3 ms of
 that is streaming the weights at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below
 the weight stream alone**, so speculation is mandatory and what decides it is
-acceptance. At 0.198 accepted per round the round needs to carry 2 tokens to reach
-20 tok/s at 133 ms, which means acceptance has to roughly double from here.
+acceptance. At W=256, 178/900 proposals were accepted (19.8%), or 178/300 =
+0.593 accepted per round. Including the verifier token gives 478/300 = 1.593
+emitted per round. At 133.33 ms, 20 tok/s requires 2.667 emitted per round:
+1.667 accepted, or 55.6% of the three proposals. Alternatively, keeping current
+acceptance requires a mean round time of at most 79.7 ms.
 
-Note also that at 10K speculation currently barely earns its round -- 11.95 tok/s
-against 10.3 for plain decode -- because 0.198 accepted means 1.2 tokens per round
-at 1.37x the cost of a plain token.
+On c2k with the corrected target, 40 rounds per window, W=0 (full prefix)
+and W=1024 each accepted 8/120 proposals; W=256 accepted 22/120. Mean
+raw-logit cosine was 0.1326, 0.0487 and 0.3028 respectively. This comparison
+supports retaining W=256 on this prompt; the target context is unchanged.
+
+On the corrected target, W=256, 60 rounds (180 proposed tokens per run),
+keeping the Markov bias accepted 65 drafts on c100 and 36 on c2k. With
+`MEGA_DSNOBIAS=1` the counts fell to 39 and 11 respectively. Keep the bias.
+These runs cover different numbers of emitted tokens: raw-logit cosines are
+averages over different anchor positions, not a paired test of conditioning.
 
 ### Sharing the drafter's K stream across its four slots: measured, and it loses
 
@@ -844,14 +854,82 @@ above, it is no longer worth cracking.
 
 | target | now | gap | next concrete step |
 |---|---|---|---|
-| prefill 200 tok/s @10K | 134.9 (74.15 s) | 23 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. |
-| decode 20 tok/s @10K | **11.95** over 300 rounds (`MEGA_SPEC=300`, 0.198 drafts per 133.33 ms round); 16.71 at 2K | needs ~2 tokens/round at 133 ms, i.e. acceptance roughly doubled | Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so speculation is mandatory and acceptance is the whole problem. The 21.28 that was recorded here before the rope fix was measured on a degenerate looping stream and is void. |
+| prefill 200 tok/s @10K | 139.1 (71.9 s), base | 21 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. The X100 path measures faster but is not yet correct (section 4); its 153-158 tok/s figures are void. |
+| decode 20 tok/s @10K | **11.95** over 300 rounds (`MEGA_SPEC=300`, 0.593 accepted drafts per 133.33 ms round); 16.71 at 2K | needs 2.67 emitted tokens/round at 133.33 ms (55.6% proposal acceptance) | Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so speculation is mandatory and acceptance is the whole problem. The 21.28 that was recorded here before the rope fix was measured on a degenerate looping stream and is void. |
 | output alignment | **exact to 1K context**: 40/40 tokens at 100, 20/20 at 256/512/1024; 2048 first differs at step 4 with cosine 0.9925 and the same argmax | the 2K+ drift is quantization noise, not layout | Do not "fix" the 2048 drift with a rope or exp change: `-e 0` and `-e 1` both first differ at the same step. The three rope implementations are now one function; keep it that way. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not
 llama.cpp Q4_0 (0.66 cosine from fp32) and not llama.cpp F16 (which does not run
 on this board). `ref_f32.py` now handles Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, so any file on
 the board can be the judge.
+
+### The golden set: how precision is scored from here on
+
+A change is an improvement only against something that is not itself, and the
+two candidates in hand (G=512 against G=1024, `-x100` on against off) are both
+ours. `refs/` now holds a frozen 10K reference produced once by llama.cpp
+(`refgreedy`, 4 threads, 64 steps) with per-step logit rows, and
+`check_logits.py` scores a candidate against it. `-force refs/golden_10k_tokens.txt`
+pins the candidate to the reference's token chain, because one near-tie otherwise
+splits the two chains and every later step compares different prefixes — at 10K
+step 12 is exactly that case (three candidates within 0.05 logits).
+
+Standing result, base configuration at 10K: **mean cosine 0.978702, top-1 60/64.**
+Of the four misses, two have a margin ratio of 0.0000, meaning our argmax is the
+reference's rank 1; step 57 is the one real outlier (cosine 0.9314, max|d| 5.27 on
+a 26.0 span). A change that lowers the mean cosine is a regression regardless of
+what it does to tok/s.
+
+Two facts this cost a day to establish, and they are cheap to forget:
+
+- **Chunk size is not numerical.** G=512 and G=1024 differ from step 12, and the
+  cause is the int8 KV scale: `pfa_convert_kv_i8` takes the max over the prefix
+  converted so far, so `sk` moves 0.315% and `sv` 2.93% between the first chunk
+  and the rest. Same configuration twice is **bit-identical** (32/32 tokens), so
+  this is the scale, not a race. The divergence is a 0.02-logit tie being broken
+  two ways, which is why the ratio column exists.
+- **Never measure while anything else runs.** Two megakernels together gave
+  `12425 61485 50734 ...` where the same binary alone gives `220 5298 242 8647 ...`,
+  and a megakernel beside `refgreedy` is just as bad.
+
+### `-x100` does not produce a correct result yet: the 153-158 tok/s figures are void
+
+The column offload to the X100 cluster looks like the answer to the prefill gap
+and measures well (GEMM 71.6 -> 64.3 s at 23%, -> 63.0 s at 40%), but **every
+token it emits is wrong**, starting at step 0 (`93979` against `220`, later
+`96761`). Two defects, in this order:
+
+1. The vendor quantiser (`quant_a_4row`, `g_pf_vendor == 2`) writes only the
+   A100 record. The X100 A copy exists solely in the vmadot quantiser, so X100
+   read untouched `hugemem`. `task_x8_quant` now builds it for the vendor path.
+2. With that fixed the output is still wrong at step 0, so the A layout or the
+   B packing or the epilogue is also mismatched. Not diagnosed.
+
+Independently of the bug, the X100 path quantises activations with **one scale
+per row** (`g_a8xs`, four floats per four-row group) where the A100 hp path uses
+**one scale per 256 k-elements**. That is a coarser step, not a byte permutation,
+so even a working X100 path would not be bit-identical and has to be scored
+against the golden set rather than assumed equal. `g_x100_pct_tab` (qkv 35, o 33,
+gate+up 37, down 28) encodes the equal-time split from rA ~486-509 GMAC/s against
+rX ~198 GMAC/s at k=6144 and ~287 at k=2048; a single 40 made `down` slower than a
+single 23 did.
+
+### llama.cpp cannot run at 16 threads on this board
+
+`REF_TH=16` produces `[KPACK] publish roundtrip FAILED` and a degenerate chain
+(`0 0 5 528 38 0 5 528 38 ...`). At 4 threads it reports no failures and a normal
+chain, taking 316 s for 10K prefill plus 64 steps. The golden set therefore has to
+come from the 4-thread configuration; a 16-thread reference would have graded
+every candidate against garbage.
+
+### Chunk size 1024 is the prefill chunk, and it is worth 2.5 s
+
+`-G 1024` gives 71.63 s against `-G 512`'s 74.13 s (139.59 against 134.88 tok/s)
+with the component times otherwise unchanged — the gain is all fixed cost, mostly
+`conv` 4.34 -> 2.24 s. `-G 2048` does not work: it runs past 8 minutes with 4.1 GB
+resident and never prints a result, so it exceeds a buffer's capacity rather than
+being slower. `-DI8G=32` (128-row attention tiles, half the K-plane passes) is
+wired up and builds; it has not been run.
 
 ---
 
