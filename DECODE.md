@@ -19,6 +19,10 @@ Numbers below are from `./bench_decode.sh` on the board (16.4 GB RAM, `/dev/shm`
 | everything else | 4.7-5.2 ms | 4.6-5.1 ms |
 | **tok/s** | **17.26** | **20.52** |
 
+The `i8xi3k` column is a short-context measurement of a repack of Q4_0, and its
+20.52 does not survive at 10K (12.36 on the real Q3_K file) nor a quality check
+(cosine 0.44). See the correction below and `FINDINGS.md` section 7.
+
 GEMM sustains 24.0 GB/s against a measured raw-stream ceiling of 27.5 GB/s, so the
 vendor kernel's serial load->use chain is leaving ~13% of the bandwidth on the
 table. Everything else in the token costs ~7.3 ms and is flat across the stages.
@@ -50,10 +54,18 @@ so a stale cache loads silently and reproduces the bug.
 
 ## Why 3-bit is not the answer on its own
 
-It clears 20 tok/s (20.52), but it changes the output: greedy tokens diverge from
-the Q4_0 run at step 1 with a margin of 0.67. The objective requires the output to
-match llama.cpp, so 3-bit cannot be the final answer unless the whole comparison
-is redefined against a 3-bit reference.
+It clears 20 tok/s (20.52) at short context, but it changes the output: greedy
+tokens diverge from the Q4_0 run at step 1 with a margin of 0.67.
+
+**Superseded, with the number this time.** On the real `MiniCPM5-2B-Q3KM.gguf`
+the 3-bit decode path measures cosine **0.4403** / rms 2.60 against exact fp32 of
+that same file, where the Q4_0 path is 0.999002 / 0.108 - and at 10K it runs
+12.36 tok/s, not 20.52. The short-context 20.52 was a repack of Q4_0 measured
+through a chain with three bugs. So 3-bit is closed on both axes: it never reaches
+the speed target at 10K, and it costs 20x the logit error. See `FINDINGS.md`
+sections 5 and 7; the weight-domain breakdown (`check_q3loss.py`) shows the packer
+is sound and it is the bit count that does it. Q4_0 + int8 KV stays the decode
+reference.
 
 ## Storage
 
@@ -96,8 +108,8 @@ observed, not explained.
 ## What this means for the three routes
 
 - **m=1 kernel work**: capped. Compute is 3 ms of 50; even a perfect GEMM saves 6%.
-- **3-bit weights**: real, 20.52 tok/s, but changes the output, so it is not
-  admissible as the final answer.
+- **3-bit weights**: measured and closed. 12.36 tok/s at 10K (not 20) and cosine
+  0.44 against exact fp32, so it fails both axes. `FINDINGS.md` section 7.
 - **dspark speculative decode**: three drafts verified per round at 1.33x the cost
   of one token. Even at a pessimistic 60% acceptance this lands near 27 tok/s, and
   the target is 20. This is the route.

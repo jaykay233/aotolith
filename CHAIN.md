@@ -598,15 +598,16 @@ The logit row for the last prompt position, 64-token prompt, against exact fp32
 The in-tree `-q3` / `-q2` packers requantise the *dequantised Q4_0* weights
 per k16 and the result is not 3-bit quality, it is noise: cosine 0.18 and 0.01.
 Their 12.9 and 13.9 tok/s are therefore speeds for a different, broken model.
-This closes the question the earlier "2-bit" section left open: the cliff is not
-at 2 bits specifically, it is that these two packers do not preserve anything.
 
-The vendor `gemm_kernel_i8i3k` / `i8i2k` kernels are fine and worthwhile; what is
-missing is real Q3_K weights from `llama-quantize` (`MiniCPM5-2B-Q3KM.gguf` is on
-the board, PPL 26.63 against Q8_0's 21.86) instead of a repack of Q4_0. Feeding
-that file through the existing Q3_K decode branch is the next quality-correct
-step, but note the arithmetic it buys: 1001.6 MB + 215 MB of int8 KV is 1216 MB,
-which is 74 ms at 16.5 GB/s, i.e. **13.5 tok/s**. Still short of 20.
+**Correction (see `FINDINGS.md` section 7): those two rows were measured through
+a chain with three bugs, so the 0.18/0.01 are the bugs, not the bit count.** With
+them fixed, the real `MiniCPM5-2B-Q3KM.gguf` through the 3-bit decode path is
+cosine **0.4403** / rms 2.60 against exact fp32 of that same file, at 12.36 tok/s
+(10K). The packer is doing what 3 bits do (~0.99 per row, compounding over 42
+layers); the verdict is unchanged but now for the right reason: 20x Q4_0's logit
+error for +10% speed is not a trade, and 3-bit never reached 20 tok/s anyway.
+llama.cpp's own Q3_K is no better a target: on the same prompt it lands on rank
+18 of the fp32 row.
 
 ### Speculative decoding is the only lever left with the required size
 

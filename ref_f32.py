@@ -12,7 +12,7 @@ IDS  = [int(x) for x in open(sys.argv[2] if len(sys.argv) > 2 else "/tmp/p5.txt"
 
 FMT = {0:"B",1:"b",2:"H",3:"h",4:"I",5:"i",6:"f",7:"?",8:"str",9:"arr",10:"Q",11:"q",12:"d"}
 SZ  = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
-TN  = {0:"F32",1:"F16",2:"Q4_0",8:"Q8_0",14:"Q6_K"}
+TN  = {0:"F32",1:"F16",2:"Q4_0",8:"Q8_0",10:"Q2_K",11:"Q3_K",12:"Q4_K",13:"Q5_K",14:"Q6_K"}
 
 f = open(GGUF, "rb")
 def rd(n): return f.read(n)
@@ -54,6 +54,99 @@ def deq_row(name, r0, r1):
         hi = (qs >> 4).astype(np.float32) - 8.0
         v = np.concatenate([lo, hi], axis=2) * d
         return v.reshape(n, n_in)
+    # K-quants, vectorised over output rows. Every offset below is a direct port
+    # of the corresponding dequantize_row_* in ggml-quants.c: a transposed field
+    # or a wrong shift produces plausible small numbers rather than an error, so
+    # the check is the greedy token sequence, not eyeballing values.
+    BLK = {10: 84, 11: 110, 12: 144, 13: 176, 14: 210}
+    if ty in BLK:
+        nsup = n_in // 256
+        f.seek(base + off + r0 * nsup * BLK[ty])
+        b = np.frombuffer(rd(n * nsup * BLK[ty]), np.uint8).reshape(n, nsup, BLK[ty])
+        out = np.empty((n, nsup, 256), np.float32)
+        f16 = lambda sl: b[:, :, sl].copy().view("<f2").astype(np.float32)
+
+        if ty == 10:                                    # Q2_K  d dmin sc[16] qs[64]
+            d, dmin = f16(slice(0, 2)), f16(slice(2, 4))
+            sc, qs = b[:, :, 4:20], b[:, :, 20:84]
+            for g in range(16):                         # 16 groups of 16 quants
+                s = sc[:, :, g]
+                dl = d * (s & 0xF).astype(np.float32)[:, :, None]
+                ml = dmin * (s >> 4).astype(np.float32)[:, :, None]
+                blk, j, sub = g // 8, (g % 8) // 2, (g % 8) % 2
+                q = qs[:, :, blk * 32 + sub * 16:blk * 32 + sub * 16 + 16]
+                v = ((q >> (2 * j)) & 3).astype(np.float32)
+                out[:, :, g * 16:(g + 1) * 16] = dl * v - ml
+
+        elif ty == 11:                                  # Q3_K  hm[32] qs[64] sc[12] d
+            hm, qs12 = b[:, :, 0:32], b[:, :, 32:96]
+            d = f16(slice(108, 110))
+            aux = np.zeros((n, nsup, 4), np.uint32)
+            aux[:, :, :3] = b[:, :, 96:108].copy().view(np.uint32).reshape(n, nsup, 3)
+            tmp, km1, km2 = aux[:, :, 2].copy(), 0x03030303, 0x0f0f0f0f
+            aux[:, :, 2] = ((aux[:, :, 0] >> 4) & km2) | (((tmp >> 4) & km1) << 4)
+            aux[:, :, 3] = ((aux[:, :, 1] >> 4) & km2) | (((tmp >> 6) & km1) << 4)
+            aux[:, :, 0] = (aux[:, :, 0] & km2) | (((tmp >> 0) & km1) << 4)
+            aux[:, :, 1] = (aux[:, :, 1] & km2) | (((tmp >> 2) & km1) << 4)
+            scales = aux.view(np.uint8).reshape(n, nsup, 16).astype(np.float32) - 32.0
+            for g in range(16):
+                h, j, sub = g // 8, (g % 8) // 2, (g % 8) % 2
+                dl = d * scales[:, :, g][:, :, None]
+                q = qs12[:, :, h * 32 + sub * 16:h * 32 + sub * 16 + 16]
+                v = ((q >> (2 * j)) & 3).astype(np.float32)
+                m = (hm[:, :, sub * 16:sub * 16 + 16] >> (h * 4 + j)) & 1
+                v = v - np.where(m != 0, 0.0, 4.0).astype(np.float32)
+                out[:, :, g * 16:(g + 1) * 16] = dl * v
+
+        elif ty in (12, 13):                            # Q4_K / Q5_K, same sc packing
+            d, dmin = f16(slice(0, 2)), f16(slice(2, 4))
+            sc12 = b[:, :, 4:16]
+            qh = b[:, :, 16:48] if ty == 13 else None
+            qs = b[:, :, 48:176] if ty == 13 else b[:, :, 16:144]
+            def gsm(j):
+                if j < 4:
+                    return (sc12[:, :, j] & 63).astype(np.float32), (sc12[:, :, j + 4] & 63).astype(np.float32)
+                dd = (sc12[:, :, j + 4] & 0xF) | ((sc12[:, :, j - 4] >> 6) << 4)
+                mm = (sc12[:, :, j + 4] >> 4) | ((sc12[:, :, j] >> 6) << 4)
+                return dd.astype(np.float32), mm.astype(np.float32)
+            for j in range(4):                          # 4 chunks of 64 quants
+                s1, m1 = gsm(2 * j)
+                s2, m2 = gsm(2 * j + 1)
+                d1, mm1 = d * s1[:, :, None], dmin * m1[:, :, None]
+                d2, mm2 = d * s2[:, :, None], dmin * m2[:, :, None]
+                q = qs[:, :, j * 32:j * 32 + 32]
+                lo = (q & 0xF).astype(np.float32)
+                hi = (q >> 4).astype(np.float32)
+                if ty == 13:
+                    hb = qh[:, :, 0:32]
+                    lo = lo + (np.where((hb & (1 << (2 * j))) != 0, 16.0, 0.0)).astype(np.float32)
+                    hi = hi + (np.where((hb & (2 << (2 * j))) != 0, 16.0, 0.0)).astype(np.float32)
+                out[:, :, j * 64:j * 64 + 32] = d1 * lo - mm1
+                out[:, :, j * 64 + 32:(j + 1) * 64] = d2 * hi - mm2
+
+        else:                                           # Q6_K  ql[128] qh[64] sc[16] d
+            ql, qhb = b[:, :, 0:128], b[:, :, 128:192]
+            sc = b[:, :, 192:208].copy().view(np.int8).astype(np.float32)
+            d = f16(slice(208, 210))
+            for h in range(2):                          # two 128-quant blocks
+                qb = ql[:, :, h * 64:h * 64 + 64]
+                hb = qhb[:, :, h * 32:h * 32 + 32]
+                sb = sc[:, :, h * 8:h * 8 + 8]
+                for qi in range(4):
+                    for half in range(2):
+                        a = half * 16
+                        if qi == 0:
+                            qv = (qb[:, :, a:a + 16] & 0xF) | (((hb[:, :, a:a + 16] >> 0) & 3) << 4)
+                        elif qi == 1:
+                            qv = (qb[:, :, 32 + a:32 + a + 16] & 0xF) | (((hb[:, :, a:a + 16] >> 2) & 3) << 4)
+                        elif qi == 2:
+                            qv = (qb[:, :, a:a + 16] >> 4) | (((hb[:, :, a:a + 16] >> 4) & 3) << 4)
+                        else:
+                            qv = (qb[:, :, 32 + a:32 + a + 16] >> 4) | (((hb[:, :, a:a + 16] >> 6) & 3) << 4)
+                        s = sb[:, :, half + 2 * qi][:, :, None]
+                        o = h * 128 + qi * 32 + a
+                        out[:, :, o:o + 16] = d * s * (qv.astype(np.float32) - 32.0)
+        return out.reshape(n, n_in)
     raise SystemExit("unsupported type %s for %s" % (TN.get(ty, ty), name))
 
 def f32w(name):

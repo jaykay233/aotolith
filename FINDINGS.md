@@ -209,6 +209,8 @@ non-int8 path.
 | + conv/quant/norm vectorisation | **73.4 s (139.4)** | yes |
 | real Q3_K via int8 copy (vmadot) | 100.4 s (99.6) | unverified |
 
+| `prefill` 3-bit via the int8 copy (vmadot) | 10K 100.4 s, 99.6 tok/s | - | 40 tok/s slower than 4-bit prefill; closed by the quality result in section 7 |
+
 **The 174-178 tok/s figure is the unaligned row.** It is the vmadot path with
 per-row int8 activation scaling and A_BLK 256; it emits a different first token.
 The fastest configuration that matches the reference is 139.4 tok/s, and that is
@@ -249,6 +251,7 @@ reason.
 | 32-column register-resident flush | B's second half-column layout differs from legacy | cancelled, reverted. |
 | 2-bit for decode (`-q2` homemade) | 13.90 tok/s at 10K; cosine **0.0106** vs fp32 | the packer destroyed the model. See section 7 for why this measurement was also polluted. |
 | 3-bit for decode (`-q3` homemade) | 12.86 tok/s; cosine **0.1766** vs fp32 | same. |
+| 3-bit decode with the bugs fixed (real Q3_K) | 12.36 tok/s at 10K; cosine **0.4403**, rms 2.60 vs exact fp32 of the same file | the packer is not broken, 3 bits is. 20x Q4_0's logit error for +10% speed. Closed. |
 | `-H` (hp one-row decode kernel, matches llama.cpp) | 6.3 tok/s vs 17.3 | 2.7x slower; an alignment probe, not a speed path. |
 | Padding one row to four and calling `_hp_m4` | token `30930` | the one-row and four-row entry points quantise A with different record layouts. Not equivalent. |
 | `gemm_kernel_i8i3k` with `count_m=4` | rows 1..3 all zero, row 0 corrupt | it is a one-row kernel. `_m4` is the four-row entry point. |
@@ -301,6 +304,12 @@ reason.
    `-fno-stack-protector`.
 9. **`count_m > 4` is ignored** by the vendor m4 kernels. Benchmarking "GMAC/s at
    count_m=128" measures the same 4 rows.
+10. **A stale binary looks exactly like a nondeterministic one.** The `3-bit`
+   decode emitted `0`, then `71986`, then `95` for the same prompt and file, and
+   each looked like a race. Three of them were different *builds*: `m3c.new` was
+   built before the embedding fix and `m3c.dbg` (`-O1`) after. Rebuilding both
+   from one source made it `95` three times in a row. When a number moves between
+   runs, check the binary's mtime against the source's before suspecting a race.
 
 ### Hardware
 
@@ -354,25 +363,55 @@ three bugs, so it measured the bugs.** Corrected record:
   the per-group rows are the correct check.)
 - **One-row A record pitch is 292 B** per K256 superblock; 288 and 290 give
   NaN/inf.
+- **The reference is now able to judge it.** `ref_f32.py` gained Q2_K/Q3_K/Q4_K/
+  Q5_K/Q6_K, and `check_kquants.py` validates each one against the Q4_0 file's
+  twin rows of the same checkpoint (correlation 0.970 for the Q3_K tensors, 0.995
+  for the Q4_K/Q5_K/Q6_K ones, norm ratios within 0.6%). llama.cpp's own Q3_K
+  dequantiser is the other side of that agreement, and it agrees.
 
-### What is still wrong
+### The verdict, with the logit row this time: 3-bit is closed on both axes
 
-Tokens are plausible but off: llama.cpp on the same `MiniCPM5-2B-Q3KM.gguf` gives
-`35 1308 26 242 4022 23047 120341 64`; the megakernel gives
-`6664 220 352 314 84 37 1207 6664` on the same 512-token prompt. The Q4_0 control
-on the same prompt gives `35`, matching llama.cpp, so the harness is sound.
+64-token prompt, last position, exact float32 of **the same Q3_K file** as judge
+(`ref_f32.py` + `RF_LOG`):
 
-Prime suspect: **`output.weight` is Q6_K in this file and the packer crushes it
-to 3 bits** (219 MB -> 91 MB at 10K). That is the one tensor read once per token
-over the whole vocabulary, and 3-bit uniform quantisation of a Q6_K head is a much
-bigger perturbation than 3-bit on the body. Second suspect: the double
-quantisation Q3_K -> uniform 3-bit -> int8.
+| stack | cosine vs fp32 | rms | top-1 |
+|---|---|---|---|
+| Q4_0 megakernel (control, same prompt) | **0.999002** | 0.108 | `65401` (fp32 `22354`, gap 0.13) |
+| 3-bit Q3_K megakernel | **0.4403** | 2.60 | `95` (fp32 rank 27) |
+| llama.cpp Q3_K, own numerics | - | - | `1219` (fp32 rank 18, 2.63 logits down) |
 
-Next experiment, in order, so it is not re-derived: (a) keep `output.weight` at
-its native Q6_K for decode (it costs +128 MB of stream, ~8 ms/token, and removes
-the largest perturbation); (b) if that does not align, quantise from the F16
-source rather than from Q4_0. Do **not** re-run the "cosine 0.18 so 3-bit is
-noise" test - it cannot answer the question through a chain with the bugs above.
+Neither implementation of a 3-bit file reproduces the fp32 row: llama.cpp's Q3_K
+lands on the fp32 row's rank 18, and the megakernel's lands on rank 27. So
+"match llama.cpp Q3_K" was never a quality target either, for the same reason
+"match llama.cpp Q4_0" was not.
+
+Why the megakernel is further off is measurable in the weight domain
+(`check_q3loss.py`, which applies the packer's own arithmetic to exact-dequantised
+rows):
+
+| tensor | source | packer q3 | same scheme at q4 |
+|---|---|---|---|
+| token_embd | Q3_K | 0.9892 | 0.9979 |
+| blk.0.attn_q | Q3_K | 0.9927 | 0.9986 |
+| blk.0.ffn_up | Q3_K | 0.9898 | 0.9980 |
+| blk.0.attn_v | Q5_K | 0.9835 | 0.9966 |
+| output.weight | Q6_K | 0.9816 | 0.9961 |
+
+Per row the packer is not broken - it is doing what 3 bits do. The problem is
+that 0.99 per row compounds over 42 layers, while 4 bits at 0.998 does not (the
+Q4_0 chain is 0.999 end to end). **3-bit weights cost 20x the logit error of
+Q4_0, and deliver 12.36 tok/s at 10K against Q4_0's 11.18.** Not a trade worth
+keeping: 3-bit clears neither the speed target nor a quality bar.
+
+Consequences, so they are not re-litigated:
+
+- Do **not** chase the residual 3-bit mismatch by keeping `output.weight` at
+  native precision. The head is 0.9816 per row and the body averages 0.988; the
+  body dominates, so a better head cannot recover a 0.44 cosine.
+- Do **not** re-run "cosine 0.18 so 3-bit is noise" - that number was measured
+  through the three bugs above. 0.44 is the number with the bugs fixed.
+- The Q4_0 + int8 KV configuration stays the decode reference: 0.999 cosine
+  against exact fp32 and 11.18 tok/s at 10K.
 
 ### The prefill tax for 3-bit
 
@@ -380,7 +419,8 @@ noise" test - it cannot answer the question through a chain with the bugs above.
 not four consecutive 292 B rows, see section 5), so prefill falls back to the
 vmadot path on the int8 copy: 10K prefill **99.6 tok/s** against 139.4 for the
 4-bit vendor path. Decode gains 11.18 -> 12.36; prefill loses 40 tok/s. Cracking
-`i8i3k_m4`'s A record is the only way to get both.
+`i8i3k_m4`'s A record is the only way to get both - and given the quality result
+above, it is no longer worth cracking.
 
 ---
 
@@ -389,11 +429,13 @@ vmadot path on the int8 copy: 10K prefill **99.6 tok/s** against 139.4 for the
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 139.4 (73.4 s) | 51.2 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. |
-| decode 20 tok/s @10K | 12.36 (3-bit) / 11.18 (Q4_0) | 50 ms | dspark at 3 drafts, but attention must first stop being time-per-position bound (int8 `vmadot` QK+PV). Byte arithmetic says 20 is out of reach without one of the two. |
-| output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`) | 3-bit does not | keep `output.weight` at native precision, re-check against it. |
+| decode 20 tok/s @10K | 11.18 (Q4_0) | 50 ms | dspark at 3 drafts (measured 21.76 short-context, exact by construction), but attention must first stop being time-per-position bound (int8 `vmadot` QK+PV). Byte arithmetic says 20 is out of reach by weight-format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
+| output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`) | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not
-llama.cpp Q4_0 and not llama.cpp F16 (which does not run on this board).
+llama.cpp Q4_0 (0.66 cosine from fp32) and not llama.cpp F16 (which does not run
+on this board). `ref_f32.py` now handles Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, so any file on
+the board can be the judge.
 
 ---
 
@@ -416,7 +458,9 @@ with the same flags as the kernel:
 | `probe_q3m4.cpp` | `i8i3k` with `count_m=4` returns zeros for rows 1..3: it is a one-row kernel. |
 | `probe_q3pf.cpp` | `quantize_a_4row_i8k` + `i8i3k_m4` is **not** four consecutive 292 B rows (garbage at every pitch 290..300). Unresolved; this is the blocker for 3-bit prefill. |
 | `probe_q3pack.cpp` | the in-tree 3-bit packer's own layout (used by `repack_b_q3`). |
-| `ref_f32.py` | exact float32 logit row via numpy, one layer at a time. The only accepted quality baseline. |
+| `ref_f32.py` | exact float32 logit row via numpy, one layer at a time. The only accepted quality baseline. Handles F32/F16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K; `RF_LOG=` dumps the full row. |
+| `check_kquants.py` | validates each K-quant dequantiser against the Q4_0 file's twin rows of the same checkpoint. Correlation and norm ratio, so a transposed field or a wrong shift is caught by a number rather than by eyeballing. |
+| `check_q3loss.py` | the packer's quantisation loss in the weight domain, per tensor, at 3 bits and at 4 bits. Separates "the packer is broken" from "3 bits is lossy". |
 | `refgreedy.cpp` | llama.cpp on the *same* file with an explicit `n_ctx`; the token-level cross-check. |
 | `layer0_ref.py` | layer 0 of the same GGUF in float64 against `MEGA_DUMP`; isolates a broken op. |
 
