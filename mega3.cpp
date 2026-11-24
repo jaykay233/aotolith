@@ -2420,31 +2420,60 @@ static void attn_pv_m4(int tid) {
 //    A dot product is permutation invariant, and q and k share the order, so
 //    the attention scores are unchanged.
 static double g_t_rope_math, g_t_rope_app;
+// LLAMA_ROPE_TYPE_NORM: pairs (2i, 2i+1), not rotate_half's (i, i+64). This is
+// what llama.cpp uses for general.architecture = llama, and getting it wrong was
+// invisible from inside the kernel: the numpy reference was written with the same
+// rotate_half convention, so the two agreed to 0.9979 cosine with a matching
+// argmax while both sat 0.87 away from llama.cpp. Changing only the reference to
+// NORM moved it to 0.9776 against llama.cpp, which is the fix applied here.
+//
+// The deinterleave has to happen in registers. This core trap-emulates strided
+// vector access, so an even/odd gather is built from the lane id (vid ^ 1 swaps
+// each pair, vid >> 1 duplicates each angle) rather than with vlse32.
+//
+//   out[2i]   = x[2i]  *c_i - x[2i+1]*s_i
+//   out[2i+1] = x[2i+1]*c_i + x[2i]  *s_i
+//   => out = x*C + swap(x)*S,  C = [c0,c0,c1,c1,...], S = [-s0,+s0,-s1,+s1,...]
+//
+// One head, one copy, three callers (prefill, single-row decode, four-row decode).
+// They used to be three separate implementations and they drifted: prefill was
+// still rotate_half after decode was changed, and the mixed cache produced garbage
+// logits and a segfault rather than a wrong number.
+__attribute__((optimize("no-tree-vectorize")))
+static inline void rope_head_norm(float * x, const float * cs, float post) {
+    const size_t vl = __riscv_vsetvl_e32m1(32);
+    const vuint32m1_t vid = __riscv_vid_v_u32m1(vl);
+    const vuint32m1_t isw = __riscv_vxor_vx_u32m1(vid, 1, vl);   // [1,0,3,2,...]
+    const vuint32m1_t idp = __riscv_vsrl_vx_u32m1(vid, 1, vl);   // [0,0,1,1,...]
+    static const float sgn_tab[64] = {
+        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
+        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
+        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
+        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1 };
+    const vfloat32m1_t vsg = __riscv_vle32_v_f32m1(sgn_tab, vl);
+    const vfloat32m1_t vpost = __riscv_vfmv_v_f_f32m1(post, vl);
+    for (int off = 0; off < HEAD_DIM; off += (int) vl) {
+        const int j = off / 2;
+        const vfloat32m1_t a = __riscv_vle32_v_f32m1(x + off, vl);
+        const vfloat32m1_t as = __riscv_vrgather_vv_f32m1(a, isw, vl);
+        const vfloat32m1_t cv = __riscv_vrgather_vv_f32m1(
+            __riscv_vle32_v_f32m1(cs + j, vl), idp, vl);
+        const vfloat32m1_t sv = __riscv_vfmul_vv_f32m1(
+            __riscv_vrgather_vv_f32m1(__riscv_vle32_v_f32m1(cs + 64 + j, vl), idp, vl), vsg, vl);
+        vfloat32m1_t r = __riscv_vfmacc_vv_f32m1(__riscv_vfmul_vv_f32m1(a, cv, vl), as, sv, vl);
+        if (post != 1.0f) r = __riscv_vfmul_vv_f32m1(r, vpost, vl);
+        __riscv_vse32_v_f32m1(x + off, r, vl);
+    }
+}
+
 static void rope_all(void) {
     const double _ta = now_s();
     const float * cs = g_rope_tab + (int64_t) g_pos * 128;
-    const vfloat32m1_t c0 = __riscv_vle32_v_f32m1(cs, 32);
-    const vfloat32m1_t c1 = __riscv_vle32_v_f32m1(cs + 32, 32);
-    const vfloat32m1_t s0 = __riscv_vle32_v_f32m1(cs + 64, 32);
-    const vfloat32m1_t s1 = __riscv_vle32_v_f32m1(cs + 96, 32);
-    for (int h = 0; h < N_HEAD + N_KV; ++h) {
-        float * x = (h < N_HEAD) ? (g_q + h * HEAD_DIM) : (g_k + (h - N_HEAD) * HEAD_DIM);
-        const vfloat32m1_t e0 = __riscv_vle32_v_f32m1(x, 32);
-        const vfloat32m1_t e1 = __riscv_vle32_v_f32m1(x + 32, 32);
-        const vfloat32m1_t o0 = __riscv_vle32_v_f32m1(x + 64, 32);
-        const vfloat32m1_t o1 = __riscv_vle32_v_f32m1(x + 96, 32);
-        __riscv_vse32_v_f32m1(x,      __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, c0, 32), __riscv_vfmul_vv_f32m1(o0, s0, 32), 32), 32);
-        __riscv_vse32_v_f32m1(x + 32, __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, c1, 32), __riscv_vfmul_vv_f32m1(o1, s1, 32), 32), 32);
-        __riscv_vse32_v_f32m1(x + 64, __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, s0, 32), __riscv_vfmul_vv_f32m1(o0, c0, 32), 32), 32);
-        __riscv_vse32_v_f32m1(x + 96, __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, s1, 32), __riscv_vfmul_vv_f32m1(o1, c1, 32), 32), 32);
-    }
-    {   // q must be scaled by 1/sqrt(head_dim); scores feed only the softmax
-        const float inv = 1.0f / sqrtf((float) HEAD_DIM);
-        for (int h = 0; h < N_HEAD; ++h)
-            for (int i = 0; i < HEAD_DIM; i += 32)
-                __riscv_vse32_v_f32m1(g_q + h * HEAD_DIM + i,
-                                      __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(g_q + h * HEAD_DIM + i, 32), inv, 32), 32);
-    }
+    const float inv = 1.0f / sqrtf((float) HEAD_DIM);
+    for (int h = 0; h < N_HEAD; ++h) rope_head_norm(g_q + h * HEAD_DIM, cs, inv);
+    for (int h = 0; h < N_KV; ++h) rope_head_norm(g_k + h * HEAD_DIM, cs, 1.0f);
+    // q carries 1/sqrt(head_dim) inside rope_head_norm's `post`, so the scores need
+    // no second factor -- the same convention the prefill path uses.
     g_t_rope_math += now_s() - _ta;
 
     const double _tb = now_s();
@@ -4631,11 +4660,10 @@ static void ds_rmsvec(float * dst, const float * src, const float * w, int n) {
     for (int i = 0; i < n; ++i) dst[i] = src[i] * r * w[i];
 }
 
-// Pairwise (2i, 2i+1) rotation in the natural layout. The target's own rope uses
-// its permuted layout; the draft's reference implementation does not permute.
-// Two rotation layouts, because the reference generator is ambiguous about which one
-// dflash uses and the two are not interchangeable. MEGA_DSROPE=half selects the
-// halves-rotate form the target model itself uses; the default is adjacent pairs.
+// Pairwise (2i, 2i+1) rotation. The target uses the same convention
+// (LLAMA_ROPE_TYPE_NORM, see rope_head_norm), which is why the halves-rotate form
+// `MEGA_DSROPE=half` used to test 0.111 accepted per round against 0.278: it was
+// not a different valid layout, it was the wrong one on both sides.
 static int g_ds_rope_half = -1;
 static void ds_rope(float * x, int pos) {
     if (g_ds_rope_half < 0) {
@@ -5202,31 +5230,8 @@ static void ds_setup(void) {
 // independent jobs, and Q's sixteen heads split exactly eight per kv head.
 static int64_t g_m4rope_p0;
 
-static inline void m4_rope_apply(float * x, vfloat32m1_t c0, vfloat32m1_t c1,
-                                 vfloat32m1_t s0, vfloat32m1_t s1, float post) {
-    const vfloat32m1_t e0 = __riscv_vle32_v_f32m1(x, 32);
-    const vfloat32m1_t e1 = __riscv_vle32_v_f32m1(x + 32, 32);
-    const vfloat32m1_t o0 = __riscv_vle32_v_f32m1(x + 64, 32);
-    const vfloat32m1_t o1 = __riscv_vle32_v_f32m1(x + 96, 32);
-    vfloat32m1_t r0 = __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, c0, 32),
-                                             __riscv_vfmul_vv_f32m1(o0, s0, 32), 32);
-    vfloat32m1_t r1 = __riscv_vfsub_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, c1, 32),
-                                             __riscv_vfmul_vv_f32m1(o1, s1, 32), 32);
-    vfloat32m1_t r2 = __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e0, s0, 32),
-                                             __riscv_vfmul_vv_f32m1(o0, c0, 32), 32);
-    vfloat32m1_t r3 = __riscv_vfadd_vv_f32m1(__riscv_vfmul_vv_f32m1(e1, s1, 32),
-                                             __riscv_vfmul_vv_f32m1(o1, c1, 32), 32);
-    if (post != 1.0f) {
-        // Same order as rope_all: the rotation result, then the 1/sqrt(d) scale.
-        r0 = __riscv_vfmul_vf_f32m1(r0, post, 32);
-        r1 = __riscv_vfmul_vf_f32m1(r1, post, 32);
-        r2 = __riscv_vfmul_vf_f32m1(r2, post, 32);
-        r3 = __riscv_vfmul_vf_f32m1(r3, post, 32);
-    }
-    __riscv_vse32_v_f32m1(x, r0, 32);
-    __riscv_vse32_v_f32m1(x + 32, r1, 32);
-    __riscv_vse32_v_f32m1(x + 64, r2, 32);
-    __riscv_vse32_v_f32m1(x + 96, r3, 32);
+static inline void m4_rope_apply(float * x, const float * cs, float post) {
+    rope_head_norm(x, cs, post);
 }
 
 static void m4_rope_item(int r, int kv) {
@@ -5235,15 +5240,11 @@ static void m4_rope_item(int r, int kv) {
     float * k = g_k4 + (int64_t) r * (N_KV * HEAD_DIM);
     const float * v = g_v4 + (int64_t) r * (N_KV * HEAD_DIM);
     const float * cs = g_rope_tab + (int64_t) pos * 128;
-    const vfloat32m1_t c0 = __riscv_vle32_v_f32m1(cs, 32);
-    const vfloat32m1_t c1 = __riscv_vle32_v_f32m1(cs + 32, 32);
-    const vfloat32m1_t s0 = __riscv_vle32_v_f32m1(cs + 64, 32);
-    const vfloat32m1_t s1 = __riscv_vle32_v_f32m1(cs + 96, 32);
     const float inv = 1.0f / sqrtf((float) HEAD_DIM);
 
     for (int i = 0; i < NH_PER_KV; ++i)
-        m4_rope_apply(q + (kv * NH_PER_KV + i) * HEAD_DIM, c0, c1, s0, s1, inv);
-    m4_rope_apply(k + kv * HEAD_DIM, c0, c1, s0, s1, 1.0f);
+        m4_rope_apply(q + (kv * NH_PER_KV + i) * HEAD_DIM, cs, inv);
+    m4_rope_apply(k + kv * HEAD_DIM, cs, 1.0f);
 
     const int pblk = pos / KT, pi = pos % KT;
     _Float16 * kb16 = ktile(g_layer, kv, pblk);
@@ -5974,34 +5975,10 @@ static void add_rows(float * dst, const float * src, int64_t rows) {
 static void prefill_qk_row(float * q, float * k, int64_t pos) {
     const float * cs = g_rope_tab + pos * 128;
     const float inv = 1.0f / sqrtf((float) HEAD_DIM);
-    const int half = HEAD_DIM / 2;
-    for (int h = 0; h < N_HEAD + N_KV; ++h) {
-        float * x = (h < N_HEAD) ? (q + h * HEAD_DIM) : (k + (h - N_HEAD) * HEAD_DIM);
-        // Half-split rotation, vectorised: both halves are contiguous runs of 64
-        // floats, so one strided-free load of each side covers the whole head.
-        for (int i = 0; i < half; ) {
-            const size_t vl = __riscv_vsetvl_e32m2((size_t) (half - i));
-            const vfloat32m2_t c  = __riscv_vle32_v_f32m2(cs + i, vl);
-            const vfloat32m2_t sv = __riscv_vle32_v_f32m2(cs + 64 + i, vl);
-            const vfloat32m2_t x0 = __riscv_vle32_v_f32m2(x + i, vl);
-            const vfloat32m2_t x1 = __riscv_vle32_v_f32m2(x + half + i, vl);
-            __riscv_vse32_v_f32m2(x + i,
-                __riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(x0, c, vl),
-                                       __riscv_vfmul_vv_f32m2(x1, sv, vl), vl), vl);
-            __riscv_vse32_v_f32m2(x + half + i,
-                __riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(x0, sv, vl),
-                                       __riscv_vfmul_vv_f32m2(x1, c, vl), vl), vl);
-            i += (int) vl;
-        }
-        // q carries 1/sqrt(head_dim) so the int8 attention operand is pre-scaled
-        if (h < N_HEAD)
-            for (int i = 0; i < HEAD_DIM; ) {
-                const size_t vl = __riscv_vsetvl_e32m2((size_t) (HEAD_DIM - i));
-                __riscv_vse32_v_f32m2(x + i,
-                    __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(x + i, vl), inv, vl), vl);
-                i += (int) vl;
-            }
-    }
+    // Same helper as single-row and four-row decode. q carries 1/sqrt(head_dim) so
+    // the int8 attention operand is pre-scaled.
+    for (int h = 0; h < N_HEAD; ++h) rope_head_norm(q + h * HEAD_DIM, cs, inv);
+    for (int h = 0; h < N_KV; ++h) rope_head_norm(k + h * HEAD_DIM, cs, 1.0f);
 }
 
 // The chunk's rotated K goes into the tiled f16 cache that attention reads, and
@@ -7357,7 +7334,9 @@ int main(int argc, char ** argv) {
                     bv = g_am_val[t]; best = g_am_idx[t];
                 }
             }
-            if (step < 10) printf("  step %d -> %d (%.4f)\n", step, best, bv);
+            // Print enough of the stream to diff a whole aligned run against the
+            // reference rather than a prefix of one.
+            if (step < 64) printf("  step %d -> %d (%.4f)\n", step, best, bv);
             if (step == 0 && getenv("MEGA_TOP")) {
                 // top-8 straight off the head, so the gap to the f32 reference
                 // (8181 at 10.83, 280 at 9.65) is visible instead of hidden

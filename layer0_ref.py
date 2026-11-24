@@ -120,10 +120,12 @@ def main():
     c, s = np.cos(th), np.sin(th)
 
     def rope(t):
-        t = t.reshape(n, -1, HEAD_DIM)
-        a, b = t[..., :64], t[..., 64:]
-        return np.concatenate([a * c[:, None, :] - b * s[:, None, :],
-                               a * s[:, None, :] + b * c[:, None, :]], axis=-1)
+        # LLAMA_ROPE_TYPE_NORM: pairs (2i, 2i+1), which is what the kernel does and
+        # what llama.cpp does. rotate_half agrees with neither.
+        t = t.reshape(n, -1, HEAD_DIM // 2, 2)
+        a, b = t[..., 0], t[..., 1]
+        return np.stack([a * c[:, None, :] - b * s[:, None, :],
+                         a * s[:, None, :] + b * c[:, None, :]], axis=-1).reshape(n, -1, HEAD_DIM)
 
     q = rope(q) / np.sqrt(HEAD_DIM)
     k = rope(k)

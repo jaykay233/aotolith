@@ -177,10 +177,14 @@ def rmsnorm(v, w):
     return v / np.sqrt((v * v).mean(-1, keepdims=True) + EPS) * w
 
 def rope(v):
-    # v: (N, NH, HD); llama rotate_half: pairs (i, i+HD/2)
-    a = v[..., :HD // 2]
-    b = v[..., HD // 2:]
-    return np.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype(np.float32)
+    # v: (N, NH, HD). LLAMA_ROPE_TYPE_NORM: pairs (2i, 2i+1).
+    # This used to be rotate_half (pairs (i, i+64)) with a comment claiming that was
+    # llama.cpp's. It is not: llama.cpp uses NORM for general.architecture = llama.
+    # With the wrong pairing this reference agreed with the megakernel to 0.9979 and
+    # disagreed with llama.cpp at 0.87, i.e. both sides were wrong together.
+    x = v.reshape(v.shape[:-1] + (HD // 2, 2))
+    a, b = x[..., 0], x[..., 1]
+    return np.stack([a * cos - b * sin, a * sin + b * cos], axis=-1).reshape(v.shape).astype(np.float32)
 
 mask = np.tril(np.ones((N, N), np.float32))
 def attn(q, k, v):

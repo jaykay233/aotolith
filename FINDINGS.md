@@ -216,7 +216,7 @@ so the A-record arena has to exist before prefill, not at the first decode round
 | variant | accepted/round | verdict |
 |---|---|---|
 | adjacent-pair rope (default) | 0.278 | keep |
-| halves-rotate rope (`MEGA_DSROPE=half`) | 0.111 | falsified; the draft does not use the target's rope layout |
+| halves-rotate rope (`MEGA_DSROPE=half`) | 0.111 | falsified; it was the wrong pairing on both sides, see section 4 |
 | `target_layers` read 1-based (`MEGA_DSL1`) | 0.292 | indistinguishable from 0.250; not the bug |
 | encoder/output norms swapped (`MEGA_DSSWAPNORM`) | 0.000 | confirms `enc.output_norm` is the encoder's and `output_norm` is the decoder's |
 | interleaved feature layout (`MEGA_DSINTER`) | 0.000 | confirms layer-major; the fused vector is 5 x 2048 in layer order |
@@ -317,37 +317,36 @@ this section that came from 40 rounds is a lower bound on a bad stretch.
 Over 300 rounds, with `MEGA_ATTN4P=1`, sweeping the window on the 10K prompt:
 | 10K, 300 rounds | ms/round | accepted/round | tok/s |
 |---|---|---|---|
-| W = 1024 | 144.25 | 0.179 | 10.65 |
-| W = 512 | 135.81 | 0.538 | 19.24 |
-| W = 256 (**default**) | 133.60 | 0.617 | **21.33** |
-| W = 128 | 132.42 | 0.804 | 25.78 |
-| W = 64 | 132.26 | 0.860 | 27.07 |
-| W = 32 | 132.01 | 0.922 | 28.53 |
+| W = 1024 | 143.75 | 0.136 | 9.79 |
+| W = 512 | 136.63 | 0.208 | 11.88 |
+| W = 256 (**default**) | 133.33 | 0.198 | **11.95** |
 
 | 2K, 300 rounds | ms/round | accepted/round | tok/s |
 |---|---|---|---|
-| W = 512 | 113.48 | 0.916 | 33.02 |
-| W = 256 | 110.88 | 0.929 | 34.15 |
-| W = 256, both defaults | 105.43 | 0.929 | 35.92 |
+| W = 256 | 110.30 | 0.281 | 16.71 |
 
-**The last three rows are a benchmark artifact and 256 is where the default stops.**
-The 10K prompt's greedy stream is degenerate: it falls into `944 242 39 944 242 39`
-and the target repeats `944` for tens of rounds, which the per-round trace shows
-directly (`spec 6..11 acc 0/3`, target 944, drafts 242 39 944 -- off by one phase).
-A drafter that sees 32 tokens can replay a cycle; the acceptance it earns there is
-not one it can generalise from. 256 and 512 are the two settings that hold up at
-both context lengths without leaning on the cycle, and 256 is better at both.
+**These numbers fell when the rope was fixed, and the fall is the point.** Before
+the fix the 10K prompt's greedy stream collapsed into a `944 242 39` cycle -- the
+target repeated one token for tens of rounds -- and a looping stream is trivially
+draftable, so acceptance read 0.617 and the rate 21.28 tok/s. With the correct rope
+the same prompt produces a normal, non-repeating stream and acceptance is **0.198**,
+for **11.95 tok/s at 10K** and 16.71 at 2K over 300 rounds. Every acceptance number
+in this section measured before the rope fix was measured on a degenerate stream and
+is not evidence of anything.
 
-Both levers are defaults now, and the pure-default configuration (only `MEGA_SPEC=300`
-set, no other environment) measures **21.28 tok/s over 300 rounds: 555/900 drafts,
-0.617 per round, 2.85 tokens per 133.95 ms round, best round 119.99 ms**. The same
-configuration at 2K is **35.92 tok/s** (0.929 per round, 105.43 ms).
+The window levers still hold their shape: 256 and 512 beat 1024 at both context
+lengths, and the round time is still halved against the full prefix (305 ms). What
+did not survive is the claim that the decode target was met.
 
-The hard bound that remains holds and is now the only thing keeping this honest:
-plain decode at 10K is 97 ms/token, and 54.3 ms of that is streaming the weights
-at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below the weight stream alone**, so
-no amount of kernel work on the non-GEMM 40 ms gets there. Speculation is
-mandatory, and 2.67 tokens per 133.60 ms round is what clears it.
+The hard bound is unchanged: plain decode at 10K is 97 ms/token, and 54.3 ms of
+that is streaming the weights at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below
+the weight stream alone**, so speculation is mandatory and what decides it is
+acceptance. At 0.198 accepted per round the round needs to carry 2 tokens to reach
+20 tok/s at 133 ms, which means acceptance has to roughly double from here.
+
+Note also that at 10K speculation currently barely earns its round -- 11.95 tok/s
+against 10.3 for plain decode -- because 0.198 accepted means 1.2 tokens per round
+at 1.37x the cost of a plain token.
 
 ### Sharing the drafter's K stream across its four slots: measured, and it loses
 
@@ -546,41 +545,83 @@ and is **slower than the three passes**: the row is 40 KB and stays hot between
 consecutive passes, so the block copy is a fifth transfer that buys nothing. The
 exp is the cost, not the traffic, which is what `-e` addresses.
 
-### The forward pass is verified against exact fp32, layer by layer
+### The RoPE convention was wrong on both sides, and that hid it
 
-This is the audit that says the speed numbers above are numbers on a correct
-kernel rather than on a fast wrong one, and it is cheap to repeat:
+This section used to claim the opposite of what follows, so it is worth stating
+plainly: **the megakernel, `ref_f32.py` and `layer0_ref.py` all used rotate_half
+(pairs `(i, i+64)`), and llama.cpp uses `LLAMA_ROPE_TYPE_NORM` (pairs `(2i, 2i+1)`)
+for `general.architecture = llama`.** The two are not interchangeable.
 
-- `PF=dc python3 layer0_ref.py mc-q4o.gguf ids.txt` compares the *decode* step's
-  layer 0 against numpy: embedding 1.000000, post-norm 1.000000, V 0.999213,
-  K-after-rope 0.999999, attention output 0.999467, residual 0.999943. The same
-  six numbers on the prefill path are 0.999151 / 0.999981 / 0.999531 / 0.999948.
-  Both paths are the same maths to f16-KV precision, so prefill's attention and
-  the decode step's attention are not two different models.
-- `ref_f32.py` dumps `/tmp/rf_LL{a,f}.bin` per layer; the decode step dumps
-  `/tmp/dc_LLf.bin`. Across **all 42 layers** the residual cosine goes
+Why it survived three separate audits:
+
+- All three of our implementations shared the mistake, so the layer-by-layer diff
+  (0.9999 on every quantity, 0.9956 at L41 across all 42 layers) was comparing the
+  kernel against a reference with the same wrong pairing. A self-consistent wrong
+  model still fails against an external one.
+- It looked like a quantization effect. The gap to llama.cpp was 0.87 cosine with
+  an additive-looking tail lift, which is exactly the shape of an activation
+  quantization floor, so it was written down as one.
+- Short prompts hid it. Rotation angles are near zero at the first positions, so a
+  2-token prompt agreed exactly (`1232` on both sides) and the split only started
+  at 3 or more positions.
+
+The isolation that found it: change *only* the reference's pairing, leave the
+kernel alone, and re-score both against llama.cpp on the same 10-token prompt.
+
+| reference rope | cosine vs llama.cpp Q4_0 |
+|---|---|
+| rotate_half `(i, i+64)` | 0.868795 |
+| NORM `(2i, 2i+1)` | **0.977566** |
+
+There were three separate rope implementations in `mega3.cpp` -- `prefill_qk_row`,
+`rope_all` for single-row decode, and `m4_rope_apply` for the four-row round, each
+with its own hand-written vector loop. They are now one `rope_head_norm` with three
+callers, because changing only one of them was enough to build a mixed KV cache
+whose logits were garbage. The deinterleave runs in registers: `vid ^ 1` swaps each
+pair and `vid >> 1` duplicates each angle, so `out = x*C + swap(x)*S` is one gather
+and one fma per vector. Strided access is trap-emulated on this core, so a `vlse32`
+gather would have been orders of magnitude slower.
+
+### Alignment with llama.cpp greedy, measured rather than argued
+
+Same prompt ids into both, 40 greedy steps, token for token:
+
+| prompt | context | matching steps |
+|---|---|---|
+| c100 | 100 | **40 / 40** |
+| head 256 | 256 | **20 / 20** |
+| head 512 | 512 | **20 / 20** |
+| head 1024 | 1024 | **20 / 20** |
+| head 2048 | 2048 | 4 / 24 (step 0 agrees, cos 0.992491, same top-1 702) |
+
+So alignment is exact out to 1K context and then drifts, and the drift is
+quantization noise between two different 4-bit integer pipelines rather than a
+layout error: at the divergence point the two logit rows still have cosine 0.9925
+and the same argmax. Our activations are int8 with a per-K32 folded scale;
+llama.cpp's are Q8_0 per 32 elements inside the Q4_0 dot. Neither is more correct,
+they are differently rounded.
+
+Two things this rules out. The three-instruction exp (`-e 1`) is **not** the drift
+source: at 2K, `-e 0` and `-e 1` both match 4 of 24 and both first differ at step
+4, so the approximation neither helps nor hurts alignment. And the prefill and
+decode paths do not disagree with each other any more, now that they share one rope:
+
+- `PF=dc python3 layer0_ref.py mc-q4o.gguf ids.txt` diffs the decode step's layer 0
+  against numpy: embedding 1.000000, post-norm 1.000000, V 0.999213, K-after-rope
+  0.999999, attention 0.999467, residual 0.999943. Prefill's layer 0 is 0.999151 /
+  0.999981 / 0.999531 / 0.999948.
+- `ref_f32.py` against the decode step across **all 42 layers**: residual cosine
   0.999958 (L0) to 0.995609 (L41) with no step drop, which is Q4_0 quantisation
-  accumulating, not a broken layer.
-- Three-way logits on the same 10-token prompt: m3 vs `ref_f32.py` **0.99790,
-  same top-1 (18119, 11.963 vs 11.982)**; m3 vs llama.cpp Q4_0 0.86412;
-  `ref_f32.py` vs llama.cpp Q4_0 0.86879. The megakernel and the float32
-  reference agree; llama.cpp is the outlier.
+  accumulating rather than a broken layer.
 
-**What llama.cpp's Q4_0 does differently, characterised.** It is not the head.
-Recomputing the logits from `rf_41f.bin` with one final norm reproduces numpy
-(cos 0.8688 against llama.cpp, top-1 18119); two norms gives 0.8451 and no norm
-0.4019, so the norm is not misplaced. What llama.cpp does is *raise the tail*:
-its top six span 11.97..10.76 while numpy's span 11.98..8.84, the same peak with
-the middle of the distribution lifted ~1.5. That is an additive floor from its
-Q8 activation quantisation in the Q4_0 dot, and it is why it picks `47` (11.973)
-over `18119` (11.963) purely on a 0.01 margin while numpy has a 2.43 gap to
-second place. It also agrees with the megakernel at 2 positions (`1232` both
-sides) and splits from 3 positions on, which is where several attention outputs
-start accumulating into the shared residual.
+### What the previous version of this section got wrong
 
-The consequence is a decision rather than a bug: llama.cpp Q4_0 is 0.87 cosine
-from its own model in fp32, so "align with llama.cpp greedy" and "be correct" are
-different targets. `ref_f32.py` is the judge the rest of this document uses.
+Recorded so the same reasoning is not repeated: it claimed the megakernel and the
+float32 reference agreed at 0.99790 with a matching argmax while llama.cpp was the
+0.87 outlier, and explained llama.cpp's tail lift as an additive Q8 floor. The
+measurements were real; the conclusion was backwards, because the reference shared
+the kernel's rope bug. What actually settled it was an external agreement check --
+`refgreedy` on the same ids -- rather than any amount of internal consistency.
 
 ### The X100 cluster, what it is good for
 
@@ -804,8 +845,8 @@ above, it is no longer worth cracking.
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 134.9 (74.15 s) | 23 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. |
-| decode 20 tok/s @10K | **21.28** over 300 rounds, **pure defaults** (`MEGA_SPEC=300` only: 0.617 drafts per 133.95 ms round, 2.85 tokens/round) | met | Both levers are now defaults: `MEGA_DSWIN=256` and `MEGA_ATTN4P=1`. Do not read this as headroom -- the benchmark prompt's greedy stream loops, which inflates acceptance, and 256 is the smallest window defensible at both 2K and 10K. Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so every remaining gain here is acceptance. |
-| output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`); per-layer residual 0.9956 at L41 and layer 0 exact on both paths | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
+| decode 20 tok/s @10K | **11.95** over 300 rounds (`MEGA_SPEC=300`, 0.198 drafts per 133.33 ms round); 16.71 at 2K | needs ~2 tokens/round at 133 ms, i.e. acceptance roughly doubled | Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so speculation is mandatory and acceptance is the whole problem. The 21.28 that was recorded here before the rope fix was measured on a degenerate looping stream and is void. |
+| output alignment | **exact to 1K context**: 40/40 tokens at 100, 20/20 at 256/512/1024; 2048 first differs at step 4 with cosine 0.9925 and the same argmax | the 2K+ drift is quantization noise, not layout | Do not "fix" the 2048 drift with a rope or exp change: `-e 0` and `-e 1` both first differ at the same step. The three rope implementations are now one function; keep it that way. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not
 llama.cpp Q4_0 (0.66 cosine from fp32) and not llama.cpp F16 (which does not run
