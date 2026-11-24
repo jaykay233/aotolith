@@ -245,6 +245,30 @@ tail) ≈ 90 ms`, which clears 20 tok/s at 1.84 accepted tokens per round. The
 short-context measurement was 1.83 with three drafts, so the chain sits on the
 line and the next lever is acceptance, not the kernels.
 
+### Four rows through the GEMM cost less than one
+
+That 54.3 in the budget was an assumption: four rows sharing one weight pass.
+`MEGA_M4GEMM` measures it with the exact matrix sequence of the decode loop --
+qkv, o, gate+up, down, 42 layers, four rows -- using the vendor hp kernel prefill
+already runs and the compact Q4_0 blob decode already has:
+
+| configuration | GEMM for the whole round | GMAC/s |
+|---|---|---|
+| one row, `gemm_kernel_i8i4` (decode today) | 54.29 ms | 38 |
+| four rows, `gemm_kernel_i8i4_hp_m4` | **50.59 ms** | 153 |
+
+Four rows are *cheaper* than one. The m1 path runs the K32 legacy kernel at
+38 GMAC/s; the m4 path runs the K256 hp kernel at 153 GMAC/s, and 1265 MB in
+50.59 ms is 25.0 GB/s, i.e. the measured contiguous streaming ceiling. So the
+round is at the DRAM floor and there is nothing left to win in the GEMM.
+
+That also settles the round budget:
+
+    50.6 (weights, four rows) + 29.3 (attention, four rows) + ~6 (tail) ≈ 86 ms
+
+which is 20 tok/s at 1.80 accepted tokens per round, or 23 tok/s at 2.0. The
+plan is no longer marginal.
+
 `probe_qkload.cpp` is the check that the dots are not the problem. Same operands,
 same eight `vmadot`, same 8 KiB of K per call, only the K load changes, all
 L1-resident:

@@ -68,8 +68,7 @@ void ggml_abort(const char * f, int l, const char * m, ...) {
 }
 
 // ------------------------------------------------------------------- model shape
-static const int N_LAYER = 42, N_EMBD = 2048, N_FF = 6144, N_HEAD = 16, N_KV = 2, HEAD_DIM = 128;
-// 12288, not 10240. A "10K" prompt is 10241 ids in practice, so a 10240-slot
+static const int N_LAYER = 42, N_EMBD = 2048, N_FF = 6144, N_HEAD = 16, N_KV = 2, HEAD_DIM = 128;// 12288, not 10240. A "10K" prompt is 10241 ids in practice, so a 10240-slot
 // cache has its last prompt position one past the end: the V cache is
 // [layer][pos][kv][dim] with a MAXCTX stride, so that position lands on the next
 // layer's position 0, and the rope table's last entry runs 128 floats off the
@@ -974,6 +973,106 @@ static void task_mgemm(int tid) {
 // At the 5-token prompt the K32 path emits `8181 350` while both the reference
 // and this path emit `8181 33`. 10K: 41.1 s of GEMM against 59.0 s.
 static int g_pf_vendor = 2;
+
+// ------------------------------------------------------- four-row decode GEMM
+// A speculation round has four rows and one weight stream. The hp kernel that
+// prefill already runs takes count_m = 4 and reads the same compact Q4_0 blob
+// decode has, so a round costs one pass over 1265 MB instead of four.
+//
+// The A record is what the kernel expects: per 256-k superblock, four scales,
+// four bias sums and four 256-byte payloads, i.e. (k/256) * 1160 bytes. That is
+// 4 MAC per weight byte at four rows against 2 at one, so the pass stays on the
+// DRAM floor rather than becoming compute bound.
+static uint8_t * g_aq4d = nullptr;               // A records, k=2048 then k=6144
+static float   * g_c4 = nullptr;                 // 4 x N_FF output scratch
+static int64_t g_aq4d_foff = 0;                  // byte offset of the k=6144 record
+static inline int64_t m4_aqsz(int64_t k) { return (k / 256) * 1160; }
+static void * hugemem(size_t n);
+
+static void m4_alloc(void) {
+    if (g_aq4d) return;
+    g_aq4d_foff = m4_aqsz(N_EMBD);
+    const size_t an = (size_t) (m4_aqsz(N_EMBD) + m4_aqsz(N_FF)) + (2 << 20);
+    const size_t cn = (size_t) 4 * N_FF * 4 + (2 << 20);
+    g_aq4d = (uint8_t *) hugemem(an);
+    g_c4   = (float *) hugemem(cn);
+    if (!g_aq4d || !g_c4) { fprintf(stderr, "oom m4 gemm\n"); return; }
+    use_huge(g_aq4d, an);
+    use_huge(g_c4, cn);
+}
+
+static inline uint8_t * m4_aq(int64_t k) {
+    return g_aq4d + (k == N_FF ? g_aq4d_foff : 0);
+}
+
+// Same job list and column split as task_mgemm; the difference is the kernel and
+// the row stride, which has to be the matrix width because row r starts at r*n.
+static void task_mgemm_m4(int tid) {
+    int64_t n0[8], n1[8], step_max = 0;
+    for (int j = 0; j < g_mjn; ++j) {
+        const int64_t ng = g_mj[j].n / 32;
+        const int64_t per = (ng + g_participants - 1) / g_participants;
+        n0[j] = per * tid;
+        n1[j] = (tid == g_participants - 1) ? ng : per * (tid + 1);
+        if (n1[j] > ng) n1[j] = ng;
+        if (n0[j] > ng) n0[j] = ng;
+        const int64_t st = (n1[j] - n0[j] + g_kstep - 1) / g_kstep;
+        if (st > step_max) step_max = st;
+    }
+    for (int64_t s = 0; s < step_max; ++s)
+        for (int j = 0; j < g_mjn; ++j) {
+            const int64_t a = n0[j] + s * g_kstep;
+            if (a >= n1[j]) continue;
+            int64_t b2 = a + g_kstep; if (b2 > n1[j]) b2 = n1[j];
+            const int64_t kb = g_mj[j].k / 32;
+            const uint8_t * bp = g_mj[j].b + a * (g_mj[j].k / 32) * 576;
+            spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m4(
+                256, m4_aq(g_mj[j].k), bp, nullptr, g_mj[j].c + a * 32,
+                4, (size_t) ((b2 - a) * 32), (size_t) (kb / 8), (size_t) g_mj[j].n);
+        }
+}
+
+// What one four-row round costs in GEMM. Runs the exact matrix sequence of the
+// decode loop with the m4 kernel and no attention, so it isolates the weight
+// stream: one pass over 1265 MB whether it feeds one row or four.
+static void m4_gemm_bench(int iters) {
+    m4_alloc();
+    if (!g_aq4d) return;
+    float * x4 = (float *) hugemem((size_t) 4 * N_FF * 4 + (2 << 20));
+    if (!x4) return;
+    for (int64_t i = 0; i < 4 * N_FF; ++i) x4[i] = sinf(0.001f * (float) (i % 4096)) * 2.0f;
+    double best = 1e9, macs = 0;
+    for (int it = 0; it < iters; ++it) {
+        const double t0 = now_s();
+        for (int L = 0; L < N_LAYER; ++L) {
+            spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, x4, (size_t) N_EMBD, m4_aq(N_EMBD));
+            g_mjn = 3;
+            g_mj[0] = { g_wq[L].b, g_wq[L].k, g_wq[L].n, g_c4 };
+            g_mj[1] = { g_wk[L].b, g_wk[L].k, g_wk[L].n, g_c4 };
+            g_mj[2] = { g_wv[L].b, g_wv[L].k, g_wv[L].n, g_c4 };
+            run(task_mgemm_m4);
+            spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, x4, (size_t) N_EMBD, m4_aq(N_EMBD));
+            g_mjn = 1; g_mj[0] = { g_wov[L].b, g_wov[L].k, g_wov[L].n, g_c4 };
+            run(task_mgemm_m4);
+            spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, x4, (size_t) N_EMBD, m4_aq(N_EMBD));
+            g_mjn = 2;
+            g_mj[0] = { g_wg[L].b, g_wg[L].k, g_wg[L].n, g_c4 };
+            g_mj[1] = { g_wu[L].b, g_wu[L].k, g_wu[L].n, g_c4 };
+            run(task_mgemm_m4);
+            spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, x4, (size_t) N_FF, m4_aq(N_FF));
+            g_mjn = 1; g_mj[0] = { g_wd[L].b, g_wd[L].k, g_wd[L].n, g_c4 };
+            run(task_mgemm_m4);
+        }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+        macs = 4.0 * (double) N_LAYER * ((double) N_EMBD * N_EMBD * 2 +
+                                         (double) N_EMBD * N_FF * 3);
+        printf("m4gemm: iter %d %.2f ms (%.1f GMAC/s)\n", it, dt * 1e3, macs / dt / 1e9);
+    }
+    printf("m4gemm: best %.2f ms for 42 layers x 4 rows -> %.1f GMAC/s\n",
+           best * 1e3, macs / best / 1e9);
+    free(x4);
+}
 
 // ------------------------------------------------------------------ prefill GEMM
 // The m=4 vendor path needs A as, per k_blk, [f32 scale x 4][int8 data 4x32]
@@ -5542,6 +5641,7 @@ int main(int argc, char ** argv) {
     // A chained -F run has already used these buffers; the benches would rerun
     // the synthetic attention on top of the prompt's geometry.
     if (!pos0 && g_pfa_rows > 0) { bench_prefill_attn(); return 0; }
+    if (getenv("MEGA_M4GEMM")) { m4_gemm_bench(atoi(getenv("MEGA_M4GEMM"))); return 0; }
     if (!pos0 && g_pf_rows > 0) { bench_prefill_gemm(g_pf_rows); return 0; }
 
     int tok = prompt;
