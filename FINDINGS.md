@@ -284,6 +284,45 @@ Also confirmed against the reference rather than by argument:
 - The drafter's cache is 31.5 MB at 12K, so a window is nearly free in memory.
   That is the one lever that changes the asymptotics instead of the constant.
 
+### The drafter's attention window: `MEGA_DSWIN`, default 512, and it raises acceptance
+
+`ds_attn_band` walked `g_ds_np` positions per (slot, head) unit with a vector
+reduction per position, so its cost is linear in the prefix. It now starts at
+`max(0, np - W)`. This was expected to be a speed-for-accuracy trade. It is not:
+acceptance goes **up**, because a 324M drafter reads a recent window better than
+it reads ten thousand positions.
+
+| 2K ctx, 40 rounds | ms/round | accepted/round | tok/s |
+|---|---|---|---|
+| W = 0 (full prefix) | 135.1 | 0.292 | 13.88 |
+| W = 1024 | 113.1 | 0.475 | 21.44 |
+| W = 512 | 105.5 | 0.575 | **25.83** |
+| W = 256 | 103.1 | 0.558 | 25.95 |
+| W = 128 | 101.8 | 0.525 | 25.30 |
+
+| 10K ctx, 40 rounds | ms/round | accepted/round | tok/s |
+|---|---|---|---|
+| W = 0 (full prefix) | 305.4 | 0.050 | 3.77 |
+| W = 1024 | 147.3 | 0.092 | 8.65 |
+| W = 512 | 138.0 | 0.092 | 9.24 |
+| W = 256 | 135.9 | 0.100 | 9.56 |
+
+At 10K the round halves (305 -> 138 ms) but acceptance stays around 0.09, so
+speculation still sits at ~9.5 tok/s against 10.31 for plain decode: at 10K the
+drafter is not yet earning its round. The drafter's KV is built for every prefill
+position (one `ds_inject4` per 4-row group per chunk, ~1.7 s once per request), so
+the weak number is content and drafter capacity, not a truncated cache. Note the
+W=0 10K acceptance here (0.050) is not comparable to the 0.308 recorded earlier:
+that stream started from the same anchor but `-e 1` is now the prefill default and
+the generated stream diverges, and acceptance is a property of the stream. The
+within-table comparison is the valid one.
+
+The hard bound that remains: plain decode at 10K is 97 ms/token, and 54.3 ms of
+that is streaming the weights at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below
+the weight stream alone**, so no amount of kernel work on the non-GEMM 40 ms gets
+there without speculative acceptance per round. Speculation is mandatory, not an
+optimisation, and at 10K the drafter's acceptance is what decides it.
+
 ### Sharing the drafter's K stream across its four slots: measured, and it loses
 
 The obvious move is the one that worked for the target: the four draft slots ask
@@ -739,7 +778,7 @@ above, it is no longer worth cracking.
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 134.9 (74.15 s) | 23 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. |
-| decode 20 tok/s @10K | 11.47 single row; four-row round now ~90 ms | 50 ms | 54.3 GEMM (DRAM floor) + 29.3 attention (`MEGA_ATTN4_ROWS=4 -e 1 MEGA_ATTN4P=1`) + ~6 four rows of tail. That clears 20 tok/s at 1.84 accepted tokens per round and short context measured 1.83, so the chain sits on the line. Remaining work is integration, not kernels: m=4 in mega3's decode GEMM, the dspark drafter, and the four-row attention hooked to the live decode KV. Then measure 10K acceptance, and it is acceptance rather than kernel speed that decides. Byte arithmetic still rules out weight format alone: 3-bit only gets to 12.36 and costs 0.44 cosine. |
+| decode 20 tok/s @10K | 10.31 plain; 9.56 with `MEGA_DSWIN=256` speculation | 50 ms/token | The bound is arithmetic: 54.3 ms of the 97 ms plain-decode token is streaming weights at 16.5 GB/s, so 20 tok/s (50 ms) sits **below** the weight stream and speculation is mandatory. The drafter window took the 10K round from 305 to 138 ms but acceptance is 0.09, so the next work is acceptance at long context, not kernel speed. |
 | output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`); per-layer residual 0.9956 at L41 and layer 0 exact on both paths | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not

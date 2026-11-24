@@ -4751,6 +4751,17 @@ static inline int ds_target_slot(int L) {
 // there is a measured acceptance rate that justifies it.
 static int g_ds_np;
 static const bool g_ds_attn4 = getenv("MEGA_DSATTN4") != nullptr;
+// MEGA_DSWIN=N: the drafter attends the last N prefix positions. Zero is the full
+// prefix. Default 512, because it wins on both axes and at both context lengths
+// measured: at 2K the round goes 135.1 -> 105.5 ms and acceptance 0.292 -> 0.575
+// per round (13.88 -> 25.83 tok/s), and at 10K the round goes 305.4 -> 138.0 ms
+// for 3.77 -> 9.24 tok/s. Acceptance rising is the interesting half: a 324M
+// drafter reads a 512-position window better than it reads 10K.
+static int g_ds_win = -1;
+static inline int ds_win(void) {
+    if (g_ds_win < 0) { const char * e = getenv("MEGA_DSWIN"); g_ds_win = e ? atoi(e) : 512; }
+    return g_ds_win;
+}
 
 // One unit per (kv head, query head), all four slots inside it. The four slots ask
 // their questions of the same prefix, so walking positions once and fanning the
@@ -4838,6 +4849,13 @@ static void ds_attn_band(int64_t lo, int64_t hi) {
     const size_t vl = __riscv_vsetvl_e32m1(32);
     const size_t vl16 = __riscv_vsetvl_e16mf2(32);
     const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    // The drafter only has to guess, so its attention does not need the whole
+    // prefix: at 10K this loop is 195 ms of a 305 ms round, and it is a full walk
+    // of K and V per (slot, head) unit with a vector reduction per position. A
+    // window of the last W positions makes the cost O(W) and leaves the acceptance
+    // to be measured rather than assumed.
+    const int64_t n = g_ds_np;
+    const int64_t wlo = (ds_win() > 0 && n > ds_win()) ? n - ds_win() : 0;
     for (int64_t t = lo; t < hi; ++t) {
         const int r = (int) (t / N_HEAD), h = (int) (t % N_HEAD);
         const int kv = h / NH_PER_KV;
@@ -4851,7 +4869,7 @@ static void ds_attn_band(int64_t lo, int64_t hi) {
         float * sc = g_dssc + (int64_t) g_pf_tid * MAXCTX;
 
         float mx = -INFINITY;
-        for (int64_t i = 0; i < g_ds_np; ++i) {
+        for (int64_t i = wlo; i < n; ++i) {
             const _Float16 * kp = kb + i * kstride;
             vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, vl);
             for (int d = 0; d < HEAD_DIM; d += 32)
@@ -4861,25 +4879,26 @@ static void ds_attn_band(int64_t lo, int64_t hi) {
             const vfloat32m1_t z = __riscv_vfmv_s_f_f32m1(0.0f, 1);
             const float v = __riscv_vfmv_f_s_f32m1_f32(
                 __riscv_vfredusum_vs_f32m1_f32m1(acc, z, vl)) * scale;
-            sc[i] = v;
+            sc[i - wlo] = v;
             if (v > mx) mx = v;
         }
         float sum = 0.0f;
-        for (int64_t i = 0; i < g_ds_np; ++i) {
+        const int64_t cnt = n - wlo;
+        for (int64_t i = 0; i < cnt; ++i) {
             const float e = expf(sc[i] - mx);
             sc[i] = e; sum += e;
         }
         const float rs = sum > 0.0f ? 1.0f / sum : 0.0f;
         if (g_dsdbg2 && r == 0 && h == 0) {
-            fprintf(stderr, "  [attn] L%d np=%d w0=%.4f w1=%.4f wmid=%.4f wlast=%.4f max=%.3f\n",
-                    g_ds_layer, g_ds_np, sc[0] * rs, g_ds_np > 1 ? sc[1] * rs : 0.0f,
-                    sc[g_ds_np / 2] * rs, sc[g_ds_np - 1] * rs, mx);
+            fprintf(stderr, "  [attn] L%d np=%d win=%lld w0=%.4f w1=%.4f wmid=%.4f wlast=%.4f max=%.3f\n",
+                    g_ds_layer, g_ds_np, (long long) (n - wlo), sc[0] * rs, cnt > 1 ? sc[1] * rs : 0.0f,
+                    sc[cnt / 2] * rs, sc[cnt - 1] * rs, mx);
         }
         for (int d = 0; d < HEAD_DIM; d += 32)
             __riscv_vse32_v_f32m1(out + d, __riscv_vfmv_v_f_f32m1(0.0f, vl), vl);
-        for (int64_t i = 0; i < g_ds_np; ++i) {
+        for (int64_t i = 0; i < cnt; ++i) {
             const float w = sc[i] * rs;
-            const _Float16 * vp = vb + i * kstride;
+            const _Float16 * vp = vb + (wlo + i) * kstride;
             for (int d = 0; d < HEAD_DIM; d += 32)
                 __riscv_vse32_v_f32m1(out + d,
                     __riscv_vfmacc_vf_f32m1(__riscv_vle32_v_f32m1(out + d, vl), w,
