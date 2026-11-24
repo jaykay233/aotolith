@@ -282,3 +282,30 @@ round is 131 ms regardless of how many drafts it accepts, and the extra acceptan
 only pays off against the extra row cost once attention is not the flat part of
 the budget. See `CHAIN.md` for the prompt-to-tokens pipeline and the alignment
 status.
+
+## Where the 10K round actually spends its time (re-measured)
+
+`-m mc-q4o.gguf -I -X -K8 -n 16 -F /tmp/p10k.txt`, 10K prompt:
+
+| stage | ms/token | share |
+|---|---|---|
+| gemm | 54.49 | 59.3% |
+| attn | 30.78 | 33.5% |
+| embed | 3.26 | 3.5% |
+| silu / rope / misc | 1.17 | 1.3% |
+| **total** | **88.6** | → 10.88 tok/s |
+
+GEMM is 1265 MB of Q4_0 weights in 54.49 ms, i.e. 23.2 GB/s against a measured
+ceiling just above that, so it is done. That fixes the single-row ceiling: a
+perfect attention at the 220 MB int8 K+V byte floor would be ~13 ms, giving
+54.5 + 13 + 4.5 ≈ 72 ms, or 13.9 tok/s. **Twenty tok/s is not reachable at one
+row per weight pass by any amount of kernel work**, which is why the speculator
+is not optional.
+
+Attention is 30.78 ms for 220 MB, i.e. 7.1 GB/s, so it is nowhere near its own
+byte floor. Section 3 of `FINDINGS.md` has the measurement that says why: the
+int8 `vmadot` path re-reads the whole K plane once per four-row group, so rows do
+not share the stream and a 64-row tile costs 312 ms at 10K. The dots are fine
+(137.6 GMAC/s per core with K hot, `probe_qkload.cpp`); the stream is the
+problem. A four-row tile that walks each K block once is the change that makes
+the speculator pay.

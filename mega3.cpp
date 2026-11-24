@@ -1797,6 +1797,13 @@ static int g_p0[N_GPU], g_p1[N_GPU];
 // is linear in the window and the prompt beyond it is simply not read.
 static int g_win = 0;
 
+// -MEGA_ATTN4=n: after prefill, time n four-row attention rounds over the whole
+// prompt using the prefill int8 vmadot machinery. This is the measurement that
+// decides whether four-row verification can pay at 10K, because decode's
+// single-row attention is time-per-position rather than per-byte: four rows
+// through it cost four times as much and cancel the weight amortisation.
+static int g_attn4 = 0;
+
 static void attn_ranges(void) {
     const int nb = g_pos + 1;
     const int lo = (g_win > 0 && nb > g_win) ? ((nb - g_win) / KT) * KT : 0;
@@ -3777,6 +3784,55 @@ static void pfa_run(int L) {
     while (g_sm_done.load(std::memory_order_acquire) < g_n_sm) sched_yield();
 }
 
+// Time four-row attention rounds at the full prompt length on the prefill int8
+// vmadot path. Decode's own attention costs time per position rather than per
+// byte, so this is the number that says whether four-row verification can pay:
+// the round's weight stream is paid once (54.5 ms at 10K), and this is what the
+// other half costs when the four rows share it.
+static void attn4_run(int rounds, int64_t ctx, int64_t rows);
+static void attn4_bench(int rounds, int64_t ctxmax) {
+    // I8_ROWS = I8_G * PFA_ROWS is the kernel's row tile, so fewer rows than that
+    // round down to zero tiles and measure nothing. Default to the tile height and
+    // divide the result by the number of four-row groups it actually did.
+    int64_t rows = getenv("MEGA_ATTN4_ROWS") ? atoll(getenv("MEGA_ATTN4_ROWS")) : I8_ROWS;
+    if (rows < I8_ROWS || rows % I8_ROWS) rows = I8_ROWS;
+    for (int64_t i = 0; i < rows * N_HEAD * HEAD_DIM; ++i)
+        g_pq[i] = 0.01f * (float) ((i * 37) % 101) - 0.5f;
+    // Same caches, several context lengths: if the cost is not linear in the
+    // position count the loop is not doing the whole context.
+    int64_t cts[8]; int nct = 0;
+    if (getenv("MEGA_ATTN4_CTX")) {
+        char * s = getenv("MEGA_ATTN4_CTX");
+        while (*s && nct < 8) {
+            char * e; long long v = strtoll(s, &e, 10);
+            if (e == s) break;
+            cts[nct++] = v; s = *e == ',' ? e + 1 : e;
+        }
+    } else cts[nct++] = ctxmax;
+    for (int ci = 0; ci < nct; ++ci) attn4_run(rounds, cts[ci], rows);
+}
+
+static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
+    if (ctx < 128) { printf("attn4: context %lld too short\n", (long long) ctx); return; }
+    double best = 1e9;
+    for (int r = 0; r < rounds; ++r) {
+        const double t0 = now_s();
+        for (int L = 0; L < N_LAYER; ++L) {
+            g_pfa_ctx = ctx;
+            g_pfa_rows = rows;
+            pfa_pack_q(rows);
+            pfa_run(L);
+        }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+        printf("attn4: round %d %.2f ms (%.2f ms/layer, ctx %lld, %s)\n", r, dt * 1e3,
+               dt * 1e3 / N_LAYER, (long long) ctx, g_pipe ? "qk/pv A100 + softmax X100" : "single cluster");
+    }
+    printf("attn4: best %.2f ms for %d layers, %lld rows x %lld pos (%.3f ms/layer, %.1f GMAC/s)\n",
+           best * 1e3, N_LAYER, (long long) rows, (long long) ctx, best * 1e3 / N_LAYER,
+           2.0 * (double) rows * N_HEAD * HEAD_DIM * (double) ctx / best / 1e9);
+}
+
 static void pfa_head(int layer, int h, int64_t qbase) {
     const int kv = h / NH_PER_KV;
     _Float16 * vbase = g_vpos + (int64_t) layer * KV_LAYER_STRIDE + kv * HEAD_DIM;
@@ -3972,6 +4028,13 @@ static void conv_kv8_all(int64_t npos) {
 }
 
 static void prefill_release(void) {
+    // -MEGA_ATTN4 keeps everything the four-row attention needs. After prefill the
+    // int8 K/V caches cover every position in the prompt, so a four-row round at
+    // 10K is exactly the prefill attention with the row chunk replaced by the four
+    // candidates. That is what a dspark verification round costs, and measuring it
+    // here reuses machinery that is already proven instead of writing a second
+    // attention kernel for decode.
+    if (g_attn4) return;
     // The int8 weight copy is prefill-only: decode reads the bit-packed blob.
     // Freeing it before generation hands 2.2 GB back to the page cache and
     // stops the two weight streams from evicting each other.
@@ -5007,6 +5070,7 @@ int main(int argc, char ** argv) {
 
     if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = atoi(getenv("MEGA_VENDOR"));
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
+    if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
     // The vendor prefill helper for 3-bit weights is a one-row kernel, and the
     // 4-row K256 kernel it would otherwise call is 4-bit. Prefill therefore runs
     // on the int8 copy, which repack_b_i8_q3 builds from this same 3-bit blob.
@@ -5320,6 +5384,7 @@ int main(int argc, char ** argv) {
         // decode reads, so generation continues from the last prompt token at
         // position np instead of starting from an empty context.
         prefill_release();
+        if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
         prompt = anchor;
         pos0 = np;
         printf("chain: decode starts at position %lld (anchor %d)\n",
