@@ -3596,7 +3596,10 @@ static void pfa_pv_i8(int layer, int h, int64_t qbase,
             // sets of eight 32-lane registers, spilled to L1 between blocks.
             for (int gg = 0; gg < g_i8g; ++gg)
                 for (int j = 0; j < 8; ++j) memset(pacc[gg][j], 0, 32 * 4);
-            uint8_t * tcm = g_tcmstage ? g_tcm[g_pfa_tid] : nullptr;
+            // TCM staging exists so sixteen row groups can share one fetch of a V
+            // block. With a single group there is one pass already, so the staging
+            // is a pure copy: at four rows and 10K it cost ~0.4 ms per layer.
+            uint8_t * tcm = (g_tcmstage && g_i8g > 1) ? g_tcm[g_pfa_tid] : nullptr;
             if (tcm && g_tcm_size >= 64 * 1024) {
                 const int64_t stage = g_tcm_size / 1024;   // position blocks that fit
                 const int nqmax = (nn + 15) / 16;
@@ -3743,6 +3746,88 @@ static void pfa_pipe_alloc(void) {
            (long long) g_tile_n, I8_NSLOT, sn / 1e6, g_w8off);
 }
 
+// ------------------------------------- four-row decode attention over both clusters
+// A decode layer has exactly sixteen head-tiles. The eight A cores take QK and PV,
+// the eight X100 cores take the softmax between them, and the handoff is one flag
+// per head rather than the tile machinery the 64-row path needs: there is nothing
+// to claim, because each head has exactly one owner on each side.
+//
+// The split is worth it because softmax is the largest of the three stages at four
+// rows (0.1 of 0.3 core-s at 10K) and the X100 cluster is otherwise idle for the
+// whole decode pass. Critical path becomes max(QK+PV, softmax) instead of their sum.
+static int g_a4p = 0;                       // -MEGA_ATTN4P
+static int16_t * g_sc4;                     // N_HEAD * SC_GSTRIDE int16
+static int8_t  * g_w4;                      // N_HEAD * WBLK bytes
+static float   * g_wsc4;                    // N_HEAD * I8_ROWS floats
+static std::atomic<int> g_a4_gen{0};
+static std::atomic<int> g_a4_qk[N_HEAD], g_a4_sm[N_HEAD];
+static std::atomic<int> g_a4_done{0};
+
+static void attn4p_alloc(void) {
+    if (g_sc4) return;
+    const size_t sn = (size_t) N_HEAD * SC_GSTRIDE * sizeof(int16_t) + (2 << 20);
+    const size_t wn = (size_t) N_HEAD * WBLK + (2 << 20);
+    g_sc4  = (int16_t *) hugemem(sn);
+    g_w4   = (int8_t *) hugemem(wn);
+    g_wsc4 = (float *) aligned_alloc(64, (size_t) N_HEAD * I8_ROWS * 4 + 64);
+    if (!g_sc4 || !g_w4 || !g_wsc4) { fprintf(stderr, "oom attn4p\n"); g_a4p = 0; return; }
+    use_huge(g_sc4, sn);
+    use_huge(g_w4, wn);
+    for (int h = 0; h < N_HEAD; ++h) { g_a4_qk[h].store(0); g_a4_sm[h].store(0); }
+    printf("  attn4p: %.1f MB scratch, %d heads, softmax on the X100 cluster\n",
+           (sn + wn) / 1e6, N_HEAD);
+}
+
+// A side. Both of this thread's QKs go out before either PV, because the wait for
+// a head's softmax is otherwise dead time: with the heads interleaved the X100
+// cluster works on head 0 while this core is still doing head 1's dots, and the
+// layer costs QK+PV instead of QK+softmax+PV.
+static void task_attn4_a(int tid) {
+    g_pfa_tid = tid;
+    const int gen = g_a4_gen.load(std::memory_order_acquire);
+    int hs[N_HEAD]; int n = 0;
+    for (int h = tid; h < N_HEAD; h += g_participants) {
+        const double _q = now_s();
+        pfa_qk_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE);
+        g_pfa_qk[tid] += now_s() - _q;
+        g_a4_qk[h].store(gen, std::memory_order_release);
+        hs[n++] = h;
+    }
+    for (int i = 0; i < n; ++i) {
+        const int h = hs[i];
+        while (g_a4_sm[h].load(std::memory_order_acquire) != gen) sched_yield();
+        const double _v = now_s();
+        pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
+                  g_wsc4 + (size_t) h * I8_ROWS);
+        g_pfa_pv[tid] += now_s() - _v;
+    }
+}
+
+// X100 side. Head t and t+8, matching the A side's stride so every head has one
+// owner on each cluster.
+static void task_attn4_sm(int id) {
+    const int gen = g_a4_gen.load(std::memory_order_acquire);
+    g_pfa_smid = id;
+    for (int h = id; h < N_HEAD; h += 8) {
+        while (g_a4_qk[h].load(std::memory_order_acquire) != gen) sched_yield();
+        int16_t * sc  = g_sc4 + (size_t) h * SC_GSTRIDE;
+        int8_t  * w8  = g_w4 + (size_t) h * WBLK;
+        float   * wsc = g_wsc4 + (size_t) h * I8_ROWS;
+        const double _s = now_s();
+        pfa_sm_i8(h, 0, sc, w8, wsc);
+        g_pfa_sm[id] += now_s() - _s;
+        g_a4_sm[h].store(gen, std::memory_order_release);
+    }
+}
+
+static void attn4p_run(int L) {
+    g_pfa_layer = L;
+    g_i8g = 1;
+    g_a4_gen.fetch_add(1, std::memory_order_acq_rel);
+    run(task_attn4_a);
+    g_i8g = I8_G;
+}
+
 // X100 worker: no /proc/set_ai_thread (that would pin it to the A cluster), so
 // it stays at VLEN=256 and runs the 8-position softmax shape.
 static int bind_cpu_x100(int cpu) {
@@ -3754,13 +3839,13 @@ static void * sm_worker(void * arg) {
     const int id = (int) (intptr_t) arg;
     bind_cpu_x100(id);
     g_ready[8 + id].store(1, std::memory_order_release);
-    int gen = 0, xgen = 0, egen = 0;
+    int gen = 0, xgen = 0, egen = 0, agen = 0;
     for (;;) {
-        // Three kinds of work share these eight threads: elementwise bands
+        // Four kinds of work share these eight threads: elementwise bands
         // (norm, quantiser, silu, KV conversion), softmax for the pipelined
-        // attention, and the column share of a prefill GEMM. The caller finishes
-        // each kind before starting the next, so the order here only has to be
-        // consistent, not clever.
+        // attention, softmax for the four-row decode attention, and the column
+        // share of a prefill GEMM. The caller finishes each kind before starting
+        // the next, so the order here only has to be consistent, not clever.
         const int e = g_el_gen.load(std::memory_order_acquire);
         if (e != egen) {
             egen = e;
@@ -3768,13 +3853,25 @@ static void * sm_worker(void * arg) {
             g_el_done.fetch_add(1, std::memory_order_release);
             continue;
         }
+        // Four-row softmax is addressed by generation counters, not the tile
+        // machinery: a decode layer has exactly sixteen head-tiles and the caller
+        // waits on them directly, so there is nothing to claim.
+        const int a = g_a4_gen.load(std::memory_order_acquire);
+        if (a != agen) {
+            agen = a;
+            task_attn4_sm(id);
+            g_a4_done.fetch_add(1, std::memory_order_release);
+            continue;
+        }
         while (g_pipe_gen.load(std::memory_order_acquire) == gen &&
-               g_xg_gen.load(std::memory_order_acquire) == xgen) {
+               g_xg_gen.load(std::memory_order_acquire) == xgen &&
+               g_a4_gen.load(std::memory_order_acquire) == agen) {
             if (g_quit.load(std::memory_order_acquire)) return nullptr;
             if (g_el_gen.load(std::memory_order_acquire) != egen) break;
             sched_yield();
         }
         if (g_el_gen.load(std::memory_order_acquire) != egen) continue;
+        if (g_a4_gen.load(std::memory_order_acquire) != agen) continue;
         const int x = g_xg_gen.load(std::memory_order_acquire);
         if (x != xgen) {
             xgen = x;
@@ -3795,7 +3892,8 @@ static void pfa_run(int L) {
     // bypasses the tile machinery entirely (g_tile_n would be zero).
     if (g_pfa_rows <= PFA_ROWS) {
         g_i8g = 1;
-        run(task_pfa_i8_4);
+        if (g_a4p && g_sc4 && g_n_sm == 8) attn4p_run(L);
+        else run(task_pfa_i8_4);
         g_i8g = I8_G;
         return;
     }
@@ -3821,6 +3919,7 @@ static void attn4_bench(int rounds, int64_t ctxmax) {
     // I8_ROWS = I8_G * PFA_ROWS is the prefill row tile; four rows is the decode
     // tile, which the head-major loop drives one group at a time. Anything between
     // the two is not a shape the kernel has.
+    if (g_a4p) attn4p_alloc();
     int64_t rows = getenv("MEGA_ATTN4_ROWS") ? atoll(getenv("MEGA_ATTN4_ROWS")) : I8_ROWS;
     if (rows != PFA_ROWS) {
         rows = rows < I8_ROWS ? I8_ROWS : rows;
@@ -3872,6 +3971,13 @@ static void attn4_run(int rounds, int64_t ctx, int64_t rows) {
     }
     printf("attn4: best %.2f ms for %d layers, %lld rows x %lld pos (%.3f ms/layer)\n",
            best * 1e3, N_LAYER, (long long) rows, (long long) ctx, best * 1e3 / N_LAYER);
+    // The split path moves softmax to the other cluster but runs the same
+    // pfa_sm_i8, so the two runs must agree exactly on the same synthetic input.
+    {   double sum = 0, sq = 0;
+        const int64_t n = rows * N_HEAD * HEAD_DIM;
+        for (int64_t i = 0; i < n; ++i) { const double v = g_pfa_out[i]; sum += v; sq += v * v; }
+        printf("attn4: out sum %.9f  sumsq %.6f  (split %d)\n", sum, sq, g_a4p ? 1 : 0);
+    }
     g_i8g = I8_G;
 }
 
@@ -5113,6 +5219,7 @@ int main(int argc, char ** argv) {
     if (getenv("MEGA_VENDOR") && atoi(getenv("MEGA_VENDOR"))) g_pf_vendor = atoi(getenv("MEGA_VENDOR"));
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
+    if (getenv("MEGA_ATTN4P")) g_a4p = atoi(getenv("MEGA_ATTN4P"));
     // The vendor prefill helper for 3-bit weights is a one-row kernel, and the
     // 4-row K256 kernel it would otherwise call is 4-bit. Prefill therefore runs
     // on the int8 copy, which repack_b_i8_q3 builds from this same 3-bit blob.
@@ -5366,7 +5473,7 @@ int main(int argc, char ** argv) {
     // then calls pthread_create. They also must not write that file themselves --
     // it pins the caller to the A cluster. Each worker signals readiness so the
     // next creation never overlaps another thread's vendor handshake.
-    if (g_x100 || (g_pipe && g_pfa_i8)) {
+    if (g_x100 || g_a4p || (g_pipe && g_pfa_i8)) {
         g_n_sm = 8;
         g_x_nt = 8;
         for (int i = 0; i < g_n_sm; ++i) {
