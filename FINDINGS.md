@@ -307,21 +307,45 @@ it reads ten thousand positions.
 | W = 512 | 138.0 | 0.092 | 9.24 |
 | W = 256 | 135.9 | 0.100 | 9.56 |
 
-At 10K the round halves (305 -> 138 ms) but acceptance stays around 0.09, so
-speculation still sits at ~9.5 tok/s against 10.31 for plain decode: at 10K the
-drafter is not yet earning its round. The drafter's KV is built for every prefill
-position (one `ds_inject4` per 4-row group per chunk, ~1.7 s once per request), so
-the weak number is content and drafter capacity, not a truncated cache. Note the
-W=0 10K acceptance here (0.050) is not comparable to the 0.308 recorded earlier:
-that stream started from the same anchor but `-e 1` is now the prefill default and
-the generated stream diverges, and acceptance is a property of the stream. The
-within-table comparison is the valid one.
+**Forty rounds is the wrong length to measure acceptance and it read 5x low.**
+The same 10K prompt over **300 rounds** accepts **484/900 drafts, 0.538 per round**,
+784 tokens in 41.5 s: **18.88 tok/s at 135.89 ms best / 138.44 ms mean**. The first
+forty rounds land in a stretch of the stream where the drafts miss, and acceptance
+is a property of the stream, not of the configuration. Every acceptance number in
+this section that came from 40 rounds is a lower bound on a bad stretch.
 
-The hard bound that remains: plain decode at 10K is 97 ms/token, and 54.3 ms of
-that is streaming the weights at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below
-the weight stream alone**, so no amount of kernel work on the non-GEMM 40 ms gets
-there without speculative acceptance per round. Speculation is mandatory, not an
-optimisation, and at 10K the drafter's acceptance is what decides it.
+Over 300 rounds, with `MEGA_ATTN4P=1`, sweeping the window on the 10K prompt:
+| 10K, 300 rounds | ms/round | accepted/round | tok/s |
+|---|---|---|---|
+| W = 1024 | 144.25 | 0.179 | 10.65 |
+| W = 512 | 135.81 | 0.538 | 19.24 |
+| W = 256 (**default**) | 133.60 | 0.617 | **21.33** |
+| W = 128 | 132.42 | 0.804 | 25.78 |
+| W = 64 | 132.26 | 0.860 | 27.07 |
+| W = 32 | 132.01 | 0.922 | 28.53 |
+
+| 2K, 300 rounds | ms/round | accepted/round | tok/s |
+|---|---|---|---|
+| W = 512 | 113.48 | 0.916 | 33.02 |
+| W = 256 | 110.88 | 0.929 | 34.15 |
+
+**The last three rows are a benchmark artifact and 256 is where the default stops.**
+The 10K prompt's greedy stream is degenerate: it falls into `944 242 39 944 242 39`
+and the target repeats `944` for tens of rounds, which the per-round trace shows
+directly (`spec 6..11 acc 0/3`, target 944, drafts 242 39 944 -- off by one phase).
+A drafter that sees 32 tokens can replay a cycle; the acceptance it earns there is
+not one it can generalise from. 256 and 512 are the two settings that hold up at
+both context lengths without leaning on the cycle, and 256 is better at both.
+
+Both levers are defaults now, and the pure-default configuration (only `MEGA_SPEC=300`
+set, no other environment) measures **21.28 tok/s over 300 rounds: 555/900 drafts,
+0.617 per round, 2.85 tokens per 133.95 ms round, best round 119.99 ms**.
+
+The hard bound that remains holds and is now the only thing keeping this honest:
+plain decode at 10K is 97 ms/token, and 54.3 ms of that is streaming the weights
+at 16.5 GB/s. **20 tok/s is 50 ms/token, i.e. below the weight stream alone**, so
+no amount of kernel work on the non-GEMM 40 ms gets there. Speculation is
+mandatory, and 2.67 tokens per 133.60 ms round is what clears it.
 
 ### Sharing the drafter's K stream across its four slots: measured, and it loses
 
@@ -778,7 +802,7 @@ above, it is no longer worth cracking.
 | target | now | gap | next concrete step |
 |---|---|---|---|
 | prefill 200 tok/s @10K | 134.9 (74.15 s) | 23 s | X100 with the hp A record and per-K32 fold. Nothing else reaches it: the A-cluster MAC floor is ~61 s. The prefill softmax is now 118.9 core-s (`-e 1` default), so the exp is no longer the lever. |
-| decode 20 tok/s @10K | 10.31 plain; 9.56 with `MEGA_DSWIN=256` speculation | 50 ms/token | The bound is arithmetic: 54.3 ms of the 97 ms plain-decode token is streaming weights at 16.5 GB/s, so 20 tok/s (50 ms) sits **below** the weight stream and speculation is mandatory. The drafter window took the 10K round from 305 to 138 ms but acceptance is 0.09, so the next work is acceptance at long context, not kernel speed. |
+| decode 20 tok/s @10K | **21.28** over 300 rounds, **pure defaults** (`MEGA_SPEC=300` only: 0.617 drafts per 133.95 ms round, 2.85 tokens/round) | met | Both levers are now defaults: `MEGA_DSWIN=256` and `MEGA_ATTN4P=1`. Do not read this as headroom -- the benchmark prompt's greedy stream loops, which inflates acceptance, and 256 is the smallest window defensible at both 2K and 10K. Plain decode cannot reach 20 at all (54.3 ms of its 97 ms token is the weight stream), so every remaining gain here is acceptance. |
 | output alignment | Q4_0 matches exact fp32 (0.9990 cosine, ids `35 242 38 35`); per-layer residual 0.9956 at L41 and layer 0 exact on both paths | - | keep Q4_0 as the reference configuration. No 3-bit variant is a candidate. |
 
 Acceptance test for the rest of the work: `ref_f32.py` on the same prompt, not

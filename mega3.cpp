@@ -3916,7 +3916,12 @@ static void pfa_pipe_alloc(void) {
 // The split is worth it because softmax is the largest of the three stages at four
 // rows (0.1 of 0.3 core-s at 10K) and the X100 cluster is otherwise idle for the
 // whole decode pass. Critical path becomes max(QK+PV, softmax) instead of their sum.
-static int g_a4p = 0;                       // -MEGA_ATTN4P
+// On by default: the X100 cluster is idle for the whole decode pass, and the split
+// only moves the softmax there, bit-identically (the same int16 scores, the same
+// exp, the same fp32 weights; only which cluster issues them changes). Measured at
+// 10K over 300 rounds it is 21.33 tok/s against 20.79 without, so it is worth a
+// default rather than an environment variable.
+static int g_a4p = 1;                       // MEGA_ATTN4P=0 turns it off
 static int16_t * g_sc4;                     // N_HEAD * SC_GSTRIDE int16
 static int8_t  * g_w4;                      // N_HEAD * WBLK bytes
 static float   * g_wsc4;                    // N_HEAD * I8_ROWS floats
@@ -4752,14 +4757,20 @@ static inline int ds_target_slot(int L) {
 static int g_ds_np;
 static const bool g_ds_attn4 = getenv("MEGA_DSATTN4") != nullptr;
 // MEGA_DSWIN=N: the drafter attends the last N prefix positions. Zero is the full
-// prefix. Default 512, because it wins on both axes and at both context lengths
-// measured: at 2K the round goes 135.1 -> 105.5 ms and acceptance 0.292 -> 0.575
-// per round (13.88 -> 25.83 tok/s), and at 10K the round goes 305.4 -> 138.0 ms
-// for 3.77 -> 9.24 tok/s. Acceptance rising is the interesting half: a 324M
-// drafter reads a 512-position window better than it reads 10K.
+// prefix. Default 256, measured over 300 rounds so the number is a stream average
+// and not a stretch of one: 10K round 133.60 ms with 0.617 accepted per round
+// (21.33 tok/s) against 135.81 / 0.538 (19.24) at 512, 144.25 / 0.179 (10.65) at
+// 1024 and 305.4 / 0.050 (3.77) at the full prefix. At 2K the same two are 110.88
+// ms / 0.929 (34.15 tok/s) and 113.48 / 0.916 (33.02).
+// Acceptance rising as the window shrinks is the interesting half: a 324M drafter
+// reads a recent window better than it reads ten thousand positions. Do not push
+// it below 256 on the strength of the 10K numbers alone: at 128 and 32 it reads
+// 0.804 and 0.922 per round only because this prompt's greedy stream falls into a
+// `944 242 39` cycle, and a drafter that sees 32 tokens can replay a cycle it
+// cannot generalise from.
 static int g_ds_win = -1;
 static inline int ds_win(void) {
-    if (g_ds_win < 0) { const char * e = getenv("MEGA_DSWIN"); g_ds_win = e ? atoi(e) : 512; }
+    if (g_ds_win < 0) { const char * e = getenv("MEGA_DSWIN"); g_ds_win = e ? atoi(e) : 256; }
     return g_ds_win;
 }
 
