@@ -158,12 +158,79 @@ m4 path cannot drift).
 In the real round, K=3 drafts (m=4) goes from 155.1 ms via 4x m1 to 72.5 ms via
 native m4, GEMM 135.7 -> 54.1 ms, essentially the m=1 stream floor.
 
+### The drafter is ported into the four-row chain, and at 10K it loses money
+
+`MEGA_SPEC=n` runs the whole thing end to end on `mega3.cpp`: prefill 10K, then
+n rounds of draft 3 / verify 4 rows / accept the matching prefix. There is no
+second binary and no replay scaffolding; the accepted prefix advances the same
+KV cache the prefill wrote.
+
+Short context (101-token prompt), 3 drafts:
+
+| | accepted/round | ms/round (mean) | tok/s |
+|---|---|---|---|
+| four rows, no drafter | - | 96 | 10.4 |
+| dspark | 0.278 | 106 | **17.3** |
+| dspark, 10K | 0.111 | 310 | 4.3 |
+| dspark, 10K (8 rounds) | 0.250 | 299 | 5.6 |
+| four rows, no drafter, 10K | - | 96 | **10.4** |
+
+So speculation is worth 1.7x at a hundred tokens and costs 2x at ten thousand.
+Both halves of that are measured, not modelled:
+
+* The drafter itself is 24-26 ms per round at 101 tokens and **190-196 ms at
+  10K**. Its attention is fp32, O(context), over 64 (slot, head) units, which is
+  the same shape that costs the target 30 ms for four rows.
+* Acceptance collapses from 0.28 to 0.11-0.25 per round. The 1.26/round that
+  `mega_decode` measures at short context does not survive to 10K.
+
+The drafter costs ~3.4 s of a 79 s 10K prefill (4%), which is acceptable; the
+per-round cost and the acceptance are not.
+
+### The drafter's four port bugs, and the controls that found them
+
+Each of these produced a plausible-looking draft, which is why they took a
+control to pin down rather than a crash.
+
+| symptom | cause |
+|---|---|
+| every position's injected K and V identical (\|K\|=26.025 at every pos), feature norms cycling with period 4 | `ds_inject4` copied `g_dshid` rows 0..3 for every group instead of `row0 + r`. The whole 10K prefix was overwritten with four positions' features. |
+| occasional NaN in the markov bias, then segfault | the rank-256 gather was replicated to one row and handed to the four-row quantiser, which reads four rows. |
+| segfault at round start, garbage token ids in the embedding gather | `int tok[4]` on the caller stack, clobbered by `m4_round`'s inlining -- the same class as the `g_m4out` bug. Both are file scope now. |
+| drafter saw an empty prefix | `ds_setup` ran after prefill, so the encoder's five-layer capture had never been armed. It has to be up before the first chunk. |
+
+`m4_alloc()` also had to move: the drafter's GEMMs go through the four-row kernel,
+so the A-record arena has to exist before prefill, not at the first decode round.
+
+### Draft-forward variants, scored by acceptance (all at 101 tokens, 3 drafts)
+
+| variant | accepted/round | verdict |
+|---|---|---|
+| adjacent-pair rope (default) | 0.278 | keep |
+| halves-rotate rope (`MEGA_DSROPE=half`) | 0.111 | falsified; the draft does not use the target's rope layout |
+| `target_layers` read 1-based (`MEGA_DSL1`) | 0.292 | indistinguishable from 0.250; not the bug |
+| encoder/output norms swapped (`MEGA_DSSWAPNORM`) | 0.000 | confirms `enc.output_norm` is the encoder's and `output_norm` is the decoder's |
+| interleaved feature layout (`MEGA_DSINTER`) | 0.000 | confirms layer-major; the fused vector is 5 x 2048 in layer order |
+| tanh on the rank-256 gather (`MEGA_DSTANH`) | 0.292 | no effect: this variant is the plain markov, as `dspark_joint_proj` being absent implies |
+| encoder features zeroed (`MEGA_DSZERO`) | 0.125 | **the control that matters**: zeroing the entire committed prefix only halves acceptance |
+| markov bias dropped (`MEGA_DSNOBIAS`) | 0.000 | the base logits alone are worse than base + bias, so the markov head is helping |
+
+The zero-feature control is the sharpest number here. If the prefix reached the
+draft properly, removing it should cost almost everything. It costs half, which
+says the drafts are being driven mostly by the anchor token and the mask block's
+own self-attention rather than by the injected context.
+
 ### What is left for decode
 
-- `dspark` at 3 drafts: **21.76 tok/s** short context, 1.26 accepted/round,
-  token-identical to greedy. At 10K the same round is expected near 12 tok/s
-  because attention does not amortise (see `CHAIN.md`), so attention must stop
-  being time-per-position bound before speculation pays at 10K.
+- The primary decode number is **0.11-0.25 accepted/round at 10K, not 1.8**.
+  Nothing about the arithmetic changes until that is understood: at 96 ms per
+  verification round even 2.5 accepted tokens per round only reaches 25 tok/s,
+  and the round would have to pay for a drafter that currently costs twice what
+  it saves.
+- The sharper probe than acceptance is the distribution itself: the draft's base
+  logit row at a position where the target's own row is known, correlated
+  against it. Acceptance is a 0/1 summary of a comparison that should be a
+  cosine.
 - Attention at 10K is 32.1 ms of the 89.5 ms token: 9 TMAC of it is QK/PV, and
   the loop stalls on 32-byte granular loads rather than hitting FMA issue.
   Running QK and PV as int8 `vmadot` GEMMs is the fix with precedent in this tree.

@@ -995,10 +995,18 @@ static int64_t g_aq4d_foff = 0;                  // byte offset of the k=6144 re
 static inline int64_t m4_aqsz(int64_t k) { return (k / 256) * 1160; }
 static void * hugemem(size_t n);
 
+// The drafter runs the same kernel at a third width, its fused feature input.
+static int64_t g_aq4d_dsoff = 0, g_aq4d_mkoff = 0;
+static const int64_t DS_IN_K = 5 * N_EMBD;
+static const int64_t DS_RANK_K = 256;
+
 static void m4_alloc(void) {
     if (g_aq4d) return;
     g_aq4d_foff = m4_aqsz(N_EMBD);
-    const size_t an = (size_t) (m4_aqsz(N_EMBD) + m4_aqsz(N_FF)) + (2 << 20);
+    g_aq4d_dsoff = m4_aqsz(N_EMBD) + m4_aqsz(N_FF);
+    g_aq4d_mkoff = g_aq4d_dsoff + m4_aqsz(DS_IN_K);
+    const size_t an = (size_t) (m4_aqsz(N_EMBD) + m4_aqsz(N_FF) + m4_aqsz(DS_IN_K)
+                                + m4_aqsz(DS_RANK_K)) + (2 << 20);
     const size_t cn = (size_t) 4 * N_FF * 4 + (2 << 20);
     g_aq4d = (uint8_t *) hugemem(an);
     g_c4   = (float *) hugemem(cn);
@@ -1010,6 +1018,14 @@ static void m4_alloc(void) {
 static inline uint8_t * m4_aq(int64_t k) {
     return g_aq4d + (k == N_FF ? g_aq4d_foff : 0);
 }
+
+static inline uint8_t * m4_aq2(int64_t k) {
+    if (k == DS_IN_K) return g_aq4d + g_aq4d_dsoff;
+    if (k == DS_RANK_K) return g_aq4d + g_aq4d_mkoff;
+    return m4_aq(k);
+}
+
+
 
 // Same job list and column split as task_mgemm; the difference is the kernel and
 // the row stride, which has to be the matrix width because row r starts at r*n.
@@ -1033,7 +1049,7 @@ static void task_mgemm_m4(int tid) {
             const int64_t kb = g_mj[j].k / 32;
             const uint8_t * bp = g_mj[j].b + a * (g_mj[j].k / 32) * 576;
             spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m4(
-                256, m4_aq(g_mj[j].k), bp, nullptr, g_mj[j].c + a * 32,
+                256, m4_aq2(g_mj[j].k), bp, nullptr, g_mj[j].c + a * 32,
                 4, (size_t) ((b2 - a) * 32), (size_t) (kb / 8), (size_t) g_mj[j].n);
         }
 }
@@ -4203,6 +4219,8 @@ static float * g_gate4 = nullptr;   // 4 x N_FF
 static float * g_up4 = nullptr;
 static float * g_logits4 = nullptr; // 4 x VOCAB
 static int g_m4dec = 0;             // -MEGA_M4DEC=n: rounds of four rows
+static int g_m4spec = 0;            // -MEGA_SPEC=n: rounds with the draft model
+static int g_m4spec_k = 3;          // drafts per round (4-row verification)
 static int64_t g_m4p0 = -1;         // MEGA_M4P0: aim the round at a prompt position
 static int32_t g_m4tok[4] = { 0, 0, 0, 0 };
 // The four answers, file-scope rather than a caller-stack array: m4_round inlines
@@ -4329,6 +4347,666 @@ static void dump_n(const char * tag, int layer, char when, const float * row, in
 // One row per thread from the pool, no internal barrier. Four rows through
 // rmsnorm_par costs four barriers per call and 168 calls per round.
 static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows);
+// ============================================================== dspark drafter
+// MiniCPM5 2.6B DSpark: a 5-layer head over the target, 324M parameters at Q4_0.
+// DSPARK.md has the architecture and the cost model; the forward pass below is the
+// one mega_decode.cpp validated against llama.cpp's dflash/dspark code.
+//
+// The drafter cannot make the output wrong. The verifier only emits a draft token
+// after the target has reproduced it, so a bad drafter costs speed and nothing
+// else -- which is what makes it safe to measure this path before optimising it.
+//
+// Only the first four slots of the block run. The reference block has seven and
+// they do not see each other (the block_uniform mask makes every slot reuse slot
+// 0's causal row), so slots 0..2 give the three drafts a four-row verification
+// needs, and four rows is the shape the target's IME2 kernel is built for.
+static const int DS_LAYER = 5;
+static const int DS_SLOT = 4;
+static int g_ds_layer;
+static void ds_add_band(int64_t lo, int64_t hi);
+static void ds_silu_band(int64_t lo, int64_t hi);
+static bool m4_round(int64_t p0, const int * toks, int * out);
+static const int DS_TARGET_LAYER[DS_LAYER] = { 2, 11, 21, 31, 40 };
+static const int DS_RANK = 256;
+
+struct DRef { uint8_t * b; int64_t k, n; };
+
+static uint8_t * g_dsmap; static size_t g_dsmap_sz;
+static uint8_t * g_dsblob;
+static DRef g_ds_wq[DS_LAYER], g_ds_wk[DS_LAYER], g_ds_wv[DS_LAYER], g_ds_wo[DS_LAYER];
+static DRef g_ds_wg[DS_LAYER], g_ds_wu[DS_LAYER], g_ds_wd[DS_LAYER];
+static DRef g_ds_fc, g_ds_w2;
+static const uint8_t * g_ds_w1;
+static const float * g_ds_attn_norm[DS_LAYER], * g_ds_ffn_norm[DS_LAYER];
+static const float * g_ds_qnorm[DS_LAYER], * g_ds_knorm[DS_LAYER];
+static const float * g_ds_enc_norm, * g_ds_out_norm;
+// The draft's own cache, position-major per layer: [layer][pos][kv][dim], fp16.
+static _Float16 * g_dskc, * g_dsvc;
+// The capture has to hold one whole prefill chunk: a chunk injects every four-row
+// group it produced, so all of the chunk's rows are still needed at the end of it.
+static int64_t g_ds_cap = 4;
+static float * g_dshid;              // [layer][row][N_EMBD]: the target's residual
+static float * g_dsx, * g_dsxa, * g_dsq, * g_dsk, * g_dsv, * g_dsgate, * g_dsup;
+static float * g_dslog, * g_dsbias, * g_dsfeat, * g_dsatt, * g_dsenc;
+static float * g_dssc;               // [thread][MAXCTX] scores
+static int g_ds = 0, g_ds_ready = 0, g_ds_hidrow = 0;
+static const bool g_dsdbg2 = getenv("MEGA_DSDBG2") != nullptr;
+static int g_ds_pending = 0;         // slots of hidden state waiting to be injected
+static int64_t g_ds_pend_p0 = 0;
+static double g_ds_t_inj, g_ds_t_dec;
+static long long g_ds_drafts = 0, g_ds_acc = 0;
+
+static const uint8_t * ds_skip_val(const uint8_t * p, uint32_t t) {
+    static const int sz[13] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 };
+    if (t == 8) { uint64_t n; memcpy(&n, p, 8); return p + 8 + n; }
+    if (t == 9) {
+        uint32_t at; memcpy(&at, p, 4); p += 4;
+        uint64_t n; memcpy(&n, p, 8); p += 8;
+        for (uint64_t i = 0; i < n; ++i) p = ds_skip_val(p, at);
+        return p;
+    }
+    return p + sz[t < 13 ? t : 0];
+}
+
+struct DsInfo { char name[64]; const uint8_t * data; int64_t ne0, ne1; uint32_t type; };
+static DsInfo g_dst[96];
+static int g_dsn;
+
+static void ds_parse(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "dspark: cannot open %s\n", path); return; }
+    fseek(f, 0, SEEK_END); g_dsmap_sz = (size_t) ftell(f); fseek(f, 0, SEEK_SET);
+    g_dsmap = (uint8_t *) malloc(g_dsmap_sz);
+    if (!g_dsmap || fread(g_dsmap, 1, g_dsmap_sz, f) != g_dsmap_sz) {
+        fprintf(stderr, "dspark: read failed\n"); fclose(f); return;
+    }
+    fclose(f);
+    const uint8_t * p = g_dsmap;
+    uint32_t magic; memcpy(&magic, p, 4);
+    if (magic != 0x46554747u) { fprintf(stderr, "dspark: bad magic\n"); return; }
+    uint64_t nt, nkv;
+    memcpy(&nt, p + 8, 8); memcpy(&nkv, p + 16, 8);
+    p += 24;
+    for (uint64_t i = 0; i < nkv; ++i) {
+        uint64_t len; memcpy(&len, p, 8); p += 8 + len;
+        uint32_t t; memcpy(&t, p, 4); p += 4;
+        p = ds_skip_val(p, t);
+    }
+    struct Raw { char name[64]; uint64_t off; int64_t ne0, ne1; uint32_t type; };
+    static Raw raw[96];
+    for (uint64_t i = 0; i < nt && g_dsn < 96; ++i) {
+        uint64_t len; memcpy(&len, p, 8); p += 8;
+        const size_t c = len < 63 ? (size_t) len : 63;
+        memcpy(raw[g_dsn].name, p, c); raw[g_dsn].name[c] = 0; p += len;
+        uint32_t nd; memcpy(&nd, p, 4); p += 4;
+        int64_t dims[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        memcpy(dims, p, 8 * nd); p += 8 * nd;
+        uint32_t ty; memcpy(&ty, p, 4); p += 4;
+        uint64_t off; memcpy(&off, p, 8); p += 8;
+        raw[g_dsn].off = off; raw[g_dsn].type = ty;
+        raw[g_dsn].ne0 = dims[0]; raw[g_dsn].ne1 = dims[1];
+        ++g_dsn;
+    }
+    const size_t hdr = ((size_t) (p - g_dsmap) + 31) & ~(size_t) 31;
+    for (int i = 0; i < g_dsn; ++i) {
+        snprintf(g_dst[i].name, sizeof g_dst[i].name, "%s", raw[i].name);
+        g_dst[i].data = g_dsmap + hdr + raw[i].off;
+        g_dst[i].ne0 = raw[i].ne0; g_dst[i].ne1 = raw[i].ne1;
+        g_dst[i].type = raw[i].type;
+    }
+    printf("dspark: %d tensors, %.1f MB\n", g_dsn, g_dsmap_sz / 1e6);
+}
+
+static const DsInfo * ds_find(const char * name) {
+    for (int i = 0; i < g_dsn; ++i)
+        if (!strcmp(g_dst[i].name, name)) return &g_dst[i];
+    fprintf(stderr, "dspark: missing tensor %s\n", name);
+    return nullptr;
+}
+
+// Q4_0 rows into the 576-byte group layout the hp kernel reads.
+static void ds_repack_b(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k) {
+    const int64_t nb = k / 32, rs = nb * 18;
+    uint8_t * d = dst;
+    for (int64_t b = 0; b < rows; b += 32)
+        for (int64_t x = 0; x < nb; ++x) {
+            _Float16 * dd = (_Float16 *) d;
+            uint8_t * qs = d + 64;
+            for (int i = 0; i < 32; ++i) {
+                const uint8_t * sp = src + (b + i) * rs + x * 18;
+                _Float16 sc; memcpy(&sc, sp, 2);
+                dd[i] = sc;
+                const uint8_t * sq = sp + 2;
+                uint8_t * dq = qs + i * 16;
+                for (int j = 0; j < 8; ++j) {
+                    dq[j]     = (uint8_t) ((sq[2 * j] & 0x0F) | ((sq[2 * j + 1] & 0x0F) << 4));
+                    dq[8 + j] = (uint8_t) ((sq[2 * j] >> 4)  | ((sq[2 * j + 1] & 0xF0)));
+                }
+            }
+            d += 576;
+        }
+}
+
+static bool ds_load(void) {
+    const char * path = getenv("MEGA_DSPARK");
+    if (!path) path = "/home/bianbu/workspace/mega/dspark-q4.gguf";
+    ds_parse(path);
+    if (!g_dsmap) return false;
+
+    size_t need = 0;
+    for (int i = 0; i < g_dsn; ++i) {
+        if (g_dst[i].type != 2) continue;
+        need += (size_t) (g_dst[i].ne1 / 32) * (g_dst[i].ne0 / 32) * 576;
+    }
+    const size_t blob = (need + (1 << 21)) & ~((size_t) (1 << 21) - 1);
+    g_dsblob = (uint8_t *) hugemem(blob);
+    if (!g_dsblob) { fprintf(stderr, "dspark: oom\n"); return false; }
+    use_huge(g_dsblob, blob);
+
+    char nm[64];
+    size_t off = 0;
+    auto take = [&](DRef & r, const char * n) {
+        const DsInfo * t = ds_find(n);
+        if (!t || t->type != 2) return;
+        ds_repack_b(g_dsblob + off, t->data, t->ne1, t->ne0);
+        r.b = g_dsblob + off; r.k = t->ne0; r.n = t->ne1;
+        off += (size_t) (t->ne1 / 32) * (t->ne0 / 32) * 576;
+    };
+    auto f32 = [&](const float ** d, const char * n) {
+        const DsInfo * t = ds_find(n);
+        if (t) *d = (const float *) t->data;
+    };
+    take(g_ds_fc, "fc.weight");
+    take(g_ds_w2, "markov_w2.weight");
+    const DsInfo * w1 = ds_find("markov_w1.weight");
+    if (!w1) return false;
+    g_ds_w1 = w1->data;
+    // The two 2048-wide norms are easy to swap; MEGA_DSSWAPNORM tests the other
+    // assignment when acceptance is the thing being measured.
+    if (getenv("MEGA_DSSWAPNORM")) {
+        f32(&g_ds_enc_norm, "output_norm.weight");
+        f32(&g_ds_out_norm, "enc.output_norm.weight");
+    } else {
+        f32(&g_ds_enc_norm, "enc.output_norm.weight");
+        if (!g_ds_enc_norm) f32(&g_ds_enc_norm, "output_norm_enc.weight");
+    }
+    if (!g_ds_out_norm) f32(&g_ds_out_norm, "output_norm.weight");
+    for (int L = 0; L < DS_LAYER; ++L) {
+        snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", L);      take(g_ds_wq[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_k.weight", L);      take(g_ds_wk[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_v.weight", L);      take(g_ds_wv[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_output.weight", L); take(g_ds_wo[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate.weight", L);    take(g_ds_wg[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_up.weight", L);      take(g_ds_wu[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_down.weight", L);    take(g_ds_wd[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_norm.weight", L);   f32(&g_ds_attn_norm[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_norm.weight", L);    f32(&g_ds_ffn_norm[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", L); f32(&g_ds_qnorm[L], nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_k_norm.weight", L); f32(&g_ds_knorm[L], nm);
+    }
+    if (!g_ds_fc.b || !g_ds_w2.b || !g_ds_enc_norm || !g_ds_out_norm) {
+        fprintf(stderr, "dspark: incomplete weights\n"); return false;
+    }
+    printf("dspark: repacked %.1f MB, fc %lldx%lld, w2 %lldx%lld, w1 %lldx%lld\n", off / 1e6,
+           (long long) g_ds_fc.n, (long long) g_ds_fc.k,
+           (long long) g_ds_w2.n, (long long) g_ds_w2.k,
+           (long long) w1->ne0, (long long) w1->ne1);
+    return true;
+}
+
+static bool ds_alloc(void) {
+    if (g_dskc) return true;
+    // The drafter's GEMMs go through the four-row kernel, so its A-record arena has
+    // to exist before prefill runs, not when the first decode round allocates it.
+    m4_alloc();
+    if (!g_aq4d) { fprintf(stderr, "dspark: oom A records\n"); return false; }
+    const size_t kvn = (size_t) DS_LAYER * MAXCTX * N_KV * HEAD_DIM * sizeof(_Float16);
+    g_ds_cap = g_pf_chunk > 4 ? g_pf_chunk : 4;
+    const size_t hn  = (size_t) DS_LAYER * g_ds_cap * N_EMBD * 4;
+    const size_t xn  = (size_t) DS_SLOT * N_EMBD * 4;
+    const size_t fn  = (size_t) DS_SLOT * N_FF * 4;
+    const size_t kn  = (size_t) DS_SLOT * N_KV * HEAD_DIM * 4;
+    g_dskc   = (_Float16 *) hugemem(kvn + (2 << 20));
+    g_dsvc   = (_Float16 *) hugemem(kvn + (2 << 20));
+    g_dshid  = (float *) hugemem(hn + (2 << 20));
+    g_dsx    = (float *) hugemem(xn + (2 << 20));
+    g_dsxa   = (float *) hugemem(xn + (2 << 20));
+    g_dsq    = (float *) hugemem(xn + (2 << 20));
+    g_dsatt  = (float *) hugemem(xn + (2 << 20));
+    g_dsk    = (float *) hugemem(kn + (2 << 20));
+    g_dsv    = (float *) hugemem(kn + (2 << 20));
+    g_dsgate = (float *) hugemem(fn + (2 << 20));
+    g_dsup   = (float *) hugemem(fn + (2 << 20));
+    g_dsfeat = (float *) hugemem((size_t) DS_SLOT * DS_IN_K * 4 + (2 << 20));
+    g_dsenc  = (float *) hugemem((size_t) DS_SLOT * N_EMBD * 4 + (2 << 20));
+    g_dslog  = (float *) hugemem((size_t) DS_SLOT * VOCAB * 4 + (2 << 20));
+    // four rows of bias, because the four-row kernel writes ldc = n per row and the
+    // markov head runs through that same kernel to stay on one code path
+    g_dsbias = (float *) hugemem((size_t) DS_SLOT * VOCAB * 4 + (2 << 20));
+    g_dssc   = (float *) hugemem((size_t) N_GPU * MAXCTX * 4 + (2 << 20));
+    if (!g_dskc || !g_dsvc || !g_dshid || !g_dsx || !g_dsxa || !g_dsq || !g_dsatt ||
+        !g_dsk || !g_dsv || !g_dsgate || !g_dsup || !g_dsfeat || !g_dsenc ||
+        !g_dslog || !g_dsbias || !g_dssc) {
+        fprintf(stderr, "dspark: oom scratch\n"); return false;
+    }
+    printf("dspark: %.1f MB draft KV x2, %.1f MB scratch\n",
+           (double) kvn / 1e6, (double) (hn + 4 * xn + 2 * fn + 2 * kn) / 1e6);
+    return true;
+}
+
+// Per-head RMSNorm, 128 wide. Scalar on purpose: 18 of these per slot per layer.
+static void ds_rmsvec(float * dst, const float * src, const float * w, int n) {
+    double ss = 0;
+    for (int i = 0; i < n; ++i) ss += (double) src[i] * src[i];
+    const float r = 1.0f / sqrtf((float) (ss / n) + RMS_EPS);
+    for (int i = 0; i < n; ++i) dst[i] = src[i] * r * w[i];
+}
+
+// Pairwise (2i, 2i+1) rotation in the natural layout. The target's own rope uses
+// its permuted layout; the draft's reference implementation does not permute.
+// Two rotation layouts, because the reference generator is ambiguous about which one
+// dflash uses and the two are not interchangeable. MEGA_DSROPE=half selects the
+// halves-rotate form the target model itself uses; the default is adjacent pairs.
+static int g_ds_rope_half = -1;
+static void ds_rope(float * x, int pos) {
+    if (g_ds_rope_half < 0) {
+        const char * e = getenv("MEGA_DSROPE");
+        g_ds_rope_half = (e && !strcmp(e, "half")) ? 1 : 0;
+    }
+    if (g_ds_rope_half) {
+        for (int i = 0; i < HEAD_DIM / 2; ++i) {
+            const float th = (float) pos * (1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM));
+            const float c = cosf(th), sn = sinf(th);
+            const float x0 = x[i], x1 = x[i + HEAD_DIM / 2];
+            x[i]                = x0 * c - x1 * sn;
+            x[i + HEAD_DIM / 2] = x0 * sn + x1 * c;
+        }
+        return;
+    }
+    for (int i = 0; i < HEAD_DIM / 2; ++i) {
+        const float th = (float) pos * (1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM));
+        const float c = cosf(th), sn = sinf(th);
+        const float x0 = x[2 * i], x1 = x[2 * i + 1];
+        x[2 * i]     = x0 * c - x1 * sn;
+        x[2 * i + 1] = x0 * sn + x1 * c;
+    }
+}
+
+// The encoder: the target's residual stream at five layers fused into one feature,
+// then that feature projected to this layer's K and V and appended to the draft's
+// cache. This is how the draft sees the committed prefix -- not as tokens.
+//
+// Four positions at a time so it runs through the same four-row IME2 kernel as
+// verification. Prefill calls it once per 64-row chunk, which is where the ~1.7 s
+// it adds to a 10K prefill goes.
+static void ds_inject4(int64_t p0, int64_t row0, int n) {
+    if (n <= 0) return;
+    // The fused vector's layout is layer-major unless MEGA_DSINTER says otherwise:
+    // if the export interleaves the five layers instead, the fc would be reading a
+    // permuted vector and every draft would be a plausible-looking wrong token.
+    static const bool interleave = getenv("MEGA_DSINTER") != nullptr;
+    for (int r = 0; r < n; ++r) {
+        float * dst = g_dsfeat + (int64_t) r * DS_IN_K;
+        if (!interleave) {
+            for (int L = 0; L < DS_LAYER; ++L)
+                memcpy(dst + (int64_t) L * N_EMBD,
+                       g_dshid + ((int64_t) L * g_ds_cap + row0 + r) * N_EMBD,
+                       (size_t) N_EMBD * 4);
+        } else {
+            for (int j = 0; j < N_EMBD; ++j)
+                for (int L = 0; L < DS_LAYER; ++L)
+                    dst[(int64_t) j * DS_LAYER + L] =
+                        g_dshid[((int64_t) L * g_ds_cap + row0 + r) * N_EMBD + j];
+        }
+    }
+    for (int r = n; r < DS_SLOT; ++r)
+        memset(g_dsfeat + (int64_t) r * DS_IN_K, 0, (size_t) DS_IN_K * 4);
+    if (getenv("MEGA_DSZERO")) memset(g_dsfeat, 0, (size_t) DS_SLOT * DS_IN_K * 4);
+
+    spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsfeat, (size_t) DS_IN_K, m4_aq2(DS_IN_K));
+    g_mjn = 1; g_mj[0] = { g_ds_fc.b, g_ds_fc.k, g_ds_fc.n, g_dsenc };
+    run(task_mgemm_m4);
+    rmsnorm_rows(g_dsenc, g_dsenc, g_ds_enc_norm, DS_SLOT);
+
+    for (int L = 0; L < DS_LAYER; ++L) {
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsenc, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 2;
+        // ldc is the matrix width, so each projection needs its own output buffer.
+        g_mj[0] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, g_dsk };
+        g_mj[1] = { g_ds_wv[L].b, g_ds_wv[L].k, g_ds_wv[L].n, g_dsv };
+        run(task_mgemm_m4);
+        for (int r = 0; r < n; ++r) {
+            const int pos = (int) (p0 + r);
+            for (int h = 0; h < N_KV; ++h) {
+                float * k = g_dsk + ((int64_t) r * N_KV + h) * HEAD_DIM;
+                ds_rmsvec(k, k, g_ds_knorm[L], HEAD_DIM);
+                ds_rope(k, pos);
+            }
+            if (g_dsdbg2 && L == 0) {
+                double a = 0, b = 0, c = 0;
+                for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+                    a += (double) g_dsk[i] * g_dsk[i];
+                    b += (double) g_dsv[i] * g_dsv[i];
+                    c += (double) g_dsenc[(int64_t) r * N_EMBD + i] * g_dsenc[(int64_t) r * N_EMBD + i];
+                }
+                fprintf(stderr, "  [inj] pos=%d L0 |K|=%.3f |V|=%.3f |enc|_part=%.3f\n",
+                        pos, sqrt(a), sqrt(b), sqrt(c));
+            }
+            _Float16 * kc = g_dskc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
+            _Float16 * vc = g_dsvc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
+            for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+                kc[i] = (_Float16) g_dsk[(int64_t) r * (N_KV * HEAD_DIM) + i];
+                vc[i] = (_Float16) g_dsv[(int64_t) r * (N_KV * HEAD_DIM) + i];
+            }
+        }
+    }
+}
+
+// The target's residual stream at the five layers the encoder reads. Captured
+// inside the layer loops of both the prefill chunk and the four-row round.
+static int g_ds_l1 = -1;
+static inline int ds_target_slot(int L) {
+    if (g_ds_l1 < 0) g_ds_l1 = getenv("MEGA_DSL1") ? 1 : 0;
+    for (int k = 0; k < DS_LAYER; ++k)
+        if (DS_TARGET_LAYER[k] - g_ds_l1 == L) return k;
+    return -1;
+}
+
+// Block attention: every slot sees the prefix plus slot 0, and nothing else. The
+// scores are plain fp32 with vectorised dots -- 640K of them per layer at 10K, which
+// the pool spreads over 64 (slot, head) units. An int8 path like the target's would
+// make this ~4x cheaper, but acceptance does not depend on speed, so it waits until
+// there is a measured acceptance rate that justifies it.
+static int g_ds_np;
+static void ds_attn_band(int64_t lo, int64_t hi) {
+    const size_t vl = __riscv_vsetvl_e32m1(32);
+    const size_t vl16 = __riscv_vsetvl_e16mf2(32);
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    for (int64_t t = lo; t < hi; ++t) {
+        const int r = (int) (t / N_HEAD), h = (int) (t % N_HEAD);
+        const int kv = h / NH_PER_KV;
+        const float * q = g_dsq + (int64_t) r * N_EMBD + h * HEAD_DIM;
+        float * out = g_dsatt + (int64_t) r * N_EMBD + h * HEAD_DIM;
+        const _Float16 * kb = g_dskc + (int64_t) g_ds_layer * KV_LAYER_STRIDE
+                            + (int64_t) kv * HEAD_DIM;
+        const _Float16 * vb = g_dsvc + (int64_t) g_ds_layer * KV_LAYER_STRIDE
+                            + (int64_t) kv * HEAD_DIM;
+        const int64_t kstride = N_KV * HEAD_DIM;
+        float * sc = g_dssc + (int64_t) g_pf_tid * MAXCTX;
+
+        float mx = -INFINITY;
+        for (int64_t i = 0; i < g_ds_np; ++i) {
+            const _Float16 * kp = kb + i * kstride;
+            vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            for (int d = 0; d < HEAD_DIM; d += 32)
+                acc = __riscv_vfmacc_vv_f32m1(acc,
+                    __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kp + d, vl16), vl),
+                    __riscv_vle32_v_f32m1(q + d, vl), vl);
+            const vfloat32m1_t z = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+            const float v = __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredusum_vs_f32m1_f32m1(acc, z, vl)) * scale;
+            sc[i] = v;
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0f;
+        for (int64_t i = 0; i < g_ds_np; ++i) {
+            const float e = expf(sc[i] - mx);
+            sc[i] = e; sum += e;
+        }
+        const float rs = sum > 0.0f ? 1.0f / sum : 0.0f;
+        if (g_dsdbg2 && r == 0 && h == 0) {
+            fprintf(stderr, "  [attn] L%d np=%d w0=%.4f w1=%.4f wmid=%.4f wlast=%.4f max=%.3f\n",
+                    g_ds_layer, g_ds_np, sc[0] * rs, g_ds_np > 1 ? sc[1] * rs : 0.0f,
+                    sc[g_ds_np / 2] * rs, sc[g_ds_np - 1] * rs, mx);
+        }
+        for (int d = 0; d < HEAD_DIM; d += 32)
+            __riscv_vse32_v_f32m1(out + d, __riscv_vfmv_v_f_f32m1(0.0f, vl), vl);
+        for (int64_t i = 0; i < g_ds_np; ++i) {
+            const float w = sc[i] * rs;
+            const _Float16 * vp = vb + i * kstride;
+            for (int d = 0; d < HEAD_DIM; d += 32)
+                __riscv_vse32_v_f32m1(out + d,
+                    __riscv_vfmacc_vf_f32m1(__riscv_vle32_v_f32m1(out + d, vl), w,
+                        __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + d, vl16), vl), vl), vl);
+        }
+    }
+}
+
+// The 2.6 MMAC rounding table lives in g_dsbias as the bias for every vocabulary
+// entry, so the markov head is one more row of the same GEMM.
+static void ds_markov_bias(int prev, float * bias) {
+    // The four-row quantizer reads four rows of A, so the rank-256 vector is
+    // replicated. Handing it one row made it read 3 KB past the array, which is
+    // where the occasional NaN came from.
+    alignas(64) static float mk[DS_SLOT * DS_RANK];
+    const uint8_t * row = g_ds_w1 + (int64_t) prev * 8 * 18;
+    for (int b = 0; b < 8; ++b) {
+        _Float16 sc; memcpy(&sc, row + b * 18, 2);
+        const uint8_t * qs = row + b * 18 + 2;
+        for (int j = 0; j < 16; ++j) {
+            mk[b * 32 + j]      = (float) ((int) (qs[j] & 0x0F) - 8) * (float) sc;
+            mk[b * 32 + j + 16] = (float) ((int) (qs[j] >> 4) - 8) * (float) sc;
+        }
+    }
+    if (getenv("MEGA_DSTANH")) for (int i = 0; i < DS_RANK; ++i) mk[i] = tanhf(mk[i]);
+    for (int r = 1; r < DS_SLOT; ++r) memcpy(mk + r * DS_RANK, mk, (size_t) DS_RANK * 4);
+    spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, mk, (size_t) DS_RANK, m4_aq2(DS_RANK_K));
+    g_mjn = 1; g_mj[0] = { g_ds_w2.b, g_ds_w2.k, g_ds_w2.n, bias };
+    run(task_mgemm_m4);      // all four rows are the same bias; callers read row 0
+}
+
+// The block: four slots at pos0..pos0+3, drafts out[0..K-1] after the markov chain.
+static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
+    for (int i = 0; i < K; ++i) drafts[i] = anchor;
+    if (!g_ds_ready) return;
+    const bool dbg = getenv("MEGA_DSDBG") != nullptr;
+    const double _t0 = now_s();
+
+    static float mask_emb[N_EMBD];
+    static int mask_done = 0;
+    const int32_t mask_tok = getenv("MEGA_DSMASK") ? atoi(getenv("MEGA_DSMASK")) : 75982;
+    if (!mask_done) {
+        dequant_row_t(mask_emb,
+            g_emb->data + (int64_t) mask_tok * src_row_bytes_t(N_EMBD, (int) g_emb->type),
+            N_EMBD, (int) g_emb->type);
+        mask_done = 1;
+    }
+    dequant_row_t(g_dsx,
+        g_emb->data + (int64_t) anchor * src_row_bytes_t(N_EMBD, (int) g_emb->type),
+        N_EMBD, (int) g_emb->type);
+    for (int r = 1; r < DS_SLOT; ++r) memcpy(g_dsx + (int64_t) r * N_EMBD, mask_emb, (size_t) N_EMBD * 4);
+
+    g_ds_np = (int) pos0 + 1;         // prefix plus slot 0's own key
+    for (int L = 0; L < DS_LAYER; ++L) {
+        g_ds_layer = L;
+        rmsnorm_rows(g_dsxa, g_dsx, g_ds_attn_norm[L], DS_SLOT);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 3;
+        g_mj[0] = { g_ds_wq[L].b, g_ds_wq[L].k, g_ds_wq[L].n, g_dsq };
+        g_mj[1] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, g_dsk };
+        g_mj[2] = { g_ds_wv[L].b, g_ds_wv[L].k, g_ds_wv[L].n, g_dsv };
+        run(task_mgemm_m4);
+
+        for (int r = 0; r < DS_SLOT; ++r) {
+            const int pos = (int) (pos0 + r);
+            for (int h = 0; h < N_HEAD; ++h) {
+                float * q = g_dsq + (int64_t) r * N_EMBD + h * HEAD_DIM;
+                ds_rmsvec(q, q, g_ds_qnorm[L], HEAD_DIM);
+                ds_rope(q, pos);
+            }
+            for (int h = 0; h < N_KV; ++h) {
+                float * k = g_dsk + (int64_t) r * (N_KV * HEAD_DIM) + h * HEAD_DIM;
+                ds_rmsvec(k, k, g_ds_knorm[L], HEAD_DIM);
+                ds_rope(k, pos);
+            }
+            _Float16 * kc = g_dskc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
+            _Float16 * vc = g_dsvc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
+            for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
+                kc[i] = (_Float16) g_dsk[(int64_t) r * (N_KV * HEAD_DIM) + i];
+                vc[i] = (_Float16) g_dsv[(int64_t) r * (N_KV * HEAD_DIM) + i];
+            }
+        }
+        parallel_for((int64_t) DS_SLOT * N_HEAD, ds_attn_band);
+
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsatt, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 1; g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, g_dsxa };
+        run(task_mgemm_m4);
+        parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
+
+        rmsnorm_rows(g_dsxa, g_dsx, g_ds_ffn_norm[L], DS_SLOT);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_mjn = 2;
+        g_mj[0] = { g_ds_wg[L].b, g_ds_wg[L].k, g_ds_wg[L].n, g_dsgate };
+        g_mj[1] = { g_ds_wu[L].b, g_ds_wu[L].k, g_ds_wu[L].n, g_dsup };
+        run(task_mgemm_m4);
+        parallel_for((int64_t) DS_SLOT * N_FF, ds_silu_band);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsgate, (size_t) N_FF, m4_aq(N_FF));
+        g_mjn = 1; g_mj[0] = { g_ds_wd[L].b, g_ds_wd[L].k, g_ds_wd[L].n, g_dsxa };
+        run(task_mgemm_m4);
+        parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
+        if (g_dsdbg2) {
+            double a = 0, b = 0;
+            for (int i = 0; i < N_EMBD; ++i) { a += (double) g_dsx[i] * g_dsx[i]; b += (double) g_dsatt[i] * g_dsatt[i]; }
+            fprintf(stderr, "  [blk] L%d |x|=%.4f |attn|=%.4f\n", L, sqrt(a), sqrt(b));
+        }
+    }
+
+    rmsnorm_rows(g_dsxa, g_dsx, g_ds_out_norm, DS_SLOT);
+    spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
+    g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_dslog };
+    run(task_mgemm_m4);
+
+    if (dbg) fprintf(stderr, "  [ds] layers done %.2f ms\n", (now_s() - _t0) * 1e3);
+    const bool nobias = getenv("MEGA_DSNOBIAS") != nullptr;
+    int prev = anchor;
+    for (int i = 0; i < K; ++i) {
+        if (nobias) memset(g_dsbias, 0, (size_t) VOCAB * 4);
+        else ds_markov_bias(prev, g_dsbias);
+        const float * lg = g_dslog + (int64_t) i * VOCAB;
+        int best = 0;
+        float bv = lg[0] + g_dsbias[0];
+        for (int v = 1; v < VOCAB; ++v) {
+            const float x = lg[v] + g_dsbias[v];
+            if (x > bv) { bv = x; best = v; }
+        }
+        drafts[i] = best;
+        prev = best;
+    }
+    if (dbg) {
+        // Separate the two halves of the decision: the target's lm_head on the draft's
+        // hidden state, and the markov bigram bias. If the base argmax is already the
+        // token the target emitted, the markov head is what is costing acceptance; if it
+        // is not, the draft's own forward is wrong.
+        const float * lg = g_dslog;
+        int bt = 0; float bv = lg[0];
+        for (int v = 1; v < VOCAB; ++v) if (lg[v] > bv) { bv = lg[v]; bt = v; }
+        int b2 = 0, b3 = 0; float bv2 = -1e30f, bv3 = -1e30f;
+        for (int v = 0; v < VOCAB; ++v) {
+            if (v == bt) continue;
+            if (lg[v] > bv2) { bv3 = bv2; b3 = b2; bv2 = lg[v]; b2 = v; }
+            else if (lg[v] > bv3) { bv3 = lg[v]; b3 = v; }
+        }
+        fprintf(stderr, "  [ds] base top3 %d(%.2f) %d(%.2f) %d(%.2f)\n", bt, bv, b2, bv2, b3, bv3);
+        int mt = 0; float mv = g_dsbias[0];
+        for (int v = 1; v < VOCAB; ++v) if (g_dsbias[v] > mv) { mv = g_dsbias[v]; mt = v; }
+        fprintf(stderr, "  [ds] draft %d %d %d in %.2f ms | base top %d (%.2f) | bias top %d (%.2f)\n",
+                drafts[0], K > 1 ? drafts[1] : -1, K > 2 ? drafts[2] : -1,
+                (now_s() - _t0) * 1e3, bt, bv, mt, mv);
+    }
+}
+
+// Draft-local residual add and silu: add4_fn/silu4_fn are hard-wired to the target's
+// four-row buffers, and the drafter runs before the round those belong to.
+static void ds_add_band(int64_t lo, int64_t hi) {
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i < 32 ? hi - i : 32));
+        __riscv_vse32_v_f32m1(g_dsx + i, __riscv_vfadd_vv_f32m1(
+            __riscv_vle32_v_f32m1(g_dsx + i, vl), __riscv_vle32_v_f32m1(g_dsxa + i, vl), vl), vl);
+    }
+}
+static void ds_silu_band(int64_t lo, int64_t hi) {
+    for (int64_t i = lo; i < hi; i += 32) {
+        const size_t vl = __riscv_vsetvl_e32m1((size_t) (hi - i < 32 ? hi - i : 32));
+        const vfloat32m1_t x = __riscv_vle32_v_f32m1(g_dsgate + i, vl);
+        const vfloat32m1_t u = __riscv_vle32_v_f32m1(g_dsup + i, vl);
+        vfloat32m1_t t = __riscv_vfmul_vf_f32m1(x, -1.4426950408889634f, vl);
+        t = __riscv_vfmax_vf_f32m1(t, -126.0f, vl);
+        t = __riscv_vfmin_vf_f32m1(t,  126.0f, vl);
+        const vfloat32m1_t den = __riscv_vfadd_vf_f32m1(exp2f_e(t, vl), 1.0f, vl);
+        __riscv_vse32_v_f32m1(g_dsgate + i,
+            __riscv_vfmul_vv_f32m1(__riscv_vfdiv_vv_f32m1(x, den, vl), u, vl), vl);
+    }
+}
+
+// ---------------------------------------------- draft, verify, accept, advance
+// One round: the drafter proposes K tokens, the target checks four rows in one
+// weight pass, and the longest matching prefix is committed. The token that breaks
+// the match is the target's own answer for that position, so the output is exactly
+// what greedy decoding would have produced -- the drafts only change the speed.
+// Both of these live at file scope for the same reason g_m4out does: m4_round
+// inlines its whole four-row body, and a caller-stack array came back with stale
+// words -- here the four candidate tokens, which then indexed the embedding table
+// out of bounds.
+static int32_t g_spec_dr[DS_SLOT];
+static int g_spec_tok[DS_SLOT];
+
+static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
+    if (K < 1) K = 1;
+    if (K > DS_SLOT - 1) K = DS_SLOT - 1;
+    int32_t * const dr = g_spec_dr;
+    long long acc = 0, total = 0;
+    double best = 1e9, tot = 0;
+    int shown = 0;
+    for (int it = 0; it < rounds; ++it) {
+        const double t0 = now_s();
+        ds_draft(anchor, p0, K, dr);
+
+        int * const tok = g_spec_tok;
+        tok[0] = anchor;
+        for (int i = 0; i < K; ++i) tok[1 + i] = dr[i];
+        for (int i = K + 1; i < DS_SLOT; ++i) tok[i] = dr[K - 1];
+
+        if (!m4_round(p0, tok, g_m4out)) return false;
+
+        int n = 0;
+        while (n < K && g_m4out[n] == dr[n]) ++n;
+        acc += n; total += K;
+        const int next = g_m4out[n];
+
+        // The round's capture has the target's residual stream for every row it ran,
+        // so the committed positions go into the draft's cache before the next round.
+        ds_inject4(p0, 0, n + 1);
+        if (shown < 12) {
+            printf("spec %2d p=%lld  acc %d/%d  drafts %d %d %d  -> %d\n",
+                   it, (long long) p0, n, K, dr[0], dr[1], dr[2], next);
+            ++shown;
+        }
+        p0 += n + 1;
+        anchor = next;
+        const double dt = now_s() - t0;
+        tot += dt;
+        if (dt < best) best = dt;
+    }
+    const double emit = (double) rounds + (double) acc;
+    printf("spec: %d rounds, %lld/%lld drafts accepted (%.3f/round), %lld tokens\n",
+           rounds, acc, total, total ? (double) acc / total : 0.0, (long long) emit);
+    // Round 0 is cold (score and weight buffers after prefill), which is why `best`
+    // is reported next to the mean, and the second rate is what the same rounds
+    // would give if no draft ever matched.
+    printf("spec: best %.2f ms/round, mean %.2f ms/round -> %.2f tok/s "
+           "(%.2f with no draft accepted)\n",
+           best * 1e3, tot / rounds * 1e3, emit / tot, (double) rounds / tot);
+    printf("spec: inject %.2f s total\n", g_ds_t_inj);
+    return true;
+}
+
+static void ds_setup(void) {
+    if (g_ds) return;
+    if (!ds_load()) { fprintf(stderr, "dspark: disabled\n"); return; }
+    if (!ds_alloc()) return;
+    g_ds = 1; g_ds_ready = 1;
+}
+
 
 // ------------------------------------ four rows of rope and KV, spread over the pool
 // rope_all is written against one position on one core, so four rows is four
@@ -4409,6 +5087,8 @@ static void m4_rope_band(int64_t lo, int64_t hi) {
 static bool m4_round(int64_t p0, const int * toks, int * out) {
     if (!g_x4) { m4dec_alloc(); if (!g_x4) return false; }
     if (p0 + 4 > MAXCTX) return false;
+    const bool m4dbg = getenv("MEGA_DSDBG") != nullptr;
+    if (m4dbg) fprintf(stderr, "  [m4] round at %lld start\n", (long long) p0);
     for (int r = 0; r < 4; ++r)
         dequant_row_t(g_x4 + (int64_t) r * N_EMBD,
                       g_emb->data + (int64_t) toks[r] * src_row_bytes_t(N_EMBD, (int) g_emb->type),
@@ -4491,6 +5171,14 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         run(task_mgemm_m4);
         if (M4TIME) { g_m4t[0] += now_s() - _t; _t = now_s(); }
         parallel_for(4 * N_EMBD, add4_fn);
+        // The drafter's encoder reads the residual stream of these layers. Captured
+        // after the FFN residual add, which is what mega_decode feeds the same head.
+        if (g_ds && ds_target_slot(L) >= 0) {
+            const int k = ds_target_slot(L);
+            for (int r = 0; r < 4; ++r)
+                memcpy(g_dshid + ((int64_t) k * g_ds_cap + r) * N_EMBD,
+                       g_x4 + (int64_t) r * N_EMBD, (size_t) N_EMBD * 4);
+        }
     }
 
     rmsnorm_rows(g_xa4, g_x4, g_out_norm, 4);
@@ -5544,6 +6232,21 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }   // C rows, not C * N_EMBD: it takes a row count
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'f', g_pfx + (int64_t) (cm - 1) * N_EMBD);
+            if (g_ds && ds_target_slot(L) >= 0) {
+                const int k = ds_target_slot(L);
+                for (int64_t r = 0; r < cm; ++r)
+                    memcpy(g_dshid + ((int64_t) k * g_ds_cap + r) * N_EMBD,
+                           g_pfx + r * N_EMBD, (size_t) N_EMBD * 4);
+            }
+        }
+        // Feed this chunk's fused features to the drafter's encoder, four positions
+        // at a time so it goes through the same four-row kernel as everything else.
+        // ~1.7 s over a 10K prompt, once per request.
+        if (g_ds) {
+            const double _i = now_s();
+            for (int64_t r = 0; r < cm; r += DS_SLOT)
+                ds_inject4(base + r, r, (int) ((cm - r) < DS_SLOT ? (cm - r) : DS_SLOT));
+            g_ds_t_inj += now_s() - _i;
         }
     }
     const double dt = now_s() - t0;
@@ -5954,6 +6657,8 @@ int main(int argc, char ** argv) {
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
     if (getenv("MEGA_M4DEC")) { g_m4dec = atoi(getenv("MEGA_M4DEC")); g_attn4 = 1; }
+    if (getenv("MEGA_SPEC")) { g_m4spec = atoi(getenv("MEGA_SPEC")); g_attn4 = 1; }
+    if (getenv("MEGA_SPEC_K")) g_m4spec_k = atoi(getenv("MEGA_SPEC_K"));
     if (getenv("MEGA_ATTN4P")) g_a4p = atoi(getenv("MEGA_ATTN4P"));
     if (getenv("MEGA_A4S")) g_a4s = atoi(getenv("MEGA_A4S"));
     // The vendor prefill helper for 3-bit weights is a one-row kernel, and the
@@ -6263,6 +6968,14 @@ int main(int argc, char ** argv) {
         // the last prompt token stays out: decode uses it as its first anchor
         const int64_t np = nt - 1;
         const int32_t anchor = toks[np];
+        // The drafter has to be live before prefill: its encoder consumes the target's
+        // residual stream at five layers of every prefill chunk, and those are exactly
+        // the features its cache is built from. Set up after prefill and the draft sees
+        // an empty prefix, which is what a first attempt did.
+        if (g_m4spec) {
+            ds_setup();
+            if (!g_ds_ready) { fprintf(stderr, "spec: drafter unavailable\n"); return 1; }
+        }
         if (!real_prefill(toks, np, g_pf_chunk)) return 1;
         if (const char * m4p = getenv("MEGA_M4P0")) {
             // Aim the round at four positions prefill already attended over, with the
@@ -6280,6 +6993,10 @@ int main(int argc, char ** argv) {
         prefill_release();
         prompt = anchor;
         pos0 = np;
+        if (g_m4spec) {
+            m4spec_run(pos0, prompt, g_m4spec, g_m4spec_k);
+            return 0;
+        }
         if (g_attn4 && g_m4dec) { m4dec_run(pos0, prompt, g_m4dec); return 0; }
         if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
         printf("chain: decode starts at position %lld (anchor %d)\n",

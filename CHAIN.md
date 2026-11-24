@@ -668,3 +668,23 @@ QK, for contrast, is already at 15.4 GB/s because its K plane is stored blocked
 `[kv][pos_blk][dim][32]` and each block is 8 KB of contiguous memory. That is the
 layout PV needs, and the difference between the two is most of the attention
 split: qk 14.0 ms against pv 23.9 ms for the same number of bytes.
+
+## Speculative decode is wired in, and its cost is the draft's own attention
+
+`MEGA_SPEC=n` runs a whole request in `mega3.cpp`: 10K prefill, then n rounds of
+draft 3 / verify 4 rows / commit the matching prefix, against the KV cache prefill
+wrote. There is no second binary and no replay path.
+
+    MEGA_ATTN4P=1 MEGA_SPEC=8 MEGA_SPEC_K=3 ./m3c.a4 -m mc-q4o.gguf -F /tmp/p10k.txt -n 0
+
+The drafter is 3.4 s of a 79 s prefill (4%), which is acceptable. The per-round
+cost is not: 24-26 ms at 101 tokens, and **190-196 ms at 10K**, because its
+attention is fp32 and O(context). That is twice the 96 ms round it exists to feed,
+so at 10K speculation measures 4.3-5.6 tok/s against 10.4 without it. Short context
+is the other way round: 17.3 against 10.4.
+
+Drafts do not affect correctness: a token is only emitted after the target
+reproduces it, and the token that breaks the match is the target's own answer.
+`DECODE.md` has the mechanism, `DSPARK.md` the drafter's internals and the
+acceptance table, `FINDINGS.md` section 2 the four port bugs and every variant that
+was scored.

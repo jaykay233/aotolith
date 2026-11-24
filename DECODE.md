@@ -447,3 +447,38 @@ Two changes, both in `m4_round`:
 Measured stage spread across runs of one binary is about 3 ms on GEMM (53.5-56.1)
 and 1 ms on attention, so the round is 96-99 ms and single runs should not be
 compared to each other. The tail itself is stable at 5.5 ms.
+### The chain runs end to end, and speculation loses at 10K
+
+`MEGA_SPEC=n` in `mega3.cpp` is the complete request: 10K prefill, then n rounds
+of draft 3 / verify 4 rows / commit the matching prefix, against the same KV cache
+prefill wrote. One binary, no replay scaffolding.
+
+    10K prefill     9999 tokens   79.1 s (126.4 tok/s), 3.4 s of it the drafter
+    drafter alone   per round     190-196 ms at 10K, 24-26 ms at 101 tokens
+    round           4 rows        96 ms (unchanged; the drafter runs before it)
+
+| context | accepted/round | ms/round | tok/s |
+|---|---|---|---|
+| 101 tokens, no drafter | - | 96 | 10.4 |
+| 101 tokens, 3 drafts | 0.278 | 106 | **17.3** |
+| 10K, no drafter | - | 96 | **10.4** |
+| 10K, 3 drafts | 0.111 | 310 | 4.3 |
+| 10K, 8 rounds | 0.250 | 299 | 5.6 |
+
+Speculation is 1.7x at a hundred tokens and 0.4x at ten thousand. Two causes, both
+measured: the drafter's own attention is fp32 and O(context) over 64 (slot, head)
+units, so it costs twice what the round it feeds costs; and acceptance falls from
+0.278 to 0.11-0.25 per round.
+
+That second number is the one to chase. The four-row round is 96 ms and near its
+bandwidth floor, so at 1.83 accepted tokens it would be 19.1 tok/s and at 2.0 it
+would be 20.8 -- the round is not the problem. The 1.83 came from short context and
+does not hold at 10K.
+
+The sharp probe is not acceptance, which is a 0/1 summary: it is the draft's base
+logit row correlated against the target's own row at the same position. `MEGA_DSDBG`
+prints the draft's top three base logits and the target's top two, and
+`MEGA_DSZERO` zeroes the encoder features -- that control only halves acceptance
+(0.250 -> 0.125), which says the committed prefix is reaching the draft weakly and
+the drafts are mostly the anchor token. `FINDINGS.md` section 2 has the full variant
+table and the four port bugs.

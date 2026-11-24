@@ -134,12 +134,70 @@ So the drafter cannot make the output wrong. It can only lower the acceptance ra
 
 ## What is left
 
-1. Load `dspark-q4.gguf`: 62 tensors, all Q4_0 or f32, offsets dumped and sizes known.
-   The linear layers repack into the same IME2 layout the target uses, which is why
-   quantising the draft to Q4_0 first was worth doing.
-2. Draft KV cache: 5 layers x MAXCTX x 2 heads x 128 dims, fp16, ~51 MB at 10K.
-3. The encoder/inject step per committed position, so the draft cache stays in step.
-4. The 7-position block pass and the Markov chain.
-5. Wire `-s 3` to take drafts from the above instead of `MEGA_REPLAY`.
+1. **Understand the 10K acceptance.** 0.11-0.25 per round against 1.26 at short
+   context. This is the number that decides whether the drafter is worth having at
+   all; everything below is cheaper than the round it feeds.
+2. **The draft's attention cost at 10K.** 190 ms of a 96 ms round is not a tuning
+   problem. It is fp32, O(context), 64 (slot, head) units. int8 `vmadot` and four
+   rows shared across slots is ~4x; a sliding window on the draft's own cache is
+   the larger lever, and the draft cache is only 31.5 MB at 12K so a window costs
+   nothing in memory.
+3. Confidence-gated `K`: `conf_proj` is loaded and unused. Trimming to the number
+   of drafts likely to survive saves verification rows, but with 0.2 accepted per
+   round it would trim to zero.
 
-Confidence-gated `K` is a later optimisation, not a prerequisite.
+## Ported and measured, 10K end to end
+
+`MEGA_SPEC=n` in `mega3.cpp` is the whole chain: 10K prefill, then n rounds of
+draft 3 / verify 4 rows / commit the matching prefix. The same KV cache carries
+over, so there is one binary and no replay scaffolding.
+
+Short context, 101-token prompt:
+
+| | accepted/round | ms/round | tok/s |
+|---|---|---|---|
+| four rows, no drafter | - | 96 | 10.4 |
+| dspark, 3 drafts | 0.278 | 106 | 17.3 |
+
+10K:
+
+| | accepted/round | ms/round | tok/s |
+|---|---|---|---|
+| four rows, no drafter | - | 96 | 10.4 |
+| dspark, 3 drafts | 0.111 | 310 | 4.3 |
+| dspark, 8 rounds | 0.250 | 299 | 5.6 |
+
+The drafter alone is 24-26 ms per round at 101 tokens and 190-196 ms at 10K. It
+adds 3.4 s to a 79 s prefill (4%), which is fine; the per-round cost is not.
+
+### The four bugs that had to go
+
+| symptom | cause |
+|---|---|
+| injected K and V identical at every position (\|K\|=26.025 throughout), feature norm cycling with period 4 | `ds_inject4` copied rows 0..3 for every four-row group instead of `row0 + r`: the whole prefix was four positions' features |
+| NaN in the markov bias, then segfault | the rank-256 gather was stored as one row and fed to the four-row quantiser, which reads four |
+| segfault at round start, garbage token ids | `int tok[4]` on the caller stack, clobbered by `m4_round`'s inlining -- the same class as the `g_m4out` bug |
+| the draft saw an empty prefix | `ds_setup` ran after prefill, so the five-layer capture was never armed |
+
+`m4_alloc()` moved with it: the drafter's GEMMs use the four-row kernel, so the
+A-record arena has to exist before prefill runs.
+
+### Variants scored by acceptance (101 tokens, 3 drafts)
+
+| variant | accepted/round | verdict |
+|---|---|---|
+| adjacent-pair rope (default) | 0.278 | keep |
+| halves-rotate rope (`MEGA_DSROPE=half`) | 0.111 | falsified: the draft does not use the target's rope layout |
+| `target_layers` 1-based (`MEGA_DSL1`) | 0.292 | indistinguishable from 0.250 |
+| encoder/output norms swapped (`MEGA_DSSWAPNORM`) | 0.000 | `enc.output_norm` is the encoder's |
+| interleaved feature layout (`MEGA_DSINTER`) | 0.000 | the fused vector is layer-major |
+| tanh on the rank-256 gather (`MEGA_DSTANH`) | 0.292 | no effect; this is the plain markov variant |
+| encoder features zeroed (`MEGA_DSZERO`) | 0.125 | zeroing the committed prefix only halves acceptance |
+| markov bias dropped (`MEGA_DSNOBIAS`) | 0.000 | base alone is worse, so the markov head helps |
+
+The zero-feature control is the informative one: if the prefix reached the draft
+properly, removing it should cost nearly everything. It costs half, so the drafts
+are mostly the anchor token and the mask block's own self-attention.
+
+All of these are still in the binary behind their environment variable, so any of
+them can be re-run rather than re-implemented.
