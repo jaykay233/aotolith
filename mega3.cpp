@@ -720,6 +720,21 @@ static float g_k8dsc[N_LAYER][N_KV], g_v8dsc[N_LAYER][N_KV];
 static int g_k8dec = 0;
 
 static const int64_t KV_LAYER_STRIDE = (int64_t) N_KV * HEAD_DIM * MAXCTX;   // V: pos-major
+// A second f16 V copy, laid out in PV order: [kv][half][pos][64]. The pos-major
+// layout makes PV read 128 bytes of every 512-byte position block, and bwprobe
+// measures that stride at 5.7 GB/s against 27.2 contiguous (stride 2 is 13.5), so
+// the hardware prefetcher pulls whole blocks in and evicts three quarters unused.
+// PV moves 264 MB at 10K, so the layout is worth more than the byte count is.
+//
+// Only decode PV reads this; prefill attention, the int8 conversion and every
+// debug path keep using g_vpos. Same values, different order, so the arithmetic
+// is unchanged.
+static _Float16 * g_vpv;
+static int g_vpo = 1;          // MEGA_VPO=0 falls back to the pos-major read
+static inline int vpo_on(void) { return g_vpo; }
+static inline int64_t vf16o(int kv, int half, int64_t pos) {
+    return (((int64_t) kv * 2 + half) * MAXCTX + pos) * 64;
+}
 // K is tiled [kv][pos_blk][dim][32]. A dim-major K with a MAXCTX stride put each
 // of the 128 dims on its own page, so both the per-token append and the QK read
 // paid a TLB miss per element (~145 us per layer). A tile keeps a 32-position
@@ -2419,17 +2434,25 @@ static void attn_pv(int tid) {
     const float * sa = &g_sa[tid][0][0];
     const int len = p1 - p0;
     const _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE;
+    // Read once per call: a getenv call inside the position loop made the compiler
+    // spill the 16 live accumulators around it.
+    const int vpo = vpo_on();
     for (int kv = 0; kv < N_KV; ++kv)
         for (int half = 0; half < 2; ++half) {
             vfloat32m1_t a00 = __riscv_vfmv_v_f_f32m1(0.0f, 32), a01 = a00;
             vfloat32m1_t a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00;
             vfloat32m1_t a40 = a00, a41 = a00, a50 = a00, a51 = a00, a60 = a00, a61 = a00, a70 = a00, a71 = a00;
             const _Float16 * base = vb + (int64_t) kv * HEAD_DIM + half * 64;
+            // PV order: this (kv, half)'s positions are contiguous, so one position
+            // is 64 contiguous f16 instead of 128 bytes of a 512-byte block.
+            const _Float16 * basev = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
+                                     vf16o((int) kv, (int) half, p0);
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
             for (int p = 0; p < len; ++p) {
-                const _Float16 * vp = base + (int64_t) (p0 + p) * N_KV * HEAD_DIM;
+                const _Float16 * vp = vpo ? (basev + (int64_t) p * 64)
+                                            : (base + (int64_t) (p0 + p) * N_KV * HEAD_DIM);
                 // int8 V is PV-order, so one position is 64 contiguous bytes and the
                 // next position is the next 64: the whole pass is one sequential run.
                 const int8_t * vp8 = base8 + (int64_t) (p0 + p) * 64;
@@ -2533,12 +2556,17 @@ static void attn_pv_m2(int tid) {
     const int len = p1 - p0;
     const float * sa = &g_sa[tid][0][0];
     const _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE;
+    const int vpo = vpo_on();
     const size_t vl = __riscv_vsetvl_e32m2(64);
     for (int kv = 0; kv < N_KV; ++kv)
         for (int half = 0; half < 2; ++half) {
             vfloat32m2_t a0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
             vfloat32m2_t a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
             const _Float16 * base = vb + (int64_t) kv * HEAD_DIM + half * 64;
+            // PV order: this (kv, half)'s positions are contiguous, so one position
+            // is 64 contiguous f16 instead of 128 bytes of a 512-byte block.
+            const _Float16 * basev = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
+                                     vf16o((int) kv, (int) half, p0);
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
@@ -2546,7 +2574,8 @@ static void attn_pv_m2(int tid) {
                 const vfloat32m2_t v = g_k8dec
                     ? ld_i8_f32_m2(base8 + (int64_t) (p0 + p) * 64, vl)
                     : __riscv_vfwcvt_f_f_v_f32m2(
-                          __riscv_vle16_v_f16m1(base + (int64_t) (p0 + p) * N_KV * HEAD_DIM, vl), vl);
+                          __riscv_vle16_v_f16m1(vpo ? basev + (int64_t) p * 64
+                                                      : base + (int64_t) (p0 + p) * N_KV * HEAD_DIM, vl), vl);
                 a0 = __riscv_vfmacc_vf_f32m2(a0, wk[0 * SMAX + p], v, vl);
                 a1 = __riscv_vfmacc_vf_f32m2(a1, wk[1 * SMAX + p], v, vl);
                 a2 = __riscv_vfmacc_vf_f32m2(a2, wk[2 * SMAX + p], v, vl);
@@ -2704,9 +2733,17 @@ static void rope_all(void) {
             }
         }
         for (int d = 0; d < HEAD_DIM; ++d) kb[(int64_t) d * KT + pi] = (_Float16) g_k[kv * HEAD_DIM + d];
-        for (int d = 0; d < HEAD_DIM; d += 32)
-            __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d,
-                                   __riscv_vfncvt_f_f_w_f16mf2(__riscv_vle32_v_f32m1(g_v + kv * HEAD_DIM + d, 32), 32), 32);
+        // Two stores of the same values: pos-major for every other reader, PV order
+        // for the PV stream. 128 bytes each, so the extra store is a rounding error
+        // next to the layer's GEMM.
+        _Float16 * vpv = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE;
+        for (int d = 0; d < HEAD_DIM; d += 32) {
+            const vfloat16mf2_t h = __riscv_vfncvt_f_f_w_f16mf2(
+                __riscv_vle32_v_f32m1(g_v + kv * HEAD_DIM + d, 32), 32);
+            __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d, h, 32);
+            if (vpo_on())
+                __riscv_vse16_v_f16mf2(vpv + vf16o((int) kv, d / 64, g_pos) + d % 64, h, 32);
+        }
     }
     g_t_rope_app += now_s() - _tb;
 }
@@ -6071,6 +6108,34 @@ static void conv_kv8_v_band(int64_t lo, int64_t hi) {
                              __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
     }
 }
+// Rearranges f16 V from pos-major into PV order over the whole prefix. One 64-dim
+// block per band item; both sides are 128 contiguous bytes, so this is a straight
+// copy with a different destination address.
+static void build_vpv_band(int64_t lo, int64_t hi) {
+    const int64_t L = g_layer;
+    const _Float16 * src = g_vpos + L * KV_LAYER_STRIDE;
+    _Float16 * dst = g_vpv + L * KV_LAYER_STRIDE;
+    for (int64_t b = lo; b < hi; ++b) {
+        const int64_t i = b * 64;
+        const int64_t pos = i / (N_KV * HEAD_DIM);
+        const int64_t kv = (i / HEAD_DIM) % N_KV;
+        const int64_t half = (i % HEAD_DIM) / 64;
+        const int64_t so = pos * N_KV * HEAD_DIM + kv * HEAD_DIM + half * 64;
+        const int64_t dof = vf16o((int) kv, (int) half, pos);
+        for (int64_t j = 0; j < 64; ) {
+            const size_t vl = __riscv_vsetvl_e16m2((size_t) (64 - j));
+            __riscv_vse16_v_f16m2(dst + dof + j, __riscv_vle16_v_f16m2(src + so + j, vl), vl);
+            j += (int64_t) vl;
+        }
+    }
+}
+static void build_vpv_order(int64_t npos) {
+    for (int L = 0; L < N_LAYER; ++L) {
+        g_layer = L;
+        parallel_for(npos * N_KV * HEAD_DIM / 64, build_vpv_band);
+    }
+}
+
 // Quantises positions [0, npos) of every layer from the f16 caches. Only used
 // when the int8 cache is wanted but prefill did not fill it layer by layer.
 static void conv_kv8_all(int64_t npos) {
@@ -7538,6 +7603,7 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     exp3_init();
     if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
+    { const char * e = getenv("MEGA_VPO"); g_vpo = (e && *e == '0') ? 0 : 1; }
     const char * path = work_path("mc-q4o.gguf");
     int ngen = 16, prompt = 1;
     int64_t pos0 = 0;                 // first decode position (prompt length with -F)
@@ -7984,6 +8050,7 @@ int main(int argc, char ** argv) {
         }
         if (g_attn4 && g_m4dec) { m4dec_run(pos0, prompt, g_m4dec); return 0; }
         if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
+        printf("[ng @chain] ngen=%d prompt=%d\n", ngen, prompt);
         printf("chain: decode starts at position %lld (anchor %d)\n",
                (long long) pos0, prompt);
     }
@@ -7998,6 +8065,23 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     int tok = prompt;
     const double t_start = now_s();
+    // The PV-order copy is allocated only now: prefill scratch has been released, so
+    // the 264 MB never overlaps the prefill working set (the int8 weight copy and the
+    // per-chunk row buffers) and cannot change prefill's memory behaviour.
+    if (vpo_on() && !g_vpv) {
+        const double _vp = now_s();
+        g_vpv = (_Float16 *) hugemem(vbytes);
+        if (!g_vpv) { g_vpo = 0; }
+        else {
+            use_huge(g_vpv, vbytes);
+            if (pos0 > 0) build_vpv_order(pos0);
+            // Fresh pages start on 4 KB, and the PV stream reads 264 MB in one run, so
+            // collapse it the same way the int8 weight copy is collapsed.
+            huge_collapse(g_vpv, vbytes);
+            printf("v order: PV-layout f16 V built for %lld positions in %.3f s\n",
+                   (long long) pos0, now_s() - _vp);
+        }
+    }
     report_huge("decode");
     // Say which optional paths are live. A flag that silently fails to parse
     // (one `-X` used to swallow the argument after it) turns a whole A/B into

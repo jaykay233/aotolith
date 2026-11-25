@@ -1764,3 +1764,81 @@ getting there means reworking the attention kernel from 12 to ~27 GB/s, which is
 a larger change than anything in the prefill work above. Anything above that
 requires either a coarser weight format (blocked on accuracy) or hardware with
 more bandwidth.
+
+## Decode PV: the KV layout, not the byte count
+
+The bandwidth ceiling above said attention ran at 12 GB/s against a 27.5 GB/s
+bus. That was the wrong denominator: it divided all of attention's 43.8 ms by
+the KV bytes, but attention also reads K and runs exp. Split per stage, at 10K:
+
+| stage | ms/token | bytes | effective |
+|---|---|---|---|
+| qk | 18.0 | K 264 MB | 14.7 GB/s |
+| exp | 1.3 | -- | -- |
+| pv | 24.0 | V 264 MB | 11.0 GB/s |
+| fin | 0.6 | -- | -- |
+
+So PV moved 264 MB in 24 ms. The question was why 11 and not 27.
+
+V is stored pos-major, `[pos][kv][dim]`, so one position is 512 bytes and PV
+takes 128 of them per pass (one kv, one 64-dim half). `bwprobe` models exactly
+that pattern with `MEGA_STRIDE`, reading N*32 bytes out of every N*128:
+
+| stride | useful bytes per block | measured |
+|---|---|---|
+| 1 | 128 of 128 | 27.2 GB/s |
+| 2 | 64 of 128 | 13.5 GB/s |
+| 4 | 32 of 128 | 5.7 GB/s |
+
+Useful bandwidth falls with the fraction of the block used, so the hardware
+prefetcher pulls the whole block in and three quarters of it is evicted unused.
+The stride, not the byte count, is what PV pays for.
+
+The fix is a second f16 V copy in PV order, `[kv][half][pos][64]`. A position's
+64 dims are then 128 contiguous bytes and consecutive positions are consecutive
+in memory, so one (kv, half) pass is a single sequential run. It is the layout
+the int8 V plane already used.
+
+**A layout change alone does not fix it, because the loop cannot be reordered.**
+Making the read contiguous in place would mean processing all four (kv, half)
+quarters of a position in one iteration, which keeps 16 heads x 128 dims of
+accumulator live -- 32 registers before the V values are even loaded. Splitting
+by half is what makes the 16 accumulators fit, and splitting by half is what
+creates the stride. So the copy is the only way.
+
+Costs and results:
+
+- The copy is built once after prefill, 264 MB read + 264 MB written, measured
+  at 0.107 s. Allocated only after `prefill_release()` so the 264 MB never
+  overlaps the prefill working set, and collapsed to 2 MB pages (`huge_collapse`)
+  because fresh pages start on 4 KB and the pass is a single 264 MB run.
+- The per-token append writes the same 128 bytes twice, to both layouts. It runs
+  once per layer per token, next to a 6144-wide GEMM.
+- Only decode PV reads the new copy. Prefill attention, the int8 conversion and
+  every debug path keep the pos-major cache.
+
+| | pv | decode at 10K |
+|---|---|---|
+| pos-major | 23.9 / 24.1 ms | 9.98 / 9.98 tok/s |
+| PV order | 13.4 / 13.6 ms | 10.98 / 10.93 tok/s |
+
+Interleaved, same thermal state. Prefill is unchanged (50.14 / 50.18 s against
+50.12 / 50.41 s for the previous commit; the board was hot for both and the
+earlier 49.2 s was measured cooler). Logits are bit-exact with the previous
+commit: md5 `46ee3c9b108fb40ee63678f632e1b465`, mean cosine 0.977316, top-1
+60/64. A reorder that moves the same values cannot change the arithmetic, and it
+does not.
+
+Two things this cost time on, both worth writing down:
+
+- `MEGA_VPO` was first read with `getenv` from inside the PV loops. That made the
+  build miscompile: `ngen` in `main` came back as a different garbage value on
+  every run, and the token loop then segfaulted. `-O2` was correct, `-O1` was
+  not, and ASan saw nothing, which is the signature of a compiler-level problem
+  rather than a real overrun. Reading the environment once in `main` into a plain
+  global fixed it. Environment reads do not belong in a worker thread.
+- The first precision run after the change came back at cosine 0.55 with the
+  first 14 steps matching. That was the run missing `-force`, so decode fed its
+  own tokens from step 15 on and the comparison was against a different prefix.
+  With `-force` the md5 is identical. Logits are only comparable step by step
+  when every step is fed the same input.
