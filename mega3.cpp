@@ -2225,6 +2225,11 @@ static void task_argmax(int tid) {
 // latency, and only 8 heads' worth of accumulator can be live. So the d loop is
 // unrolled by 4 and all four K vectors are issued before any multiply, which
 // hides the load latency behind 32 independent FMAs.
+// One 32-position K row (or int8 row) widened to f32 lanes.
+#define QK_LD1(V, D) \
+    V = g_k8dec ? ld_i8_f32(kb8 + (int64_t) (D) * KT, vl) \
+                : __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (D) * KT, vl), vl);
+
 #define QK_ACC(H) \
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 0], k0, vl); \
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 1], k1, vl); \
@@ -2330,22 +2335,12 @@ static void attn_qk(int tid) {
             const size_t vl = __riscv_vsetvl_e32m1((size_t) (len - pb < KT ? len - pb : KT));
             vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
             vfloat32m1_t a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+            vfloat32m1_t k0, k1, k2, k3;
             for (int d = 0; d < HEAD_DIM; d += 4) {
-                vfloat32m1_t k0, k1, k2, k3;
-                if (g_k8dec) {
-                    // int8 -> int16 -> int32 -> f32 is three conversions against the
-                    // one widening a f16 load needs, but QK is memory bound at 10K
-                    // (the whole dot loop is ~2 ms of the 40) so the trade is free.
-                    k0 = ld_i8_f32(kb8 + (int64_t) (d + 0) * KT, vl);
-                    k1 = ld_i8_f32(kb8 + (int64_t) (d + 1) * KT, vl);
-                    k2 = ld_i8_f32(kb8 + (int64_t) (d + 2) * KT, vl);
-                    k3 = ld_i8_f32(kb8 + (int64_t) (d + 3) * KT, vl);
-                } else {
-                    k0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 0) * KT, vl), vl);
-                    k1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 1) * KT, vl), vl);
-                    k2 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 2) * KT, vl), vl);
-                    k3 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(kb + (int64_t) (d + 3) * KT, vl), vl);
-                }
+                // int8 -> int16 -> int32 -> f32 is three conversions against the
+                // one widening a f16 load needs, but the dot loop is not bound by
+                // the conversions: see the qk section split in FINDINGS.
+                QK_LD1(k0, d + 0) QK_LD1(k1, d + 1) QK_LD1(k2, d + 2) QK_LD1(k3, d + 3)
                 QK_ACC(0) QK_ACC(1) QK_ACC(2) QK_ACC(3)
                 QK_ACC(4) QK_ACC(5) QK_ACC(6) QK_ACC(7)
             }

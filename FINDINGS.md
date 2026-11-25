@@ -2130,3 +2130,51 @@ source produces, not the recorded `46ee3c9b...`. The recorded hash belongs to th
 `{48,48,45,28}` X100 column split, and the cosine is the same quality either way
 (0.9783 against 0.9773, both 60/64). The comparison that matters -- same source,
 same split, before and after a change -- is bit-exact in every arm above.
+
+### Where decode QK's 12.9 ms goes, measured on the path that runs
+
+The earlier section said the remaining QK time was "the score stores, the per-head
+max pass and the partial last block". Timing those three separately inside the
+32-wide decode path, summed over all threads per token, says otherwise:
+
+| section | thread-ms/token | share of qk work |
+|---|---|---|
+| dot loop | 68.2 | 70% |
+| score stores | 0.27 | 0.3% |
+| per-head max sweep | 8.4 | 9% |
+
+The dot loop dominates. Stores are already free; the max sweep is 9% and is a
+serial `vfmax` chain over the score matrix.
+
+**A correction.** The claim that decode QK is not memory bound came from
+`MEGA_QKSAME`, but that run's output was grepped for `qk` and picked up the
+*prefill* line (`attn work: qk 58.0 ...`), so decode was never tested. Pinning
+every position block to tile 0 of each layer (1.3 MB, L2-resident) on the decode
+path gives dot 68.3 -> 63.0 thread-ms and qk 13.78 -> 12.29 ms, i.e. **11%**, not
+"nothing". Decode QK does have a memory component, it is just small.
+
+**The three cheap levers are exhausted**, all bit-identical:
+
+| change | effect on qk |
+|---|---|
+| lanes doubled (m2, vl=64 through `MEGA_K64=1`) | 13.83 -> 12.65 ms (+8.5%) |
+| position blocks pinned to L2 | 13.78 -> 12.29 ms (+11%) |
+| K loads software-pipelined one d-group ahead | 68.23 vs 68.48 dot thread-ms (0%) |
+
+The pipeline is neutral because the compiler already hoists those loads; the
+register pressure of holding eight K vectors alongside eight accumulators buys
+nothing. That variant was removed rather than shipped behind a flag.
+
+**Per-core rate, and a stale number.** `probe_cores` (same inner loop, `vsetvl`
+sized) gives **25.0 GMAC/s on an X100 core**, identical whether one X100 core or
+all eight run, so there is no occupancy clock drop on that cluster. The recorded
+"X100 = 7.44 GMAC/s, one fifth of an A100" is wrong and should not be used to size
+a port: at 25 GMAC/s an X100 core is in the same class as the 13.6 GMAC/s a
+production A100 thread sustains. The A100 side of that probe faulted on this board
+(`/proc/set_ai_thread` and thread creation interact), so its number here comes
+from production, not from the probe.
+
+So the remaining lever for attention is the idle X100 cluster, and it is worth
+more than the recorded 3% estimate -- but it needs VLEN-agnostic QK/PV kernels and
+a second thread pool, since every int8 kernel in this file assumes 32 e32 lanes
+(VLEN=1024) and would compute garbage on an X100 core.
