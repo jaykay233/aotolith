@@ -1311,3 +1311,67 @@ What is left is contention, and `-0` measures it: skipping PV entirely drops QK'
 own core-seconds from 103.8 to **74.4** for identical work, i.e. PV's V stream
 makes QK 1.4x more expensive while both run. Even with PV gone QK is at
 57.8 GMAC/s per core, 2.3x off hot, so contention is part of it and not all of it.
+
+### Elementwise cannot hide behind GEMM either: IME2 and plain RVV share the issue port
+
+The earlier port probe (`probe_coinissue.cpp`) settled GEMM against the attention
+dots: IME2 and `vmadot` land on the same unit, so splitting rows to overlap them
+returns 1-2%. That left a different bet open. Elementwise is not a dot op -- it is
+`vle32`, `vfadd`, `vfmul`, `vse32` -- and if those retired on a separate pipe then
+the chunk could be split by rows and norm/quant/silu/conv for rows i+1 would run
+under the GEMM for rows i. That would take seconds off the critical path, so
+`probe_coinissue2.cpp` measures it directly: one thread, Z IME2 calls, Z elementwise
+passes, and Z of each interleaved one for one.
+
+| working set | ime2 | rvv | serial sum | ideal overlap | both |
+|---|---|---|---|---|---|
+| 32 KB (L1) | 0.1091 s | 0.0061 s | 0.1151 s | 0.1091 s | **0.1161 s** |
+| 128 KB (L1) | 0.0244 s rvv at 322 GB/s | | 0.1333 s | 0.1089 s | **0.1338 s** |
+| 1 MB (L2/DRAM) | 0.1123 s | 0.4765 s | 0.5888 s | 0.4765 s | 0.1050 s worse |
+
+With the working set inside L1, `both` equals the serial sum to within 1%. Ordinary
+vector instructions contend for the same issue slots as IME2. The large-working-set
+row is worse than serial and is a separate effect: interleaving two streams that do
+not fit in L1 evicts each other, which is why the 1 MB case is 2x the sum. So the
+8.28 s of elementwise rounds off the GEMM time and cannot be scheduled under it.
+This closes the last structural idea for the prefill target.
+
+### The quantiser is at 79% of the bus, not 10 GB/s
+
+An earlier entry derived ~10 GB/s for the quantiser from dividing 26 GB by 2.56 s
+across four stages. Instrumenting each stage separately (`g_qa_t`, `g_qa_bytes`)
+gives the qkv phase **1.75 s at 15.3 GB/s**, against the board's 19.3 GB/s. The
+vendor kernel is at 79% of the achievable bus on the phase that dominates quant, so
+the "five times slower than its hot rate" reading was the probe's 32 KB array
+staying in L1, not headroom in production.
+
+### Staging the V convert block changes nothing, and is reverted
+
+`pfa_convert_kv_i8` reads V through `conv16` with a 256-element stride, so each
+16-position block issues sixteen 2-byte loads, one per cache line. Staging the 4 KB
+block into a thread-local buffer first looks like it should recover most of the
+1.04 s. Measured: **1.04 s -> 1.02 s**, noise. `conv` is bound by the max scan in
+`task_pfa_conv_max`, not by the convert's loads. The staged version also scored
+cosine 0.529916 and 15/64 top-1, so it was wrong as well as useless, and is
+reverted; the standing build is restored.
+
+### Where the prefill target stands
+
+| | s |
+|---|---|
+| GEMM | 29.17 |
+| attention | 15.35 |
+| quant | 2.60 |
+| misc | 2.62 |
+| add | 1.83 |
+| silu | 1.51 |
+| conv | 1.02 |
+| rope | 0.79 |
+| packq | 0.34 |
+| norm | 0.02 |
+| **total** | **52.77** |
+
+200 tok/s is a 50.0 s budget. The dot work is 44.5 s and every elementwise stage is
+within 1.3x of its own bandwidth; the three ways to remove the remaining 2.8 s --
+overlapping elementwise under GEMM, a faster quantiser, a faster KV convert -- are
+each measured and closed above. 188.4 tok/s is where this configuration lands.

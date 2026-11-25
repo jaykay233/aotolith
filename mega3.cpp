@@ -1221,6 +1221,10 @@ static void task_pf_quant(int tid) {
     const int64_t mg = g_qa_rows / 4;
     for (int64_t g = tid; g < mg; g += g_participants) pf_quant_band(g, g + 1);
 }
+// Per-phase quantiser cost and traffic, so a slow phase shows up as a low GB/s
+// instead of hiding inside one 2.56 s total.
+static double g_qa_t[4];
+static double g_qa_bytes[4];
 static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
     // One 4-row record per k block is 152 B: [4 x f32 a_scale][4 x i16 a_sum]
     // [4 x 32 int8]. The vendor asm advances A by 16+8+128, so 144 overlaps the
@@ -1237,9 +1241,13 @@ static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
     g_qa_rows = rows;
     g_qa_k = k;
     g_qa_j = j;
+    const double _t = now_s();
     if (g_elq) { int wa, wx; el_split(g_elq, &wa, &wx);
                  parallel_for_w(g_qa_rows / 4, pf_quant_band, wa, wx); }
     else run(task_pf_quant);
+    g_qa_t[j & 3] += now_s() - _t;
+    g_qa_bytes[j & 3] += (double) rows * (double) k * 4.0
+                       + (double) (rows / 4) * (double) g_pfa_rowstride;
 }
 
 // ------------------------------------------------------------------ int8 dot GEMM
@@ -6819,6 +6827,13 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     }
     printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
            t_norm, t_quant, t_silu, t_gemm, t_conv, t_packq, t_attn, t_misc);
+    {
+        static const char * qn[4] = { "qkv", "o", "gate+up", "down" };
+        for (int i = 0; i < 4; ++i)
+            if (g_qa_t[i] > 0)
+                printf("  quant %-8s %6.2f s  %6.1f GB/s\n",
+                       qn[i], g_qa_t[i], g_qa_bytes[i] / g_qa_t[i] / 1e9);
+    }
     printf("  detail: rope %.2f kvst %.2f add %.2f zero %.2f (s)\n", t_rope, t_kvst, t_add, t_zero);
     printf("    gemm split: qkv %.2f  o %.2f  gate+up %.2f  down %.2f (s)\n",
            t_gqkv, t_go, t_ggu, t_gd);
