@@ -1109,10 +1109,27 @@ were established by the probes above, so the dot work is 46.2 s of the 54.8 --
 216 tok/s would be the figure with all elementwise free.
 
 That reframes the target. 200 tok/s is a 50.0 s budget, so elementwise has to fit
-in 3.8 s where it now takes 8.6 s. The only stage with an obvious order-of-
-magnitude gap is the activation quantiser: it moves 5.16 G elements in 2.56 s
-across 8 cores, i.e. 0.14 elements per cycle per core against 32 lanes of e32, so
-it is running at well under one percent of the vector width. Everything else is within 2x of its bandwidth.
+in 3.8 s where it now takes 8.6 s.
+
+The activation quantiser looked like the place to find it and is not.
+`probe_quant.cpp` measures the vendor `quantize_a_4row_i8_hp` at 1277 M elem/s per
+core (K=2048) and 1244 (K=6144) against 121 for a hand-written RVV version, so the
+vendor code is ten times faster than the obvious rewrite. An earlier entry here
+claimed an order-of-magnitude gap from dividing its element count by its wall time
+and getting 252 M/s; that ignored its traffic. 5.16 G elements at 4 B in and 1.1 B
+out is 26 GB over 2.56 s, i.e. about 10 GB/s, which is why it is where it is. It
+is bandwidth bound already.
+
+The same probe settles the record layout question: the fp16 scales in an hp
+subblock are not max|row|/127 (256 of 256 differ), the int8 values differ from
+round(x/scale) by up to 127, and the 72-byte trailer's values reach 28046, so it
+is not a sum of 32 int8 in i16 either. Reimplementing it bit-exactly is not
+available by inspection, and it is not needed.
+
+conv is real work rather than handshake overhead, measured: on sixteen bands 1.12 s
+against 1.93 s on the A cluster alone, so the X100 half is doing 0.8 s of it. The
+per-element cost is f16->f32 widen, scale, round, clamp, narrow, on a strided read,
+not a data-movement anomaly. Everything else is within 2x of its bandwidth.
 
 Also measured and left alone: the X100 column split is already balanced to 0.79 s
 of idle across the four GEMM phases (qkv 0.19, o 0.38, gate+up 0.04, down 0.18),
