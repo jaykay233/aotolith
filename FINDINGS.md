@@ -1086,6 +1086,39 @@ so. Final standing on the same build:
 |---|---|---|---|
 | best verified | **57.58 s / 173.67 tok/s** | **0.977893** | **60/64** |
 
+### The 10K budget now adds up, and what is left is elementwise
+
+Full breakdown at 10K, chunk 2560, best verified build (54.59-55.0 s):
+
+| stage | s | what sets it |
+|---|---|---|
+| GEMM | 30.36 | 19.8 TMAC at the measured 652 GMAC/s aggregate (A 383 + X100 269) |
+| attention | 15.85 | QK 58.5 + PV 53.2 core-s over 8 = 587 GMAC/s of vmadot |
+| quant | 2.56 | vendor quantiser, 252 M elem/s/core, compute bound |
+| silu | 1.52 | ~20 GB/s |
+| add | 1.27 | ~32 GB/s, bandwidth bound |
+| conv | 1.12 | only 55 M elements, so overhead not data |
+| rope | 0.92 | ~8.4 GB/s |
+| norm | 0.90 | sixteen even bands |
+| packq | 0.34 | quantised Q for attention |
+| **total** | **54.84** | |
+
+Two of those are at a hard limit and should be read as fixed: GEMM at the IME2
+issue rate plus the X100's column share, and attention at the vmadot rate. Both
+were established by the probes above, so the dot work is 46.2 s of the 54.8 --
+216 tok/s would be the figure with all elementwise free.
+
+That reframes the target. 200 tok/s is a 50.0 s budget, so elementwise has to fit
+in 3.8 s where it now takes 8.6 s. The only stage with an obvious order-of-
+magnitude gap is the activation quantiser: it moves 5.16 G elements in 2.56 s,
+i.e. 0.07 elements per cycle per lane, where a vectorised form should run several
+per cycle. Everything else is within 2x of its bandwidth.
+
+Also measured and left alone: the X100 column split is already balanced to 0.79 s
+of idle across the four GEMM phases (qkv 0.19, o 0.38, gate+up 0.04, down 0.18),
+which is the ceiling on what rebalancing can return, and `per-phase pack` costs
+0.43 s because the same weights are repacked once per chunk.
+
 ### The score epilogue was the QK cost, and removing it is exact
 
 `qk4` left its eight int32 accumulators in memory: eight `vse32` into a thread

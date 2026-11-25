@@ -1883,6 +1883,10 @@ static void task_x8_pack_b(int tid) {
 }
 
 static double g_xt_pack, g_xt_run;
+// Per-phase copy/wait, so an unbalanced column split shows up as one cluster
+// idling rather than as a uniformly slow GEMM.
+static double g_xt_pack_p[4], g_xt_run_p[4];
+static int    g_xt_phase = 0;
 
 // The X100 A copy is written by the activation quantiser itself, so all this has
 // to do is size the buffers once and keep g_x_rowstride in step with the matrix
@@ -1935,6 +1939,7 @@ static void x100_prepare(const PfJob * js, int nj) {
         ++g_xjn;
     }
     g_xt_pack = now_s() - _tp;
+    g_xt_pack_p[g_xt_phase & 3] += g_xt_pack;
     for (int j = 0; j < 4; ++j) g_xchunk[j].store(0, std::memory_order_relaxed);
     g_xg_done.store(0, std::memory_order_relaxed);
     g_xg_gen.fetch_add(1, std::memory_order_release);
@@ -1944,6 +1949,7 @@ static void x100_wait(void) {
     const double _t = now_s();
     while (g_xg_done.load(std::memory_order_acquire) < g_x_nt) sched_yield();
     g_xt_run = now_s() - _t;
+    g_xt_run_p[g_xt_phase & 3] += g_xt_run;
 }
 
 // Sets the column split for one projection's jobs and prepares the X100 side.
@@ -1951,6 +1957,7 @@ static void x100_wait(void) {
 // same matrices; a null entry disables the offload for that job rather than
 // silently reading the wrong blob.
 static void x100_begin(int phase, PfJob * js, int nj, const uint8_t * const * srcs) {
+    g_xt_phase = phase;
     const int pct = g_xpct_explicit ? g_x100_pct : g_x100_pct_tab[phase & 3];
     for (int j = 0; j < nj; ++j) {
         if (!srcs[j]) { g_x100 = 0; fprintf(stderr, "x100: no int8 copy for job %d\n", j); return; }
@@ -6767,8 +6774,14 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     printf("  detail: rope %.2f kvst %.2f add %.2f zero %.2f (s)\n", t_rope, t_kvst, t_add, t_zero);
     printf("    gemm split: qkv %.2f  o %.2f  gate+up %.2f  down %.2f (s)\n",
            t_gqkv, t_go, t_ggu, t_gd);
-    if (g_x100) printf("    x100 last: pack %.3f ms, wait %.3f ms\n",
-                       g_xt_pack * 1e3, g_xt_run * 1e3);
+    if (g_x100) {
+        static const char * pn[4] = { "qkv", "o", "gate+up", "down" };
+        printf("    x100 last: pack %.3f ms, wait %.3f ms\n",
+               g_xt_pack * 1e3, g_xt_run * 1e3);
+        for (int i = 0; i < 4; ++i)
+            printf("    x100 %-8s pack %6.2f s  wait %6.2f s\n",
+                   pn[i], g_xt_pack_p[i], g_xt_run_p[i]);
+    }
     return export_kv(npref);
 }
 
