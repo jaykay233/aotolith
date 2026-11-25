@@ -730,6 +730,7 @@ static const int64_t KV_LAYER_STRIDE = (int64_t) N_KV * HEAD_DIM * MAXCTX;   // 
 // debug path keep using g_vpos. Same values, different order, so the arithmetic
 // is unchanged.
 static _Float16 * g_vpv;
+static int g_qksame = 0;    // MEGA_QKSAME=1: always read tile 0, to split issue from memory
 static int g_vpo = 1;          // MEGA_VPO=0 falls back to the pos-major read
 static inline int vpo_on(void) { return g_vpo; }
 static inline int64_t vf16o(int kv, int half, int64_t pos) {
@@ -742,6 +743,20 @@ static inline int64_t vf16o(int kv, int half, int64_t pos) {
 static const int KT = 32;
 static const int NKT = (MAXCTX + KT - 1) / KT;
 static const int64_t K_LAYER_STRIDE = (int64_t) N_KV * NKT * HEAD_DIM * KT;
+// A second f16 K copy tiled 64 positions wide instead of 32, for decode QK only.
+// qkprobe runs the real inner-loop shape both ways with data in L1: the two take
+// identical time per iteration (3.498 s), so the loop is dominated by the fixed
+// cost of four loads, four widening converts and 32 broadcast scalars. Doubling
+// the lanes is free and doubles the MACs per iteration, 18.74 -> 37.47 GMAC/s.
+// Prefill keeps the 32-wide tiles; only decode reads this copy.
+static const int KT64 = 64;
+static const int NKT64 = (MAXCTX + KT64 - 1) / KT64;
+static const int64_t K64_LAYER_STRIDE = (int64_t) N_KV * NKT64 * HEAD_DIM * KT64;
+static _Float16 * g_k64;
+static int g_k64on = 0;
+static inline _Float16 * k64tile(int layer, int kv, int pblk) {
+    return g_k64 + (int64_t) layer * K64_LAYER_STRIDE + (((int64_t) kv * NKT64 + pblk) * HEAD_DIM) * KT64;
+}
 static inline _Float16 * ktile(int layer, int kv, int pblk) {
     return g_kdim + (int64_t) layer * K_LAYER_STRIDE + (((int64_t) kv * NKT + pblk) * HEAD_DIM) * KT;
 }
@@ -2140,13 +2155,16 @@ static int g_attn4 = 0;
 
 static void attn_ranges(void) {
     const int nb = g_pos + 1;
-    const int lo = (g_win > 0 && nb > g_win) ? ((nb - g_win) / KT) * KT : 0;
-    const int nt = (nb - lo + KT - 1) / KT;
+    // QK reads whole tiles from position 0 of each, so a thread's range must start
+    // on a tile boundary. Which boundary depends on the tile width in use.
+    const int st = (g_k64on && !g_k8dec) ? KT64 : KT;
+    const int lo = (g_win > 0 && nb > g_win) ? ((nb - g_win) / st) * st : 0;
+    const int nt = (nb - lo + st - 1) / st;
     const int per = (nt + g_participants - 1) / g_participants;
     for (int t = 0; t < g_participants; ++t) {
         const int t0 = per * t, t1 = (t == g_participants - 1) ? nt : per * (t + 1);
-        g_p0[t] = lo + ((t0 * KT > nb - lo) ? nb - lo : t0 * KT);
-        g_p1[t] = lo + ((t1 * KT > nb - lo) ? nb - lo : t1 * KT);
+        g_p0[t] = lo + ((t0 * st > nb - lo) ? nb - lo : t0 * st);
+        g_p1[t] = lo + ((t1 * st > nb - lo) ? nb - lo : t1 * st);
     }
 }
 
@@ -2204,6 +2222,18 @@ static void task_argmax(int tid) {
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 2], k2, vl); \
     a##H = __riscv_vfmacc_vf_f32m1(a##H, qb[(H) * HEAD_DIM + d + 3], k3, vl);
 
+#define QK_ACC2(H) \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 0], k0, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 1], k1, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 2], k2, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 3], k3, vl);
+
+#define QK_ACC2(H) \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 0], k0, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 1], k1, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 2], k2, vl); \
+    b##H = __riscv_vfmacc_vf_f32m2(b##H, qb[(H) * HEAD_DIM + d + 3], k3, vl);
+
 // 32 int8 lanes -> 32 f32 lanes. e8mf4 holds exactly the bytes a 32-lane f32m1
 // result consumes, so the load needs no masking and the widening is in-register.
 static inline vfloat32m1_t ld_i8_f32(const int8_t * p, size_t vl) {
@@ -2218,10 +2248,74 @@ static void attn_qk(int tid) {
     const double _w = now_s();
     float * sa = &g_sa[tid][0][0];
     const int len = p1 - p0;
+    if (g_k64on && !g_k8dec) {
+        // 64 positions per tile: four loads, four converts and 32 broadcast scalars
+        // now cover twice the MACs. Same dim order per position, so the scores are
+        // identical bit for bit.
+        for (int kv = 0; kv < N_KV; ++kv) {
+            const float * qb = g_q + (int64_t) kv * NH_PER_KV * HEAD_DIM;
+            for (int pb = 0; pb < len; pb += KT64) {
+                const _Float16 * kb = k64tile(g_layer, kv, (p0 + pb) / KT64);
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (len - pb < KT64 ? len - pb : KT64));
+                vfloat32m2_t b0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+                vfloat32m2_t b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0, b6 = b0, b7 = b0;
+                for (int d = 0; d < HEAD_DIM; d += 4) {
+                    vfloat32m2_t k0 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 0) * KT64, vl), vl);
+                    vfloat32m2_t k1 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 1) * KT64, vl), vl);
+                    vfloat32m2_t k2 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 2) * KT64, vl), vl);
+                    vfloat32m2_t k3 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 3) * KT64, vl), vl);
+                    QK_ACC2(0) QK_ACC2(1) QK_ACC2(2) QK_ACC2(3)
+                    QK_ACC2(4) QK_ACC2(5) QK_ACC2(6) QK_ACC2(7)
+                }
+                const int64_t base = (int64_t) kv * NH_PER_KV * SMAX + pb;
+                __riscv_vse32_v_f32m2(sa + base + 0 * SMAX, b0, vl);
+                __riscv_vse32_v_f32m2(sa + base + 1 * SMAX, b1, vl);
+                __riscv_vse32_v_f32m2(sa + base + 2 * SMAX, b2, vl);
+                __riscv_vse32_v_f32m2(sa + base + 3 * SMAX, b3, vl);
+                __riscv_vse32_v_f32m2(sa + base + 4 * SMAX, b4, vl);
+                __riscv_vse32_v_f32m2(sa + base + 5 * SMAX, b5, vl);
+                __riscv_vse32_v_f32m2(sa + base + 6 * SMAX, b6, vl);
+                __riscv_vse32_v_f32m2(sa + base + 7 * SMAX, b7, vl);
+            }
+        }
+    }
+    else {
+    if (g_k64on && !g_k8dec) {
+        // 64 positions per tile: four loads, four converts and 32 broadcast scalars
+        // now cover twice the MACs. Same dim order per position, so the scores are
+        // identical bit for bit.
+        for (int kv = 0; kv < N_KV; ++kv) {
+            const float * qb = g_q + (int64_t) kv * NH_PER_KV * HEAD_DIM;
+            for (int pb = 0; pb < len; pb += KT64) {
+                const _Float16 * kb = k64tile(g_layer, kv, (p0 + pb) / KT64);
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (len - pb < KT64 ? len - pb : KT64));
+                vfloat32m2_t b0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+                vfloat32m2_t b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0, b6 = b0, b7 = b0;
+                for (int d = 0; d < HEAD_DIM; d += 4) {
+                    vfloat32m2_t k0 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 0) * KT64, vl), vl);
+                    vfloat32m2_t k1 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 1) * KT64, vl), vl);
+                    vfloat32m2_t k2 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 2) * KT64, vl), vl);
+                    vfloat32m2_t k3 = __riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(kb + (int64_t) (d + 3) * KT64, vl), vl);
+                    QK_ACC2(0) QK_ACC2(1) QK_ACC2(2) QK_ACC2(3)
+                    QK_ACC2(4) QK_ACC2(5) QK_ACC2(6) QK_ACC2(7)
+                }
+                const int64_t base = (int64_t) kv * NH_PER_KV * SMAX + pb;
+                __riscv_vse32_v_f32m2(sa + base + 0 * SMAX, b0, vl);
+                __riscv_vse32_v_f32m2(sa + base + 1 * SMAX, b1, vl);
+                __riscv_vse32_v_f32m2(sa + base + 2 * SMAX, b2, vl);
+                __riscv_vse32_v_f32m2(sa + base + 3 * SMAX, b3, vl);
+                __riscv_vse32_v_f32m2(sa + base + 4 * SMAX, b4, vl);
+                __riscv_vse32_v_f32m2(sa + base + 5 * SMAX, b5, vl);
+                __riscv_vse32_v_f32m2(sa + base + 6 * SMAX, b6, vl);
+                __riscv_vse32_v_f32m2(sa + base + 7 * SMAX, b7, vl);
+            }
+        }
+    }
+    else {
     for (int kv = 0; kv < N_KV; ++kv) {
         const float * qb = g_q + (int64_t) kv * NH_PER_KV * HEAD_DIM;
         for (int pb = 0; pb < len; pb += KT) {
-            const _Float16 * kb = ktile(g_layer, kv, (p0 + pb) / KT);
+            const _Float16 * kb = ktile(g_layer, kv, g_qksame ? 0 : (p0 + pb) / KT);
             const int8_t * kb8 = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE +
                                  (((int64_t) kv * NKT + (p0 + pb) / KT) * HEAD_DIM) * KT;
             const size_t vl = __riscv_vsetvl_e32m1((size_t) (len - pb < KT ? len - pb : KT));
@@ -2256,6 +2350,8 @@ static void attn_qk(int tid) {
             __riscv_vse32_v_f32m1(sa + base + 6 * SMAX, a6, vl);
             __riscv_vse32_v_f32m1(sa + base + 7 * SMAX, a7, vl);
         }
+    }
+    }
     }
     for (int h = 0; h < N_HEAD; ++h) {
         const float * row = sa + (int64_t) h * SMAX;
@@ -2733,6 +2829,11 @@ static void rope_all(void) {
             }
         }
         for (int d = 0; d < HEAD_DIM; ++d) kb[(int64_t) d * KT + pi] = (_Float16) g_k[kv * HEAD_DIM + d];
+        if (g_k64on) {
+            _Float16 * k6 = k64tile(g_layer, kv, g_pos / KT64);
+            const int pi6 = g_pos % KT64;
+            for (int d = 0; d < HEAD_DIM; ++d) k6[(int64_t) d * KT64 + pi6] = (_Float16) g_k[kv * HEAD_DIM + d];
+        }
         // Two stores of the same values: pos-major for every other reader, PV order
         // for the PV stream. 128 bytes each, so the extra store is a rounding error
         // next to the layer's GEMM.
@@ -6129,6 +6230,32 @@ static void build_vpv_band(int64_t lo, int64_t hi) {
         }
     }
 }
+// One band item is one (64-position block, dim): copy the same 64 positions out of
+// the two adjacent 32-wide tiles. Both sides are 64 contiguous bytes.
+static int64_t g_k64_nblk = 0;
+static void build_k64_band(int64_t lo, int64_t hi) {
+    const int L = g_layer;
+    for (int64_t x = lo; x < hi; ++x) {
+        // Blocks in use, not NKT64: the prefix usually ends mid-tile, and keying on
+        // NKT64 would run past the last real block of kv 0 and skip the tail of kv 1.
+        const int kv = (int) (x / (g_k64_nblk * HEAD_DIM));
+        const int64_t r = x % (g_k64_nblk * HEAD_DIM);
+        const int pb = (int) (r / HEAD_DIM), d = (int) (r % HEAD_DIM);
+        const _Float16 * s0 = ktile(L, kv, pb * 2) + d * KT;
+        const _Float16 * s1 = ktile(L, kv, pb * 2 + 1) + d * KT;
+        _Float16 * dst = k64tile(L, kv, pb) + d * KT64;
+        __riscv_vse16_v_f16mf2(dst, __riscv_vle16_v_f16mf2(s0, 32), 32);
+        __riscv_vse16_v_f16mf2(dst + 32, __riscv_vle16_v_f16mf2(s1, 32), 32);
+    }
+}
+static void build_k64(int64_t npos) {
+    g_k64_nblk = (npos + KT64 - 1) / KT64;
+    for (int L = 0; L < N_LAYER; ++L) {
+        g_layer = L;
+        parallel_for(g_k64_nblk * N_KV * HEAD_DIM, build_k64_band);
+    }
+}
+
 static void build_vpv_order(int64_t npos) {
     for (int L = 0; L < N_LAYER; ++L) {
         g_layer = L;
@@ -7604,6 +7731,8 @@ int main(int argc, char ** argv) {
     exp3_init();
     if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
     { const char * e = getenv("MEGA_VPO"); g_vpo = (e && *e == '0') ? 0 : 1; }
+    if (getenv("MEGA_QKSAME")) g_qksame = 1;
+    { const char * e = getenv("MEGA_K64"); g_k64on = (e && *e != '0') ? 1 : 0; }
     const char * path = work_path("mc-q4o.gguf");
     int ngen = 16, prompt = 1;
     int64_t pos0 = 0;                 // first decode position (prompt length with -F)
@@ -8068,6 +8197,18 @@ int main(int argc, char ** argv) {
     // The PV-order copy is allocated only now: prefill scratch has been released, so
     // the 264 MB never overlaps the prefill working set (the int8 weight copy and the
     // per-chunk row buffers) and cannot change prefill's memory behaviour.
+    if (g_k64on && !g_k64) {
+        const double _k = now_s();
+        g_k64 = (_Float16 *) hugemem(kbytes);
+        if (!g_k64) { g_k64on = 0; }
+        else {
+            use_huge(g_k64, kbytes);
+            if (pos0 > 0) build_k64(pos0);
+            huge_collapse(g_k64, kbytes);
+            printf("k order: 64-wide K tile built for %lld positions in %.3f s\n",
+                   (long long) pos0, now_s() - _k);
+        }
+    }
     if (vpo_on() && !g_vpv) {
         const double _vp = now_s();
         g_vpv = (_Float16 *) hugemem(vbytes);

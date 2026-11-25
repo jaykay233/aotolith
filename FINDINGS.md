@@ -1882,3 +1882,68 @@ scheduling change but a different K tile width: KT=32 means each K load is 64
 bytes, and widening the tile to 64 would make every load a full 128-byte line and
 halve the q broadcasts per MAC at the same time. That changes the K layout, the
 per-token append and the prefill store, so it is a separate piece of work.
+
+## Decode QK: 64 positions per K tile
+
+The previous section left QK at 18.0 ms and named a 64-wide K tile as the next
+thing to try. Three measurements decided it, and the first one inverted the
+question.
+
+**QK is not memory bound.** Pointing every position block at tile 0, so the whole
+K stream is one 8 KB tile resident in L1, changes nothing:
+
+| | qk |
+|---|---|
+| real tiles | 17.605 / 17.529 ms |
+| tile 0 every time | 17.584 / 17.562 ms |
+
+215 MB of K per token is fully hidden behind the arithmetic. That removed layout,
+prefetch and load-width as explanations and left instruction issue.
+
+**A wider LMUL is free, not faster.** `fmaprobe` runs the same 8-accumulator loop
+at f32m1 and f32m2 with nothing else live: 70.10 and 70.22 GMAC/s. The vector
+unit's throughput is per MAC, so m2 does not shorten an FMA -- but it also does
+not cost anything.
+
+**What a wider tile actually buys.** `qkprobe` runs the real QK inner loop (four
+K loads, four widening converts, 32 FMA and 32 broadcast scalars per group of four
+dims) at both tile widths, data in L1:
+
+| tile | time | MACs | rate |
+|---|---|---|---|
+| KT=32 | 3.498 s | 1.07 G | 18.74 GMAC/s |
+| KT=64 | 3.498 s | 2.15 G | 37.47 GMAC/s |
+
+Identical wall time. The loop is dominated by the fixed per-iteration cost, so
+doubling the lanes doubles the MACs for free. This is why PV's m2 lost while QK's
+should win: PV is stream limited and has nothing to amortise, QK is issue limited
+and everything to amortise.
+
+Implemented as a second f16 K copy tiled 64 wide, built in 0.050 s after prefill,
+freeing prefill from any change to the shared 32-wide cache:
+
+- `build_k64` merges each pair of adjacent 32-wide tiles; one band item is one
+  (block, dim) and both sides are 64 contiguous bytes.
+- Thread position ranges now split on the tile width in use, because QK reads a
+  tile from its position 0.
+- The per-token append writes the new position to both tilings.
+- Only decode QK reads the 64-wide copy; `-K8` still takes the 32-wide path.
+
+| | qk | decode at 10K |
+|---|---|---|
+| 32-wide | 17.96 / 17.89 ms | 10.88 / 10.90 tok/s |
+| 64-wide | 14.53 / 14.46 ms | 11.16 / 11.15 tok/s |
+
+Bit-exact again: md5 `46ee3c9b108fb40ee63678f632e1b465`, cosine 0.977316, top-1
+60/64. The gain is 19%, not the 2x the loop-shape probe implied, so the remaining
+4.5 ms is not the dot loop -- it is the score stores, the per-head max pass and
+the partial last block.
+
+One bug worth recording: the builder first enumerated blocks against `NKT64`
+instead of the number of blocks actually in use. A 9999-position prefix ends
+mid-tile, so that walked past the last real block of kv 0 and never built the tail
+of kv 1. Cosine came back 0.648. Two things to note about how it surfaced -- the
+timings looked fine, and the second flag bug hid the A/B that would have caught
+it: `getenv("MEGA_K64")` returns the string `"0"`, which is truthy, so both arms
+of the first A/B ran the new path and both read `qk 14.4`. Flags that can be
+switched off must compare the value, not test for presence.
