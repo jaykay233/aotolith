@@ -1649,3 +1649,37 @@ So the remaining decode gap is not a prefetch-distance problem, and the two leve
 that would actually move the bytes -- int8 KV (needs per-position scales first, see
 above) and coarser weights (breaks accuracy, cosine 0.44) -- are both blocked on
 numerics rather than on kernel work.
+### int8 KV costs 0.04 cosine and per-position scales are not where it goes
+
+With the half-addressing bug fixed, int8 KV sits at cosine 0.9121 and step 0 is
+already 0.9394 against the f16 path's 0.9821. It is not compounding error; the
+quantised prefix is simply read less accurately from the first token.
+
+The obvious suspect was the scale granularity: `g_v8dsc[layer][kv]` is one absmax
+over 128 dims times every position of the prefix, i.e. 1.28M values sharing one
+grid. So V was given a scale per 64-byte block -- position-local, 64 dims each,
+no history rewrite needed, and folded into the softmax weights inside PV so it
+costs eight scalar multiplies per position instead of vector work:
+
+| `-K8`, 64 tokens at 10K | cosine | top-1 | attn |
+|---|---|---|---|
+| one scale per head | 0.9121 | 55/64 | 35.9 ms |
+| one scale per 64-dim block | 0.9078 | 54/64 | 37.7 ms |
+
+**No improvement, and slightly slower** (the per-block absmax costs a second pass
+over the block). So V's error is not a granularity problem: within a head, V is
+already close to uniform in magnitude, so the global scale was near-optimal. It
+is reverted.
+
+That leaves K, and K cannot be fixed the same way. V's scale multiplies the
+output, so a per-position scale folds into the weight for free. K's scale enters
+`exp(S*ks - max)` *before* the softmax, so a per-position scale becomes a
+per-position vector multiply and a per-position max in the hottest loop. It would
+also barely help: the error term is `(max_k / k_rms) / 254`, and that ratio is
+about 4 both within one position and across the whole prefix, so position-local
+scales leave it unchanged. What would actually cut it is a scale per 32 dims --
+and that breaks the single vmadot accumulation that makes the QK dot fast in the
+first place.
+
+So int8 KV buys 10.01 -> 10.7 tok/s, about 5 percent, for cosine 0.977 -> 0.91.
+By default it stays off.
