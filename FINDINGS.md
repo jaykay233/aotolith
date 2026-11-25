@@ -1477,3 +1477,52 @@ f16 max-scan plus convert. The earlier idea of converting only new positions is
 already recorded as a numerics change: it rescales the prefix when a new maximum
 appears, which moves greedy output (11127 against 5 at 10K), so the full rewrite
 is what keeps the dump bit-exact.
+### Residual add + rmsnorm + quantisation as one pass: 1.48 s
+
+`add_then_rmsnorm` kept the summed row in a thread-local buffer so the norm did
+not have to read the residual stream back from DRAM. The norm's own **output**
+was still written out and read straight back, because `pf_quant` runs on it
+immediately and nothing else ever reads it. That is 8 KB per row written and
+8 KB read again, 9999 rows, twice per layer (FFN norm and next layer's attention
+norm).
+
+The three are now one pass over each four-row group. The summed row goes into a
+staged buffer (`4 x 2048` floats, 32 KB, L2-resident like the silu fusion's
+96 KB), the norm scales it in place, and both quantisers read it from there. What
+leaves the core is the record, not the f32 activations.
+
+Bit-exactness is structural, not lucky: the add is the same `vfadd`, the sum of
+squares accumulates over `i` in the same double, the scale is the same
+`x*rn*w` association, and the quantisers see the same f32 values in the same
+`[4][N_EMBD]` order. The running `vfmax` for the X100 copy is order-free and
+matches the separate `vfredmax` reduce it replaces.
+
+| two interleaved pairs | three passes | fused |
+|---|---|---|
+| prefill | 53.096 / 53.709 s | 52.087 / 51.755 s |
+| mean | 53.40 s | **51.92 s** |
+
+Worth 1.48 s, both rounds in the same direction. `MEGA_ATRQ=0` restores the
+three-pass path. Verified on the fused run: logit md5
+`ac0a0fbd89d13ad4757be8b17b8189df`, cosine 0.977893, top-1 60/64.
+
+#### The X100 A copy has to be built in one register's worth of elements
+
+The first attempt scored cosine 0.62 despite the A100 records being byte-exact.
+The `MEGA_ATRQ=2` bisect (fuse the A100 record, leave the X100 copy on the old
+path) restored the golden md5 and left all twelve dump files identical, which
+put the fault inside `x8_quant_stage`. Dumping its output showed every four-row
+group at index 320 and above with the **second** 32-byte half of each 64-byte
+block zero, and the first 320 groups correct.
+
+The cause is the loop it inherited from `x100_quant_a`: sixteen elements per step
+through an `e8mf4` store, which is eight lanes on this core. Half the source
+elements therefore had no lane to land in. The rewrite steps eight elements at a
+time, so every load, conversion and store is a single register:
+
+```
+(x[i/16])*64 + r*8 + ((i%16) >= 8)*32 + (i%8)
+```
+
+The record layout is unchanged, and the copy now matches the pre-existing
+`x100_quant_a` byte for byte.

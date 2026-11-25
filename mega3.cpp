@@ -6370,7 +6370,13 @@ static void silu_mul_quant_band(int64_t lo, int64_t hi) {
 // cluster's kernel reads. Same arithmetic as task_x8_quant, which does the whole
 // tensor from DRAM.
 static void x8_quant_stage(const float * st, int64_t k, int64_t g, const float * rowmax) {
-    const int64_t kst = k / 16;
+    // Eight elements per step, one register wide on this core (e32m1 = 8 lanes at
+    // VLEN=256), so every conversion and every store is a single-register
+    // operation. The sixteen-wide form this replaced asked vncvt and vslidedown
+    // for a two-register group while declaring an mf4 type; the record layout here
+    // is the same either way, since element i of a row lands at
+    // (i/16)*64 + r*8 + ((i%16) >= 8)*32 + (i%8) in both.
+    const int64_t n8 = k / 8;
     int8_t * xbase = g_a8x + g * g_x_rowstride;
     float rowsc[4];
     for (int r = 0; r < 4; ++r) {
@@ -6380,20 +6386,16 @@ static void x8_quant_stage(const float * st, int64_t k, int64_t g, const float *
     for (int r = 0; r < 4; ++r) {
         const float * a = st + r * k;
         const float xr = 1.0f / rowsc[r];
-        for (int64_t t = 0; t < kst; ++t) {
-            const size_t vl = __riscv_vsetvl_e32m1(16);
-            vfloat32m1_t v = __riscv_vle32_v_f32m1(a + t * 16, vl);
+        int8_t * xo = xbase + r * 8;
+        for (int64_t u = 0; u < n8; ++u) {
+            const size_t vl = __riscv_vsetvl_e32m1(8);
+            const vfloat32m1_t v = __riscv_vle32_v_f32m1(a + u * 8, vl);
             vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(__riscv_vfmul_vf_f32m1(v, xr, vl), vl);
             q = __riscv_vmax_vx_i32m1(q, -127, vl);
             q = __riscv_vmin_vx_i32m1(q, 127, vl);
             const vint8mf4_t b8 =
                 __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl);
-            const size_t v8 = __riscv_vsetvl_e8mf4(8);
-            int8_t * xo = xbase + t * 64 + r * 8;
-            __riscv_vse8_v_i8mf4(xo, b8, v8);
-            __riscv_vse8_v_i8mf4(xo + 32,
-                __riscv_vslidedown_vx_i8mf4(b8, 8, (size_t) 16), v8);
-            __riscv_vsetvl_e32m1(16);
+            __riscv_vse8_v_i8mf4(xo + (u >> 1) * 64 + (u & 1) * 32, b8, vl);
         }
     }
 }
@@ -6530,6 +6532,96 @@ static void atr_band(int64_t lo, int64_t hi) {
         rms_scale(t, dst, w, N_EMBD, rn);
     }
 }
+// Residual add, the rmsnorm over it, and the activation quantisation of the
+// norm's output, in one pass over each four-row group.
+//
+// The norm's f32 output used to go to DRAM and be read straight back by the
+// quantiser -- nothing else ever reads it. Keeping the four rows in a per-thread
+// buffer instead (4 x 8 KB, resident in the 4 MB L2 the way the silu fusion's
+// 96 KB was) removes 16 KB of the 32 KB each row costs. The records are the only
+// thing that still leaves the core.
+//
+// Bit-exact: the add is the same vfadd, the sum accumulates over i in the same
+// double, the scale is the same x*rn*w association, and both quantisers see the
+// same f32 values in the same [4][N_EMBD] order. Only the address changes.
+static void add_then_rmsnorm(float * res, const float * src, float * dst,
+                             const float * w, int64_t rows);
+static float * atr_q_res;
+static const float * atr_q_src, * atr_q_w;
+static int64_t atr_q_rows, atr_q_j;
+static int g_atrq = -1;
+static bool atrq_on(int64_t rows) {
+    if (g_atrq < 0) { const char * e = getenv("MEGA_ATRQ"); g_atrq = e ? atoi(e) : 1; }
+    return g_atr && g_atrq && g_pf_vendor == 2 && (rows % 4 == 0)
+           && !getenv("MEGA_DUMP") && !getenv("MEGA_PROBE_REF");
+}
+static void atr_quant_band(int64_t lo, int64_t hi) {
+    static __thread float stage[4 * N_EMBD] __attribute__((aligned(64)));
+    const float * w = atr_q_w;
+    const int64_t j = atr_q_j, rows = atr_q_rows;
+    for (int64_t g = lo; g < hi; ++g) {
+        float rowmax[4];
+        for (int r = 0; r < 4; ++r) {
+            const int64_t row = g * 4 + r;
+            float * res = atr_q_res + row * N_EMBD;
+            const float * s = atr_q_src + row * N_EMBD;
+            float * d = stage + r * N_EMBD;
+            for (int i = 0; i < N_EMBD; ) {
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_EMBD - i));
+                const vfloat32m2_t v = __riscv_vfadd_vv_f32m2(
+                    __riscv_vle32_v_f32m2(res + i, vl), __riscv_vle32_v_f32m2(s + i, vl), vl);
+                __riscv_vse32_v_f32m2(res + i, v, vl);   // residual stream, as add_rows left it
+                __riscv_vse32_v_f32m2(d + i, v, vl);     // same row, staged for the norm
+                i += (int) vl;
+            }
+            const float rn = rms_inv(g_atr_fsum ? ss_vdouble(d, N_EMBD)
+                                                : ss_scalar(d, N_EMBD), N_EMBD);
+            // Same two multiplies as rms_scale, plus the running max the X100 copy
+            // needs. The max is exact and order-free, so it matches the separate
+            // reduce in task_x8_quant.
+            const size_t vl0 = __riscv_vsetvl_e32m2((size_t) N_EMBD);
+            vfloat32m2_t mxv = __riscv_vfmv_v_f_f32m2(0.0f, vl0);
+            for (int i = 0; i < N_EMBD; ) {
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_EMBD - i));
+                vfloat32m2_t v = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(d + i, vl), rn, vl);
+                v = __riscv_vfmul_vv_f32m2(v, __riscv_vle32_v_f32m2(w + i, vl), vl);
+                __riscv_vse32_v_f32m2(d + i, v, vl);
+                mxv = __riscv_vfmax_vv_f32m2(mxv, __riscv_vfabs_v_f32m2(v, vl), vl);
+                i += (int) vl;
+            }
+            rowmax[r] = __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredmax_vs_f32m2_f32m1(mxv, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl0));
+        }
+        uint8_t * dst = (uint8_t *) (g_pfa + (j * (rows / 4) + g) * g_pfa_rowstride);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, stage, (size_t) N_EMBD, dst);
+        // The X100 cluster's A copy is built from the same staged rows; skipping it
+        // is what made the fused silu path score 0.04 cosine with bit-exact A100 records.
+        if (g_x8_want) x8_quant_stage(stage, N_EMBD, g, rowmax);
+    }
+}
+static void add_then_rmsnorm_quant(float * res, const float * src, float * dst,
+                                   const float * w, int64_t rows, int64_t j) {
+    if (!atrq_on(rows)) {
+        add_then_rmsnorm(res, src, dst, w, rows);
+        const int xw = g_x8_want;
+        g_x8_want = g_x100;
+        pf_quant(dst, rows, N_EMBD, j);
+        g_x8_want = xw;
+        return;
+    }
+    atr_q_res = res; atr_q_src = src; atr_q_w = w; atr_q_rows = rows; atr_q_j = j;
+    g_pfa_rowstride = (N_EMBD / 256) * 1160;
+    if (g_x8_want) g_x_rowstride = 4 * N_EMBD;
+    const double _t = now_s();
+    if (g_eln) { int wa, wx; el_split(g_eln, &wa, &wx);
+                 parallel_for_w(rows / 4, atr_quant_band, wa, wx); }
+    else parallel_for(rows / 4, atr_quant_band);
+    g_qa_t[j & 3] += now_s() - _t;
+    // Only the records cross the bus now, so this phase's GB/s rises by the f32
+    // round trip it no longer makes.
+    g_qa_bytes[j & 3] += (double) (rows / 4) * (double) g_pfa_rowstride;
+}
+
 static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows);
 static void add_then_rmsnorm(float * res, const float * src, float * dst,
                              const float * w, int64_t rows) {
@@ -6744,11 +6836,14 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             // Layer L's attention norm is computed by layer L-1's fused residual
             // add, so this only runs for the first layer of a chunk (and for the
             // fallback path when the fusion is off).
-            if (L == 0 || !g_atr) rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
+            // With the quantisation fused into the add, layer L-1 already left both
+            // the norm and the records for this layer's qkv GEMM.
+            const bool atrq = atrq_on(C);
+            if (L == 0 || !atrq) rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
             t_norm+=now_s()-_a; _a=now_s();
             g_x8_want = g_x100;
             g_pfa_jslot[1] = g_pfa_jslot[2] = 0;
-            pf_quant(g_pfxa, C, N_EMBD, 0);
+            if (L == 0 || !atrq) pf_quant(g_pfxa, C, N_EMBD, 0);
             g_x8_want = 0;
             t_quant+=now_s()-_a; _a=now_s();
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
@@ -6919,15 +7014,14 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
             { double _ad=now_s();
-              add_then_rmsnorm(g_pfx, g_pfxa, g_pfxa, g_ffn_norm[L], C);
+              g_x8_want = g_x100;
+              g_pfa_jslot[1] = 0;
+              add_then_rmsnorm_quant(g_pfx, g_pfxa, g_pfxa, g_ffn_norm[L], C, 0);
+              g_x8_want = 0;
               t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'a', g_pfx + (int64_t) (cm - 1) * N_EMBD);
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'n', g_pfxa + (int64_t) (cm - 1) * N_EMBD);
-            g_x8_want = g_x100;
-            g_pfa_jslot[1] = 0;
-            pf_quant(g_pfxa, C, N_EMBD, 0);
-            g_x8_want = 0;
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 2;
             g_pfj[0] = { g_pf_vendor ? g_wg[L].b : g_wg[L].b8, g_wg[L].k, g_wg[L].n, g_pfgate, N_FF, 0 };
@@ -7002,9 +7096,11 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 down: %.5f %.5f %.5f\n",
                                                        g_pfxa[0], g_pfxa[1], g_pfxa[2]);
             { double _ad=now_s();
-              if (L + 1 < N_LAYER)
-                  add_then_rmsnorm(g_pfx, g_pfxa, g_pfxa, g_attn_norm[L + 1], C);
-              else
+              if (L + 1 < N_LAYER) {
+                  g_x8_want = g_x100;
+                  add_then_rmsnorm_quant(g_pfx, g_pfxa, g_pfxa, g_attn_norm[L + 1], C, 0);
+                  g_x8_want = 0;
+              } else
                   add_rows(g_pfx, g_pfxa, C);
               t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
