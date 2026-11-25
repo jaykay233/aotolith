@@ -1437,3 +1437,43 @@ so any index table for that cluster has to be built from its own VLMAX; and this
 toolchain's `riscv_vector.h` has no `vcreate`, so assembling a fractional-LMUL tile
 has to go through assembly. Also `vslideup`/`vslidedown` need `.vi` for an immediate;
 `.vx` is rejected.
+
+### The RMSNorm scale vectorises for 0.61 s, and the sum does not
+
+Both RMSNorm sites (`atr_band` and `rn_rows_band`) did two scalar loops per row: a
+dependent `double` chain of N_EMBD adds for the sum of squares, then a scalar
+`dst[i] = t[i] * rn * w[i]`. The second loop is element-wise, and the two
+multiplies are the same operations in the same order as the scalar version, so
+vectorising it is exact: verified `md5 ac0a0fbd...`, cosine 0.977893, 60/64.
+
+The sum is a different question, and the answer is no. It is serial within the
+row, so no number of bands shortens it. `-FSUM` offers a vector-double form
+(`vfwcvt` to f64, `vfmadd`, one `vfredusum`) and it measured **slower**:
+
+| two interleaved pairs | scalar scale | vector scale |
+|---|---|---|
+| prefill | 52.845 / 53.127 s | 52.393 / 52.355 s |
+| mean | 52.986 s | **52.374 s** |
+
+f64m2 is eight lanes on this VLEN, so the accumulate is eight elements per
+instruction and the `vfredusum` costs more than it saves. It stays scalar, which
+also keeps the sum bit-identical to what the reference used.
+
+The vectorised scale is worth 0.61 s, and unlike the fusion above it is outside
+the run-to-run spread: both vector runs are below both scalar runs, in order.
+
+### The `conv` cost is 42 layers of real work, not a broken access pattern
+
+`conv` is 1.02-1.17 s and only moves about 1 GB, so it looked like a bad access
+shape. `MEGA_TIME=1` prints the two halves per layer:
+
+```
+  conv L0: max 0.001 s, quant 0.004 s
+  conv L1..L40: max 0.001 s, quant 0.002 s
+```
+
+Per layer it is milliseconds, so the total is 42 layers x 4 chunks of genuine
+f16 max-scan plus convert. The earlier idea of converting only new positions is
+already recorded as a numerics change: it rescales the prefix when a new maximum
+appears, which moves greedy output (11127 against 5 at 10K), so the full rewrite
+is what keeps the dump bit-exact.

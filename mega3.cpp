@@ -6133,16 +6133,71 @@ static const float * rn_rows_src;
 static const float * rn_rows_src_c;
 static const float * rn_rows_w;
 static int64_t rn_rows_n;
+// The RMSNorm scale was two scalar loops per row: a dependent double chain of
+// N_EMBD adds for the sum of squares, then a scalar multiply. The chain cannot be
+// split across threads -- it is serial within the row -- so it shows up as a
+// fixed cost no matter how many bands the pool has. The scale loop is
+// element-wise and vectorises with identical rounding (two vfmul, same operands),
+// so that part is free and exact. The sum is offered in two forms: the scalar
+// chain (bit-identical to what it replaced) and a vector-double accumulation
+// behind MEGA_FSUM, which reorders the adds and so is not byte-identical.
+static int g_atr_fsum = 0;
+
+static double ss_scalar(const float * x, int n) {
+    double ss = 0;
+    for (int i = 0; i < n; ++i) ss += (double) x[i] * x[i];
+    return ss;
+}
+
+static double ss_vdouble(const float * x, int n) {
+    const size_t vl = __riscv_vsetvl_e64m2((size_t) n);
+    vfloat64m2_t a0 = __riscv_vfmv_v_f_f64m2(0.0, vl);
+    vfloat64m2_t a1 = __riscv_vfmv_v_f_f64m2(0.0, vl);
+    int i = 0;
+    for (; i + 2 * (int) vl <= n; i += 2 * (int) vl) {
+        const vfloat64m2_t d0 = __riscv_vfwcvt_f_f_v_f64m2(
+            __riscv_vle32_v_f32m1(x + i, vl), vl);
+        const vfloat64m2_t d1 = __riscv_vfwcvt_f_f_v_f64m2(
+            __riscv_vle32_v_f32m1(x + i + vl, vl), vl);
+        a0 = __riscv_vfadd_vv_f64m2(a0, __riscv_vfmul_vv_f64m2(d0, d0, vl), vl);
+        a1 = __riscv_vfadd_vv_f64m2(a1, __riscv_vfmul_vv_f64m2(d1, d1, vl), vl);
+    }
+    for (; i + (int) vl <= n; i += (int) vl) {
+        const vfloat64m2_t d0 = __riscv_vfwcvt_f_f_v_f64m2(
+            __riscv_vle32_v_f32m1(x + i, vl), vl);
+        a0 = __riscv_vfadd_vv_f64m2(a0, __riscv_vfmul_vv_f64m2(d0, d0, vl), vl);
+    }
+    a0 = __riscv_vfadd_vv_f64m2(a0, a1, vl);
+    double ss = __riscv_vfmv_f_s_f64m1_f64(__riscv_vfredusum_vs_f64m2_f64m1(
+        a0, __riscv_vfmv_s_f_f64m1(0.0, 1), vl));
+    for (; i < n; ++i) ss += (double) x[i] * x[i];
+    return ss;
+}
+
+// dst[i] = x[i] * rn * w[i], vectorised with the same two multiplies per element.
+static void rms_scale(const float * x, float * dst, const float * w, int n, float rn) {
+    for (int i = 0; i < n; ) {
+        const size_t vl = __riscv_vsetvl_e32m2((size_t) (n - i));
+        vfloat32m2_t v = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(x + i, vl), rn, vl);
+        v = __riscv_vfmul_vv_f32m2(v, __riscv_vle32_v_f32m2(w + i, vl), vl);
+        __riscv_vse32_v_f32m2(dst + i, v, vl);
+        i += (int) vl;
+    }
+}
+
+static inline float rms_inv(double ss, int n) {
+    return 1.0f / sqrtf((float) (ss / n) + RMS_EPS);
+}
+
 static void rn_rows_band(int64_t lo, int64_t hi) {
     const float * src = rn_rows_src; float * dst = rn_rows_dst;
     const float * w = rn_rows_w; (void) rn_rows_n;
     for (int64_t r = lo; r < hi; ++r) {
         const float * x = src + r * N_EMBD;
         float * y = dst + r * N_EMBD;
-        double ss = 0;
-        for (int i = 0; i < N_EMBD; ++i) ss += (double) x[i] * x[i];
-        const float rn = 1.0f / sqrtf((float) (ss / N_EMBD) + RMS_EPS);
-        for (int i = 0; i < N_EMBD; ++i) y[i] = x[i] * rn * w[i];
+        const float rn = rms_inv(g_atr_fsum ? ss_vdouble(x, N_EMBD)
+                                            : ss_scalar(x, N_EMBD), N_EMBD);
+        rms_scale(x, y, w, N_EMBD, rn);
     }
 }
 static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows) {
@@ -6470,10 +6525,9 @@ static void atr_band(int64_t lo, int64_t hi) {
             __riscv_vse32_v_f32m2(t + i, v, vl);        // the same row, for the norm below
             i += (int) vl;
         }
-        double ss = 0;
-        for (int i = 0; i < N_EMBD; ++i) ss += (double) t[i] * t[i];
-        const float rn = 1.0f / sqrtf((float) (ss / N_EMBD) + RMS_EPS);
-        for (int i = 0; i < N_EMBD; ++i) dst[i] = t[i] * rn * w[i];
+        const float rn = rms_inv(g_atr_fsum ? ss_vdouble(t, N_EMBD)
+                                            : ss_scalar(t, N_EMBD), N_EMBD);
+        rms_scale(t, dst, w, N_EMBD, rn);
     }
 }
 static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows);
@@ -7387,6 +7441,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
         else if (!strcmp(argv[i], "-K8")) g_k8dec = 1;
         else if (!strcmp(argv[i], "-SQ0")) silu_q_on = 0;
+        else if (!strcmp(argv[i], "-FSUM")) g_atr_fsum = 1;
         else if (!strcmp(argv[i], "-P4")) g_pvm4 = 1;
         else if (!strcmp(argv[i], "-P2")) g_pvm2 = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
