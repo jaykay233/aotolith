@@ -1032,6 +1032,60 @@ summed across groups and printed `WRONG` for a correct walk, and `layer0_ref`'s
 first version read GGUF offsets as file offsets.
 
 
+### The chunk sweep reaches a plateau at 2560, and the elementwise pool is real
+
+`-G 2048` used to hang; that was the buffer bug, not the size, so the sweep could
+finally run past 1024 on the current build:
+
+| chunk | 10K prefill | tok/s | conv | gemm | mean cosine |
+|---|---|---|---|---|---|
+| 1024 | 63.17 s | 158.29 | 2.46 | 32.70 | 0.977614 (60/64) |
+| 1280 | 62.24 s | 160.65 | 2.10 | 32.06 | - |
+| 1536 | 61.23 s | 163.31 | 2.04 | 32.00 | - |
+| 2048 | 60.21 s | 166.07 | 1.55 | 31.25 | - |
+| **2560** | **59.49 s** | **168.08** | **1.06** | **31.10** | **0.977893 (60/64)** |
+| 3072 | 60.14 s | 166.25 | 1.30 | 31.07 | - |
+| 4096 | 59.44 s | 168.21 | 0.96 | 30.59 | 0.977109 (60/64) |
+
+The gain is entirely fixed cost: conv 2.46 -> 1.06 s and the GEMM's per-phase
+setup 32.70 -> 31.10 s, while attention stays flat at 18.7-19.2 s. 2560 also
+scores *higher* than 1024, because the int8 KV scale is a max over the prefix
+processed so far and fewer chunks put it nearer its final value. 4096 is the same
+speed as 2560 and scores worse, so 2560 is the default.
+
+### Sixteen bands for rmsnorm and the residual add, and one quantisation per phase
+
+`MEGA_ELN` splits rmsnorm and the residual add across all sixteen cores. An even
+split wins, not the 3:1 an A100 core's f32 throughput would suggest, because the
+bands are row bands and the X100 cores get through their share:
+
+| 10K, G=2560 | norm | add | prefill |
+|---|---|---|---|
+| 8 bands | 1.50 s | 1.50 s | 60.2 s |
+| 16, weighted 3:1 | 1.24 s | - | 60.69 s |
+| 16, even | **0.85 s** | **0.84 s** | **58.9 s** |
+
+silu does not go to sixteen bands (1.50 -> 1.85 s) and still runs on A.
+
+The activation quantiser had its own waste: q/k/v are the same 2048 activation
+rows and gate/up likewise, but the loop quantised the phase once per job, i.e.
+five times per layer for three distinct buffers. `g_pfa_jslot` makes the jobs of a
+phase read one copy, written once:
+
+| 10K, G=2560 | quant | prefill |
+|---|---|---|
+| per-job copies | 3.10 s | 59.16 s |
+| aliased | **2.57 s** | **58.24 s** |
+
+Both changes are numerically exact by construction -- they change who writes a
+byte, not what the byte is -- and the 64-step logit dump after them is
+byte-identical to the one before (`md5 ac0a0fbd...`), which is the check that says
+so. Final standing on the same build:
+
+| | 10K prefill | mean cosine | top-1 |
+|---|---|---|---|
+| best verified | **57.58 s / 173.67 tok/s** | **0.977893** | **60/64** |
+
 ### The GEMM kernel is at its engine rate, measured with the stream removed
 
 `probe_hp_peak.cpp` feeds `gemm_kernel_i8i4_hp_m4` the same A record prefill builds

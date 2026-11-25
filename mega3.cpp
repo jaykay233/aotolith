@@ -642,6 +642,38 @@ static inline void band_w(const int * W, int tid, int64_t n, int64_t * lo, int64
     *lo = n * pre / tot; *hi = n * (pre + mine) / tot;
 }
 
+// A 16-band parallel_for. `wa` and `wx` are the weights one A100 and one X100
+// thread get, so 3:1 asks an A core for three times an X100 core's share --
+// which is the ratio the two cores' f32 vector throughput has. With g_el_on
+// clear it degrades to the plain eight-way split.
+static void (*g_pfw_fn)(int64_t, int64_t);
+static int64_t g_pfw_n;
+static int g_pfw_w[16];
+static int g_elq = 0;   // MEGA_ELQ: 1 = weighted 3:1, 2 = even, for the quantizer
+// rmsnorm and the residual add measured 60.2 -> 58.9 s on sixteen bands with an
+// even split (0.85 + 0.84 against 1.50 + 1.50 s), so the pool is the default for
+// them. silu and the activation quantiser stay on the A cluster: silu gets slower
+// (1.50 -> 1.85) and the quantiser's gain comes from the aliasing below, not from
+// the extra bands. Both are still selectable so the comparison can be re-run.
+static int g_eln = 2;   // MEGA_ELN: 0 off, 1 weighted 3:1, 2 even
+static int g_els = 0;   // MEGA_ELS: same for silu, which loses on sixteen bands
+static void pfw_task(int id) {
+    int64_t lo, hi;
+    band_w(g_pfw_w, id, g_pfw_n, &lo, &hi);
+    if (lo < hi) g_pfw_fn(lo, hi);
+}
+static void parallel_for_w(int64_t n, void (*fn)(int64_t, int64_t), int wa, int wx) {
+    if (!g_el_on) { parallel_for(n, fn); return; }
+    g_pfw_fn = fn; g_pfw_n = n;
+    for (int t = 0; t < 8; ++t) g_pfw_w[t] = wa;
+    for (int t = 8; t < 16; ++t) g_pfw_w[t] = wx;
+    run_el(pfw_task);
+}
+static inline void el_split(int mode, int * wa, int * wx) {
+    if (mode == 2) { *wa = 1; *wx = 1; }
+    else           { *wa = 3; *wx = 1; }
+}
+
 // ---------------------------------------------------------------- model buffers
 static uint8_t * g_wblob;
 static size_t g_wblob_sz = 0;
@@ -1111,6 +1143,12 @@ static int g_pf_reps = 0;            // repeat q_proj to isolate compute peak
 static uint8_t * g_pfa;              // quantized A for the whole chunk
 static int64_t g_pfa_rowstride;      // bytes per 4-row group
 
+// Every job in a phase reads the same activation rows with the same k (q, k and v
+// are all k=2048; gate and up likewise), so the per-job copies were three
+// quantisations of identical bytes. g_pfa_jslot says which copy a job reads; the
+// quantiser writes copy 0 once per phase and the three jobs alias it.
+static int g_pfa_jslot[4] = { 0, 1, 2, 3 };
+
 static int g_x100;              // defined with the X100 section below
 struct PfJob {
     const uint8_t * b; int64_t k, n; float * c; int64_t ldc;
@@ -1137,7 +1175,7 @@ static void task_pf_gemm(int tid) {
         const int64_t atile = G * g_pfa_rowstride;
         const bool use_tcm = g_tcm[tid] != nullptr && atile <= g_tcm_size;
         for (int64_t mt = tid; mt < mtiles; mt += g_participants) {
-            const uint8_t * asrc = g_pfa + (j * mgroups + mt * G) * g_pfa_rowstride;
+            const uint8_t * asrc = g_pfa + (g_pfa_jslot[j] * mgroups + mt * G) * g_pfa_rowstride;
             const uint8_t * abase = asrc;
             if (use_tcm) {
                 memcpy(g_tcm[tid], asrc, (size_t) atile);
@@ -1168,16 +1206,19 @@ static void task_pf_gemm(int tid) {
 static const float * g_qa_src;
 static int64_t       g_qa_rows, g_qa_k;
 static int64_t       g_qa_j;
-static void task_pf_quant(int tid) {
-    const int64_t mg = g_qa_rows / 4;
-    for (int64_t g = tid; g < mg; g += g_participants) {
-        void * dst = g_pfa + (g_qa_j * mg + g) * g_pfa_rowstride;
+static void pf_quant_band(int64_t lo, int64_t hi) {
+    for (int64_t g = lo; g < hi; ++g) {
+        void * dst = g_pfa + (g_qa_j * (g_qa_rows / 4) + g) * g_pfa_rowstride;
         const float * src = g_qa_src + g * 4 * g_qa_k;
         if (g_pf_vendor == 2)
             spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, src, (size_t) g_qa_k, (uint8_t *) dst);
         else
             spacemit_kernels::rvv::quantize_a_4row_i8(32, src, (size_t) g_qa_k, (uint8_t *) dst);
     }
+}
+static void task_pf_quant(int tid) {
+    const int64_t mg = g_qa_rows / 4;
+    for (int64_t g = tid; g < mg; g += g_participants) pf_quant_band(g, g + 1);
 }
 static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
     // One 4-row record per k block is 152 B: [4 x f32 a_scale][4 x i16 a_sum]
@@ -1195,7 +1236,9 @@ static void quant_a_4row(const float * a, int64_t rows, int64_t k, int64_t j) {
     g_qa_rows = rows;
     g_qa_k = k;
     g_qa_j = j;
-    run(task_pf_quant);
+    if (g_elq) { int wa, wx; el_split(g_elq, &wa, &wx);
+                 parallel_for_w(g_qa_rows / 4, pf_quant_band, wa, wx); }
+    else run(task_pf_quant);
 }
 
 // ------------------------------------------------------------------ int8 dot GEMM
@@ -1625,7 +1668,7 @@ static void task_pf_gemm_i8(int tid) {
                 int64_t rend = rt + CH;
                 if (rend > mgroups) rend = mgroups;
                 for (int64_t g = rt; g < rend; ++g) {
-                    const uint8_t * arec = g_pfa + (j * mgroups + g) * g_a8_stride;
+                    const uint8_t * arec = g_pfa + (g_pfa_jslot[j] * mgroups + g) * g_a8_stride;
                     const float * asc = (const float *) (arec + kst * 64);
                     if (g_noepi) {
                         gemm_i8d_4x64((const int8_t *) arec, bcol, g_i8c[tid], kst);
@@ -6009,7 +6052,8 @@ static void rn_rows_band(int64_t lo, int64_t hi) {
 }
 static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows) {
     rn_rows_dst = dst; rn_rows_src = src; rn_rows_w = w; rn_rows_n = rows;
-    parallel_for(rows, rn_rows_band);
+    if (g_eln) { int wa, wx; el_split(g_eln, &wa, &wx); parallel_for_w(rows, rn_rows_band, wa, wx); }
+    else parallel_for(rows, rn_rows_band);
 }
 static void rmsnorm_rows_serial(float * dst, const float * src, const float * w, int64_t rows) {
     for (int64_t r = 0; r < rows; ++r) {
@@ -6096,7 +6140,8 @@ static void silu_mul_band(int64_t lo, int64_t hi) {
 static void silu_mul_rows(float * g, const float * up, int64_t rows) {
     silu_rows_buf = g;
     silu_mul_up = up;
-    parallel_for(rows, silu_mul_band);
+    if (g_els) { int wa, wx; el_split(g_els, &wa, &wx); parallel_for_w(rows, silu_mul_band, wa, wx); }
+    else parallel_for(rows, silu_mul_band);
 }
 
 // Layer-by-layer probe: writes one row of the residual stream so the two paths
@@ -6158,7 +6203,8 @@ static void add_rows_band(int64_t lo, int64_t hi) {
 }
 static void add_rows(float * dst, const float * src, int64_t rows) {
     add_dst = dst; add_src = src;
-    parallel_for(rows, add_rows_band);
+    if (g_eln) { int wa, wx; el_split(g_eln, &wa, &wx); parallel_for_w(rows, add_rows_band, wa, wx); }
+    else parallel_for(rows, add_rows_band);
 }
 
 // Rotates one row's Q and K at its own position. Half-split pairing, the llama
@@ -6361,7 +6407,8 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
             t_norm+=now_s()-_a; _a=now_s();
             g_x8_want = g_x100;
-            for (int j = 0; j < 3; ++j) pf_quant(g_pfxa, C, N_EMBD, j);
+            g_pfa_jslot[1] = g_pfa_jslot[2] = 0;
+            pf_quant(g_pfxa, C, N_EMBD, 0);
             g_x8_want = 0;
             t_quant+=now_s()-_a; _a=now_s();
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
@@ -6538,7 +6585,8 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             rmsnorm_rows(g_pfxa, g_pfx, g_ffn_norm[L], C);
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'n', g_pfxa + (int64_t) (cm - 1) * N_EMBD);
             g_x8_want = g_x100;
-            for (int j = 0; j < 2; ++j) pf_quant(g_pfxa, C, N_EMBD, j);
+            g_pfa_jslot[1] = 0;
+            pf_quant(g_pfxa, C, N_EMBD, 0);
             g_x8_want = 0;
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 2;
@@ -7046,6 +7094,9 @@ int main(int argc, char ** argv) {
         else printf("steplog -> %s (%d f32 per step)\n", sp, VOCAB);
     }
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
+    if (getenv("MEGA_ELQ")) g_elq = atoi(getenv("MEGA_ELQ"));
+    if (getenv("MEGA_ELN")) g_eln = atoi(getenv("MEGA_ELN"));
+    if (getenv("MEGA_ELS")) g_els = atoi(getenv("MEGA_ELS"));
     if (getenv("MEGA_ATTN4")) g_attn4 = atoi(getenv("MEGA_ATTN4"));
     if (getenv("MEGA_M4DEC")) { g_m4dec = atoi(getenv("MEGA_M4DEC")); g_attn4 = 1; }
     if (getenv("MEGA_SPEC")) { g_m4spec = atoi(getenv("MEGA_SPEC")); g_attn4 = 1; }
