@@ -1110,9 +1110,9 @@ were established by the probes above, so the dot work is 46.2 s of the 54.8 --
 
 That reframes the target. 200 tok/s is a 50.0 s budget, so elementwise has to fit
 in 3.8 s where it now takes 8.6 s. The only stage with an obvious order-of-
-magnitude gap is the activation quantiser: it moves 5.16 G elements in 2.56 s,
-i.e. 0.07 elements per cycle per lane, where a vectorised form should run several
-per cycle. Everything else is within 2x of its bandwidth.
+magnitude gap is the activation quantiser: it moves 5.16 G elements in 2.56 s
+across 8 cores, i.e. 0.14 elements per cycle per core against 32 lanes of e32, so
+it is running at well under one percent of the vector width. Everything else is within 2x of its bandwidth.
 
 Also measured and left alone: the X100 column split is already balanced to 0.79 s
 of idle across the four GEMM phases (qkv 0.19, o 0.38, gate+up 0.04, down 0.18),
