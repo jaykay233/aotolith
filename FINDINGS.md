@@ -2174,10 +2174,12 @@ production A100 thread sustains. The A100 side of that probe faulted on this boa
 (`/proc/set_ai_thread` and thread creation interact), so its number here comes
 from production, not from the probe.
 
-So the remaining lever for attention is the idle X100 cluster, and it is worth
-more than the recorded 3% estimate -- but it needs VLEN-agnostic QK/PV kernels and
-a second thread pool, since every int8 kernel in this file assumes 32 e32 lanes
-(VLEN=1024) and would compute garbage on an X100 core.
+So the remaining lever for attention looked like the idle X100 cluster, and more
+than the recorded 3% estimate suggested -- but it needs VLEN-agnostic QK/PV kernels
+and a second thread pool, since every int8 kernel in this file assumes 32 e32 lanes
+(VLEN=1024) and would compute garbage on an X100 core. That lever was pulled: the
+port is built, it is correct, and it is **2.1 to 2.5 tok/s slower**, for the reason
+in the next section. Attention stays on the A cluster.
 ### The X100 cluster cannot take decode QK yet: the score slab is owned by a thread
 
 The port is half done and the half that is done is inert. The default path is
@@ -2213,3 +2215,69 @@ the split by measured lanes keeps both clusters at the same finish line but does
 not make the X100 tile cheap: the load/store overhead per element is unchanged,
 which is why the port is worth doing only if the arithmetic it removes from the A
 cluster is what the A cluster was waiting on.
+### The X100 cluster cannot take decode attention: it is correct now, and 2.1 tok/s slower
+
+The port works. Sixteen threads fill the score slabs, the A cluster's PV reads them,
+and the result is bit-for-bit as accurate as the eight-thread path (cosine 0.978228
+against 0.978269, 60/64 both). It is also slower in every weighting tried, and the
+reason is not the one the 25 GMAC/s probe suggested.
+
+| arm, 64 forced steps | exit | qk | exp | pv | decode | cosine | top-1 |
+|---|---|---|---|---|---|---|---|
+| 8-way A cluster (shipped) | 0 | 13.10 | 1.05 | 13.04 | **11.62** | 0.978269 | 60/64 |
+| XATTN, X weight = its lanes | 0 | 34.26 | 3.01 | 12.75 | 9.20 | 0.978228 | 60/64 |
+| XATTN, weight 31% | 0 | 30.56 | 3.19 | 12.89 | 9.57 | -- | -- |
+| XATTN, weight 200% | 0 | 34.07 | 3.21 | 13.11 | 9.16 | -- | -- |
+
+**Three defects had to be fixed to get a correct answer at all, and each one is a
+fact about this code that will bite again.**
+
+1. *A score slab belongs to the thread whose PV band covers it.* PV reads
+   `g_sa[tid]` and indexes it from its own `p0`, so a split over a wider thread
+   count reads positions nobody wrote. Sixteen-way QK with eight-way PV gave cosine
+   0.172 and made QK *slower* (24.05 ms): the A threads waited on the barrier while
+   ten of the sixteen threads' work was thrown away. The fix is to pair A thread `t`
+   with X thread `t`, give the pair PV band `t`, and have the X thread write the
+   second part of that same band at the offset the first part ends on. PV is then
+   untouched, and the split can only divide a band, never cross one.
+2. *A layout fix that is arithmetically neutral can cost 25 ms.* Indexing the slab
+   by absolute position removes the ownership question entirely -- and it is
+   bit-identical (`c016e612...`, so the addressing change alone moves no arithmetic)
+   -- but PV went from 13.04 to **38.41 ms** and the token to 9.08. A PV thread reads
+   eight head rows; per-thread slabs put those rows 12.5 KB apart over a 48 KB band,
+   absolute indexing puts them 49 KB apart over 393 KB. The compact per-thread slab
+   is worth more than the ownership rule costs.
+3. *A reduction must reduce the register, not the last chunk.* The exp sum for a
+   narrow core reduced with the final chunk's `vl`, dropping every lane the earlier
+   chunks had accumulated: cosine 0.684, 28/64. Lanes past a chunk's `vl` were never
+   written, so they are still the accumulator's initial zero and reducing the full
+   register is correct.
+
+**Why it still loses, measured rather than assumed.** The X cluster's own reported
+work time is 127.66 thread-ms of QK against the eight-thread path's 75.46 while it
+holds 6% of the positions: about 7 ms per X thread per token regardless of how much
+it is given. Fitting the two weighting points gives ~27.5 ms of per-call cost plus a
+slope of 0.0272 ms/position against the A cluster's 0.0103, so a third of the loss is
+the narrower vector and two thirds is paid per stage.
+
+`probe_ops` says that cost is not an emulated instruction, which was the hypothesis
+worth testing: on an X100 core at vl=8, `fma` is 0.45 ns (17.8 GMAC/s per core), a
+f32 load+add 1.82, an f16 load plus widening convert 2.27, a store 1.89, `vfredusum`
+1.36 and `vrgather` 1.36. Nothing is trap-emulated; the vector unit is fine at the
+width it has. The cost is in dispatching a second cluster once per attention stage,
+and the ceiling without it is still small: even at zero fixed cost the slope alone
+takes QK from 12.66 to ~9.3 ms, 4% of a token.
+
+**What was kept, and what was taken back out.** The port itself is removed -- a flag
+that turns a 11.62 tok/s path into 9.20 is not a variant worth carrying, and this
+file already has the precedent. What stays is the kernel change it forced: QK's tile
+loop steps by the vector length it is granted and carries the offset inside the tile.
+That is the same loop at 32 lanes (step is KT, offset is zero, output unchanged --
+`c016e612...` and 11.62 tok/s before and after), and it removes an assumption that
+was silently false: the loop claimed to cover a tile while storing only the lanes one
+op produced.
+
+The one number this section does not have is the A cluster's own `probe_ops` row.
+That arm dies in the `/proc/set_ai_thread` handshake (exit 255, single-threaded, no
+thread creation), so every A100 figure quoted here is from production rather than
+from the probe.
