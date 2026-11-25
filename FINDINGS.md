@@ -2009,3 +2009,49 @@ So flash decoding is in place, its split is deep enough that adding the X100s is
 worth 3%, and the remaining gap is a per-core streaming rate on a bus that GEMM
 has already saturated. Going past ~13 tok/s means fewer bytes per token, which is
 the weight-format question the previous section closed on accuracy.
+
+### The 3-bit accuracy loss is the bit budget, not the quantizer
+
+The 3-bit arm reached 12.37 tok/s but scored cosine 0.6744 against the Q4_0
+reference. The working hypothesis was that `repack_b_q3` lost range: it stores
+one int8 scale per 16-weight sub-block under a per-row fp16 `fs = smax / 127`,
+so a row whose sub-blocks differ by more than 127:1 would have to clamp the small
+ones. Two measurements falsified that.
+
+First, instrumenting the repack over all 140,574,720 sub-blocks of the model:
+the largest intra-row step ratio is **90:1**, 0.000% of rows exceed 127:1, and
+only **0.0032%** of sub-blocks round below `fs/2` and get clamped to scale 1. The
+int8 intermediate never runs out of range.
+
+Second, accumulating squared error during the same repack, once against the
+stored `isc * fs` grid and once against an exact float per-sub-block step:
+
+| grid | relative RMS weight error |
+|---|---|
+| stored `isc * fs` (what ships) | 19.36% |
+| exact float step (upper bound) | 19.43% |
+
+Quantizing the scale into int8 costs **-0.07%** — it is not measurable. The grid
+itself is the loss.
+
+A 3-bit, 8-level, 16-weight-group quantizer is worth about 18% relative RMS on
+Gaussian weights, and the shipped rule already sits at that ceiling:
+
+| rule | relative RMS on N(0,1), groups of 16 |
+|---|---|
+| shipped `max(mp/3, mn/4)`, codes -4..3 | 18.01% |
+| symmetric `max(mp,mn)/3`, codes -3..3 | 19.89% |
+| `std/2` step | 20.45% |
+| least-squares-optimal step | 18.87% |
+
+18.01% is the best of the four. There is no scale rule to fix.
+
+19.4% independent weight noise accumulating over 28 layers predicts
+`1/sqrt(1 + 28 * 0.194^2) = 0.71` output cosine, which is the 0.674 observed.
+The path is behaving correctly and is simply too lossy for the accuracy bar. A
+mixed-precision split does not rescue it either: protecting attention and
+compressing only the per-layer FFN halves the injected variance and still lands
+near 0.73.
+
+So the 12.37 tok/s arm is closed on accuracy, and the ~13.0 tok/s Q4_0 ceiling
+above — bit-exact, no new format — is the target that remains.
