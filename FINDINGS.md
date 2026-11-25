@@ -2055,3 +2055,46 @@ near 0.73.
 
 So the 12.37 tok/s arm is closed on accuracy, and the ~13.0 tok/s Q4_0 ceiling
 above — bit-exact, no new format — is the target that remains.
+
+### PV was one position in flight; batching four is bit-exact
+
+`attn_pv_m2` issued a position's two vector loads and then consumed them
+immediately, so a single iteration's requests were the only ones on the bus. Four
+positions are now loaded before any is used, which puts four independent 64-byte
+streams in flight without holding anything extra:
+
+| arm | pv ms | decode tok/s | logits |
+|---|---|---|---|
+| m1 accumulators, U=1 | 14.39 | 11.28 | `614c5ac3...` |
+| m2 accumulators, U=1 | 11.77 | 11.62 | `614c5ac3...` |
+| m2 accumulators, U=4 | **9.82** | **11.89** | `614c5ac3...` |
+
+U=8 spills (pv 14.4 ms). All three arms write byte-identical logits, and the
+binary built before the change writes the same `614c5ac3...`, so the reordering
+moves the same values.
+
+A zicbop prefetch at distance 8 or 16 positions made it slower (10.4 and 10.4 ms
+against 9.9), so the hardware prefetcher already has this stream; the gain came
+from issuing loads earlier inside the loop, not from more of them outstanding.
+
+**Batching does nothing on the f16 path** (pv 13.5 ms before and after): a
+position there is 128 bytes and one `vle16` already covers it, so the loop was
+never short of in-flight bytes. The win is int8-only, 14.2 to 9.8 ms.
+
+### The int8 KV cache now costs more accuracy than speed it buys
+
+Verifying the arms turned up a bookkeeping error worth recording: the
+`0.977316` cosine in earlier sections belongs to the **f16** KV path. Scored
+against the same golden logits, the two KV dtypes are
+
+| KV | qk ms | pv ms | decode tok/s | cosine | top-1 |
+|---|---|---|---|---|---|
+| f16 | 12.37 | 13.49 | 11.65 | **0.9783** | **60/64** |
+| int8 (`-K8`) | 13.23 | 9.82 | 11.89 | 0.9075 | 54/64 |
+
+int8 KV reads 107 MB instead of 215 MB and saves 3.7 ms of PV, but it costs 0.07
+of cosine and six top-1 slots, and after the PV batching the whole net speed
+advantage is 2%. Per byte it is now the slower path (10.9 GB/s against 15.9),
+because halving the bytes per position turns PV into an issue-bound loop rather
+than a bandwidth one. The precision-preserving configuration is therefore f16 KV
+at 11.65 tok/s, and `-K8` is a speed experiment, not a default.

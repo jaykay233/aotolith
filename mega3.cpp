@@ -732,6 +732,15 @@ static const int64_t KV_LAYER_STRIDE = (int64_t) N_KV * HEAD_DIM * MAXCTX;   // 
 static _Float16 * g_vpv;
 static int g_qksame = 0;    // MEGA_QKSAME=1: always read tile 0, to split issue from memory
 static int g_vpo = 1;          // MEGA_VPO=0 falls back to the pos-major read
+// PV issues one position's two vector loads and then immediately consumes them,
+// so a single iteration's requests are the only ones in flight and the loop
+// throughput is 64B per memory latency (~9 GB/s measured). MEGA_PVU batches the
+// loads for U positions before any of them is used, which puts U independent
+// streams on the bus at once.
+static int g_pvu = 4;
+// zicbop prefetch distance in positions, 0 = off. A position is one 64-byte
+// line, so this puts PF more lines on the bus without holding any register.
+static int g_pvpf = 0;
 static inline int vpo_on(void) { return g_vpo; }
 static inline int64_t vf16o(int kv, int half, int64_t pos) {
     return (((int64_t) kv * 2 + half) * MAXCTX + pos) * 64;
@@ -2523,6 +2532,54 @@ static void attn_exp_sum(int tid) {
 // per MAC on this core. Two dim chunks x 8 heads = 16 accumulators keeps enough
 // independent chains to cover FMA latency, and both V chunks are loaded before
 // the multiplies so the load latency overlaps.
+// One position's V: 64 contiguous f16 (PV order) or 64 contiguous int8.
+#define PV_LD(V0, V1, Q)                                                       \
+    do {                                                                       \
+        const _Float16 * vp_ = vpo ? (basev + (int64_t) (Q) * 64)              \
+                                   : (base + (int64_t) (p0 + (Q)) * N_KV * HEAD_DIM); \
+        if (g_k8dec) {                                                         \
+            V0 = ld_i8_f32(base8 + (int64_t) (p0 + (Q)) * 64, 32);             \
+            V1 = ld_i8_f32(base8 + (int64_t) (p0 + (Q)) * 64 + 32, 32);        \
+        } else {                                                              \
+            V0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp_, 32), 32); \
+            V1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp_ + 32, 32), 32); \
+        }                                                                     \
+    } while (0)
+
+// The eight attention weights for one position, then the 16 accumulations.
+#define PV_ACC(Q, V0, V1)                                                      \
+    do {                                                                       \
+        const int _q = (Q);                                                    \
+        float w0, w1, w2, w3, w4, w5, w6, w7;                                     \
+        if (g_pvprobe) { w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 1e-4f; }    \
+        else {                                                                \
+            w0 = wk[0 * SMAX + _q]; \
+            w1 = wk[1 * SMAX + _q]; \
+            w2 = wk[2 * SMAX + _q]; \
+            w3 = wk[3 * SMAX + _q]; \
+            w4 = wk[4 * SMAX + _q]; \
+            w5 = wk[5 * SMAX + _q]; \
+            w6 = wk[6 * SMAX + _q]; \
+            w7 = wk[7 * SMAX + _q]; \
+        }                                                                     \
+        a00 = __riscv_vfmacc_vf_f32m1(a00, w0, V0, 32); \
+        a01 = __riscv_vfmacc_vf_f32m1(a01, w0, V1, 32); \
+        a10 = __riscv_vfmacc_vf_f32m1(a10, w1, V0, 32); \
+        a11 = __riscv_vfmacc_vf_f32m1(a11, w1, V1, 32); \
+        a20 = __riscv_vfmacc_vf_f32m1(a20, w2, V0, 32); \
+        a21 = __riscv_vfmacc_vf_f32m1(a21, w2, V1, 32); \
+        a30 = __riscv_vfmacc_vf_f32m1(a30, w3, V0, 32); \
+        a31 = __riscv_vfmacc_vf_f32m1(a31, w3, V1, 32); \
+        a40 = __riscv_vfmacc_vf_f32m1(a40, w4, V0, 32); \
+        a41 = __riscv_vfmacc_vf_f32m1(a41, w4, V1, 32); \
+        a50 = __riscv_vfmacc_vf_f32m1(a50, w5, V0, 32); \
+        a51 = __riscv_vfmacc_vf_f32m1(a51, w5, V1, 32); \
+        a60 = __riscv_vfmacc_vf_f32m1(a60, w6, V0, 32); \
+        a61 = __riscv_vfmacc_vf_f32m1(a61, w6, V1, 32); \
+        a70 = __riscv_vfmacc_vf_f32m1(a70, w7, V0, 32); \
+        a71 = __riscv_vfmacc_vf_f32m1(a71, w7, V1, 32); \
+    } while (0)
+
 static void attn_pv(int tid) {
     const int p0 = g_p0[tid], p1 = g_p1[tid];
     if (p0 >= p1) return;
@@ -2546,47 +2603,25 @@ static void attn_pv(int tid) {
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
-            for (int p = 0; p < len; ++p) {
-                const _Float16 * vp = vpo ? (basev + (int64_t) p * 64)
-                                            : (base + (int64_t) (p0 + p) * N_KV * HEAD_DIM);
-                // int8 V is PV-order, so one position is 64 contiguous bytes and the
-                // next position is the next 64: the whole pass is one sequential run.
-                const int8_t * vp8 = base8 + (int64_t) (p0 + p) * 64;
+            if (g_pvu >= 4) {
+                for (int p = 0; p + 4 <= len; p += 4) {
+                    vfloat32m1_t x0, y0, x1, y1, x2, y2, x3, y3;
+                    PV_LD(x0, y0, p + 0); PV_LD(x1, y1, p + 1);
+                    PV_LD(x2, y2, p + 2); PV_LD(x3, y3, p + 3);
+                    PV_ACC(p + 0, x0, y0); PV_ACC(p + 1, x1, y1);
+                    PV_ACC(p + 2, x2, y2); PV_ACC(p + 3, x3, y3);
+                }
+            } else if (g_pvu >= 2) {
+                for (int p = 0; p + 2 <= len; p += 2) {
+                    vfloat32m1_t x0, y0, x1, y1;
+                    PV_LD(x0, y0, p + 0); PV_LD(x1, y1, p + 1);
+                    PV_ACC(p + 0, x0, y0); PV_ACC(p + 1, x1, y1);
+                }
+            }
+            for (int p = (g_pvu >= 2 ? len & ~(g_pvu - 1) : 0); p < len; ++p) {
                 vfloat32m1_t v0, v1;
-                if (g_k8dec) {
-                    v0 = ld_i8_f32(vp8, 32);
-                    v1 = ld_i8_f32(vp8 + 32, 32);
-                } else {
-                    v0 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp, 32), 32);
-                    v1 = __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2(vp + 32, 32), 32);
-                }
-                // MEGA_PVPROBE drops the eight scattered weight loads (one per
-                // 10.5 KB score row, so eight pages per position) to separate the
-                // V stream from the score reads. Results are garbage.
-                float w0, w1, w2, w3, w4, w5, w6, w7;
-                if (g_pvprobe) { w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 1e-4f; }
-                else {
-                    w0 = wk[0 * SMAX + p]; w1 = wk[1 * SMAX + p];
-                    w2 = wk[2 * SMAX + p]; w3 = wk[3 * SMAX + p];
-                    w4 = wk[4 * SMAX + p]; w5 = wk[5 * SMAX + p];
-                    w6 = wk[6 * SMAX + p]; w7 = wk[7 * SMAX + p];
-                }
-                a00 = __riscv_vfmacc_vf_f32m1(a00, w0, v0, 32);
-                a01 = __riscv_vfmacc_vf_f32m1(a01, w0, v1, 32);
-                a10 = __riscv_vfmacc_vf_f32m1(a10, w1, v0, 32);
-                a11 = __riscv_vfmacc_vf_f32m1(a11, w1, v1, 32);
-                a20 = __riscv_vfmacc_vf_f32m1(a20, w2, v0, 32);
-                a21 = __riscv_vfmacc_vf_f32m1(a21, w2, v1, 32);
-                a30 = __riscv_vfmacc_vf_f32m1(a30, w3, v0, 32);
-                a31 = __riscv_vfmacc_vf_f32m1(a31, w3, v1, 32);
-                a40 = __riscv_vfmacc_vf_f32m1(a40, w4, v0, 32);
-                a41 = __riscv_vfmacc_vf_f32m1(a41, w4, v1, 32);
-                a50 = __riscv_vfmacc_vf_f32m1(a50, w5, v0, 32);
-                a51 = __riscv_vfmacc_vf_f32m1(a51, w5, v1, 32);
-                a60 = __riscv_vfmacc_vf_f32m1(a60, w6, v0, 32);
-                a61 = __riscv_vfmacc_vf_f32m1(a61, w6, v1, 32);
-                a70 = __riscv_vfmacc_vf_f32m1(a70, w7, v0, 32);
-                a71 = __riscv_vfmacc_vf_f32m1(a71, w7, v1, 32);
+                PV_LD(v0, v1, p);
+                PV_ACC(p, v0, v1);
             }
             __riscv_vse32_v_f32m1(g_acc[tid][(int64_t) kv * NH_PER_KV + 0] + 0 + half * 64, a00, 32);
             __riscv_vse32_v_f32m1(g_acc[tid][(int64_t) kv * NH_PER_KV + 0] + 32 + half * 64, a01, 32);
@@ -2637,13 +2672,58 @@ static inline vfloat32m2_t ld_i8_f32_m2(const int8_t * p, size_t vl) {
         __riscv_vwcvt_x_x_v_i32m2(__riscv_vwcvt_x_x_v_i16m1(b, vl), vl), vl);
 }
 
+
 // PV at m2: one 64-byte load and eight 64-lane FMAs per position covers the whole
 // half, against two loads and sixteen 32-lane FMAs at m1. Same MAC count, half the
 // instructions, which is what matters once the PV-order V plane has removed the
 // stride: at m1 the loop measures 8.1 GB/s for 8 MAC per byte, so it is issuing
 // instructions, not waiting on memory. m2 cost 24% more per MAC in the old
 // dimension-chunk loop, and this is the case where that trade wins.
-static int g_pvm2 = 0;
+static int g_pvm2 = 1;
+
+#define PV2_PF(Q, LEN)                                                         \
+    do {{                                                                       \
+        const int64_t _pf = (Q) + g_pvpf;                                      \
+        if (g_pvpf && _pf < (LEN))                                             \
+            __builtin_prefetch(g_k8dec                                          \
+                ? (const void *) (base8 + (int64_t) (p0 + _pf) * 64)           \
+                : (const void *) (vpo ? (basev + _pf * 64)                     \
+                                      : (base + (int64_t) (p0 + _pf) * N_KV * HEAD_DIM))); \
+    }} while (0)
+
+#define PV2_LD(V, Q)                                                           \
+    do {                                                                       \
+        V = g_k8dec                                                            \
+                ? ld_i8_f32_m2(base8 + (int64_t) (p0 + (Q)) * 64, vl)          \
+                : __riscv_vfwcvt_f_f_v_f32m2(                                  \
+                      __riscv_vle16_v_f16m1(vpo ? basev + (int64_t) (Q) * 64   \
+                                                : base + (int64_t) (p0 + (Q)) * N_KV * HEAD_DIM, vl), vl); \
+    } while (0)
+
+#define PV2_ACC(Q, V)                                                          \
+    do {                                                                       \
+        const int _q = (Q);                                                    \
+        float w0, w1, w2, w3, w4, w5, w6, w7;                                  \
+        if (g_pvprobe) { w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 1e-4f; }    \
+        else {                                                                \
+            w0 = wk[0 * SMAX + _q]; \
+            w1 = wk[1 * SMAX + _q]; \
+            w2 = wk[2 * SMAX + _q]; \
+            w3 = wk[3 * SMAX + _q]; \
+            w4 = wk[4 * SMAX + _q]; \
+            w5 = wk[5 * SMAX + _q]; \
+            w6 = wk[6 * SMAX + _q]; \
+            w7 = wk[7 * SMAX + _q]; \
+        }                                                                     \
+        a0 = __riscv_vfmacc_vf_f32m2(a0, w0, V, vl); \
+        a1 = __riscv_vfmacc_vf_f32m2(a1, w1, V, vl); \
+        a2 = __riscv_vfmacc_vf_f32m2(a2, w2, V, vl); \
+        a3 = __riscv_vfmacc_vf_f32m2(a3, w3, V, vl); \
+        a4 = __riscv_vfmacc_vf_f32m2(a4, w4, V, vl); \
+        a5 = __riscv_vfmacc_vf_f32m2(a5, w5, V, vl); \
+        a6 = __riscv_vfmacc_vf_f32m2(a6, w6, V, vl); \
+        a7 = __riscv_vfmacc_vf_f32m2(a7, w7, V, vl); \
+    } while (0) \
 
 static void attn_pv_m2(int tid) {
     const int p0 = g_p0[tid], p1 = g_p1[tid];
@@ -2666,20 +2746,26 @@ static void attn_pv_m2(int tid) {
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
-            for (int p = 0; p < len; ++p) {
-                const vfloat32m2_t v = g_k8dec
-                    ? ld_i8_f32_m2(base8 + (int64_t) (p0 + p) * 64, vl)
-                    : __riscv_vfwcvt_f_f_v_f32m2(
-                          __riscv_vle16_v_f16m1(vpo ? basev + (int64_t) p * 64
-                                                      : base + (int64_t) (p0 + p) * N_KV * HEAD_DIM, vl), vl);
-                a0 = __riscv_vfmacc_vf_f32m2(a0, wk[0 * SMAX + p], v, vl);
-                a1 = __riscv_vfmacc_vf_f32m2(a1, wk[1 * SMAX + p], v, vl);
-                a2 = __riscv_vfmacc_vf_f32m2(a2, wk[2 * SMAX + p], v, vl);
-                a3 = __riscv_vfmacc_vf_f32m2(a3, wk[3 * SMAX + p], v, vl);
-                a4 = __riscv_vfmacc_vf_f32m2(a4, wk[4 * SMAX + p], v, vl);
-                a5 = __riscv_vfmacc_vf_f32m2(a5, wk[5 * SMAX + p], v, vl);
-                a6 = __riscv_vfmacc_vf_f32m2(a6, wk[6 * SMAX + p], v, vl);
-                a7 = __riscv_vfmacc_vf_f32m2(a7, wk[7 * SMAX + p], v, vl);
+            if (g_pvu >= 4) {
+                for (int p = 0; p + 4 <= len; p += 4) {
+                    vfloat32m2_t u0, u1, u2, u3;
+                    PV2_PF(p + 4, len);
+                    PV2_LD(u0, p + 0); PV2_LD(u1, p + 1);
+                    PV2_LD(u2, p + 2); PV2_LD(u3, p + 3);
+                    PV2_ACC(p + 0, u0); PV2_ACC(p + 1, u1);
+                    PV2_ACC(p + 2, u2); PV2_ACC(p + 3, u3);
+                }
+            } else if (g_pvu >= 2) {
+                for (int p = 0; p + 2 <= len; p += 2) {
+                    vfloat32m2_t u0, u1;
+                    PV2_LD(u0, p + 0); PV2_LD(u1, p + 1);
+                    PV2_ACC(p + 0, u0); PV2_ACC(p + 1, u1);
+                }
+            }
+            for (int p = (g_pvu >= 2 ? len & ~(g_pvu - 1) : 0); p < len; ++p) {
+                vfloat32m2_t v;
+                PV2_LD(v, p);
+                PV2_ACC(p, v);
             }
             const int64_t off = half * 64;
             __riscv_vse32_v_f32m2(g_acc[tid][kv * NH_PER_KV + 0] + off, a0, vl);
@@ -7731,6 +7817,8 @@ int main(int argc, char ** argv) {
     exp3_init();
     if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
     { const char * e = getenv("MEGA_VPO"); g_vpo = (e && *e == '0') ? 0 : 1; }
+    { const char * e = getenv("MEGA_PVU"); g_pvu = e ? atoi(e) : 4; if (g_pvu != 1 && g_pvu != 2 && g_pvu != 4) g_pvu = 4; }
+    { const char * e = getenv("MEGA_PVPF"); g_pvpf = e ? atoi(e) : 0; if (g_pvpf < 0 || g_pvpf > 64) g_pvpf = 0; }
     if (getenv("MEGA_QKSAME")) g_qksame = 1;
     { const char * e = getenv("MEGA_K64"); g_k64on = (e && *e != '0') ? 1 : 0; }
     const char * path = work_path("mc-q4o.gguf");
@@ -7751,6 +7839,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-SQ0")) silu_q_on = 0;
         else if (!strcmp(argv[i], "-FSUM")) g_atr_fsum = 1;
         else if (!strcmp(argv[i], "-P4")) g_pvm4 = 1;
+        else if (!strcmp(argv[i], "-P1")) g_pvm2 = 0;
         else if (!strcmp(argv[i], "-P2")) g_pvm2 = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
         else if (!strcmp(argv[i], "-N") && i + 1 < argc) g_pf_nb = atoll(argv[++i]);
