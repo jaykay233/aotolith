@@ -1104,7 +1104,7 @@ static void m4_gemm_bench(int iters) {
 // re-read per row, which is what kept prefill pinned to DRAM bandwidth.
 static int64_t g_pf_rows;
 static const char * g_pf_file = nullptr;   // prompt token ids, whitespace separated
-static int64_t g_pf_chunk = 512;
+static int64_t g_pf_chunk = 2560;
 static int64_t g_pf_nb = 1;          // n-blocks per gemm call
 static int g_pf_mt = 4;              // row groups (4 rows each) per shared-B tile
 static int g_pf_reps = 0;            // repeat q_proj to isolate compute peak
@@ -6617,6 +6617,12 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
         double tq=0, ts=0, tv=0;
         for (int t = 0; t < N_GPU; ++t) { tq += g_pfa_qk[(t) * PFA_TSTRIDE]; ts += g_pfa_sm[(t) * PFA_TSTRIDE]; tv += g_pfa_pv[(t) * PFA_TSTRIDE]; }
         printf("  attn work: qk %.1f  softmax %.1f  pv %.1f (core-s)\n", tq, ts, tv);
+    if (g_pfa_i8 && g_pipe) {
+        double tb = 0;
+        for (int t = 0; t < 8; ++t) tb += g_pfa_smb[(t) * PFA_TSTRIDE];
+        printf("  x100 softmax %.1f core-s over %d (%.1f s wall if saturated)\n",
+               tb, g_n_sm, tb / (g_n_sm > 0 ? g_n_sm : 1));
+    }
     }
     printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
            t_norm, t_quant, t_silu, t_gemm, t_conv, t_packq, t_attn, t_misc);
@@ -7059,7 +7065,10 @@ int main(int argc, char ** argv) {
         g_i8w = 1;
         if (!getenv("MEGA_NOI8")) {   // TEMP: isolates the f16 attention path
             g_pfa_i8 = 1;
-            g_pipe = 1;    // cross-cluster: A cluster on QK, X100 on softmax
+            // MEGA_NOPIPE keeps the int8 path but runs QK+softmax+PV all on the A
+            // cluster, which is the measurement that says whether handing softmax
+            // to X100 is a net win or just moves the critical path.
+            g_pipe = getenv("MEGA_NOPIPE") ? 0 : 1;
             g_tcmstage = 1; // -Q measured 49.71 -> 44.63 s on attn at 10K
         }
     }
