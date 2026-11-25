@@ -689,6 +689,7 @@ static _Float16 * g_kdim;       // [layer][kv][pos_blk][dim][32], tiled
 static _Float16 * g_vpos;       // [layer][kv][pos][dim]
 static uint8_t * g_aq;
 static float * g_rope_tab;                      // [pos][2][64] cos,sin
+static float * g_rope_exp;                      // [pos][128 cos, 128 signed sin] expanded
 static int   g_perm[N_EMBD];                    // planar rotation-pair order
 
 static int g_pos, g_layer;
@@ -2614,26 +2615,18 @@ static double g_t_rope_math, g_t_rope_app;
 // still rotate_half after decode was changed, and the mixed cache produced garbage
 // logits and a segfault rather than a wrong number.
 __attribute__((optimize("no-tree-vectorize")))
+// cs points at the pre-expanded pair for this position: 128 cos then 128 signed
+// sin, so a 32-lane chunk loads its two vectors at off and 128+off with no gather
+// and no sign multiply. The only permute left is the rotate-pair swap of x.
 static inline void rope_head_norm(float * x, const float * cs, float post) {
     const size_t vl = __riscv_vsetvl_e32m1(32);
-    const vuint32m1_t vid = __riscv_vid_v_u32m1(vl);
-    const vuint32m1_t isw = __riscv_vxor_vx_u32m1(vid, 1, vl);   // [1,0,3,2,...]
-    const vuint32m1_t idp = __riscv_vsrl_vx_u32m1(vid, 1, vl);   // [0,0,1,1,...]
-    static const float sgn_tab[64] = {
-        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
-        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
-        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1,
-        -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1 };
-    const vfloat32m1_t vsg = __riscv_vle32_v_f32m1(sgn_tab, vl);
+    const vuint32m1_t isw = __riscv_vxor_vx_u32m1(__riscv_vid_v_u32m1(vl), 1, vl);
     const vfloat32m1_t vpost = __riscv_vfmv_v_f_f32m1(post, vl);
     for (int off = 0; off < HEAD_DIM; off += (int) vl) {
-        const int j = off / 2;
         const vfloat32m1_t a = __riscv_vle32_v_f32m1(x + off, vl);
         const vfloat32m1_t as = __riscv_vrgather_vv_f32m1(a, isw, vl);
-        const vfloat32m1_t cv = __riscv_vrgather_vv_f32m1(
-            __riscv_vle32_v_f32m1(cs + j, vl), idp, vl);
-        const vfloat32m1_t sv = __riscv_vfmul_vv_f32m1(
-            __riscv_vrgather_vv_f32m1(__riscv_vle32_v_f32m1(cs + 64 + j, vl), idp, vl), vsg, vl);
+        const vfloat32m1_t cv = __riscv_vle32_v_f32m1(cs + off, vl);
+        const vfloat32m1_t sv = __riscv_vle32_v_f32m1(cs + 128 + off, vl);
         vfloat32m1_t r = __riscv_vfmacc_vv_f32m1(__riscv_vfmul_vv_f32m1(a, cv, vl), as, sv, vl);
         if (post != 1.0f) r = __riscv_vfmul_vv_f32m1(r, vpost, vl);
         __riscv_vse32_v_f32m1(x + off, r, vl);
@@ -2642,7 +2635,7 @@ static inline void rope_head_norm(float * x, const float * cs, float post) {
 
 static void rope_all(void) {
     const double _ta = now_s();
-    const float * cs = g_rope_tab + (int64_t) g_pos * 128;
+    const float * cs = g_rope_exp + (int64_t) g_pos * 256;
     const float inv = 1.0f / sqrtf((float) HEAD_DIM);
     for (int h = 0; h < N_HEAD; ++h) rope_head_norm(g_q + h * HEAD_DIM, cs, inv);
     for (int h = 0; h < N_KV; ++h) rope_head_norm(g_k + h * HEAD_DIM, cs, 1.0f);
@@ -5569,7 +5562,7 @@ static void m4_rope_item(int r, int kv) {
     float * q = g_q4 + (int64_t) r * N_EMBD;
     float * k = g_k4 + (int64_t) r * (N_KV * HEAD_DIM);
     const float * v = g_v4 + (int64_t) r * (N_KV * HEAD_DIM);
-    const float * cs = g_rope_tab + (int64_t) pos * 128;
+    const float * cs = g_rope_exp + (int64_t) pos * 256;
     const float inv = 1.0f / sqrtf((float) HEAD_DIM);
 
     for (int i = 0; i < NH_PER_KV; ++i)
@@ -6353,7 +6346,7 @@ static void add_then_rmsnorm(float * res, const float * src, float * dst,
 // 1/sqrt(head_dim) factor, because the caller packs it straight into the int8
 // attention operand.
 static void prefill_qk_row(float * q, float * k, int64_t pos) {
-    const float * cs = g_rope_tab + pos * 128;
+    const float * cs = g_rope_exp + pos * 256;
     const float inv = 1.0f / sqrtf((float) HEAD_DIM);
     // Same helper as single-row and four-row decode. q carries 1/sqrt(head_dim) so
     // the int8 attention operand is pre-scaled.
@@ -7314,11 +7307,21 @@ int main(int argc, char ** argv) {
         g_perm[r] = h * HEAD_DIM + (j < HEAD_DIM / 2 ? 2 * j : 2 * (j - HEAD_DIM / 2) + 1);
     }
     g_rope_tab = (float *) malloc((size_t) MAXCTX * 2 * (HEAD_DIM / 2) * sizeof(float));
+    // Pre-expanded rotation per position: 128 cos, then 128 signed sin, already in
+    // the lane order the kernel consumes. rope_head_norm used to build both of
+    // these with a vrgather per 32 lanes and fold the sign in with an extra vfmul;
+    // doing it once here removes two gathers and a multiply from every chunk of
+    // every head. Multiplying by +-1.0f is exact, so the values are identical.
+    g_rope_exp = (float *) malloc((size_t) MAXCTX * 256 * sizeof(float));
     for (int pos = 0; pos < MAXCTX; ++pos)
         for (int i = 0; i < HEAD_DIM / 2; ++i) {
             const float th = (float) pos * (1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM));
-            g_rope_tab[(int64_t) pos * 128 + i] = cosf(th);
-            g_rope_tab[(int64_t) pos * 128 + 64 + i] = sinf(th);
+            const float c = cosf(th), sv = sinf(th);
+            g_rope_tab[(int64_t) pos * 128 + i] = c;
+            g_rope_tab[(int64_t) pos * 128 + 64 + i] = sv;
+            float * e = g_rope_exp + (int64_t) pos * 256;
+            e[2 * i]     = c;   e[2 * i + 1]     = c;
+            e[128 + 2 * i] = -sv; e[128 + 2 * i + 1] = sv;
         }
 
     size_t total = 0;

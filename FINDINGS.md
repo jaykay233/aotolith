@@ -1136,6 +1136,22 @@ of idle across the four GEMM phases (qkv 0.19, o 0.38, gate+up 0.04, down 0.18),
 which is the ceiling on what rebalancing can return, and `per-phase pack` costs
 0.43 s because the same weights are repacked once per chunk.
 
+### Pre-expanding the rotation table removes the gathers from RoPE
+
+`rope_head_norm` rebuilt its cos and signed-sin vectors from the raw table on
+every 32-lane chunk: one `vrgather` to duplicate each angle across the rotate pair,
+another to swap the pairs of x, and a `vfmul` by a +-1 sign table. The angle
+sequence is fixed per position, so all of it can be built once at startup into 128
+cos and 128 signed sin per position, in the order the kernel consumes them:
+
+| 10K, chunk 2560 | prefill | rope |
+|---|---|---|
+| gather from the raw table | 53.78 s | 0.92 s |
+| pre-expanded table | **53.07 s** | **0.78 s** |
+
+Multiplying by +-1.0f is exact, so the 64-step logit dump is byte-identical again
+(`md5 ac0a0fbd...`). Verified 53.07 s / 188.4 tok/s, cosine 0.977893, 60/64.
+
 ### Fusing the residual add into the norm that reads it is exact
 
 Every layer does `add(residual stream)`, then `rmsnorm` that reads the row straight
