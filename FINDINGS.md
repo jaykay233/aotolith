@@ -1619,3 +1619,33 @@ step for the whole head. Per-position scales would fix it and cost 64 KB per
 layer of side array; the same reasoning applies to K. Until then int8 KV buys
 10.01 -> 10.70 tok/s for cosine 0.9773 -> 0.9121, which is not a trade worth
 taking by default, so `-K8` stays off.
+### Decode attention is at 12 GB/s and prefetching it ahead does not help
+
+At 10K the f16 decode attention takes 43.8 ms and streams about 528 MB of K and V,
+which is 12 GB/s against the probe's 27.5 GB/s ceiling. Two things were checked
+before touching the loop:
+
+- **The score reads are not the problem.** PV loads eight softmax weights per
+  position, one from each head, 10.5 KB apart -- eight pages per step, which looks
+  like the obvious suspect. `MEGA_PVPROBE=1` removes those loads entirely:
+  attn 43.8 -> 42.8 ms. So the scores are L2-hot as designed and the V stream is
+  what stalls.
+- **Explicit prefetch makes it worse.** The V walk reads 128 B of every 512 B
+  block, a stride the hardware prefetcher does not follow, so
+  `__builtin_prefetch` (which does emit `prefetch.r` under `zicbop`) was added 12
+  positions, i.e. 6 KB, ahead. Two interleaved pairs:
+
+| | attn | decode |
+|---|---|---|
+| prefetch off | 45.5 / 45.3 ms | 9.83 / 9.87 tok/s |
+| prefetch on | 48.5 / 48.4 ms | 9.59 / 9.60 tok/s |
+
+Consistently 3 ms worse, both rounds. The prefetch instructions cost issue slots
+and the stream is already partly covered, so this is reverted. Note the run-to-run
+offset from the 43.8 ms figure above: absolute numbers move between binaries, which
+is why every one of these is an interleaved pair.
+
+So the remaining decode gap is not a prefetch-distance problem, and the two levers
+that would actually move the bytes -- int8 KV (needs per-position scales first, see
+above) and coarser weights (breaks accuracy, cosine 0.44) -- are both blocked on
+numerics rather than on kernel work.
