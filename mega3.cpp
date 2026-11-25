@@ -6301,6 +6301,53 @@ static void add_rows(float * dst, const float * src, int64_t rows) {
     else parallel_for(rows, add_rows_band);
 }
 
+// Residual add and the rmsnorm that follows it, in one pass over each row.
+//
+// The two are always called back to back -- add writes the residual stream, norm
+// reads it straight back -- and a row is 8 KB, so the norm's read is one full
+// DRAM pass that the add has just made. Keeping the summed row in a per-thread
+// buffer turns that pass into an L1 hit.
+//
+// Bit-exact: the add is the same elementwise vfadd, the sum is accumulated over
+// i in the same order in double, and the scale applies x*rn*w with the same
+// association. Only the address the norm reads changes.
+static float * atr_res, * atr_dst;
+static const float * atr_src, * atr_w;
+static int g_atr = 1;       // MEGA_ATR=0 restores the two passes
+static void atr_band(int64_t lo, int64_t hi) {
+    static __thread float t[N_EMBD];
+    const float * w = atr_w;
+    for (int64_t r = lo; r < hi; ++r) {
+        float * res = atr_res + r * N_EMBD;
+        float * dst = atr_dst + r * N_EMBD;
+        const float * s = atr_src + r * N_EMBD;
+        for (int i = 0; i < N_EMBD; ) {
+            const size_t vl = __riscv_vsetvl_e32m2((size_t) (N_EMBD - i));
+            const vfloat32m2_t v = __riscv_vfadd_vv_f32m2(
+                __riscv_vle32_v_f32m2(res + i, vl), __riscv_vle32_v_f32m2(s + i, vl), vl);
+            __riscv_vse32_v_f32m2(res + i, v, vl);      // residual stream, as add_rows left it
+            __riscv_vse32_v_f32m2(t + i, v, vl);        // the same row, for the norm below
+            i += (int) vl;
+        }
+        double ss = 0;
+        for (int i = 0; i < N_EMBD; ++i) ss += (double) t[i] * t[i];
+        const float rn = 1.0f / sqrtf((float) (ss / N_EMBD) + RMS_EPS);
+        for (int i = 0; i < N_EMBD; ++i) dst[i] = t[i] * rn * w[i];
+    }
+}
+static void rmsnorm_rows(float * dst, const float * src, const float * w, int64_t rows);
+static void add_then_rmsnorm(float * res, const float * src, float * dst,
+                             const float * w, int64_t rows) {
+    if (!g_atr) {
+        add_rows(res, src, rows);
+        rmsnorm_rows(dst, res, w, rows);
+        return;
+    }
+    atr_res = res; atr_src = src; atr_dst = dst; atr_w = w;
+    if (g_eln) { int wa, wx; el_split(g_eln, &wa, &wx); parallel_for_w(rows, atr_band, wa, wx); }
+    else parallel_for(rows, atr_band);
+}
+
 // Rotates one row's Q and K at its own position. Half-split pairing, the llama
 // convention: (x[i], x[i + HEAD_DIM/2]) share an angle. Q also carries the
 // 1/sqrt(head_dim) factor, because the caller packs it straight into the int8
@@ -6498,7 +6545,10 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
 
         for (int L = 0; L < N_LAYER; ++L) {
             double _a=now_s();
-            rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
+            // Layer L's attention norm is computed by layer L-1's fused residual
+            // add, so this only runs for the first layer of a chunk (and for the
+            // fallback path when the fusion is off).
+            if (L == 0 || !g_atr) rmsnorm_rows(g_pfxa, g_pfx, g_attn_norm[L], C);
             t_norm+=now_s()-_a; _a=now_s();
             g_x8_want = g_x100;
             g_pfa_jslot[1] = g_pfa_jslot[2] = 0;
@@ -6672,11 +6722,11 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             if (g_pf_vendor) run(task_pf_gemm); else run(task_pf_gemm_i8);
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_go+=_g; } _a=now_s();
-            { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }
+            { double _ad=now_s();
+              add_then_rmsnorm(g_pfx, g_pfxa, g_pfxa, g_ffn_norm[L], C);
+              t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'a', g_pfx + (int64_t) (cm - 1) * N_EMBD);
-
-            rmsnorm_rows(g_pfxa, g_pfx, g_ffn_norm[L], C);
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'n', g_pfxa + (int64_t) (cm - 1) * N_EMBD);
             g_x8_want = g_x100;
             g_pfa_jslot[1] = 0;
@@ -6724,7 +6774,12 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             { const double _g=now_s()-_a; t_gemm+=_g; t_gd+=_g; } _a=now_s();
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 down: %.5f %.5f %.5f\n",
                                                        g_pfxa[0], g_pfxa[1], g_pfxa[2]);
-            { double _ad=now_s(); add_rows(g_pfx, g_pfxa, C); t_add+=now_s()-_ad; }   // C rows, not C * N_EMBD: it takes a row count
+            { double _ad=now_s();
+              if (L + 1 < N_LAYER)
+                  add_then_rmsnorm(g_pfx, g_pfxa, g_pfxa, g_attn_norm[L + 1], C);
+              else
+                  add_rows(g_pfx, g_pfxa, C);
+              t_add+=now_s()-_ad; }
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'f', g_pfx + (int64_t) (cm - 1) * N_EMBD);
             if (g_ds && ds_target_slot(L) >= 0) {
@@ -7197,6 +7252,7 @@ int main(int argc, char ** argv) {
         else printf("steplog -> %s (%d f32 per step)\n", sp, VOCAB);
     }
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
+    if (getenv("MEGA_ATR")) g_atr = atoi(getenv("MEGA_ATR"));
     if (getenv("MEGA_QK2")) g_qk2 = atoi(getenv("MEGA_QK2"));
     if (getenv("MEGA_QKFUSE")) g_qkfuse = atoi(getenv("MEGA_QKFUSE"));
     if (getenv("MEGA_NOSM")) g_nosm = atoi(getenv("MEGA_NOSM"));

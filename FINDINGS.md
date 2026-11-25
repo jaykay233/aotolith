@@ -1136,6 +1136,23 @@ of idle across the four GEMM phases (qkv 0.19, o 0.38, gate+up 0.04, down 0.18),
 which is the ceiling on what rebalancing can return, and `per-phase pack` costs
 0.43 s because the same weights are repacked once per chunk.
 
+### Fusing the residual add into the norm that reads it is exact
+
+Every layer does `add(residual stream)`, then `rmsnorm` that reads the row straight
+back. A row is 8 KB, so the norm's read is a full DRAM pass the add has just made
+and left in nothing smaller than L2. Keeping the summed row in a per-thread
+buffer makes the second read an L1 hit, and the second call disappears entirely:
+
+| 10K, chunk 2560 | prefill | add + norm |
+|---|---|---|
+| two passes | 54.92 s | 2.89 s |
+| fused | **53.78 s** | **1.95 s** |
+
+The 64-step logit dump is byte-identical to the unfused arm (`md5 ac0a0fbd...`),
+because the add is the same `vfadd`, the sum accumulates over `i` in the same order
+in double, and the scale keeps `x*rn*w`. Verified: **53.78 s / 185.9 tok/s**,
+cosine 0.977893, 60/64.
+
 ### The score epilogue was the QK cost, and removing it is exact
 
 `qk4` left its eight int32 accumulators in memory: eight `vse32` into a thread
