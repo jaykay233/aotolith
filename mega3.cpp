@@ -8547,5 +8547,13 @@ int main(int argc, char ** argv) {
 
     g_quit.store(1, std::memory_order_release);
     barrier();
-    return 0;
+    // The worker threads are still parked in worker()'s loop and every buffer here
+    // is a raw huge-page mapping, so returning from main would run static
+    // destructors and tear down the C runtime underneath threads that have not
+    // been joined -- that faulted after the last line of output on every run, with
+    // all results already written. Exit directly once the streams are flushed.
+    fflush(stdout);
+    fflush(stderr);
+    if (g_steplog) { fflush(g_steplog); fclose(g_steplog); g_steplog = nullptr; }
+    _exit(0);
 }

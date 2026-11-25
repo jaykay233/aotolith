@@ -2098,3 +2098,35 @@ advantage is 2%. Per byte it is now the slower path (10.9 GB/s against 15.9),
 because halving the bytes per position turns PV into an issue-bound loop rather
 than a bandwidth one. The precision-preserving configuration is therefore f16 KV
 at 11.65 tok/s, and `-K8` is a speed experiment, not a default.
+
+### Correctness record for the shipped decode configuration
+
+Two things were open, and both are now pinned.
+
+**The exit fault is fixed.** Every decode run faulted after printing its last line,
+with all logits already on disk. The cause is shutdown, not arithmetic: main
+returns to run static destructors while sixteen worker threads are still parked in
+`worker()`'s loop and every buffer is a raw huge-page mapping that nothing joins
+or tears down in order. main now flushes stdout, stderr and the step log, closes
+the step log, and calls `_exit(0)`. Exit status is 0 on every arm, and the logits
+are unchanged by the fix -- `d532fda4...` before and after on the same arm, so it
+touched no arithmetic.
+
+**The default configuration is the precision-preserving one.** Teacher-forced over
+64 steps at 10K, against the frozen llama.cpp golden:
+
+| arm | exit | logits md5 | qk | pv | gemm | decode | cosine | top-1 |
+|---|---|---|---|---|---|---|---|---|
+| m1 accumulators, U=1 | 0 | `d532fda4...` (n=32) | 12.94 | 13.74 | -- | 11.41 | -- | -- |
+| m2 accumulators, U=4 (default) | 0 | `d532fda4...` (n=32) | 12.94 | 13.26 | -- | 11.33 | -- | -- |
+| default, 64 steps | 0 | `c016e612...` | 12.88 | 13.36 | 52.95 | **11.62** | **0.9783** | **60/64** |
+
+The default and the unbatched m1 arm write byte-identical logits, so the PV
+batching is a pure reordering. The default keeps f16 KV: the `-K8` int8 cache is
+2% faster and 0.07 cosine worse, so it stays an experiment.
+
+One bookkeeping correction to the earlier sections: `c016e612...` is what this
+source produces, not the recorded `46ee3c9b...`. The recorded hash belongs to the
+`{48,48,45,28}` X100 column split, and the cosine is the same quality either way
+(0.9783 against 0.9773, both 60/64). The comparison that matters -- same source,
+same split, before and after a change -- is bit-exact in every arm above.
