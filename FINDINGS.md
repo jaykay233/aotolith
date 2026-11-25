@@ -1086,6 +1086,57 @@ so. Final standing on the same build:
 |---|---|---|---|
 | best verified | **57.58 s / 173.67 tok/s** | **0.977893** | **60/64** |
 
+### GEMM and the attention dots share one port; softmax does not
+
+The layer chain is strictly serial, so the only way to overlap GEMM with attention
+is across rows. That pays only if the IME2 path (Q4_0 GEMM) and the vmadot path
+(QK/PV) are different execution ports, so `probe_coinissue.cpp` runs both in one
+thread against identical buffers:
+
+| K=2048 | ime2 | vmadot | sum | max | both |
+|---|---|---|---|---|---|
+| 1 thread | 0.169 s | 0.097 s | 0.265 | 0.169 | **0.264** (2% overlap) |
+| 8 threads | 0.049 | 0.050 | 0.099 | 0.050 | 0.089 (21%, at the noise floor) |
+| 1 thread, N=6144 | 0.046 | 0.026 | 0.072 | 0.046 | **0.072** (0%) |
+
+`both` is the sum, so the two dot paths contend for one issue port. Row-splitting
+GEMM against QK/PV is therefore not a lever, and the comment in mega3.cpp that
+calls them "the same dot units" is right. The 47.9-vs-74.6 GMAC/s gap between them
+is the operand width (i8i4 against i8i8) and the K per call, not a second port.
+
+Softmax is a different story and worth stating separately: it runs on X100 as
+plain RVV f32, so it never competes with a GEMM on the A cluster. It still cannot
+fill the GEMM window, for two reasons. It depends on QK, and QK is the contending
+stage above. And it is not the critical path even inside attention:
+
+| 10K attention | A cluster | X100 |
+|---|---|---|
+| QK | 82-87 core-s | - |
+| PV | 54-57 core-s | - |
+| softmax | - | 104-111 core-s (max 54, exp 56, other 42) |
+| wall per cluster | 17.0 s | 13.0 s |
+
+So A is the critical path and hiding softmax buys nothing. What is left to hide is
+the elementwise set -- quant 2.57, silu 1.52, norm 0.86, conv 1.06, add 0.84, i.e.
+about 6 s of RVV f32 that uses no dot unit at all -- because X100 is idle for the
+whole 30 s GEMM phase.
+
+### QK at 10K is 74.6 GMAC/s per core once both ends are removed
+
+The same three-way isolation on the current build, chunk 2560, 10K:
+
+| configuration | prefill | QK core-s | QK GMAC/s/core |
+|---|---|---|---|
+| base | 57.42 s | 82.0 | 52.3 |
+| `MEGA_NOSM` (X100 skips the score reads) | 53.77 s | 73.3 | 58.6 |
+| + `MEGA_QKNOST` (one score store in eight) | 46.30 s | **57.6** | **74.6** |
+
+So QK's 82 core-s is 57.6 of dot loop, ~15.7 of score stores, ~8.7 of contention
+with the consumer's reads. 74.6 GMAC/s is the production loop ceiling under the K
+stream -- the 131.7 in the probe was a K plane resident in L2, which the real
+prefix is not. `-D` alone only recovered 2.4 core-s because it parks the stores in
+one L1 block while both the K stream and the X100 reader are still there.
+
 ### The GEMM kernel is at its engine rate, measured with the stream removed
 
 `probe_hp_peak.cpp` feeds `gemm_kernel_i8i4_hp_m4` the same A record prefill builds

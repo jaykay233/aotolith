@@ -3752,6 +3752,10 @@ static int g_pipe_layer = 0;
 // SC_NBLK above: the epilogue is one vnsra plus one 64-byte store per position
 // block. sc is slot memory in the pipelined path and thread-local in the
 // single-cluster one, so the body is shared.
+static int g_qk2 = 0;   // MEGA_QK2: two row groups per K fetch
+static int g_nosm = 0;  // MEGA_NOSM: X100 skips the score reads (timing only)
+static int g_qknost = 0; // MEGA_QKNOST: one score store in eight (timing only)
+
 static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
     const int kv = h / NH_PER_KV;
     const int nn = (int) (g_pfa_ctx + qbase + PFA_ROWS * g_i8g);
@@ -3773,6 +3777,10 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
             int16_t * dst = g_nostore ? g_nspark : blk + (size_t) gg * SC_GSTRIDE;
             for (int j = 0; j < 8; ++j) {
                 const vint32m1_t a = __riscv_vle32_v_i32m1(raw[j], vl32);
+                // MEGA_QKNOST keeps one store in eight so the accumulators are
+                // still live; the loop's cost without the seven missing stores is
+                // what the score epilogue actually charges. Timing only.
+                if (g_qknost && j) continue;
                 __riscv_vse16_v_i16mf2(dst + j * 32,
                                        __riscv_vnsra_wx_i16mf2(a, SC_SHIFT, vl32), vl16);
             }
@@ -4082,7 +4090,11 @@ static void task_pfa_pipe_B(int tid) {
         TileSlot & sl = g_tslot[r.slot];
         const int64_t qb = tile_qb(t);
         const double _sm = now_s();
-        pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
+        // MEGA_NOSM: keep the handshake but never touch the score buffer, so the
+        // A cluster's QK runs with no consumer reading what it wrote. Every other
+        // isolation so far (-D, -0) left the consumer's reads in place, which is
+        // the only structural difference left against probe_qk_real.
+        if (!g_nosm) pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
         g_pfa_sm[(tid) * PFA_TSTRIDE] += now_s() - _sm;
         r.st.store(2, std::memory_order_release);
     }
@@ -6668,8 +6680,11 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     if (g_pfa_i8 && g_pipe) {
         double tb = 0;
         for (int t = 0; t < 8; ++t) tb += g_pfa_smb[(t) * PFA_TSTRIDE];
-        printf("  x100 softmax %.1f core-s over %d (%.1f s wall if saturated)\n",
-               tb, g_n_sm, tb / (g_n_sm > 0 ? g_n_sm : 1));
+        double mxb = 0, exb = 0;
+        for (int t = 0; t < 8; ++t) { mxb += g_pfa_mxb[(t) * PFA_TSTRIDE]; exb += g_pfa_exb[(t) * PFA_TSTRIDE]; }
+        printf("  x100 softmax %.1f core-s over %d (%.1f s wall if saturated)"
+               "  [max %.1f exp %.1f other %.1f]\n",
+               tb, g_n_sm, tb / (g_n_sm > 0 ? g_n_sm : 1), mxb, exb, tb - mxb - exb);
     }
     }
     printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
@@ -7094,6 +7109,9 @@ int main(int argc, char ** argv) {
         else printf("steplog -> %s (%d f32 per step)\n", sp, VOCAB);
     }
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
+    if (getenv("MEGA_QK2")) g_qk2 = atoi(getenv("MEGA_QK2"));
+    if (getenv("MEGA_NOSM")) g_nosm = atoi(getenv("MEGA_NOSM"));
+    if (getenv("MEGA_QKNOST")) g_qknost = atoi(getenv("MEGA_QKNOST"));
     if (getenv("MEGA_ELQ")) g_elq = atoi(getenv("MEGA_ELQ"));
     if (getenv("MEGA_ELN")) g_eln = atoi(getenv("MEGA_ELN"));
     if (getenv("MEGA_ELS")) g_els = atoi(getenv("MEGA_ELS"));
