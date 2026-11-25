@@ -1683,3 +1683,84 @@ first place.
 
 So int8 KV buys 10.01 -> 10.7 tok/s, about 5 percent, for cosine 0.977 -> 0.91.
 By default it stays off.
+
+## What 10K decode is actually limited by
+
+Decode at 10K is 10 tok/s, i.e. 100 ms a token, and the split is nearly all of it:
+
+| stage | ms per token | share |
+|---|---|---|
+| gemm | 53.2 | 53% |
+| attn | 43.8 | 44% |
+| rmsnorm | 0.63 | 0.6% |
+| silu | 0.38 | 0.4% |
+| rope | 0.35 | 0.4% |
+| lm_head + argmax | 0.16 | 0.2% |
+| embed + misc | 0.41 | 0.4% |
+
+Two numbers from `bwprobe` on this board set the frame. A contiguous
+full-width vector read:
+
+| threads | buffer | measured |
+|---|---|---|
+| 8 | 2048 MB | 27.5 GB/s |
+| 8 | 1024 MB | 27.4 GB/s |
+| 16 | 1024 MB | 25.8 GB/s |
+
+Sixteen threads is no better than eight, so **27.5 GB/s is the ceiling** and the
+older 19.3 figure came from a strided pattern, not from the bus.
+
+### The GEMM is already at the wall
+
+Decode streams the whole weight set once per token: 1265 MB of Q4_0. At 53.2 ms
+that is **23.8 GB/s, or 87 percent of the ceiling**. There is at most 7 ms of
+headroom in the GEMM and it would take restructuring the kernel for a stream it
+is already mostly saturating. The `MEGA_BHOT` isolation (pin one B column block,
+results garbage) confirms it is not a scheduling or reuse problem: holding B
+entirely in cache saves only 4 percent of prefill GEMM.
+
+### Attention is at 12 GB/s and that is a kernel problem
+
+At 10K the f16 KV caches are 528 MB and attention takes 43.8 ms, which is
+**12 GB/s, 44 percent of the ceiling**. Unlike the GEMM this has room. Two
+explanations were ruled out with measurements:
+
+- **Not the score reads.** PV loads eight softmax weights per position from eight
+  different head rows 10.5 KB apart. `MEGA_PVPROBE=1` deletes those loads:
+  attn 43.8 -> 42.8 ms. The scores are L2-hot as designed.
+- **Not a prefetch-distance problem.** The V walk reads 128 B of every 512 B
+  block. `__builtin_prefetch` (`prefetch.r`, verified in the assembly) 12
+  positions ahead is consistently **3 ms worse** over two interleaved pairs
+  (45.3 -> 48.4 ms) because the instructions cost issue slots. Reverted.
+
+### So the arithmetic ceiling for this configuration
+
+```
+weights          1265 MB   (Q4_0, streamed once per token)
+f16 KV            528 MB   (42 layers x 2 kv x 128 dims x 10000 pos x 2 B)
+total            1793 MB / 27.5 GB/s = 65.2 ms  ->  15.3 tok/s
+```
+
+Reaching 20 tok/s means 50 ms a token, i.e. at most 1375 MB, and the weights
+alone are 1265 MB. KV would have to fit in 110 MB -- a 4.8x reduction -- while
+attention is simultaneously fixed to go from 12 to 27.5 GB/s.
+
+The three ways to shrink the bytes, and why each is closed:
+
+| lever | bytes | ceiling | measured | blocked on |
+|---|---|---|---|---|
+| Q4_0 + f16 KV (today) | 1793 MB | 15.3 tok/s | 10.0 | attention at 12 GB/s |
+| Q4_0 + int8 KV | 1529 MB | 18.0 tok/s | 10.7 | cosine 0.977 -> 0.91 |
+| Q3_K + int8 KV | 1266 MB | 21.7 tok/s | 12.4 | cosine 0.44 |
+| Q3_K + int8 KV, 4096 window | 1266 MB | 21.7 tok/s | 16.5 | same accuracy, plus truncated context |
+
+The int8 KV accuracy loss is on the K side and does not respond to scale
+granularity (see the section above), and the 3-bit loss is 20x the Q4_0 logit
+error -- not a dial that can be turned a little.
+
+**Conclusion: 20 tok/s at 10K is not reachable on this board with a 4-bit weight
+format.** The honest target for Q4_0 with accuracy held is about 15 tok/s, and
+getting there means reworking the attention kernel from 12 to ~27 GB/s, which is
+a larger change than anything in the prefill work above. Anything above that
+requires either a coarser weight format (blocked on accuracy) or hardware with
+more bandwidth.
