@@ -1568,9 +1568,15 @@ tok/s) and 49.202 s (203.22 tok/s), both reproducing `46ee3c9b...` and cosine
 split is `{35,33,37,28}`, which is what `ac0a0fbd89d13ad4757be8b17b8189df` was
 recorded against.
 
-Making the X100 copy carry per-K256 scales, matching what the A100 record has,
-would buy this speed back without the accuracy cost. The copy is built by
-`x8_quant_stage` and costs well under 0.1 s total, so finer scales there are
-nearly free; the limiter is that `x100_gemm_4x16` reads one row scale and would
-have to learn the per-superblock form. That is the next step if the last 0.0006
-of cosine matters.
+Recovering the accuracy means giving the X100 copy per-K256 scales, and that is
+not a local change. Building them is cheap -- `x8_quant_stage` costs well under
+0.1 s and already has the row max in hand -- but consuming them is not:
+`x100_gemm_4x16` accumulates the *whole* K in int32 in one call (`nsteps = k/16`,
+384 steps at k=6144) and the epilogue applies a single per-row scale to that
+finished accumulator. Per-superblock scales therefore mean either 24 kernel calls
+per tile with an f32 accumulation between them, or rescaling 128 int32
+accumulators in place, and both put 24x the current epilogue work on the hot
+path. The scale is not free where it is actually read.
+
+So the split stays the dial it is: `{48,48,45,28}` for 200+ tok/s with cosine
+0.977316, `{35,33,37,28}` for 194.6 tok/s and a bit-exact md5.
