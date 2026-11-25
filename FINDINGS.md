@@ -1947,3 +1947,65 @@ timings looked fine, and the second flag bug hid the A/B that would have caught
 it: `getenv("MEGA_K64")` returns the string `"0"`, which is truthy, so both arms
 of the first A/B ran the new path and both read `qk 14.4`. Flags that can be
 switched off must compare the value, not test for presence.
+
+## Split-KV, flash decoding, and what the X100 cluster is worth
+
+Decode attention is already a split-KV with a combine: `attn_ranges` divides the
+position range across the eight participants and `attn_combine` reduces the
+per-thread partials with the log-sum-exp rescale. That is the flash-decoding
+structure. The question is not whether to adopt it but whether the split is deep
+enough, and that is measurable by changing the participant count:
+
+| participants | qk | pv | decode |
+|---|---|---|---|
+| 4 | 28.66 ms | 23.41 ms | 7.55 tok/s |
+| 8 | 14.54 ms | 13.67 ms | 10.29 tok/s |
+
+Doubling the participants roughly halves both stages, so the position split is
+still paying at eight. That invites the obvious next step -- the other eight cores
+on the die.
+
+**The two clusters are not interchangeable, and the cores that were idle are the
+slow ones.** Measuring `vlenb` per core:
+
+| cores | cluster | vlenb | VLEN | e32m2 lanes |
+|---|---|---|---|---|
+| 0..7 | X100 | 32 | 256 | 16 |
+| 8..15 | A100 | 128 | 1024 | 64 |
+
+The A100s need the `/proc/set_ai_thread` handshake before they accept a bind,
+which is why the direct measurement sees only cores 0..7. Decode attention binds
+the A100s and never touches the X100s.
+
+Running the QK inner loop on both, one thread each:
+
+| cluster | per core | 8 cores |
+|---|---|---|
+| A100 | 37.47 GMAC/s | 299.8 |
+| X100 | 7.44 GMAC/s | 59.5 |
+
+An X100 core is worth one fifth of an A100 on this loop, so all eight of them add
+20% to QK's issue throughput. QK would go from 14.5 to 12.1 ms, and since QK is
+14.5 ms of an 89.6 ms token, the end-to-end gain is about 2.4 ms, or 3%. PV cannot
+follow them usefully: at e32m2 = 16 lanes a 64-dim accumulator needs four
+registers, so eight heads no longer fit and the head count would have to drop.
+
+**Where the 89.6 ms actually goes, measured at 10K:**
+
+| stage | ms | bytes | effective |
+|---|---|---|---|
+| gemm | 52.1 | 1265 MB | 24.3 GB/s |
+| qk | 14.5 | 215 MB | 14.8 GB/s |
+| pv | 13.6 | 215 MB | 15.8 GB/s |
+| exp + fin + embed + norm + lm_head | 9.4 | -- | -- |
+
+GEMM is 58% of the token and already runs at 88% of the 27.5 GB/s bus. Taking
+attention all the way to the streaming ceiling would give 52.1 + 15.6 + 9.4 =
+77 ms, or 13.0 tok/s, against 11.16 today. That is the realistic ceiling for Q4_0
+on this board, and it needs no new cluster: it needs PV to reach 27.5 GB/s, which
+the layout change already moved from 11.0 to 15.8.
+
+So flash decoding is in place, its split is deep enough that adding the X100s is
+worth 3%, and the remaining gap is a per-core streaming rate on a bus that GEMM
+has already saturated. Going past ~13 tok/s means fewer bytes per token, which is
+the weight-format question the previous section closed on accuracy.
