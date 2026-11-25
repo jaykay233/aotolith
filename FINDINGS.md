@@ -1086,6 +1086,36 @@ so. Final standing on the same build:
 |---|---|---|---|
 | best verified | **57.58 s / 173.67 tok/s** | **0.977893** | **60/64** |
 
+### The score epilogue was the QK cost, and removing it is exact
+
+`qk4` left its eight int32 accumulators in memory: eight `vse32` into a thread
+buffer, then the caller's eight `vle32`, eight `vnsra` and eight `vse16` to write
+the int16 scores. The narrowing can read the accumulators where they are.
+`qk4n` does `vnsra.wx` and `vse16` straight from v16..v30 inside the asm, so
+sixteen vector accesses per row group disappear. Shift, shift-out and destination
+address are unchanged, so this is bit-exact by construction and the 64-step logit
+dump confirms it: `md5 ac0a0fbd...` before and after.
+
+| 10K, chunk 2560 | prefill | QK core-s | QK GMAC/s/core |
+|---|---|---|---|
+| memory round trip | 57.53 s | 83.1 | 52.3 |
+| fused narrowing store | **54.13 s** | **58.6** | **74.1** |
+
+Verified: **54.59 s / 183.17 tok/s**, mean cosine 0.977893, 60/64. QK at 58.6
+core-s against the 57.6 that the loop alone measured, i.e. the epilogue now costs
+almost nothing and what remains is the dot loop under the K stream.
+
+Two dead ends measured in the same pass, both worth recording so they are not
+retried:
+
+* X100 is not idle during GEMM. It already owns 28-37% of the columns and is
+  balanced against the A cluster (37% of 201 GMAC/s against 63% of 338 gives the
+  same wall time, and its wait is 0.001 ms). Raising the share makes it worse:
+  pct 50 -> 34.20 s of GEMM, pct 65 -> 41.24 s. There is no spare X100 capacity
+  to hide the elementwise set in, so the row-pipelined overlap is not available.
+* Tile height is already optimal. `-DI8G=8` gives 60.75 s (QK 103.7 core-s) and
+  `-DI8G=32` 60.95 s (QK 96.3), against 57.5 s at the default 16.
+
 ### GEMM and the attention dots share one port; softmax does not
 
 The layer chain is strictly serial, so the only way to overlap GEMM with attention

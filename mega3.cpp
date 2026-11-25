@@ -3752,6 +3752,74 @@ static int g_pipe_layer = 0;
 // SC_NBLK above: the epilogue is one vnsra plus one 64-byte store per position
 // block. sc is slot memory in the pipelined path and thread-local in the
 // single-cluster one, so the body is shared.
+// Same dots as qk4, but the score stores happen inside the asm.
+//
+// qk4 hands its eight int32 accumulators back through memory: eight vse32, then
+// the caller does eight vle32, eight vnsra and eight vse16. That round trip is
+// two vector accesses per store for nothing -- the values are in v16..v30 and the
+// narrowing can read them there. This variant does vnsra+vse16 straight from the
+// accumulators, so the eight vse32 and eight vle32 disappear. Scores are
+// bit-identical: same shift, same shift-out, same destination.
+static void qk4n(int16_t * const * dst, const int8_t * q8g, const int8_t * kblk,
+                 int nks, int shift) {
+    asm volatile(
+        "vsetvli t0, x0, e32, m1        \n\t"
+        "vxor.vv v16, v16, v16          \n\t"
+        "vxor.vv v18, v18, v18          \n\t"
+        "vxor.vv v20, v20, v20          \n\t"
+        "vxor.vv v22, v22, v22          \n\t"
+        "vxor.vv v24, v24, v24          \n\t"
+        "vxor.vv v26, v26, v26          \n\t"
+        "vxor.vv v28, v28, v28          \n\t"
+        "vxor.vv v30, v30, v30          \n\t"
+        "mv     t3, %[NK]               \n\t"
+        "1:                             \n\t"
+        "vl1re32.v v1, (%[Q])           \n\t"
+        "vl8re32.v v8, (%[K])           \n\t"
+        "addi    %[Q], %[Q], 64         \n\t"
+        "addi    %[K], %[K], 1024       \n\t"
+        "vmadot  v16, v1, v8            \n\t"
+        "vmadot  v18, v1, v9            \n\t"
+        "vmadot  v20, v1, v10           \n\t"
+        "vmadot  v22, v1, v11           \n\t"
+        "vmadot  v24, v1, v12           \n\t"
+        "vmadot  v26, v1, v13           \n\t"
+        "vmadot  v28, v1, v14           \n\t"
+        "vmadot  v30, v1, v15           \n\t"
+        "addi    t3, t3, -1             \n\t"
+        "bgtz    t3, 1b                 \n\t"
+        // vsetvli changes the element width, so the mask-out and the narrowing
+        // both use the 16-bit view of the same 32 accumulators.
+        "vsetvli t0, x0, e16, mf2       \n\t"
+        "vnsra.wx v16, v16, %[SH]       \n\t"
+        "vnsra.wx v18, v18, %[SH]       \n\t"
+        "vnsra.wx v20, v20, %[SH]       \n\t"
+        "vnsra.wx v22, v22, %[SH]       \n\t"
+        "vnsra.wx v24, v24, %[SH]       \n\t"
+        "vnsra.wx v26, v26, %[SH]       \n\t"
+        "vnsra.wx v28, v28, %[SH]       \n\t"
+        "vnsra.wx v30, v30, %[SH]       \n\t"
+        "vse16.v v16, (%[O0])           \n\t"
+        "vse16.v v18, (%[O1])           \n\t"
+        "vse16.v v20, (%[O2])           \n\t"
+        "vse16.v v22, (%[O3])           \n\t"
+        "vse16.v v24, (%[O4])           \n\t"
+        "vse16.v v26, (%[O5])           \n\t"
+        "vse16.v v28, (%[O6])           \n\t"
+        "vse16.v v30, (%[O7])           \n\t"
+        : [Q] "+r"(q8g), [K] "+r"(kblk)
+        : [NK] "r"(nks), [SH] "r"(shift),
+          [O0] "r"(dst[0]), [O1] "r"(dst[1]), [O2] "r"(dst[2]), [O3] "r"(dst[3]),
+          [O4] "r"(dst[4]), [O5] "r"(dst[5]), [O6] "r"(dst[6]), [O7] "r"(dst[7])
+        : "t0", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+          "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "vl", "memory");
+}
+
+// On by default: it measured 57.53 -> 54.13 s at 10K with QK 83.1 -> 58.6 core-s,
+// i.e. the whole score epilogue. MEGA_QKFUSE=0 restores the memory round trip.
+static int g_qkfuse = 1;
 static int g_qk2 = 0;   // MEGA_QK2: two row groups per K fetch
 static int g_nosm = 0;  // MEGA_NOSM: X100 skips the score reads (timing only)
 static int g_qknost = 0; // MEGA_QKNOST: one score store in eight (timing only)
@@ -3768,6 +3836,13 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
         const int8_t * kb = k8i_base(g_pfa_layer) + ((kv * g_k8i_npb + pb) * 8) * 1024;
         int16_t * blk = sc + (size_t) (pb * 8) * 32;
         for (int gg = 0; gg < g_i8g; ++gg) {
+            if (g_qkfuse && !g_nostore) {
+                int16_t * dp[8];
+                for (int j = 0; j < 8; ++j)
+                    dp[j] = blk + (size_t) gg * SC_GSTRIDE + j * 32;
+                qk4n(dp, q8g + gg * 512, kb, HEAD_DIM / 16, SC_SHIFT);
+                continue;
+            }
             int8_t * op[8];
             for (int j = 0; j < 8; ++j) op[j] = (int8_t *) raw[j];
             qk4(op, q8g + gg * 512, kb, HEAD_DIM / 16);
@@ -7110,6 +7185,7 @@ int main(int argc, char ** argv) {
     }
     if (getenv("MEGA_PVPROBE")) g_pvprobe = 1;
     if (getenv("MEGA_QK2")) g_qk2 = atoi(getenv("MEGA_QK2"));
+    if (getenv("MEGA_QKFUSE")) g_qkfuse = atoi(getenv("MEGA_QKFUSE"));
     if (getenv("MEGA_NOSM")) g_nosm = atoi(getenv("MEGA_NOSM"));
     if (getenv("MEGA_QKNOST")) g_qknost = atoi(getenv("MEGA_QKNOST"));
     if (getenv("MEGA_ELQ")) g_elq = atoi(getenv("MEGA_ELQ"));
