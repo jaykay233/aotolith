@@ -1842,3 +1842,43 @@ Two things this cost time on, both worth writing down:
   own tokens from step 15 on and the comparison was against a different prefix.
   With `-force` the md5 is identical. Logits are only comparable step by step
   when every step is fed the same input.
+
+## What is left in decode attention, and what is not
+
+PV is now 13.5 ms for 215 MB of V (15.9 GB/s) and QK is 18.0 ms for 215 MB of K
+(11.9 GB/s), against 27.2 GB/s for a plain sequential read. Three attempts to
+close that gap, all measured at 10K, interleaved, with logits bit-exact:
+
+**Load depth (QK).** The inner loop kept four K loads in flight and then ran 32
+FMAs. Double-buffering -- load the next four dims before the current four are
+consumed, eight loads outstanding -- changed nothing: qk 18.07 / 18.03 ms against
+17.97 / 18.00 ms without it. Outstanding load count is not the limit, and the
+change was reverted rather than left in.
+
+**The q broadcasts (QK).** Per iteration the loop also issues 32 scalar loads for
+`qb[head*HEAD_DIM + d + j]`, one broadcast per FMA. Replacing them with a
+constant made qk 2.031 -> 1.670 ms on a short prompt, 18% faster. So they cost
+18%, and the cost is structural: the scalar for a (head, dim) pair is reused
+across every position block, but with `d` in the inner loop it has to be reloaded
+per block, and 8 heads x 128 dims of scalars do not fit in registers. Cutting it
+means either 2x the positions per FMA (see below) or re-reading K per dim.
+
+**Wider LMUL (PV).** PV issues two loads plus 16 FMAs per 128 bytes, which is
+close to its measured time at 1.8 GHz -- it is issue-bound, not bandwidth-bound.
+If that is right, LMUL=2 should halve the FMAs and win. It does not: with the new
+contiguous layout, the existing m2 path measures pv 14.85 / 14.88 ms against
+13.50 / 13.52 ms for m1. This core's wide-LMUL FMA costs more per MAC than the
+instruction saving is worth, which is the same result the m4 PV path already
+recorded, now confirmed with a layout that no longer penalises m1.
+
+**The scattered score reads (PV).** PV reads eight weights per position from
+eight rows 40 KB apart, i.e. eight pages. Dropping them entirely (`MEGA_PVPROBE`)
+leaves pv at 11.43 / 11.38 ms against 11.43 / 11.47 ms -- no effect at all on the
+contiguous layout. The score rows stay L2-hot and are not the limiter.
+
+So the remaining 33 ms of attention sits at 1.4x to 2.3x the bandwidth floor, and
+none of the four obvious levers moves it. The next thing to try is not another
+scheduling change but a different K tile width: KT=32 means each K load is 64
+bytes, and widening the tile to 64 would make every load a full 128-byte line and
+halve the q broadcasts per MAC at the same time. That changes the K layout, the
+per-token append and the prefill store, so it is a separate piece of work.
