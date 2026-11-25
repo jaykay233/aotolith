@@ -1562,8 +1562,15 @@ last-bit noise, and it is entirely the activation-quantisation granularity: both
 clusters accumulate the same integer products, they just start from different
 int8 activations. Top-1 agreement with the f32 reference is unchanged.
 
-Accepted deliberately: 50.001 s is 199.98 tok/s. The bit-exact split is
-`{35,33,37,28}`, which is what `ac0a0fbd89d13ad4757be8b17b8189df` was recorded
-against. Making the X100 copy carry per-superblock scales would buy the speed
-back without the accuracy cost, and is the obvious next step if the last
-0.0006 of cosine turns out to matter.
+Accepted deliberately. Two runs of the committed source: 50.001 s (199.98
+tok/s) and 49.202 s (203.22 tok/s), both reproducing `46ee3c9b...` and cosine
+0.977316 exactly, so the spread is the board and not the code. The bit-exact
+split is `{35,33,37,28}`, which is what `ac0a0fbd89d13ad4757be8b17b8189df` was
+recorded against.
+
+Making the X100 copy carry per-K256 scales, matching what the A100 record has,
+would buy this speed back without the accuracy cost. The copy is built by
+`x8_quant_stage` and costs well under 0.1 s total, so finer scales there are
+nearly free; the limiter is that `x100_gemm_4x16` reads one row scale and would
+have to learn the per-superblock form. That is the next step if the last 0.0006
+of cosine matters.
