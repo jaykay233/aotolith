@@ -2693,10 +2693,12 @@ static void rope_all(void) {
                 vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
                 q = __riscv_vmax_vx_i32m1(q, -127, vl);
                 q = __riscv_vmin_vx_i32m1(q, 127, vl);
-                // PV order: [kv][half][pos][64], so this writes the d-th block into
-                // the half it belongs to rather than at kv*HEAD_DIM + d of a pos-major row.
+                // PV order: [kv][half][pos][64]. d/64 selects the half, and leaving
+                // it out of the address put the second 64 dims of every head at the
+                // first half's slot, so half 0 held dims 64..127 and half 1 was never
+                // written at all. v8_off is the same mapping conv_kv8_v_band uses.
                 int8_t * vq = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
-                              ((int64_t) kv * 2 * MAXCTX + (int64_t) g_pos) * 64 + d % 64;
+                              v8_off(kv, d / 64, g_pos) + d % 64;
                 __riscv_vse8_v_i8mf4(vq,
                                      __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
             }

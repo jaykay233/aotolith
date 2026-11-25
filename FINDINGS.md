@@ -1580,3 +1580,42 @@ path. The scale is not free where it is actually read.
 
 So the split stays the dial it is: `{48,48,45,28}` for 200+ tok/s with cosine
 0.977316, `{35,33,37,28}` for 194.6 tok/s and a bit-exact md5.
+### The int8 KV decode cache never stored the second half of V
+
+Turning on `-K8` scored cosine 0.4524 with 9 of 64 top-1. That is the same
+neighbourhood as the 3-bit weight result (`0.4403`), which had already been
+written off as "3 bits is broken". It was not the same cause.
+
+The V plane is `[kv][half][pos][64]`, sixty-four contiguous int8 per half, and
+`v8_off(kv, half, pos)` is the mapping. The per-token append path built its
+address by hand:
+
+```
+kv * 2 * MAXCTX + pos, then * 64, then + d % 64
+```
+
+With `HEAD_DIM = 128` the loop takes `d = 0, 32, 64, 96`, so `d % 64` is
+`0, 32, 0, 32` -- and there is no `half` term at all. The second 64 dims of each
+head were written over the first 64, and half 1 was never written, so the reader
+(which does include `half * MAXCTX * 64`) read zeroes for half of every V vector.
+The prefill path was already correct because it calls `v8_off`; only the decode
+append was wrong, which is why the error showed up in every decode step and not
+in prefill.
+
+Routing the append through `v8_off` too:
+
+| `-K8`, 64 tokens after 10K prefill | cosine | top-1 | decode |
+|---|---|---|---|
+| before | 0.4524 | 9/64 | 10.76 tok/s |
+| after | **0.9121** | **55/64** | 10.70 tok/s |
+
+The f16 path is untouched and still reproduces `46ee3c9b...` at 0.977316, 60/64.
+
+What is left is genuine quantisation error, not a bug: step 0 is already 0.9417
+and it stays in that band, so it does not compound. The cause is the scale:
+`g_v8dsc[layer][kv]` is one absmax over **every position of the prefix times all
+128 dims**, i.e. 1.28M values sharing one grid, so one outlier position sets the
+step for the whole head. Per-position scales would fix it and cost 64 KB per
+layer of side array; the same reasoning applies to K. Until then int8 KV buys
+10.01 -> 10.70 tok/s for cosine 0.9773 -> 0.9121, which is not a trade worth
+taking by default, so `-K8` stays off.
