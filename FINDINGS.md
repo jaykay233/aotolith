@@ -1375,3 +1375,65 @@ reverted; the standing build is restored.
 within 1.3x of its own bandwidth; the three ways to remove the remaining 2.8 s --
 overlapping elementwise under GEMM, a faster quantiser, a faster KV convert -- are
 each measured and closed above. 188.4 tok/s is where this configuration lands.
+
+### Fusing silu into the quantiser: exact, and worth 0.26 s
+
+The FFN product ran as two passes: `silu_mul_rows` wrote `h = silu(gate)*up` to
+DRAM (10.6 GB), then `pf_quant` read it back (10.6 GB, twice for the max scan and
+the quantise). Keeping the product in a thread-local row and handing that to the
+same vendor kernel removes both DRAM passes.
+
+What makes it legal was measured first, with two probes:
+
+- `MEGA_QPROBE`: the vendor hp record for one K256 superblock is byte-identical
+  whether or not the data past 256 is zeroed. The quantiser is superblock-local.
+- `probe_quant3`: calling it over the full width and over 1024-wide slices writes
+  the same 27840 bytes for K=6144, so the record does not depend on the call shape.
+
+The staging buffer is 4 rows x N_FF floats = 96 KB per thread. An A core's L2 is
+4 MB (from `cache/index2/size`), so eight threads hold 768 KB and every group's
+copy stays resident.
+
+The first attempt scored cosine 0.043751. The cause was not the quantiser: the
+record was byte-identical to the two-pass one (`sqcmp: 0 of 27840 bytes differ`).
+It was the X100 cluster. `pf_quant` builds a second A copy for the tail columns
+those cores own, behind `if (g_x8_want && j == 0)`, and the fused path bypassed
+that hook, so the cluster multiplied against the previous phase's activations.
+Rebuilding the X100 copy inside the fused band from the same staged rows fixed it,
+and the logit dump returned to `ac0a0fbd...` with cosine 0.977893 and 60/64.
+
+Measured, same binary, `-SQ0` selecting the two-pass path:
+
+| | two passes | fused |
+|---|---|---|
+| prefill | 52.73 s | 52.47 s |
+| silu | 1.51 s | 1.30 s (part of fused) |
+| gate quantise | 1.93 s | 1.84 s (part of fused) |
+| **silu + quantise** | **3.44 s** | **3.15 s** |
+
+Verified build: 53.06 s, `md5 ac0a0fbd89d13ad4757be8b17b8189df`, cosine 0.977893,
+60/64. The gain is 0.29 s on that pair, which is inside this board's +/-0.5 s run
+to run spread, so it is recorded as a small win rather than a step change.
+
+### Rewriting the X100 A-copy store buys 2%, so that path is closed
+
+The fused band's X100 half writes each 64-byte step block with eight 8-byte stores
+and two vsetvl round-trips, which looked like the reason the fused pass was not
+faster. `probe_x8store.cpp` rewrites it three ways and compares bytes and speed:
+
+- per row, 8-byte stores (what the code does) -- 516.6 M elem/s
+- four rows per step, one `vrgather` and one 64-byte store -- `vrgather.vv` on
+  SEW=8 measured 100 M elem/s here, five times slower, so it was dropped
+- four rows per step, `vslideup.vi`/`vslidedown.vi` transposing into two 32-byte
+  stores, byte-exact against the layout spec -- **528.8 M elem/s, +2%**
+
+So the routine is arithmetic bound at about 515 M elem/s per core, not store bound,
+and the whole X100 half of the fused band measures 0.07 s wall. There is nothing
+there to recover.
+
+Two things the probe settled for later work: the A cluster's VLEN is 256 (A-core
+`e8m1=32`) while `cpu8`, the first X100 core, reports `e8m1=128`, i.e. VLEN 1024,
+so any index table for that cluster has to be built from its own VLMAX; and this
+toolchain's `riscv_vector.h` has no `vcreate`, so assembling a fractional-LMUL tile
+has to go through assembly. Also `vslideup`/`vslidedown` need `.vi` for an immediate;
+`.vx` is rejected.

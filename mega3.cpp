@@ -6232,6 +6232,146 @@ static void silu_mul_band(int64_t lo, int64_t hi) {
         }
     }
 }
+// silu(gate) * up, quantised where it is produced, so the product never reaches
+// DRAM.
+//
+// The two passes cost 1.51 s and 0.85 s, and the traffic that decides both is the
+// intermediate: silu writes h (10.6 GB) and the quantiser reads it straight back
+// (10.6 GB). `MEGA_QPROBE` shows the vendor quantiser is superblock-local -- a
+// K256 record is byte-identical when everything past 256 is zeroed -- so four
+// rows of one superblock are a 4 KB working set that stays in L1. Staging a few
+// superblocks at a time and handing each staged block to the same vendor kernel
+// removes both DRAM passes over h while leaving every product and every record
+// byte exactly as the two passes computed them.
+//
+// The staged silu uses the same vector sequence as silu_mul_band with a shorter
+// loop bound, so its rounding is identical element for element.
+static const float * silu_q_up;
+static int64_t silu_q_k;
+static int silu_q_on = 1;
+static void x8_quant_stage(const float * st, int64_t k, int64_t g, const float * rowmax);
+
+// One row group's silu*up product is 4 x N_FF floats = 96 KB, and the A core's L2
+// is 4 MB, so eight bands keep every group's copy resident while both quantisers
+// read it back. The intermediate therefore never reaches DRAM: the two passes it
+// used to cost were a 10.6 GB write and two 10.6 GB reads.
+//
+// Handing the vendor kernel the whole row (rather than one superblock at a time)
+// keeps it on its normal path; probe_quant3 shows its record is identical whether
+// it is called over the full width or in 1024-wide slices.
+static void silu_mul_quant_band(int64_t lo, int64_t hi) {
+    static __thread float stage[4 * N_FF] __attribute__((aligned(64)));
+    const int64_t k = silu_q_k;
+    for (int64_t g = lo; g < hi; ++g) {
+        float rowmax[4];
+        for (int r = 0; r < 4; ++r) {
+            const float * p = silu_rows_buf + (g * 4 + r) * k;
+            const float * u = silu_q_up + (g * 4 + r) * k;
+            float * d = stage + r * k;
+            // The row max is a running vector max, reduced once after the loop. A
+            // vfredmax per 16-lane chunk is 384 reductions per row at k=6144 and
+            // cost 1.7 s of the 1.5 s this pass is meant to be.
+            const size_t vl0 = __riscv_vsetvl_e32m2((size_t) k);
+            vfloat32m2_t mxv = __riscv_vfmv_v_f_f32m2(0.0f, vl0);
+            for (int64_t i = 0; i < k; ) {
+                const size_t vl = __riscv_vsetvl_e32m2((size_t) (k - i));
+                const vfloat32m2_t x = __riscv_vle32_v_f32m2(p + i, vl);
+                const vfloat32m2_t t = __riscv_vfmul_vf_f32m2(
+                    __riscv_vfneg_v_f32m2(x, vl), 1.4426950408889634f, vl);
+                const vint32m2_t ni = __riscv_vfcvt_x_f_v_i32m2(t, vl);
+                const vfloat32m2_t f = __riscv_vfsub_vv_f32m2(
+                    t, __riscv_vfcvt_f_x_v_f32m2(ni, vl), vl);
+                vfloat32m2_t q = __riscv_vfmv_v_f_f32m2(0.0013333558f, vl);
+                q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0096181291f, vl), vl);
+                q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.0555041087f, vl), vl);
+                q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.2402265070f, vl), vl);
+                q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(0.6931471806f, vl), vl);
+                q = __riscv_vfmadd_vv_f32m2(q, f, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
+                q = __riscv_vfmul_vv_f32m2(q, __riscv_vreinterpret_v_i32m2_f32m2(
+                    __riscv_vsll_vx_i32m2(__riscv_vadd_vx_i32m2(ni, 127, vl), 23, vl)), vl);
+                const vfloat32m2_t sb = __riscv_vfdiv_vv_f32m2(
+                    x, __riscv_vfadd_vf_f32m2(q, 1.0f, vl), vl);
+                const vfloat32m2_t pr = __riscv_vfmul_vv_f32m2(
+                    sb, __riscv_vle32_v_f32m2(u + i, vl), vl);
+                __riscv_vse32_v_f32m2(d + i, pr, vl);
+                mxv = __riscv_vfmax_vv_f32m2(mxv, __riscv_vfabs_v_f32m2(pr, vl), vl);
+                i += (int64_t) vl;
+            }
+            rowmax[r] = __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredmax_vs_f32m2_f32m1(mxv, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl0));
+        }
+        uint8_t * dst = (uint8_t *) (g_pfa + (g_qa_j * (g_qa_rows / 4) + g) * g_pfa_rowstride);
+        spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, stage, (size_t) k, dst);
+        // The X100 cluster takes the tail columns, and its A copy is built from the
+        // same f32 rows. If it is not refreshed here the cluster reads the previous
+        // phase's copy and every column it owns is wrong, which is what the fused
+        // path scored 0.04 cosine with.
+        if (g_x8_want) x8_quant_stage(stage, k, g, rowmax);
+    }
+}
+
+// One group's X100 record, from rows already staged: one scale per row (the max
+// over the whole row), then 16 k values per step into the 4x16 layout the
+// cluster's kernel reads. Same arithmetic as task_x8_quant, which does the whole
+// tensor from DRAM.
+static void x8_quant_stage(const float * st, int64_t k, int64_t g, const float * rowmax) {
+    const int64_t kst = k / 16;
+    int8_t * xbase = g_a8x + g * g_x_rowstride;
+    float rowsc[4];
+    for (int r = 0; r < 4; ++r) {
+        rowsc[r] = rowmax[r] > 0 ? rowmax[r] / 127.0f : 1.0f;
+        g_a8xs[g * 4 + r] = rowsc[r];
+    }
+    for (int r = 0; r < 4; ++r) {
+        const float * a = st + r * k;
+        const float xr = 1.0f / rowsc[r];
+        for (int64_t t = 0; t < kst; ++t) {
+            const size_t vl = __riscv_vsetvl_e32m1(16);
+            vfloat32m1_t v = __riscv_vle32_v_f32m1(a + t * 16, vl);
+            vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(__riscv_vfmul_vf_f32m1(v, xr, vl), vl);
+            q = __riscv_vmax_vx_i32m1(q, -127, vl);
+            q = __riscv_vmin_vx_i32m1(q, 127, vl);
+            const vint8mf4_t b8 =
+                __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl);
+            const size_t v8 = __riscv_vsetvl_e8mf4(8);
+            int8_t * xo = xbase + t * 64 + r * 8;
+            __riscv_vse8_v_i8mf4(xo, b8, v8);
+            __riscv_vse8_v_i8mf4(xo + 32,
+                __riscv_vslidedown_vx_i8mf4(b8, 8, (size_t) 16), v8);
+            __riscv_vsetvl_e32m1(16);
+        }
+    }
+}
+
+static int64_t g_sq_mg;
+static double g_sq_t;
+static void task_silu_q(int tid) {
+    const int64_t per = (g_sq_mg + g_participants - 1) / g_participants;
+    int64_t lo = per * tid, hi = lo + per;
+    if (hi > g_sq_mg) hi = g_sq_mg;
+    if (lo < hi) silu_mul_quant_band(lo, hi);
+}
+
+// Silu, multiply and quantise one phase in one pass, for both clusters' A copies.
+static void silu_mul_quant(const float * gate, const float * up, int64_t rows,
+                           int64_t k, int64_t j) {
+    g_pfa_rowstride = (k / 256) * 1160;
+    g_qa_src = gate; g_qa_rows = rows; g_qa_k = k; g_qa_j = j;
+    silu_rows_buf = (float *) gate;
+    silu_q_up = up;
+    silu_q_k = k;
+    if (g_x8_want) g_x_rowstride = 4 * k;
+    g_sq_mg = rows / 4;
+    const double _t = now_s();
+    // The eight A cores, matching pf_quant's default pool.
+    run(task_silu_q);
+    // Its own counter: j is 0 here, the same slot the qkv phase uses, so adding
+    // into g_qa_t would report the fused pass as a slower qkv quantiser.
+    g_sq_t += now_s() - _t;
+    g_qa_bytes[j & 3] += (double) rows * (double) k * 8.0
+                       + (double) (rows / 4) * (double) g_pfa_rowstride;
+}
+
 static void silu_mul_rows(float * g, const float * up, int64_t rows) {
     silu_rows_buf = g;
     silu_mul_up = up;
@@ -6527,6 +6667,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
     double t_norm=0,t_quant=0,t_gemm=0,t_attn=0,t_conv=0,t_misc=0,t_silu=0,t_packq=0;
     double t_rope=0,t_kvst=0,t_add=0,t_zero=0;   // TEMP detail
     double t_gqkv=0,t_go=0,t_ggu=0,t_gd=0;
+    double t_qo=0,t_ds=0;   // TEMP: the two things billed inside t_misc
     const double t0 = now_s();
     for (int64_t base = 0; base < npref; base += R) {
         const int64_t cm = (npref - base < R) ? (npref - base) : R;
@@ -6711,7 +6852,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             memset(g_pfa_out + cm * N_EMBD, 0, (size_t) (C - cm) * N_EMBD * 4);
             t_zero+=now_s()-_z; }
             g_x8_want = g_x100;
-            pf_quant(g_pfa_out, C, N_EMBD, 0);
+            { double _q=now_s(); pf_quant(g_pfa_out, C, N_EMBD, 0); t_qo+=now_s()-_q; }
             g_x8_want = 0;
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
@@ -6745,12 +6886,41 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             if (g_x100) x100_wait();
             { const double _g=now_s()-_a; t_gemm+=_g; t_ggu+=_g; } _a=now_s();
 
+            // Does the hp quantiser's record for one K256 superblock depend only on
+            // that superblock's 256 values? If it does, a fused silu->quant can stage
+            // four rows of 256 floats (4 KB, L1) instead of 96 KB, and the intermediate
+            // never reaches DRAM. Compare the first superblock of a full-width record
+            // against the same record with everything past 256 zeroed.
+            if (getenv("MEGA_QPROBE") && L == 0) {
+                static float qa[4 * N_FF], qb[4 * N_FF];
+                static uint8_t ra[4 * 24 * 1160], rb[4 * 24 * 1160];
+                memcpy(qa, g_pfgate, sizeof qa);
+                memcpy(qb, g_pfgate, sizeof qb);
+                for (int r = 0; r < 4; ++r)
+                    for (int i = 256; i < N_FF; ++i) qb[r * N_FF + i] = 0.0f;
+                spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, qa, (size_t) N_FF, ra);
+                spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, qb, (size_t) N_FF, rb);
+                int diff = 0, first = -1;
+                for (int i = 0; i < 1160; ++i)
+                    if (ra[i] != rb[i]) { if (first < 0) first = i; ++diff; }
+                printf("qprobe: superblock0 %s (%d of 1160 bytes differ, first %d)\n",
+                       diff ? "DEPENDS ON LATER DATA" : "LOCAL", diff, first);
+            }
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 gate/up: %.5f %.5f %.5f | %.5f %.5f\n",
                                                        g_pfgate[0], g_pfgate[1], g_pfgate[2], g_pfup[0], g_pfup[1]);
             if (L == 0 && getenv("MEGA_PROBE")) printf("pfL0 h: %.5f %.5f %.5f | h[6143]=%.5f\n",
                                                        g_pfgate[0], g_pfgate[1], g_pfgate[3072], g_pfgate[6143]);
             double _s=now_s();
-            silu_mul_rows(g_pfgate, g_pfup, C);
+            // The fused pass keeps silu's product in L1 for the quantiser, so it
+            // only applies to the hp record layout, and the dump path needs the
+            // real g_pfgate rows.
+            const bool sq = g_pf_vendor == 2 && silu_q_on && !getenv("MEGA_DUMP");
+            if (sq) {
+                g_x8_want = g_x100;   // the fused band builds the X100 A copy too
+                silu_mul_quant(g_pfgate, g_pfup, C, N_FF, 0);
+                g_x8_want = 0;
+            }
+            else silu_mul_rows(g_pfgate, g_pfup, C);
             if (L == 0 && getenv("MEGA_DUMP")) {
                 FILE * fp = fopen("/tmp/pf_h.bin", "wb");
                 fwrite(g_pfgate + (int64_t) (C - 1) * N_FF, 4, (size_t) N_FF, fp); fclose(fp);
@@ -6758,10 +6928,12 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
                 fwrite(g_pfup + (int64_t) (C - 1) * N_FF, 4, (size_t) N_FF, fp); fclose(fp);
             }
             t_silu+=now_s()-_s; _s=now_s();
-            g_x8_want = g_x100;
-            pf_quant(g_pfgate, C, N_FF, 0);
-            g_x8_want = 0;
-            t_quant+=now_s()-_s;
+            if (!sq) {
+                g_x8_want = g_x100;
+                pf_quant(g_pfgate, C, N_FF, 0);
+                g_x8_want = 0;
+                t_quant+=now_s()-_s;
+            }
             _a=now_s();   // else the next t_gemm also bills silu and this quant
             for (int c = 0; c < NCHUNK; ++c) g_chunk[c].store(0, std::memory_order_relaxed);
             g_pfjn = 1;
@@ -6784,10 +6956,12 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             t_misc+=now_s()-_a; _a=now_s();
             if (getenv("MEGA_DUMP")) dump_row("pf", L, 'f', g_pfx + (int64_t) (cm - 1) * N_EMBD);
             if (g_ds && ds_target_slot(L) >= 0) {
+                const double _d=now_s();
                 const int k = ds_target_slot(L);
                 for (int64_t r = 0; r < cm; ++r)
                     memcpy(g_dshid + ((int64_t) k * g_ds_cap + r) * N_EMBD,
                            g_pfx + r * N_EMBD, (size_t) N_EMBD * 4);
+                t_ds+=now_s()-_d;
             }
         }
         // Feed this chunk's fused features to the drafter's encoder, four positions
@@ -6825,15 +6999,27 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
                tb, g_n_sm, tb / (g_n_sm > 0 ? g_n_sm : 1), mxb, exb, tb - mxb - exb);
     }
     }
-    printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f  misc %.2f (s)\n",
-           t_norm, t_quant, t_silu, t_gemm, t_conv, t_packq, t_attn, t_misc);
+    // t_misc is a residual that several windows bill into, and two of those windows
+    // contain calls already timed on their own (rope, the fused add+norm). Print the
+    // categories rather than the residual, and the leftover separately, so the line
+    // cannot double count: the row below sums to the wall time.
+    printf("  norm %.2f  quant %.2f  silu %.2f  gemm %.2f  conv %.2f  packq %.2f  attn %.2f"
+           "  rope %.2f  add %.2f  qkst %.2f (s)\n",
+           t_norm, t_quant, t_silu, t_gemm, t_conv, t_packq, t_attn,
+           t_rope, t_add, t_misc - t_add - t_rope - t_qo - t_ds);
+    printf("  (prev line totals %.2f s vs wall %.2f s; quant-o %.2f)\n",
+           t_norm + t_quant + t_silu + t_gemm + t_conv + t_packq + t_attn
+             + t_misc + t_rope, dt, t_qo);
     {
         static const char * qn[4] = { "qkv", "o", "gate+up", "down" };
+        if (g_sq_t > 0) printf("  silu+quant   %6.2f s  (fused, one pass)\n", g_sq_t);
         for (int i = 0; i < 4; ++i)
             if (g_qa_t[i] > 0)
                 printf("  quant %-8s %6.2f s  %6.1f GB/s\n",
                        qn[i], g_qa_t[i], g_qa_bytes[i] / g_qa_t[i] / 1e9);
     }
+    printf("  misc split: quant-o %.2f  ds-copy %.2f  zero %.2f  rest %.2f (s)\n",
+           t_qo, t_ds, t_zero, t_misc - t_qo - t_ds);
     printf("  detail: rope %.2f kvst %.2f add %.2f zero %.2f (s)\n", t_rope, t_kvst, t_add, t_zero);
     printf("    gemm split: qkv %.2f  o %.2f  gate+up %.2f  down %.2f (s)\n",
            t_gqkv, t_go, t_ggu, t_gd);
@@ -7200,6 +7386,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-q2")) g_bit2 = 1;
         else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
         else if (!strcmp(argv[i], "-K8")) g_k8dec = 1;
+        else if (!strcmp(argv[i], "-SQ0")) silu_q_on = 0;
         else if (!strcmp(argv[i], "-P4")) g_pvm4 = 1;
         else if (!strcmp(argv[i], "-P2")) g_pvm2 = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) g_pf_rows = atoll(argv[++i]);
