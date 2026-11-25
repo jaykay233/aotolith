@@ -1760,7 +1760,22 @@ static void task_pf_gemm_i8(int tid) {
 // X100 became its critical path.
 static int g_x100_pct = 23;     // X100 takes this share of the columns
 static int g_xpct_explicit = 0; // -x100 N was given, so it wins over the table
-static int g_x100_pct_tab[4] = { 35, 33, 37, 28 };   // qkv, o, gate+up, down
+// Per-phase split of the columns between the clusters.
+//
+// The X100 cores are the faster side here, so more columns to them is faster
+// until they stop being able to keep A fed: sweeping -x100 over 24..48 and reading
+// the per-shape gemm split gives qkv 48, o 48, gate+up 45, down 28. down_proj
+// (k=6144) is the exception -- above about 30 percent it climbs from 8.1 s to
+// 11.2 s and takes the whole prefill with it.
+//
+// The split is not free. An A100 record carries one scale per K256 superblock,
+// while the copy the X100 cluster reads carries one scale for the whole row, so
+// every column moved to X100 is dot-producted from more coarsely quantised
+// activations. Against the f32 reference that costs cosine 0.977893 -> 0.977316
+// and moves the logits by 0.12 mean (1.38 max), with top-1 agreement unchanged at
+// 60/64. Taking it is worth 51.38 -> 50.00 s. The bit-exact split is
+// { 35, 33, 37, 28 }, which the golden md5 was recorded against.
+static int g_x100_pct_tab[4] = { 48, 48, 45, 28 };   // qkv, o, gate+up, down
 static int g_xpct_j[4] = { 23, 23, 23, 23 };         // per-job share for x100_prepare
 // Weight source for the X100 columns: the plain int8 copy, not the vendor record
 // the A100 kernel reads. x100_prepare repacks it into X100 order.

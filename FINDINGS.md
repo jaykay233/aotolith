@@ -1526,3 +1526,44 @@ time, so every load, conversion and store is a single register:
 
 The record layout is unchanged, and the copy now matches the pre-existing
 `x100_quant_a` byte for byte.
+### The column split between the clusters is a precision dial: 51.38 s -> 50.00 s
+
+Sweeping `-x100` over 24..48 percent and reading the per-shape `gemm split` takes
+the prefill from 194.6 to 200.0 tok/s. The optimum is not one number, because the
+shapes do not share it:
+
+| share given to X100 | qkv | o | gate+up | down | prefill |
+|---|---|---|---|---|---|
+| 24 percent | 3.70 | 3.54 | 16.13 | 8.46 | 54.97 s |
+| 27 | 3.44 | 3.54 | 15.70 | 8.30 | 54.03 s |
+| 30 | 3.37 | 3.41 | 15.12 | 8.12 | 52.75 s |
+| 42 | 3.07 | 3.16 | 12.84 | 11.22 | 53.84 s |
+| 48 | 2.92 | 3.13 | 12.82 | 12.66 | 54.74 s |
+| table `{48,48,45,28}` | 3.05 | 2.97 | 12.47 | 8.40 | **50.00 s** |
+
+`down_proj` is the odd one out: it is the only k=6144 shape, and above about 30
+percent it goes from 8.1 s to 11.2 s, which costs more than the other three gain.
+The three smaller-k shapes keep improving up to nearly half.
+
+**It is not free, and the cost is understood.** An A100 record carries one scale
+per K256 superblock; the copy the X100 cluster reads carries one scale for the
+whole row (`rowsc = rowmax/127`). Every column moved to X100 is therefore a dot
+product over more coarsely quantised activations. The split decides how many
+columns are computed that way, which is why it moves the output at all:
+
+| split | prefill | logit md5 | cosine | top-1 |
+|---|---|---|---|---|
+| `{35,33,37,28}` | 51.377 s | `ac0a0fbd...` | 0.977893 | 60/64 |
+| `{48,48,45,28}` | 50.001 s | `46ee3c9b...` | 0.977316 | 60/64 |
+
+The two runs differ in 100 percent of logit elements, 0.12 mean absolute
+(1.38 max against a peak of 28). That is a real numerical difference, not
+last-bit noise, and it is entirely the activation-quantisation granularity: both
+clusters accumulate the same integer products, they just start from different
+int8 activations. Top-1 agreement with the f32 reference is unchanged.
+
+Accepted deliberately: 50.001 s is 199.98 tok/s. The bit-exact split is
+`{35,33,37,28}`, which is what `ac0a0fbd89d13ad4757be8b17b8189df` was recorded
+against. Making the X100 copy carry per-superblock scales would buy the speed
+back without the accuracy cost, and is the obvious next step if the last
+0.0006 of cosine turns out to matter.
