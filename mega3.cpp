@@ -74,6 +74,9 @@ static const int N_LAYER = 42, N_EMBD = 2048, N_FF = 6144, N_HEAD = 16, N_KV = 2
 // layer's position 0, and the rope table's last entry runs 128 floats off the
 // end. Every 10K number taken before this was measured on a corrupted cache.
 static const int N_GPU = 8, MAXCTX = 12288, VOCAB = 130560;
+// Attention can also be served by the eight X100 cores, so its per-thread state is
+// sized for sixteen participants. GEMM and argmax stay on N_GPU.
+static const int N_ATTN = 16;
 static const int NH_PER_KV = N_HEAD / N_KV;
 static const float RMS_EPS = 1e-6f;
 static const float ROPE_BASE = 5000000.0f;
@@ -503,6 +506,18 @@ static std::atomic<int> g_bar_cnt{0};
 static std::atomic<int> g_quit{0};
 static int g_participants = N_GPU;
 
+// How many threads the current attention stage uses. Sixteen while the X100
+// cluster is helping QK and exp, eight for the stages that stay on the A cluster.
+static int g_attn_parts = N_GPU;
+static int g_xattn = 0;          // MEGA_XATTN=1: X100 cores join decode QK and exp
+static std::atomic<int> g_ax_gen{0}, g_ax_done{0};
+// Lanes one vector op gives each participant, measured at bind time. The tile
+// split is proportional to this so both clusters finish together: an A100 core
+// gets 32 positions per m1 op and an X100 core 8, so it gets four times the tiles.
+static int g_lane1[N_ATTN], g_lane2[N_ATTN];
+static void (*g_ax_fn)(int) = nullptr;
+static int g_ax_on = 0;
+
 static inline void barrier(void) {
     const int g = g_bar_gen.load(std::memory_order_acquire);
     if (g_bar_cnt.fetch_add(1, std::memory_order_acq_rel) == g_participants - 1) {
@@ -567,6 +582,8 @@ static std::atomic<int> g_ready[16];
 static void * worker(void * arg) {
     const int id = (int) (intptr_t) arg;
     bind_cpu(g_cpu0 + id);
+    g_lane1[id] = (int) __riscv_vsetvl_e32m1((size_t) 1 << 20);
+    g_lane2[id] = (int) __riscv_vsetvl_e32m2((size_t) 1 << 20);
     tcm_attach(id);
     g_ready[id].store(1, std::memory_order_release);
     for (;;) {
@@ -583,6 +600,19 @@ static void run(task_fn fn) {
     barrier();
     fn(0);
     barrier();
+}
+
+// Dispatch one attention stage to the A cluster and, when it is helping, the X100
+// cluster. The X100 threads are driven by a generation counter and report through
+// g_ax_done, exactly as run_el does; the A cluster still goes through run().
+static void ax_run(void (*fn)(int)) {
+    if (!g_ax_on) { g_attn_parts = g_participants; run(fn); return; }
+    g_attn_parts = N_ATTN;
+    g_ax_fn = fn;
+    g_ax_done.store(0, std::memory_order_relaxed);
+    g_ax_gen.fetch_add(1, std::memory_order_release);
+    run(fn);
+    while (g_ax_done.load(std::memory_order_acquire) < 8) sched_yield();
 }
 
 static void (*g_pf)(int64_t, int64_t);
@@ -773,9 +803,9 @@ static inline _Float16 * ktile(int layer, int kv, int pblk) {
 // attention scratch: per-thread score strip, per-thread partial accumulators
 static int g_pvprobe = 0;                     // MEGA_PVPROBE: PV without the score loads
 static const int SMAX = MAXCTX / 4 + 64;         // a thread may own up to 1/4 of ctx
-static float g_sa[N_GPU][N_HEAD][SMAX];
-static float g_acc[N_GPU][N_HEAD][HEAD_DIM];
-static float g_lmax[N_GPU][N_HEAD], g_lsum[N_GPU][N_HEAD];
+static float g_sa[N_ATTN][N_HEAD][SMAX];
+static float g_acc[N_ATTN][N_HEAD][HEAD_DIM];
+static float g_lmax[N_ATTN][N_HEAD], g_lsum[N_ATTN][N_HEAD];
 static float g_gmax[N_HEAD], g_gsum[N_HEAD];
 static int g_dbg = 0;
 static double g_aw[4];   // real work inside each attn task, excluding barrier wait
@@ -2147,7 +2177,7 @@ static void quant_a(const float * a, int64_t k) {
 // RVV vector types cannot live in arrays on this toolchain, so the accumulators
 // are spelled out one by one; the head-group sizes (8 for QK, 8 for PV) are
 // chosen so the whole set stays in the 32 vector registers.
-static int g_p0[N_GPU], g_p1[N_GPU];
+static int g_p0[N_ATTN], g_p1[N_ATTN], g_pv0[N_GPU], g_pv1[N_GPU];
 
 // -W n caps attention to the last n positions. Nothing else changes: the causal
 // mask already ends at g_pos, so dropping the old end is just a shorter range.
@@ -2162,6 +2192,20 @@ static int g_win = 0;
 // through it cost four times as much and cancel the weight amortisation.
 static int g_attn4 = 0;
 
+static void split_tiles(int nt, int st, int lo, int nb, const int * w, int n,
+                        int * q0, int * q1) {
+    int tot = 0;
+    for (int t = 0; t < n; ++t) tot += w[t];
+    int pre = 0;
+    for (int t = 0; t < n; ++t) {
+        const int t0 = (int) ((int64_t) nt * pre / tot);
+        const int t1 = (int) ((int64_t) nt * (pre + w[t]) / tot);
+        pre += w[t];
+        q0[t] = lo + ((t0 * st > nb - lo) ? nb - lo : t0 * st);
+        q1[t] = lo + ((t1 * st > nb - lo) ? nb - lo : t1 * st);
+    }
+}
+
 static void attn_ranges(void) {
     const int nb = g_pos + 1;
     // QK reads whole tiles from position 0 of each, so a thread's range must start
@@ -2169,12 +2213,28 @@ static void attn_ranges(void) {
     const int st = (g_k64on && !g_k8dec) ? KT64 : KT;
     const int lo = (g_win > 0 && nb > g_win) ? ((nb - g_win) / st) * st : 0;
     const int nt = (nb - lo + st - 1) / st;
+    // PV keeps the whole range on the A cluster: an X100 core cannot hold eight
+    // heads times 64 dims of accumulators (VLEN 256 gives a quarter of the register
+    // bytes), so it cannot stream V once for eight heads and would multiply V
+    // traffic fourfold. Its split is the plain ceil-band split it has always used,
+    // which keeps an X100-free run byte-identical.
     const int per = (nt + g_participants - 1) / g_participants;
     for (int t = 0; t < g_participants; ++t) {
         const int t0 = per * t, t1 = (t == g_participants - 1) ? nt : per * (t + 1);
-        g_p0[t] = lo + ((t0 * st > nb - lo) ? nb - lo : t0 * st);
-        g_p1[t] = lo + ((t1 * st > nb - lo) ? nb - lo : t1 * st);
+        g_pv0[t] = lo + ((t0 * st > nb - lo) ? nb - lo : t0 * st);
+        g_pv1[t] = lo + ((t1 * st > nb - lo) ? nb - lo : t1 * st);
     }
+    if (!g_ax_on) {
+        for (int t = 0; t < g_participants; ++t) { g_p0[t] = g_pv0[t]; g_p1[t] = g_pv1[t]; }
+        return;
+    }
+    // QK and exp are sixteen-way. The split is proportional to the lanes one vector
+    // op gives each participant, so a slow thread gets proportionally fewer tiles
+    // and both clusters reach the barrier together.
+    int w[N_ATTN];
+    const int * lanes = (g_k64on && !g_k8dec) ? g_lane2 : g_lane1;
+    for (int t = 0; t < N_ATTN; ++t) w[t] = lanes[t] > 0 ? lanes[t] : 1;
+    split_tiles(nt, st, lo, nb, w, N_ATTN, g_p0, g_p1);
 }
 
 static double g_at[6];
@@ -2191,7 +2251,7 @@ static void compute_gmax(float * out) {
     }
     for (int h = 0; h < N_HEAD; ++h) {
         float m = -INFINITY;
-        for (int t = 0; t < g_participants; ++t)
+        for (int t = 0; t < g_attn_parts; ++t)
             if (g_p0[t] < g_p1[t]) m = fmaxf(m, g_lmax[t][h]);
         out[h] = m;
     }
@@ -2200,7 +2260,7 @@ __attribute__((optimize("no-tree-vectorize")))
 static void compute_gsum(float * out) {
     for (int h = 0; h < N_HEAD; ++h) {
         double s = 0;
-        for (int t = 0; t < g_participants; ++t)
+        for (int t = 0; t < g_attn_parts; ++t)
             if (g_p0[t] < g_p1[t]) s += (double) g_lsum[t][h];
         out[h] = (float) s;
     }
@@ -2328,11 +2388,21 @@ static void attn_qk(int tid) {
     else {
     for (int kv = 0; kv < N_KV; ++kv) {
         const float * qb = g_q + (int64_t) kv * NH_PER_KV * HEAD_DIM;
-        for (int pb = 0; pb < len; pb += KT) {
-            const _Float16 * kb = ktile(g_layer, kv, g_qksame ? 0 : (p0 + pb) / KT);
+        for (int pb = 0; pb < len; ) {
+            // A tile is KT positions wide and the rows inside it are dim-major, so
+            // the position a chunk starts at is an offset inside every row. On an
+            // A100 vl divides KT and the offset is always zero; an X100 core steps
+            // in eighths of a tile and must carry it.
+            const int lt = pb & (KT - 1);
+            const _Float16 * kb = ktile(g_layer, kv, g_qksame ? 0 : (p0 + pb) / KT) + lt;
             const int8_t * kb8 = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE +
-                                 (((int64_t) kv * NKT + (p0 + pb) / KT) * HEAD_DIM) * KT;
+                                 (((int64_t) kv * NKT + (p0 + pb) / KT) * HEAD_DIM) * KT + lt;
             const size_t vl = __riscv_vsetvl_e32m1((size_t) (len - pb < KT ? len - pb : KT));
+            // The range is tile-aligned so the K pointer is valid for the whole
+            // tile, but the vector width is not: an X100 core only reaches 8 lanes
+            // at m1, and would silently compute a quarter of the tile if the loop
+            // stepped by KT. Step by vl and the same body covers both clusters.
+            const int step = (int) vl;
             vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
             vfloat32m1_t a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
             vfloat32m1_t k0, k1, k2, k3;
@@ -2353,6 +2423,7 @@ static void attn_qk(int tid) {
             __riscv_vse32_v_f32m1(sa + base + 5 * SMAX, a5, vl);
             __riscv_vse32_v_f32m1(sa + base + 6 * SMAX, a6, vl);
             __riscv_vse32_v_f32m1(sa + base + 7 * SMAX, a7, vl);
+            pb += step;
         }
     }
     }
@@ -2361,10 +2432,11 @@ static void attn_qk(int tid) {
         const float * row = sa + (int64_t) h * SMAX;
         vfloat32m1_t m = __riscv_vfmv_v_f_f32m1(-INFINITY, 32);
         int i = 0;
-        for (; i + 32 <= len; i += 32)
-            m = __riscv_vfmax_vv_f32m1(m, __riscv_vle32_v_f32m1(row + i, 32), 32);
+        size_t mv = __riscv_vsetvl_e32m1((size_t) 1 << 20);
+        for (; i + (int) mv <= len; i += (int) mv)
+            m = __riscv_vfmax_vv_f32m1(m, __riscv_vle32_v_f32m1(row + i, mv), mv);
         float mx = __riscv_vfmv_f_s_f32m1_f32(
-            __riscv_vfredmax_vs_f32m1_f32m1(m, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), 32));
+            __riscv_vfredmax_vs_f32m1_f32m1(m, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), mv));
         for (; i < len; ++i) mx = fmaxf(mx, row[i]);
         g_lmax[tid][h] = mx;
     }
@@ -2497,6 +2569,25 @@ static void attn_exp_sum(int tid) {
                           (g_k8dec ? g_k8dsc[g_layer][h / NH_PER_KV] : 1.0f);
         vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 32);
         int i = 0;
+        const size_t vmx = __riscv_vsetvl_e32m1((size_t) 1 << 20);
+        if (vmx < 32) {
+            // An X100 core reaches vmx lanes, not 32. Same arithmetic per element,
+            // stepped by vl, so only the reduction order over chunks differs.
+            size_t last = vmx;
+            for (int j = 0; j < len; ) {
+                const size_t vl = __riscv_vsetvl_e32m1((size_t) (len - j));
+                const vfloat32m1_t t0 = __riscv_vfmul_vf_f32m1(
+                    __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + j, vl), mx, vl), l2e, vl);
+                const vfloat32m1_t e0 = exp2f_e(__riscv_vfmax_vf_f32m1(t0, -126.0f, vl), vl);
+                __riscv_vse32_v_f32m1(row + j, e0, vl);
+                vs = __riscv_vfadd_vv_f32m1(vs, e0, vl);
+                j += (int) vl;
+                last = vl;
+            }
+            g_lsum[tid][h] = __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredusum_vs_f32m1_f32m1(vs, __riscv_vfmv_v_f_f32m1(0.0f, 1), last));
+            continue;
+        }
         for (; i + 64 <= len; i += 64) {
             const vfloat32m1_t t0 = __riscv_vfmul_vf_f32m1(
                 __riscv_vfsub_vf_f32m1(__riscv_vle32_v_f32m1(row + i, 32), mx, 32), l2e, 32);
@@ -2576,7 +2667,7 @@ static void attn_exp_sum(int tid) {
     } while (0)
 
 static void attn_pv(int tid) {
-    const int p0 = g_p0[tid], p1 = g_p1[tid];
+    const int p0 = g_pv0[tid], p1 = g_pv1[tid];
     if (p0 >= p1) return;
     const double _w = now_s();
     const float * sa = &g_sa[tid][0][0];
@@ -2721,7 +2812,7 @@ static int g_pvm2 = 1;
     } while (0) \
 
 static void attn_pv_m2(int tid) {
-    const int p0 = g_p0[tid], p1 = g_p1[tid];
+    const int p0 = g_pv0[tid], p1 = g_pv1[tid];
     if (p0 >= p1) return;
     const double _w = now_s();
     const int len = p1 - p0;
@@ -2776,7 +2867,7 @@ static void attn_pv_m2(int tid) {
 }
 
 static void attn_pv_m4(int tid) {
-    const int p0 = g_p0[tid], p1 = g_p1[tid];
+    const int p0 = g_pv0[tid], p1 = g_pv1[tid];
     if (p0 >= p1) return;
     const double _w = now_s();
     const int len = p1 - p0;
@@ -2945,7 +3036,7 @@ static void attn_combine(int tid) {
         for (int d = 0; d < HEAD_DIM; d += 32) {
             vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, 32);
             for (int t = 0; t < g_participants; ++t)
-                if (g_p0[t] < g_p1[t]) acc = __riscv_vfadd_vv_f32m1(acc, __riscv_vle32_v_f32m1(g_acc[t][hh] + d, 32), 32);
+                if (g_pv0[t] < g_pv1[t]) acc = __riscv_vfadd_vv_f32m1(acc, __riscv_vle32_v_f32m1(g_acc[t][hh] + d, 32), 32);
             __riscv_vse32_v_f32m1(g_attn_out + hh * HEAD_DIM + d, __riscv_vfmul_vf_f32m1(acc, inv, 32), 32);
         }
     }
@@ -2956,9 +3047,9 @@ static void attention(void) {
     double _a = now_s();
     attn_ranges();
     g_at[0] += now_s() - _a; _a = now_s();
-    run(attn_qk);
+    ax_run(attn_qk);
     g_at[1] += now_s() - _a; _a = now_s();
-    run(attn_exp_sum);
+    ax_run(attn_exp_sum);
     g_at[3] += now_s() - _a; _a = now_s();
     run(g_pvm4 ? attn_pv_m4 : g_pvm2 ? attn_pv_m2 : attn_pv);
     g_at[4] += now_s() - _a; _a = now_s();
@@ -4697,8 +4788,10 @@ static int bind_cpu_x100(int cpu) {
 static void * sm_worker(void * arg) {
     const int id = (int) (intptr_t) arg;
     bind_cpu_x100(id);
+    g_lane1[8 + id] = (int) __riscv_vsetvl_e32m1((size_t) 1 << 20);
+    g_lane2[8 + id] = (int) __riscv_vsetvl_e32m2((size_t) 1 << 20);
     g_ready[8 + id].store(1, std::memory_order_release);
-    int gen = 0, xgen = 0, egen = 0, agen = 0;
+    int gen = 0, xgen = 0, egen = 0, agen = 0, agen_x = 0;
     for (;;) {
         // Four kinds of work share these eight threads: elementwise bands
         // (norm, quantiser, silu, KV conversion), softmax for the pipelined
@@ -4710,6 +4803,15 @@ static void * sm_worker(void * arg) {
             egen = e;
             g_el_fn(8 + id);
             g_el_done.fetch_add(1, std::memory_order_release);
+            continue;
+        }
+        // Decode attention QK and exp, when the caller has handed them to this
+        // cluster. Same generation-counter handshake as the elementwise bands.
+        const int ax = g_ax_gen.load(std::memory_order_acquire);
+        if (ax != agen_x) {
+            agen_x = ax;
+            g_ax_fn(8 + id);
+            g_ax_done.fetch_add(1, std::memory_order_release);
             continue;
         }
         // Four-row softmax is addressed by generation counters, not the tile
@@ -4724,11 +4826,13 @@ static void * sm_worker(void * arg) {
         }
         while (g_pipe_gen.load(std::memory_order_acquire) == gen &&
                g_xg_gen.load(std::memory_order_acquire) == xgen &&
-               g_a4_gen.load(std::memory_order_acquire) == agen) {
+               g_a4_gen.load(std::memory_order_acquire) == agen &&
+               g_ax_gen.load(std::memory_order_acquire) == agen_x) {
             if (g_quit.load(std::memory_order_acquire)) return nullptr;
             if (g_el_gen.load(std::memory_order_acquire) != egen) break;
             sched_yield();
         }
+        if (g_ax_gen.load(std::memory_order_acquire) != agen_x) continue;
         if (g_el_gen.load(std::memory_order_acquire) != egen) continue;
         if (g_a4_gen.load(std::memory_order_acquire) != agen) continue;
         const int x = g_xg_gen.load(std::memory_order_acquire);
@@ -7815,6 +7919,7 @@ int main(int argc, char ** argv) {
     { const char * e = getenv("MEGA_PVU"); g_pvu = e ? atoi(e) : 4; if (g_pvu != 1 && g_pvu != 2 && g_pvu != 4) g_pvu = 4; }
     { const char * e = getenv("MEGA_PVPF"); g_pvpf = e ? atoi(e) : 0; if (g_pvpf < 0 || g_pvpf > 64) g_pvpf = 0; }
     if (getenv("MEGA_QKSAME")) g_qksame = 1;
+    if (getenv("MEGA_XATTN")) g_xattn = 1;
     { const char * e = getenv("MEGA_K64"); g_k64on = (e && *e != '0') ? 1 : 0; }
     const char * path = work_path("mc-q4o.gguf");
     int ngen = 16, prompt = 1;
@@ -8188,6 +8293,10 @@ int main(int argc, char ** argv) {
             while (!g_ready[8 + i].load(std::memory_order_acquire)) sched_yield();
         }
         fprintf(stderr, "[dbg] %d X100 softmax threads up\n", g_n_sm);
+        // Only the f16 QK/exp path is lane-generic so far; int8 KV keeps attention
+        // on the A cluster.
+        g_ax_on = (g_xattn && !g_k8dec) ? 1 : 0;
+        if (g_xattn && g_k8dec) fprintf(stderr, "[xattn] not available with int8 KV\n");
     }
     for (int i = 1; i < g_participants; ++i) {
         pthread_t t;

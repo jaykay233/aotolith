@@ -2178,3 +2178,38 @@ So the remaining lever for attention is the idle X100 cluster, and it is worth
 more than the recorded 3% estimate -- but it needs VLEN-agnostic QK/PV kernels and
 a second thread pool, since every int8 kernel in this file assumes 32 e32 lanes
 (VLEN=1024) and would compute garbage on an X100 core.
+### The X100 cluster cannot take decode QK yet: the score slab is owned by a thread
+
+The port is half done and the half that is done is inert. The default path is
+byte-identical to the shipped one, so nothing regressed:
+
+| arm | exit | logits md5 | qk | pv | decode | cosine | top-1 |
+|---|---|---|---|---|---|---|---|
+| `c016e612...` before this change, 64 steps | 0 | `c016e612...` | 12.77 | 13.35 | 11.61 | 0.978269 | 60/64 |
+| after the refactor below, 64 steps | 0 | `c016e612...` | 12.77 | 13.35 | 11.61 | 0.978269 | 60/64 |
+| `MEGA_XATTN=1`, 64 steps | 0 | `bba293f9...` | 24.05 | 13.73 | 10.19 | 0.171912 | 1/64 |
+
+**What was built.** QK's inner loop now advances by the achieved `vl` instead of
+by the tile width, and carries the intra-tile offset into the K pointer, so one
+body serves 32-lane and 8-lane cores. `attn_exp_sum` has the same treatment. The
+per-thread attention state grew from eight slots to sixteen (`N_ATTN`), the X100
+worker has an attention branch behind `g_ax_gen`, and `ax_run` posts QK/exp to all
+sixteen threads with tile weights taken from each thread's measured `vsetvl`.
+
+**Why it is wrong, and why the timing says so.** QK got *slower* going from eight
+threads to sixteen (12.77 -> 24.05 ms) while producing garbage. Both are the same
+defect: PV reads `g_sa[tid]`, so a score slab belongs to the thread whose PV band
+covers it. Sixteen-way QK splits positions across two sets of slabs, and PV then
+reads every position from the A cluster's own slab -- the second half of the
+context is read from memory nobody wrote, and the ten X100 threads' QK work is
+paid for and used by nothing. The fix is to have X100 thread `t` write into A
+thread `t`'s slab at an offset past that thread's own band, which leaves PV's
+addressing untouched; the eight-slot width of `g_sa` then also bounds the split.
+
+**One correction to the port's premise.** An X100 core reaches 8 lanes at
+`e32m1`, not the 32 the tile loop assumes, so its share of a KT=32 tile is four
+steps of arithmetic and four load/store pairs instead of one of each. Weighting
+the split by measured lanes keeps both clusters at the same finish line but does
+not make the X100 tile cheap: the load/store overhead per element is unchanged,
+which is why the port is worth doing only if the arithmetic it removes from the A
+cluster is what the A cluster was waiting on.
