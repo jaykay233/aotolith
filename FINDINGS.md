@@ -2393,10 +2393,107 @@ moves by more than the GEMM does, which is the prep work's variance, not a trend
 So the draft's 21.8 ms is gemm 5.66 (at the bus), shared head 6.54 (23 GB/s), prep
 6.26 (of which attention 2.14) and bias 3.28. Nothing in it is three times off.
 
-**Where the round's headroom actually is.** A round moves 1421 + 153 + 150 + 150 =
-1874 MB, which at 27.5 GB/s is 68 ms; the round takes 123.8. The 55 ms above the
-floor is dominated by verify attention at 8.7 GB/s: at the bus it would be 8 ms
-instead of 25.2, taking the round to ~107 ms and the rate to ~15.3 tok/s. That is
-the same dim-major tiling conclusion this file reached for the single-row path,
-now with a 17 ms price on it. 15.3 tok/s is also roughly the accuracy-preserving
-ceiling the Q4_0 analysis derived, reached from a different direction.
+**Where the round's headroom is not.** A round moves 1421 + 153 + 150 + 150 =
+1874 MB, which at 27.5 GB/s is 68 ms; the round took 123.8. I read the 55 ms above
+that floor as verify attention running at 8.7 GB/s, and projected 8 ms and 15.3
+tok/s from tiling it dim-major. That projection was wrong, and the measurement
+below is what corrected it.
+
+## Four-row verify attention is MAC bound, not byte bound
+
+`MEGA_QKNOST=1` keeps one int16 score store in eight and drops the other seven.
+Across 60 rounds at 10K, QK went 57.95 -> 58.49 core-s, i.e. **nowhere**. The
+score write-back is not the cost, so the 8.7 GB/s figure was the wrong lens: the
+kernel is not waiting on memory at all.
+
+What it is doing is arithmetic. Four rows mean four queries against every cached
+position, so a round asks for 4 x 16 x 10240 x 128 = 83.9 MMAC a layer for QK and
+the same again for PV, 3.52 GMAC each. Against the measured 12.1 ms of QK and
+10.8 ms of PV that is 291 and 326 GMAC/s of aggregate `vmadot` throughput on eight
+A100 cores -- 36 to 41 GMAC/s a core, above the 25 GMAC/s a core that a f32 FMA
+pass reaches on this chip. The int8 QK/PV pair is at the dot-instruction ceiling.
+There is no 17 ms sitting in the KV layout, and dim-major tiling would buy nothing
+that is not already there.
+
+The consequence for the round: 25.2 ms of verify attention is the price of
+checking four rows, and the only way to move it is to stop asking four rows to
+read the whole context, or to put the second cluster's `vmadot` on half the heads.
+It is not a layout problem.
+
+## The X100 elementwise pool is wrong for four rows
+
+`parallel_for_w` gives rmsnorm a sixteen-band split, which was measured as a win on
+prefill's sixty-four rows (`60.2 -> 58.9 s`). A four-row decode norm has 8192
+floats in total, so each A core gets a quarter of a row and then the whole cluster
+waits on the X100 wake path. Per round:
+
+| 10K, four rows | rmsnorm | draft prep | round |
+|---|---|---|---|
+| `MEGA_ELN=2` (was the default) | 1.54-2.58 | 5.31-7.41 | 125.23 |
+| `MEGA_ELN=0` | **0.12** | 3.88 | 121.26 |
+
+A dispatch of the A pool costs 3.1 us (`MEGA_BARTIME`), so the 200 us a call this
+path was paying is the cross-cluster handshake, not the work. `parallel_for_w` now
+falls back to the eight-way A split below eight bands, which keeps prefill's
+sixteen bands and gives decode the plain one. Whole rows move between threads, and
+`rn_rows_band` reduces each row on one thread, so the result is unchanged bit for
+bit -- the golden check below is the same 60/64 top-1.
+
+## The yield in the X100 idle loop is a rate limiter, and must stay one
+
+The idle loop polled five generation counters and called `sched_yield` between
+polls, which looked like an obvious waste: eight syscalls every few hundred
+nanoseconds on cores that are otherwise parked. Both replacements were worse.
+
+| 40 rounds, 10K | attn mean | attn min | attn max |
+|---|---|---|---|
+| `sched_yield` | 28.3 | 24.9 | **40.3** |
+| `pause` spin | 37.0 | 24.8 | 86.0 |
+| `pause` then 200 us sleep | 36.3 | 24.8 | **143.0** |
+
+A bare spin polls `g_a4_gen` at full rate from eight cores and invalidates the
+line under the A cluster's QK; a sleeping thread is late to the layer handshake,
+which comes every 600 us. The yield is what paces both. Reverted, with the numbers
+in the comment so the next reader does not repeat it.
+
+The same table is also the four-row softmax's whole story: the X100 handshake has a
+24.8 ms floor against 35.9 ms for doing the softmax on the A cluster, but it
+averages out to the same round (118.46 against 118.92 over 100 rounds) because of
+the tail. Keeping it -- the floor is real headroom if the handshake can be
+shortened -- and it emits the identical 49/300 tokens either way.
+
+## Three small items, and what each was worth
+
+The drafter's per-layer prologue was eighty `ds_rmsvec`/`ds_rope` calls and four
+512-element scalar f16 stores on a single core: 1.09 ms a round. It is now one
+(slot, head) unit per pool thread, the same shape as the target's `m4_rope_band`,
+and costs **0.19 ms**. Every element is independent, so the split changes no
+result.
+
+The draft's markov argmax carried `best` through 16320 iterations of a
+compare-and-branch, 3.28 ms for three slots. A lane-wise running max with the same
+strict `>` gives each lane its own chain and the same earliest-index tie-break:
+**3.00 ms**. Only 0.3 ms, which says the scan was already at the memory floor of
+reading a 130560-wide row plus the bias.
+
+The prologue fix also had to resolve `g_ds_rope_half` before the band runs, since
+eight threads reading and lazily writing the same flag is a race even when they
+all write the same value.
+
+## Where the speculative round stands
+
+Steady-state per-round budget on the current build, `/tmp/p10k.txt` at 10K:
+
+| stage | ms | note |
+|---|---|---|
+| verify GEMM, 42 layers | 52.0 | 1265 MB at 24.3 GB/s, 88% of the stream peak |
+| verify attention, 4 rows | 25.2 | at the `vmadot` ceiling, see above |
+| verify lm_head | 7.4 | 150 MB at 23 GB/s |
+| draft, 5 layers | 18.2 | gemm 5.66 (at the bus), prep 3.09, head 6.50, bias 3.00 |
+| round | **118.5** | 12.58 tok/s at the 0.490 acceptance of this text |
+
+The remaining measurable items are 2 ms in the two lm_head passes (23 against 27.5
+GB/s) and 6 ms in the verify GEMM (24.3 against 27.5), both of them the vendor
+IME2 kernel. Everything else in the round is either at the bus, at the dot
+instruction, or is the four-row attention's arithmetic. Acceptance is the larger
+lever: this file's 0.637 text gives 13.8 tok/s at the same round cost.

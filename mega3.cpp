@@ -663,7 +663,11 @@ static void pfw_task(int id) {
     if (lo < hi) g_pfw_fn(lo, hi);
 }
 static void parallel_for_w(int64_t n, void (*fn)(int64_t, int64_t), int wa, int wx) {
-    if (!g_el_on) { parallel_for(n, fn); return; }
+    // Sixteen bands need sixteen bands of work. A four-row decode norm gives an
+    // A core one row and then waits on the X100 wake path, which measured 1.5 ms
+    // a round against 0.12 ms for the plain eight-way split. The pool pays only
+    // for prefill's sixty-four wide rows.
+    if (!g_el_on || n < 8) { parallel_for(n, fn); return; }
     g_pfw_fn = fn; g_pfw_n = n;
     for (int t = 0; t < 8; ++t) g_pfw_w[t] = wa;
     for (int t = 8; t < 16; ++t) g_pfw_w[t] = wx;
@@ -4735,6 +4739,12 @@ static void * sm_worker(void * arg) {
                g_a4_gen.load(std::memory_order_acquire) == agen) {
             if (g_quit.load(std::memory_order_acquire)) return nullptr;
             if (g_el_gen.load(std::memory_order_acquire) != egen) break;
+            // The yield is a rate limiter, not politeness. Pausing instead
+            // (or sleeping) makes this worse: a bare spin polls g_a4_gen at full
+            // rate from eight cores and invalidates the line under the A cluster's
+            // QK, and a sleeping thread is late to the 600 us handshake -- mean
+            // attn 37.0 / max 86.0 for the spin and 36.3 / 143 for the sleep,
+            // against 28.3 / 40.3 for the yield.
             sched_yield();
         }
         if (g_el_gen.load(std::memory_order_acquire) != egen) continue;
@@ -5537,9 +5547,34 @@ static const float * g_lgb_row;   // this draft slot's logit row
 static void lgb_band(int64_t lo, int64_t hi) {
     const int t = g_pf_tid;
     if (lo >= hi) { g_lgb_val[t] = -INFINITY; g_lgb_idx[t] = 0; return; }
-    float bv = g_lgb_row[lo] + g_dsbias[lo];
-    int bi = (int) lo;
-    for (int64_t v = lo + 1; v < hi; ++v) {
+    // Three slots of 130560 against 3.3 ms is one element per 170 cycles: the
+    // scan carried `best` through 16320 iterations of a compare-and-branch, so
+    // every element waited on the previous one. A lane-wise running max gives
+    // each lane its own chain, and because the lanes are strided the winner is
+    // still the earliest index holding the greatest value -- `>` is strict, as
+    // in the serial scan, so an equal value never steals the index.
+    const size_t vl = __riscv_vsetvl_e32m1(32);
+    const vuint32m1_t step = __riscv_vmv_v_x_u32m1(32u, vl);
+    vuint32m1_t base = __riscv_vadd_vx_u32m1(__riscv_vid_v_u32m1(vl), (uint32_t) lo, vl);
+    vuint32m1_t vidx = base;
+    vfloat32m1_t vmax = __riscv_vfmv_v_f_f32m1(-INFINITY, vl);
+    int64_t v = lo;
+    for (; v + 32 <= hi; v += 32) {
+        const vfloat32m1_t x = __riscv_vfadd_vv_f32m1(
+            __riscv_vle32_v_f32m1(g_lgb_row + v, vl),
+            __riscv_vle32_v_f32m1(g_dsbias + v, vl), vl);
+        const vbool32_t m = __riscv_vmfgt_vv_f32m1_b32(x, vmax, vl);
+        vidx = __riscv_vmerge_vvm_u32m1(vidx, base, m, vl);
+        vmax = __riscv_vfmax_vv_f32m1(vmax, x, vl);
+        base = __riscv_vadd_vv_u32m1(base, step, vl);
+    }
+    float lmax[32]; uint32_t lidx[32];
+    __riscv_vse32_v_f32m1(lmax, vmax, vl);
+    __riscv_vse32_v_u32m1(lidx, vidx, vl);
+    float bv = -INFINITY; int bi = (int) lo;
+    for (int i = 0; i < 32; ++i)
+        if (lmax[i] > bv || (lmax[i] == bv && (int) lidx[i] < bi)) { bv = lmax[i]; bi = (int) lidx[i]; }
+    for (; v < hi; ++v) {
         const float x = g_lgb_row[v] + g_dsbias[v];
         if (x > bv) { bv = x; bi = (int) v; }
     }
@@ -5587,6 +5622,44 @@ static void ds_dump_once(int anchor, int64_t pos0, int npref) {
     }
 }
 
+static double g_dst_nrm, g_dst_qnt, g_dst_el, g_dst_pro;
+// The drafter's per-layer prologue is one (slot, head) unit: rmsnorm and rope on a
+// query head, or the same on a key head plus the f16 cache store. Serially it was
+// eighty calls of 128 floats on a single core, 1.1 ms of a 20 ms round. The
+// target's four-row rope pass already spreads its own units this way, and every
+// element here is independent of every other, so the split changes no result.
+static int64_t g_ds_pro_p0;
+static void ds_prologue_band(int64_t lo, int64_t hi) {
+    const int per = N_HEAD + N_KV;
+    const int L = g_ds_layer;
+    for (int64_t u = lo; u < hi; ++u) {
+        const int r = (int) (u / per), j = (int) (u % per);
+        const int pos = (int) (g_ds_pro_p0 + r);
+        if (j < N_HEAD) {
+            float * q = g_dsq + (int64_t) r * N_EMBD + (int64_t) j * HEAD_DIM;
+            ds_rmsvec(q, q, g_ds_qnorm[L], HEAD_DIM);
+            ds_rope(q, pos);
+            continue;
+        }
+        const int h = j - N_HEAD;
+        const int64_t off = (int64_t) r * (N_KV * HEAD_DIM) + (int64_t) h * HEAD_DIM;
+        float * k = g_dsk + off;
+        ds_rmsvec(k, k, g_ds_knorm[L], HEAD_DIM);
+        ds_rope(k, pos);
+        const int64_t coff = (int64_t) L * KV_LAYER_STRIDE
+                           + (int64_t) pos * (N_KV * HEAD_DIM) + (int64_t) h * HEAD_DIM;
+        _Float16 * kc = g_dskc + coff;
+        _Float16 * vc = g_dsvc + coff;
+        for (int d = 0; d < HEAD_DIM; d += 32) {
+            const size_t v2 = __riscv_vsetvl_e32m1((size_t) (HEAD_DIM - d < 32 ? HEAD_DIM - d : 32));
+            __riscv_vse16_v_f16mf2(kc + d, __riscv_vfncvt_f_f_w_f16mf2(
+                __riscv_vle32_v_f32m1(k + d, v2), v2), v2);
+            __riscv_vse16_v_f16mf2(vc + d, __riscv_vfncvt_f_f_w_f16mf2(
+                __riscv_vle32_v_f32m1(g_dsv + off + d, v2), v2), v2);
+        }
+    }
+}
+
 static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     for (int i = 0; i < K; ++i) drafts[i] = anchor;
     if (!g_ds_ready) return;
@@ -5614,8 +5687,11 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     const double _tl = now_s();
     for (int L = 0; L < DS_LAYER; ++L) {
         g_ds_layer = L;
+        double _c = now_s();
         rmsnorm_rows(g_dsxa, g_dsx, g_ds_attn_norm[L], DS_SLOT);
+        g_dst_nrm += now_s() - _c; _c = now_s();
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_dst_qnt += now_s() - _c;
         g_mjn = 3;
         g_mj[0] = { g_ds_wq[L].b, g_ds_wq[L].k, g_ds_wq[L].n, g_dsq };
         g_mj[1] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, g_dsk };
@@ -5624,25 +5700,15 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         run(task_mgemm_m4);
         g_dst_gemm += now_s() - _g0;
 
-        for (int r = 0; r < DS_SLOT; ++r) {
-            const int pos = (int) (pos0 + r);
-            for (int h = 0; h < N_HEAD; ++h) {
-                float * q = g_dsq + (int64_t) r * N_EMBD + h * HEAD_DIM;
-                ds_rmsvec(q, q, g_ds_qnorm[L], HEAD_DIM);
-                ds_rope(q, pos);
-            }
-            for (int h = 0; h < N_KV; ++h) {
-                float * k = g_dsk + (int64_t) r * (N_KV * HEAD_DIM) + h * HEAD_DIM;
-                ds_rmsvec(k, k, g_ds_knorm[L], HEAD_DIM);
-                ds_rope(k, pos);
-            }
-            _Float16 * kc = g_dskc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
-            _Float16 * vc = g_dsvc + (int64_t) L * KV_LAYER_STRIDE + (int64_t) pos * (N_KV * HEAD_DIM);
-            for (int i = 0; i < N_KV * HEAD_DIM; ++i) {
-                kc[i] = (_Float16) g_dsk[(int64_t) r * (N_KV * HEAD_DIM) + i];
-                vc[i] = (_Float16) g_dsv[(int64_t) r * (N_KV * HEAD_DIM) + i];
-            }
+        _c = now_s();
+        // Resolve the rope layout once, before eight threads read it.
+        if (g_ds_rope_half < 0) {
+            const char * e = getenv("MEGA_DSROPE");
+            g_ds_rope_half = (e && !strcmp(e, "half")) ? 1 : 0;
         }
+        g_ds_pro_p0 = pos0;
+        parallel_for((int64_t) DS_SLOT * (N_HEAD + N_KV), ds_prologue_band);
+        g_dst_pro += now_s() - _c;
         // Measured at 10K: 338 ms/round against 305 for the per-slot band, so the
         // default stays per-slot. Sharing the stream cannot pay while the inner loop
         // issues one vector reduction per (position, slot) and reads K in 32-byte
@@ -5655,28 +5721,36 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
             g_dst_attn += now_s() - _ta;
         }
 
+        _c = now_s();
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsatt, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_dst_qnt += now_s() - _c;
         g_mjn = 1; g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, g_dsxa };
         const double _g1 = now_s();
         run(task_mgemm_m4);
         g_dst_gemm += now_s() - _g1;
+        _c = now_s();
         parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
-
         rmsnorm_rows(g_dsxa, g_dsx, g_ds_ffn_norm[L], DS_SLOT);
+        g_dst_nrm += now_s() - _c; _c = now_s();
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
+        g_dst_qnt += now_s() - _c;
         g_mjn = 2;
         g_mj[0] = { g_ds_wg[L].b, g_ds_wg[L].k, g_ds_wg[L].n, g_dsgate };
         g_mj[1] = { g_ds_wu[L].b, g_ds_wu[L].k, g_ds_wu[L].n, g_dsup };
         const double _g2 = now_s();
         run(task_mgemm_m4);
         g_dst_gemm += now_s() - _g2;
+        _c = now_s();
         parallel_for((int64_t) DS_SLOT * N_FF, ds_silu_band);
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsgate, (size_t) N_FF, m4_aq(N_FF));
+        g_dst_qnt += now_s() - _c;
         g_mjn = 1; g_mj[0] = { g_ds_wd[L].b, g_ds_wd[L].k, g_ds_wd[L].n, g_dsxa };
         const double _g3 = now_s();
         run(task_mgemm_m4);
         g_dst_gemm += now_s() - _g3;
+        _c = now_s();
         parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
+        g_dst_el += now_s() - _c;
         if (g_dsdbg2) {
             double a = 0, b = 0;
             for (int i = 0; i < N_EMBD; ++i) { a += (double) g_dsx[i] * g_dsx[i]; b += (double) g_dsatt[i] * g_dsatt[i]; }
@@ -5885,6 +5959,8 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
                g_dst_layer * r + (g_dst_head + g_dst_bias) * r, g_dst_layer * r,
                g_dst_gemm * r, (g_dst_layer - g_dst_gemm) * r, g_dst_attn * r,
                g_dst_head * r, g_dst_bias * r, g_spec_verify * r, tot / rounds * 1e3);
+        printf("spec: draft prep split -- nrm %.2f qnt %.2f el %.2f prologue %.2f ms/round\n",
+               g_dst_nrm * r, g_dst_qnt * r, g_dst_el * r, g_dst_pro * r);
     }
     return true;
 }
@@ -8315,6 +8391,18 @@ int main(int argc, char ** argv) {
 
     bind_cpu(g_cpu0);
     fprintf(stderr, "[dbg] threads up, participants=%d pf_rows=%lld\n", g_participants, (long long)g_pf_rows); fflush(stderr);
+    struct NoopBand { static void fn(int64_t, int64_t) {} };
+    if (getenv("MEGA_BARTIME")) {
+        // An empty dispatch: barrier, no work, barrier. Whatever this costs is paid
+        // by every run() in a round, and a four-row layer issues about eight.
+        const int N = 2000;
+        const double t0 = now_s();
+        for (int i = 0; i < N; ++i) parallel_for(0, NoopBand::fn);
+        const double d = now_s() - t0;
+        printf("barrier: %.1f us per empty dispatch over %d threads (%d iters)\n",
+               d / N * 1e6, g_participants, N);
+        fflush(stdout);
+    }
     tcm_attach(0);
     fprintf(stderr, "[tcm] size=%lld buf=%p\n", (long long) g_tcm_size, (void*) g_tcm[0]);
     if (g_pf_file) {
