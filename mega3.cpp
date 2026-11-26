@@ -4891,7 +4891,7 @@ static const bool M4TIME = getenv("MEGA_M4TIME") != nullptr;
 static double g_m4t[8];   // gemm, attn, norm, silu, rope+kv, quant, argmax, other
 static void m4_report(void) {
     static const char * nm[8] = { "gemm", "attn", "norm", "silu", "rope+kv",
-                                 "quant", "argmax", "other" };
+                                 "quant", "embed", "lm_head" };
     printf("m4dec: ");
     for (int i = 0; i < 8; ++i) printf("%s %.2f  ", nm[i], g_m4t[i] * 1e3);
     printf("(ms)\n");
@@ -5160,6 +5160,22 @@ static bool ds_alloc(void) {
     g_dsbias = (float *) hugemem((size_t) DS_SLOT * VOCAB * 4 + (2 << 20));
     // four slots' score rows per thread: the four-row draft pass shares one K stream
     g_dssc   = (float *) hugemem((size_t) N_GPU * DS_SLOT * MAXCTX * 4 + (2 << 20));
+    {
+        int64_t by = 0;
+        for (int L = 0; L < DS_LAYER; ++L) {
+            const DRef * w[7] = { &g_ds_wq[L], &g_ds_wk[L], &g_ds_wv[L], &g_ds_wo[L],
+                                  &g_ds_wg[L], &g_ds_wu[L], &g_ds_wd[L] };
+            for (int j = 0; j < 7; ++j)
+                by += (int64_t) (w[j]->k / 32) * g_blk_bytes;
+        }
+        // per round: this many bytes of the drafter, plus the target's own lm_head
+        printf("  drafter: %d layers, %.1f MB of weights per round (lm_head shared: %.1f MB)\n",
+               DS_LAYER, (double) by / 1e6,
+               (double) ((int64_t) (g_wo.k / 32) * g_blk_bytes) / 1e6);
+        printf("  drafter: markov table %.1f MB, %d layers, FFN %lld\n",
+               (double) ((int64_t) (g_ds_w2.k / 32) * g_blk_bytes) / 1e6, DS_LAYER,
+               (long long) g_ds_wg[0].n);
+    }
     if (!g_dskc || !g_dsvc || !g_dshid || !g_dsx || !g_dsxa || !g_dsq || !g_dsatt ||
         !g_dsk || !g_dsv || !g_dsgate || !g_dsup || !g_dsfeat || !g_dsenc ||
         !g_dslog || !g_dsbias || !g_dssc) {
@@ -5301,6 +5317,11 @@ static inline int ds_target_slot(int L) {
 // make this ~4x cheaper, but acceptance does not depend on speed, so it waits until
 // there is a measured acceptance rate that justifies it.
 static int g_ds_np;
+// Where a draft's 38 ms goes. The drafter shares the target's lm_head, so its head
+// is a 150 MB read of Q4_0 weights for four rows; the layer GEMMs are the model's
+// own ~120 MB; the attention walks a 256-position window over 64 units. Which of
+// the three dominates is not something to guess at when a round is 134 ms.
+static double g_dst_layer, g_dst_attn, g_dst_head, g_dst_bias;
 static const bool g_ds_attn4 = getenv("MEGA_DSATTN4") != nullptr;
 // MEGA_DSWIN=N: the drafter attends the last N prefix positions. Zero is the full
 // prefix. Default 256, measured over 300 rounds so the number is a stream average
@@ -5478,6 +5499,24 @@ static void ds_attn_band(int64_t lo, int64_t hi) {
 
 // The 2.6 MMAC rounding table lives in g_dsbias as the bias for every vocabulary
 // entry, so the markov head is one more row of the same GEMM.
+// The bias pass is 3 x VOCAB scalar compares per round, all on one core, and the
+// row it reads was just written by a GEMM on eight. Each band keeps the same
+// first-wins tie rule the scalar loop used, so the chosen token is identical.
+static float g_lgb_val[N_GPU];
+static int   g_lgb_idx[N_GPU];
+static const float * g_lgb_row;   // this draft slot's logit row
+static void lgb_band(int64_t lo, int64_t hi) {
+    const int t = g_pf_tid;
+    if (lo >= hi) { g_lgb_val[t] = -INFINITY; g_lgb_idx[t] = 0; return; }
+    float bv = g_lgb_row[lo] + g_dsbias[lo];
+    int bi = (int) lo;
+    for (int64_t v = lo + 1; v < hi; ++v) {
+        const float x = g_lgb_row[v] + g_dsbias[v];
+        if (x > bv) { bv = x; bi = (int) v; }
+    }
+    g_lgb_val[t] = bv; g_lgb_idx[t] = bi;
+}
+
 static void ds_markov_bias(int prev, float * bias) {
     // The four-row quantizer reads four rows of A, so the rank-256 vector is
     // replicated. Handing it one row made it read 3 KB past the array, which is
@@ -5543,6 +5582,7 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     for (int r = 1; r < DS_SLOT; ++r) memcpy(g_dsx + (int64_t) r * N_EMBD, mask_emb, (size_t) N_EMBD * 4);
 
     g_ds_np = (int) pos0 + 1;         // prefix plus slot 0's own key
+    const double _tl = now_s();
     for (int L = 0; L < DS_LAYER; ++L) {
         g_ds_layer = L;
         rmsnorm_rows(g_dsxa, g_dsx, g_ds_attn_norm[L], DS_SLOT);
@@ -5577,8 +5617,12 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         // issues one vector reduction per (position, slot) and reads K in 32-byte
         // granules across a 512-byte position stride; the fix is a dim-major tile,
         // which is the same conclusion the target's own attention reached.
-        if (g_ds_attn4) parallel_for((int64_t) N_HEAD, ds_attn4_band);
-        else parallel_for((int64_t) DS_SLOT * N_HEAD, ds_attn_band);
+        {
+            const double _ta = now_s();
+            if (g_ds_attn4) parallel_for((int64_t) N_HEAD, ds_attn4_band);
+            else parallel_for((int64_t) DS_SLOT * N_HEAD, ds_attn_band);
+            g_dst_attn += now_s() - _ta;
+        }
 
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsatt, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 1; g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, g_dsxa };
@@ -5603,10 +5647,15 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         }
     }
 
+    g_dst_layer += now_s() - _tl;
     rmsnorm_rows(g_dsxa, g_dsx, g_ds_out_norm, DS_SLOT);
     spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsxa, (size_t) N_EMBD, m4_aq(N_EMBD));
     g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_dslog };
-    run(task_mgemm_m4);
+    {
+        const double _th = now_s();
+        run(task_mgemm_m4);
+        g_dst_head += now_s() - _th;
+    }
 
     if (dbg) fprintf(stderr, "  [ds] layers done %.2f ms\n", (now_s() - _t0) * 1e3);
     if (const char * lp = getenv("MEGA_DSLOGD")) {
@@ -5620,6 +5669,7 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         }
     }
     const bool nobias = getenv("MEGA_DSNOBIAS") != nullptr;
+    const double _tb = now_s();
     int prev = anchor;
     for (int i = 0; i < K; ++i) {
         if (nobias) memset(g_dsbias, 0, (size_t) VOCAB * 4);
@@ -5636,16 +5686,16 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
                 }
             }
         }
-        const float * lg = g_dslog + (int64_t) i * VOCAB;
+        g_lgb_row = g_dslog + (int64_t) i * VOCAB;
+        parallel_for(VOCAB, lgb_band);
         int best = 0;
-        float bv = lg[0] + g_dsbias[0];
-        for (int v = 1; v < VOCAB; ++v) {
-            const float x = lg[v] + g_dsbias[v];
-            if (x > bv) { bv = x; best = v; }
-        }
+        float bv = -INFINITY;
+        for (int t = 0; t < g_participants; ++t)
+            if (g_lgb_val[t] > bv) { bv = g_lgb_val[t]; best = g_lgb_idx[t]; }
         drafts[i] = best;
         prev = best;
     }
+    g_dst_bias += now_s() - _tb;
     if (dbg) {
         // Separate the two halves of the decision: the target's lm_head on the draft's
         // hidden state, and the markov bigram bias. If the base argmax is already the
@@ -5786,6 +5836,14 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
                "in %d/%d rounds (%d/%d within 8)\n",
                cos_sum / cos_n, top1_hit, cos_n, top8_hit, cos_n);
     printf("spec: inject %.2f s total\n", g_ds_t_inj);
+    if (M4TIME) m4_report();
+    if (rounds) {
+        const double r = 1e3 / rounds;
+        printf("spec: per round -- draft: layers %.2f attn %.2f head %.2f bias %.2f ms"
+               " | total draft %.2f, round %.2f\n",
+               g_dst_layer * r, g_dst_attn * r, g_dst_head * r, g_dst_bias * r,
+               (g_dst_layer + g_dst_attn + g_dst_head + g_dst_bias) * r, tot / rounds * 1e3);
+    }
     return true;
 }
 
@@ -5851,10 +5909,12 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
     if (p0 + 4 > MAXCTX) return false;
     const bool m4dbg = getenv("MEGA_DSDBG") != nullptr;
     if (m4dbg) fprintf(stderr, "  [m4] round at %lld start\n", (long long) p0);
+    const double _te = now_s();
     for (int r = 0; r < 4; ++r)
         dequant_row_t(g_x4 + (int64_t) r * N_EMBD,
                       g_emb->data + (int64_t) toks[r] * src_row_bytes_t(N_EMBD, (int) g_emb->type),
                       N_EMBD, (int) g_emb->type);
+    if (M4TIME) { g_m4t[6] += now_s() - _te; }
 
     for (int L = 0; L < N_LAYER; ++L) {
         g_layer = L;
@@ -5943,10 +6003,12 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         }
     }
 
+    const double _th = now_s();
     rmsnorm_rows(g_xa4, g_x4, g_out_norm, 4);
     spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
     g_mjn = 1; g_mj[0] = { g_wo.b, g_wo.k, g_wo.n, g_logits4 };
     run(task_mgemm_m4);
+    if (M4TIME) { g_m4t[7] += now_s() - _th; }
     // task_argmax reads g_logits, so the four heads are taken one row at a time.
     // Ties go to the lower index exactly as the single-row path does.
     if (const char * ld = getenv("MEGA_M4LOGD")) {

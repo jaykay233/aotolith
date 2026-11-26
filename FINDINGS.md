@@ -2281,3 +2281,44 @@ The one number this section does not have is the A cluster's own `probe_ops` row
 That arm dies in the `/proc/set_ai_thread` handshake (exit 255, single-threaded, no
 thread creation), so every A100 figure quoted here is from production rather than
 from the probe.
+
+### Measuring the speculative round, and 5% out of the drafter's bias pass
+
+The round was never broken down. `m4_report` existed and nothing called it, so the
+four-row timers it fills were write-only. Wired up at 10K over 300 rounds:
+
+| where a 128 ms round goes | ms | what it is |
+|---|---|---|
+| verify: gemm | 52.0 | 42 layers x Q4_0 through the hp_m4 kernel for four rows |
+| verify: attention | 25.2 | int8 4-row QK+PV+softmax over 215 MB of K/V |
+| verify: lm_head | 7.4 | 150 MB of the shared output head |
+| verify: norm/rope/quant/silu | 4.6 | -- |
+| draft: 5 layers | 13.4 | 1.7 MB of weights, so it is not bandwidth |
+| draft: attention | 2.1 | 256-position window, 64 units |
+| draft: shared lm_head | 6.5 | the 150 MB head again, for the draft's four rows |
+| draft: markov bias | 6.2 | 3 x 308 KB of weights plus an argmax |
+
+The draft's own forward is 1.7 MB of weights in 13.4 ms, i.e. 0.13 GB/s: the
+drafter is latency, not bandwidth, and the same is true of its markov head.
+
+**The one clear win there is the bias pass's argmax.** It was three scalar scans of
+130,560 entries on one core, 6.2 ms of a 128 ms round. Bands over eight threads
+with the same first-wins tie rule:
+
+| 10K, 300 rounds | accepted/round | ms/round | tok/s |
+|---|---|---|---|
+| baseline | 0.637 (191/900) | 134.25 | 12.19 |
+| bias argmax over eight threads | 0.637 (191/900) | 127.91 | **12.80** |
+
+Identical acceptance, so the reordering is exact. Two measurements cost an hour
+before it was right, and both are the same mistake:
+
+* **A parallel argmax must carry the row it is scanning.** The first version
+  indexed `g_dslog` from zero instead of `i * VOCAB`, so draft slots 1 and 2 read
+  slot 0's logits. Acceptance "rose" to 0.793 (238/900) and tok/s to 14.10. That
+  is the shape of the error to watch for: a *better* acceptance number from a
+  change that was supposed to be a pure reordering means the change moved tokens.
+* **A stale process on the board invalidates everything.** Those runs also
+  reported 4.43 tok/s, because two `m3c.xd` instances from earlier measurements
+  were still resident at 786% and 668% CPU. This is the same trap the earlier
+  section recorded; `ps` before a measurement is cheaper than the run.
