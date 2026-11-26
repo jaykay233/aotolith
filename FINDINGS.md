@@ -2322,3 +2322,36 @@ before it was right, and both are the same mistake:
   reported 4.43 tok/s, because two `m3c.xd` instances from earlier measurements
   were still resident at 786% and 668% CPU. This is the same trap the earlier
   section recorded; `ps` before a measurement is cheaper than the run.
+
+### The drafter's rope recomputed 23,040 transcendentals a round
+
+The drafter's prep work was 7.0 ms a round for 4 x 2048 elements a layer, which is
+not a bandwidth number. `ds_rope` called `powf`, `cosf` and `sinf` once per element
+pair, per head, per row, per layer: 64 freqs x 4 rows x 18 vectors x 5 layers =
+23,040 transcendental calls. The angle depends only on `(pos, i)`, and `g_rope_tab`
+already holds cos and sin for every position, built by the target's setup from the
+identical expression -- so the fix is a table lookup, and it is bit-exact.
+
+It made things **worse** at first, which is the interesting half. Removing the
+function calls left a pure load/FMA body over interleaved pairs, and GCC vectorised
+it into stride-2 accesses. This core trap-emulates strided vector access at ~600 ns
+an instruction, so prep went to 9.8 ms and the round to 133.4 ms. `compute_gmax`
+already carries the `no-tree-vectorize` attribute for exactly this reason; `ds_rope`
+needed it too.
+
+| 10K, 300 rounds | draft layers | prep (excl. attn) | ms/round | tok/s |
+|---|---|---|---|---|
+| powf/cosf/sinf per element | 14.72 | 6.97 | 127.91 | 12.80 |
+| table lookup, auto-vectorised | 17.44 | 9.78 | 133.36 | 12.27 |
+| table lookup, scalar | **11.48** | **3.79** | **123.81** | **13.22** |
+
+Acceptance is 191/900 in all three, so the table is exact and the only thing that
+changed is time. The injection path also benefits: 3.5 -> 2.8 s, because it ropes
+every prefix position and was paying the same tax there.
+
+**13.22 tok/s is past the 13.0 tok/s single-row ceiling** this file derived for
+Q4_0: four rows amortise the 52 ms of weights over 1.637 tokens instead of one.
+The round is now verify 101.3 + draft 21.3 + 1.2. Inside the draft, the shared
+lm_head is 6.55 ms for 150 MB (23 GB/s, at the bus) and the five layers' 20 GEMM
+calls are 5.56 ms for 1.7 MB (0.3 GB/s), so the layers are still latency, not
+bytes, which is where the next 3 ms is.

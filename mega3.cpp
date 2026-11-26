@@ -4889,12 +4889,19 @@ static void add4_fn(int64_t lo, int64_t hi) {
 static const bool M4DUMP = getenv("MEGA_M4DUMP") != nullptr;
 static const bool M4TIME = getenv("MEGA_M4TIME") != nullptr;
 static double g_m4t[8];   // gemm, attn, norm, silu, rope+kv, quant, argmax, other
+// The buckets add up to less than the round. These two say whether the difference
+// is inside the layer loop (work between buckets) or after it (argmax, dumps).
+static double g_m4_loop, g_m4_round_t;
 static void m4_report(void) {
     static const char * nm[8] = { "gemm", "attn", "norm", "silu", "rope+kv",
-                                 "quant", "embed", "lm_head" };
+                                 "quant", "argmax", "lm_head" };
     printf("m4dec: ");
     for (int i = 0; i < 8; ++i) printf("%s %.2f  ", nm[i], g_m4t[i] * 1e3);
-    printf("(ms)\n");
+    double sum = 0;
+    for (int i = 0; i < 8; ++i) sum += g_m4t[i];
+    printf("| buckets %.2f loop %.2f round %.2f (ms)\n",
+           sum * 1e3, g_m4_loop * 1e3, g_m4_round_t * 1e3);
+    g_m4_loop = g_m4_round_t = 0;
     for (int i = 0; i < 8; ++i) g_m4t[i] = 0;
 }
 static const bool M4ARGMAX_ONE = getenv("MEGA_M4AX2") != nullptr;
@@ -5199,15 +5206,26 @@ static void ds_rmsvec(float * dst, const float * src, const float * w, int n) {
 // `MEGA_DSROPE=half` used to test 0.111 accepted per round against 0.278: it was
 // not a different valid layout, it was the wrong one on both sides.
 static int g_ds_rope_half = -1;
+// The angle depends only on (pos, i), and g_rope_tab already holds cos and sin for
+// every position, built from the identical expression. Recomputing it here meant
+// powf + cosf + sinf per element pair per head per row per layer: 23,040
+// transcendentals a round, which was 7 of the drafter's 23 ms. The table lookup
+// returns the same bits, because it is the same arithmetic done once at startup.
+// The table lookup made this loop a pure load/store/FMA body, and GCC then
+// vectorised the interleaved pairs into stride-2 accesses, which this core
+// trap-emulates at ~600 ns an instruction: prep went from 7.0 to 9.8 ms. Same trap
+// compute_gmax documents. Keep it scalar.
+__attribute__((optimize("no-tree-vectorize")))
 static void ds_rope(float * x, int pos) {
     if (g_ds_rope_half < 0) {
         const char * e = getenv("MEGA_DSROPE");
         g_ds_rope_half = (e && !strcmp(e, "half")) ? 1 : 0;
     }
+    const float * cs = g_rope_tab + (int64_t) pos * 2 * (HEAD_DIM / 2);
+    const float * sn_t = cs + HEAD_DIM / 2;
     if (g_ds_rope_half) {
         for (int i = 0; i < HEAD_DIM / 2; ++i) {
-            const float th = (float) pos * (1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM));
-            const float c = cosf(th), sn = sinf(th);
+            const float c = cs[i], sn = sn_t[i];
             const float x0 = x[i], x1 = x[i + HEAD_DIM / 2];
             x[i]                = x0 * c - x1 * sn;
             x[i + HEAD_DIM / 2] = x0 * sn + x1 * c;
@@ -5215,8 +5233,7 @@ static void ds_rope(float * x, int pos) {
         return;
     }
     for (int i = 0; i < HEAD_DIM / 2; ++i) {
-        const float th = (float) pos * (1.0f / powf(ROPE_BASE, (float) (2 * i) / (float) HEAD_DIM));
-        const float c = cosf(th), sn = sinf(th);
+        const float c = cs[i], sn = sn_t[i];
         const float x0 = x[2 * i], x1 = x[2 * i + 1];
         x[2 * i]     = x0 * c - x1 * sn;
         x[2 * i + 1] = x0 * sn + x1 * c;
@@ -5321,7 +5338,11 @@ static int g_ds_np;
 // is a 150 MB read of Q4_0 weights for four rows; the layer GEMMs are the model's
 // own ~120 MB; the attention walks a 256-position window over 64 units. Which of
 // the three dominates is not something to guess at when a round is 134 ms.
-static double g_dst_layer, g_dst_attn, g_dst_head, g_dst_bias;
+static double g_dst_layer, g_dst_attn, g_dst_head, g_dst_bias, g_spec_verify;
+// Inside a draft layer: the four-row GEMMs against everything else (norm, quant,
+// rope and the scalar KV store). 1.7 MB of weights in 13 ms means one of the two
+// is pure overhead, and which one decides what is worth changing.
+static double g_dst_gemm, g_dst_prep;
 static const bool g_ds_attn4 = getenv("MEGA_DSATTN4") != nullptr;
 // MEGA_DSWIN=N: the drafter attends the last N prefix positions. Zero is the full
 // prefix. Default 256, measured over 300 rounds so the number is a stream average
@@ -5591,7 +5612,9 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         g_mj[0] = { g_ds_wq[L].b, g_ds_wq[L].k, g_ds_wq[L].n, g_dsq };
         g_mj[1] = { g_ds_wk[L].b, g_ds_wk[L].k, g_ds_wk[L].n, g_dsk };
         g_mj[2] = { g_ds_wv[L].b, g_ds_wv[L].k, g_ds_wv[L].n, g_dsv };
+        const double _g0 = now_s();
         run(task_mgemm_m4);
+        g_dst_gemm += now_s() - _g0;
 
         for (int r = 0; r < DS_SLOT; ++r) {
             const int pos = (int) (pos0 + r);
@@ -5626,7 +5649,9 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
 
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsatt, (size_t) N_EMBD, m4_aq(N_EMBD));
         g_mjn = 1; g_mj[0] = { g_ds_wo[L].b, g_ds_wo[L].k, g_ds_wo[L].n, g_dsxa };
+        const double _g1 = now_s();
         run(task_mgemm_m4);
+        g_dst_gemm += now_s() - _g1;
         parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
 
         rmsnorm_rows(g_dsxa, g_dsx, g_ds_ffn_norm[L], DS_SLOT);
@@ -5634,11 +5659,15 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         g_mjn = 2;
         g_mj[0] = { g_ds_wg[L].b, g_ds_wg[L].k, g_ds_wg[L].n, g_dsgate };
         g_mj[1] = { g_ds_wu[L].b, g_ds_wu[L].k, g_ds_wu[L].n, g_dsup };
+        const double _g2 = now_s();
         run(task_mgemm_m4);
+        g_dst_gemm += now_s() - _g2;
         parallel_for((int64_t) DS_SLOT * N_FF, ds_silu_band);
         spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_dsgate, (size_t) N_FF, m4_aq(N_FF));
         g_mjn = 1; g_mj[0] = { g_ds_wd[L].b, g_ds_wd[L].k, g_ds_wd[L].n, g_dsxa };
+        const double _g3 = now_s();
         run(task_mgemm_m4);
+        g_dst_gemm += now_s() - _g3;
         parallel_for((int64_t) DS_SLOT * N_EMBD, ds_add_band);
         if (g_dsdbg2) {
             double a = 0, b = 0;
@@ -5765,6 +5794,7 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
     for (int it = 0; it < rounds; ++it) {
         const double t0 = now_s();
         ds_draft(anchor, p0, K, dr);
+        const double t1 = now_s();
 
         int * const tok = g_spec_tok;
         tok[0] = anchor;
@@ -5772,6 +5802,7 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
         for (int i = K + 1; i < DS_SLOT; ++i) tok[i] = dr[K - 1];
 
         if (!m4_round(p0, tok, g_m4out)) return false;
+        g_spec_verify += now_s() - t1;
 
         // Acceptance is a 0/1 summary of a comparison that is really a whole
         // distribution. Row 0 of the round is the anchor, so its logit row is the
@@ -5839,10 +5870,13 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
     if (M4TIME) m4_report();
     if (rounds) {
         const double r = 1e3 / rounds;
-        printf("spec: per round -- draft: layers %.2f attn %.2f head %.2f bias %.2f ms"
-               " | total draft %.2f, round %.2f\n",
-               g_dst_layer * r, g_dst_attn * r, g_dst_head * r, g_dst_bias * r,
-               (g_dst_layer + g_dst_attn + g_dst_head + g_dst_bias) * r, tot / rounds * 1e3);
+        // attn is measured inside the layer loop, so it is a share of `layers`,
+        // not an addend. Summing it in overstated the draft by 2 ms.
+        printf("spec: per round -- draft %.2f ms (layers %.2f = gemm %.2f + prep %.2f,"
+               " incl attn %.2f; head %.2f, bias %.2f) | verify %.2f | round %.2f\n",
+               g_dst_layer * r + (g_dst_head + g_dst_bias) * r, g_dst_layer * r,
+               g_dst_gemm * r, (g_dst_layer - g_dst_gemm) * r, g_dst_attn * r,
+               g_dst_head * r, g_dst_bias * r, g_spec_verify * r, tot / rounds * 1e3);
     }
     return true;
 }
@@ -5909,7 +5943,8 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
     if (p0 + 4 > MAXCTX) return false;
     const bool m4dbg = getenv("MEGA_DSDBG") != nullptr;
     if (m4dbg) fprintf(stderr, "  [m4] round at %lld start\n", (long long) p0);
-    const double _te = now_s();
+    const double _tr0 = now_s();
+    const double _te = _tr0;
     for (int r = 0; r < 4; ++r)
         dequant_row_t(g_x4 + (int64_t) r * N_EMBD,
                       g_emb->data + (int64_t) toks[r] * src_row_bytes_t(N_EMBD, (int) g_emb->type),
@@ -6003,6 +6038,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         }
     }
 
+    if (M4TIME) g_m4_loop += now_s() - _tr0;
     const double _th = now_s();
     rmsnorm_rows(g_xa4, g_x4, g_out_norm, 4);
     spacemit_kernels::rvv::quantize_a_4row_i8_hp(256, g_xa4, (size_t) N_EMBD, m4_aq(N_EMBD));
@@ -6032,6 +6068,7 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
     // are contiguous, so a band per thread covers them naturally and each thread
     // keeps four running maxima. Scanning in increasing index with a strict ">"
     // keeps ties on the lower id, which is what the single-row path does.
+    const double _ta = now_s();
     {
         if (M4ARGMAX_ONE) {
             run(task_argmax4_init);
@@ -6066,6 +6103,8 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             g_logits = keep;
         }
     }
+    if (M4TIME) g_m4t[6] += now_s() - _ta;
+    if (M4TIME) g_m4_round_t = now_s() - _tr0;
     if (M4TIME) {
         // qk/pv are A-cluster core-s, sm is X100 core-s: the split says whether the
         // round's attention is dot-bound or bound by the KV stream.
