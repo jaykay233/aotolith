@@ -5371,6 +5371,21 @@ static int g_ds_np;
 // own ~120 MB; the attention walks a 256-position window over 64 units. Which of
 // the three dominates is not something to guess at when a round is 134 ms.
 static double g_dst_layer, g_dst_attn, g_dst_head, g_dst_bias, g_spec_verify;
+// MEGA_TOKD=path appends one int32 per emitted token, so a speculative run and a
+// single-row run can be diffed for output equality. Speculation emits the verify's
+// own argmax chain, which is the same decision the single-row path makes -- but
+// verify reads an int8 K plane and single-row reads f16, so equality is a
+// measurement, not an assumption.
+static FILE * tdump(void) {
+    static FILE * f = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const char * p = getenv("MEGA_TOKD");
+        if (p) f = fopen(p, "wb");
+    }
+    return f;
+}
 // Inside a draft layer: the four-row GEMMs against everything else (norm, quant,
 // rope and the scalar KV store). 1.7 MB of weights in 13 ms means one of the two
 // is pure overhead, and which one decides what is worth changing.
@@ -5674,6 +5689,10 @@ static void ds_prologue_band(int64_t lo, int64_t hi) {
     }
 }
 
+// A diagnostic can re-run one round's draft under a second slot-0 weight and
+// judge both against the same verify logits; see MEGA_DSBW2.
+static float g_dsbw_ovr = 0.0f;
+static float g_dsbw0 = 0.80f;     // the slot-0 weight in force, for the diagnostic print
 static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
     for (int i = 0; i < K; ++i) drafts[i] = anchor;
     if (!g_ds_ready) return;
@@ -5794,11 +5813,56 @@ static void ds_draft(int anchor, int64_t pos0, int K, int32_t * drafts) {
         }
     }
     const bool nobias = getenv("MEGA_DSNOBIAS") != nullptr;
+    // The markov bigram table is added to the drafter's logits. It used to be
+    // weight 1, which asserts a calibration nothing ever measured, and it only
+    // reorders the drafts, so the target's output cannot change whatever it is.
+    //
+    // The weight is per slot because the slots are not the same question. Only
+    // slot 0's predecessor is a token the target emitted; slots 1-3 condition on a
+    // draft. Measured at 10K over 600 rounds of /tmp/p10k.txt:
+    //
+    //   uniform 0.80         0.638 accepted/round   13.71 tok/s
+    //   0.80 / 0.25 x3       1.143 accepted/round   17.89 tok/s
+    //
+    // The slot-0 weight itself is flat between 0.5 and 1.0 and falls off a cliff
+    // past 1.6 (paired slot-0 hits over 300 rounds: 0.5 -> 218, 0.8 -> 221,
+    // 1.0 -> 214, 1.3 -> 186, 1.6 -> 154, 2.2 -> 78, 3.0 -> 37).
+    // MEGA_DSBVW=w0,w1,w2,w3 sets them; MEGA_DSBW sets all four at once.
+    static float dsvw[4] = { 0.80f, 0.25f, 0.25f, 0.25f };
+    static bool dsvw_init = false;
+    if (!dsvw_init) {
+        dsvw_init = true;
+        if (const char * e = getenv("MEGA_DSBVW")) {
+            for (int k = 0; k < 4 && *e; ++k) { dsvw[k] = (float) atof(e); if (!(e = strchr(e, ','))) break; ++e; }
+        } else if (const char * e = getenv("MEGA_DSBW")) {
+            const float w = (float) atof(e);
+            for (int k = 0; k < 4; ++k) dsvw[k] = w;
+        }
+    }
+    // The bias head reads its 16.7 MB matrix once per slot, which is the whole
+    // reason bias costs 3.2 ms of a 97 ms round. MEGA_DSNW limits how many leading
+    // slots pay for it.
+    static int dsnw = -1;
+    if (dsnw < 0) { const char * e = getenv("MEGA_DSNW"); dsnw = e ? atoi(e) : DS_SLOT; }
     const double _tb = now_s();
     int prev = anchor;
     for (int i = 0; i < K; ++i) {
-        if (nobias) memset(g_dsbias, 0, (size_t) VOCAB * 4);
-        else ds_markov_bias(prev, g_dsbias);
+        float wslot = dsvw[i & 3];
+        if (i == 0) g_dsbw0 = wslot;
+        // A paired diagnostic overrides slot 0 only: slots 1-3 chain off a draft
+        // that the second draft did not produce, so their hits are not comparable.
+        if (i == 0 && g_dsbw_ovr > 0) wslot = g_dsbw_ovr;
+        if (nobias || i >= dsnw) memset(g_dsbias, 0, (size_t) VOCAB * 4);
+        else {
+            ds_markov_bias(prev, g_dsbias);
+            if (wslot != 1.0f) {
+                for (int v = 0; v < VOCAB; v += 32) {
+                    const size_t vl = __riscv_vsetvl_e32m1((size_t) (VOCAB - v < 32 ? VOCAB - v : 32));
+                    __riscv_vse32_v_f32m1(g_dsbias + v, __riscv_vfmul_vf_f32m1(
+                        __riscv_vle32_v_f32m1(g_dsbias + v, vl), wslot, vl), vl);
+                }
+            }
+        }
         if (i == 0) {
             if (const char * bp = getenv("MEGA_DSBIASD")) {
                 // The markov bias for the first position, so the reference can add
@@ -5884,6 +5948,7 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
     if (K > DS_SLOT - 1) K = DS_SLOT - 1;
     int32_t * const dr = g_spec_dr;
     double cos_sum = 0.0; int cos_n = 0, top1_hit = 0, top8_hit = 0;
+    long long pair_hit[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }, pair_n = 0;
     long long acc = 0, total = 0;
     double best = 1e9, tot = 0;
     int shown = 0;
@@ -5929,6 +5994,29 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
                         (long long) p0, cs, want, rank);
         }
 
+        // Paired weight comparison: slot 0 answers "what follows the anchor",
+        // and the verify's row 0 answers the same question under the same prefix
+        // whatever the draft said, so a second draft at a different weight is
+        // scored against identical target logits. That is the only way to compare
+        // two weights without the two runs walking different token streams.
+        static int bw2n = -1;
+        static float bw2v[7];
+        if (bw2n < 0) {
+            bw2n = 0;
+            if (const char * e = getenv("MEGA_DSBW2"))
+                for (const char * q = e; *q && bw2n < 7; ) { bw2v[bw2n++] = (float) atof(q); if ((q = strchr(q, ','))) ++q; else break; }
+        }
+        if (bw2n) {
+            static int32_t dr2[DS_SLOT];
+            if (dr[0] == g_m4out[0]) pair_hit[0] += 1;
+            for (int k = 0; k < bw2n; ++k) {
+                g_dsbw_ovr = bw2v[k];
+                ds_draft(anchor, p0, K, dr2);
+                if (dr2[0] == g_m4out[0]) pair_hit[k + 1] += 1;
+            }
+            g_dsbw_ovr = 0.0f;
+            pair_n += 1;
+        }
         int n = 0;
         while (n < K && g_m4out[n] == dr[n]) ++n;
         acc += n; total += K;
@@ -5941,6 +6029,11 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
             printf("spec %2d p=%lld  acc %d/%d  drafts %d %d %d  -> %d\n",
                    it, (long long) p0, n, K, dr[0], dr[1], dr[2], next);
             ++shown;
+        }
+        if (FILE * f = tdump()) {
+            for (int i = 0; i < n; ++i) { int32_t t = dr[i]; fwrite(&t, 4, 1, f); }
+            int32_t t = next; fwrite(&t, 4, 1, f);
+            fflush(f);
         }
         p0 += n + 1;
         anchor = next;
@@ -5962,6 +6055,15 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
         printf("spec: draft vs target logits: mean cos %.4f, target argmax at draft rank 0 "
                "in %d/%d rounds (%d/%d within 8)\n",
                cos_sum / cos_n, top1_hit, cos_n, top8_hit, cos_n);
+    if (pair_n) {
+        const char * e = getenv("MEGA_DSBW2");
+        printf("spec: paired slot0 -- w=%.2f %lld/%lld", (double) g_dsbw0, pair_hit[0], pair_n);
+        for (int k = 0; k < 7 && e && *e; ++k) {
+            printf(", w=%.2f %lld/%lld", (double) atof(e), pair_hit[k + 1], pair_n);
+            if ((e = strchr(e, ','))) ++e; else break;
+        }
+        printf("\n");
+    }
     printf("spec: inject %.2f s total\n", g_ds_t_inj);
     if (M4TIME) m4_report();
     if (rounds) {
@@ -8499,7 +8601,12 @@ int main(int argc, char ** argv) {
         pos0 = np;
         if (g_m4spec) {
             m4spec_run(pos0, prompt, g_m4spec, g_m4spec_k);
-            return 0;
+            // The same exit fault the single-row path documents: the workers are
+            // parked on raw huge-page buffers, so unwinding static destructors on
+            // return from main runs underneath them. Every line is already out.
+            fflush(stdout);
+            fflush(stderr);
+            _exit(0);
         }
         if (g_attn4 && g_m4dec) { m4dec_run(pos0, prompt, g_m4dec); return 0; }
         if (g_attn4) { attn4_bench(g_attn4, np); return 0; }
@@ -8744,6 +8851,9 @@ int main(int argc, char ** argv) {
                 printf("\n");
             }
             tok = best;
+            // Flushed per token because this path ends in _exit(0), which does not
+            // run stdio's flush.
+            if (FILE * f = tdump()) { int32_t t = tok; fwrite(&t, 4, 1, f); fflush(f); }
             // Teacher forcing: walk the reference's token chain instead of our own
             // argmax. Without it a single near-tie splits the two chains and every
             // later step compares different prefixes, so the logits cannot be

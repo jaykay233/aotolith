@@ -504,3 +504,27 @@ the diagnosis. 36 of 40 rounds put the right token in the draft's top eight.
 drops 10K acceptance to 0.133, so both the injected prefix and the markov chain are
 load-bearing. `FINDINGS.md` section 2 has the variant table, the layer-shift sweep and
 the four port bugs.
+
+## Where the speculative route stands now
+
+The 305 ms round and the 6.3 tok/s in the table above are the state before the
+drafter's 256-position window, the fused prep, and the per-slot markov weights.
+Current build, `/tmp/p10k.txt` at 10K, 600 rounds:
+
+    round 119.8 ms   (draft 18.4 = layers 8.6 + head 6.5 + bias 3.2, verify 100.4)
+    accepted 1.143 drafts per round -> 2.143 tokens per round -> 17.89 tok/s
+
+The lever that moved it last was not a kernel: the markov bias was added at weight
+1, and a paired sweep (one draft re-run per round, judged against the same verify
+row 0, so every weight sees identical positions) puts the slot-0 plateau at
+0.5-1.0 and the cliff past 1.6. The slots then split: slot 0's predecessor is a
+committed token, slots 1-3 chain off a hypothesis, and 0.80/0.25/0.25/0.25 gives
+1.143 accepted/round against 0.638 for a uniform 0.80 at the same round cost.
+`FINDINGS.md`, last section, has the tables and the reason the unpaired sweep at
+the start of it cannot decide the weight.
+
+20 tok/s at this round needs 1.40 accepted per round, i.e. 2.40 emitted. Slots 1-3
+deliver 0.08 each because all four slots attend the prefix plus slot 0 and nothing
+else -- they are four parallel guesses at four positions, not a chain. The next step
+is a draft structure where slot 1 can condition on slot 0's token, or a tree that
+spends the four rows on alternatives at fewer positions.

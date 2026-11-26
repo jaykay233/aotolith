@@ -17,6 +17,9 @@ file is the index of conclusions; it does not repeat their derivations.
 ## 导读（中文）
 
 - **10K decode 目前 12.36 tok/s**（真实 Q3_K 权重 + int8 KV），Q4_0 是 11.18。
+  投机解码（Q4_0 + dspark，逐 slot markov 权重 0.8/0.25/0.25/0.25）在同一块板上
+  是 **17.89 tok/s**：每轮 119.8 ms、接受 1.143 个草案。剩下的差距在 drafter
+  结构上——四个 slot 都只看前缀 + slot 0，slot 1-3 无法条件于 slot 0 的结果。
   20 tok/s 不是内核问题，是**每 token 要搬的字节数**问题：Q4_0 权重 1265 MB
   + int8 KV 215 MB = 1480 MB，在 16.5 GB/s 上就是 89.5 ms。要 20 tok/s 必须
   让一次权重读取产出多个 token（dspark 投机解码），或者把权重压到 2-3 bit。
@@ -2490,13 +2493,14 @@ Steady-state per-round budget on the current build, `/tmp/p10k.txt` at 10K:
 | verify attention, 4 rows | 25.2 | at the `vmadot` ceiling, see above |
 | verify lm_head | 7.4 | 150 MB at 23 GB/s |
 | draft, 5 layers | 18.2 | gemm 5.66 (at the bus), prep 3.09, head 6.50, bias 3.00 |
-| round | **118.5** | 12.58 tok/s at the 0.490 acceptance of this text |
+| round | **119.8** | 17.89 tok/s at 1.143 accepted per round (see the bias section below) |
 
 The remaining measurable items are 2 ms in the two lm_head passes (23 against 27.5
 GB/s) and 6 ms in the verify GEMM (24.3 against 27.5), both of them the vendor
 IME2 kernel. Everything else in the round is either at the bus, at the dot
-instruction, or is the four-row attention's arithmetic. Acceptance is the larger
-lever: this file's 0.637 text gives 13.8 tok/s at the same round cost.
+instruction, or is the four-row attention's arithmetic. Acceptance, not the round,
+is what moved last: per-slot markov weights took the same 119.8 ms round from
+12.58 to 17.89 tok/s.
 
 ## Decode V in int8, K left in f16
 
@@ -2551,3 +2555,109 @@ workers. Both came back with 0/300 drafts accepted instead of 49/300, at a
 changes what the speculative path computes, because the four-row verify's softmax
 runs on that pool. `/tmp/p10k.txt` takes 150 s of prefill, so it is tempting to
 run two arms at once; don't.
+
+## The markov bias weight, and why slot 0 is the only draft that matters
+
+`ds_markov_bias` projects the token into a rank-256 space and back out to the
+vocabulary, and the result was added to the drafter's own logits at weight 1. That
+weight asserts that the bigram prior and the drafter's 324M forward have been
+calibrated against each other, which nothing ever measured. It is a free knob: the
+bias reorders drafts and the emitted tokens are the verify's own argmax chain, so
+the target's output cannot change whatever it does. On the 10K prompt:
+
+| weight | accepted/round | where it was measured |
+|---|---|---|
+| 1.00 (the old constant) | 0.33 | 30 rounds |
+| 0.55 | 0.505 | 100 rounds |
+| 0.40 | 0.590 / 0.527 | two runs, 100 and 150 rounds |
+| 0.35 | 0.690 | 100 rounds |
+| 0.30 | 0.490 | 100 rounds |
+| 0.25 | 0.420 | 100 rounds |
+| 0.20 | 0.280 | 100 rounds |
+
+**That table cannot decide the weight.** The emitted stream is the verify's chain,
+so the tokens are the same for every weight; what a weight changes is the stride
+`p0 += n + 1`, and two weights therefore sample different stretches of the same
+text. This prompt's accept rate varies by more than 2x between stretches, which is
+why a neighbouring weight reads 0.35 and 0.40 and 0.55 in that order. Two 600-round
+runs settle the same question with numbers that do not overlap at all.
+
+The measurement that does decide it is paired, and it exists because of one
+asymmetry: slot 0's question is "what follows the anchor", and the verify's row 0
+answers exactly that question under the same prefix whatever the draft said. So a
+round can run its draft twice at two weights and score both against one set of
+target logits, on identical positions. `MEGA_DSBW2=a,b,c` up to seven extra
+weights; the extra drafts cost 18 ms each and are for measurement only.
+
+| paired slot-0 hits, 300 rounds | w=0.50 | 0.80 | 1.00 | 1.30 | 1.60 | 2.20 | 3.00 | 4.00 |
+|---|---|---|---|---|---|---|---|---|
+| target argmax at draft rank 0 | **218** | **221** | 214 | 186 | 154 | 78 | 37 | 23 |
+
+The plateau runs 0.5-1.0 and the cliff is past 1.6, so the old constant of 1 sat
+near the top of the plateau by luck and the earlier 0.2-0.55 readings were sampling
+noise.
+
+**The larger finding is that the slots are not the same question.** Every draft
+slot attends the prefix plus slot 0 and nothing else, so slots 1-3 predict
+positions t+1..t+3 from one context and differ from slot 0 only by their bias. At
+300 rounds, slot 0 alone accounts for 221 of 297 accepted drafts: slots 1-3 deliver
+0.25 per round between them, 0.08 each, and at weight 0.40 they delivered 0.135.
+
+That makes a per-slot weight the right shape. Only slot 0's predecessor is a token
+the target actually emitted, so it can carry a strong prior; slots 1-3 condition on
+a hypothesis. `MEGA_DSBVW=w0,w1,w2,w3`, and two 600-round runs on the same prompt:
+
+| 600 rounds at 10K | accepted/round | ms/round | tok/s |
+|---|---|---|---|
+| uniform 0.80 | 0.638 (383/1800) | 119.46 | 13.71 |
+| **0.80 / 0.25 x 3** | **1.143 (686/1800)** | 119.78 | **17.89** |
+
+Same round cost, 79% more accepted tokens. That is the default now. The round
+budget is unchanged: draft 18.4 ms (layers 8.6, head 6.5, bias 3.2), verify 100.4,
+round 119.8.
+
+**What this does not fix.** tokens/round is `1 + E[accepted]`, so 20 tok/s at
+119.8 ms needs 1.40 accepted per round, and slot 0 alone caps out near
+`E[n] = P(slot 0) + P(slot 0) * P(slot 1) + ...`. With slot 0 at 0.74 and slots 1-3
+at 0.08 the sum is 1.14, which is where the line above sits. Closing the last 2
+tok/s needs the drafter to condition slot 1 on slot 0's token, which it cannot do:
+the slots are parallel mask queries over one anchor. A tree over the four rows
+would let the four rows cover 4 positions with alternatives instead of one
+position each.
+
+**Also in this round.** The speculative path ended in the same exit fault the
+single-row path documents -- workers parked on raw huge-page buffers, static
+destructors run underneath them -- so every spec run printed `rc=139` after its
+last line of output. It is `_exit(0)` now, and the numbers above come from runs
+that exit 0. `MEGA_TOKD=path` writes one int32 per emitted token from either decode
+path so the two can be diffed.
+
+### What speculative decode emits, and where it differs from plain greedy
+
+The emitted tokens are the four-row verify's own argmax chain, so the draft
+weights cannot move them. The four-row verify and the single-row path are still
+different arithmetic: verify reads the int8 K plane `g_k8i`, single-row reads f16
+K. `MEGA_TOKD` on both paths, same 10K prompt:
+
+| | |
+|---|---|
+| identical tokens | 21 of the first 300 |
+| first difference | token 12 (spec 3009, single 367) |
+
+Divergence compounds, so 21/300 is really "agreed to 12, then the chains split".
+The size of the underlying difference, at position 10000, row 0 of the verify
+against the same position from the single-row path:
+
+| | |
+|---|---|
+| cosine | 0.9883 |
+| top-1 | 220 both, 15.43 against 16.00 |
+| top-2 | 1207 both |
+| max abs difference | 1.909 on a 26-logit span |
+
+That is smaller than this build's own deviation from the frozen llama.cpp
+reference, which is 0.978 cosine with `max|d|` 1.7-5.2 at the steps in the golden
+table. So the speculative stream is the same model at int8-K resolution rather
+than a different model, and a near-tie at token 12 is what a 1.9-logit difference
+flips. Anyone quoting output equality between the two paths has to say which
+position they compared: step 0 agrees, step 12 does not.
