@@ -2661,3 +2661,95 @@ table. So the speculative stream is the same model at int8-K resolution rather
 than a different model, and a near-tie at token 12 is what a 1.9-logit difference
 flips. Anyone quoting output equality between the two paths has to say which
 position they compared: step 0 agrees, step 12 does not.
+
+## The backup softmax inherited a loop bound from the stage that came after it
+
+The neighbour-backup pass took the round from 119.9 to 113.3 ms, and the first
+determinism checks -- 100 rounds at 2K and 150 at 10K, comparing token md5 -- passed.
+They passed because they were too short to cross a window that opens about once in
+400 rounds.
+
+The audit that finds it hashes the round's own numbers instead of its tokens: an FNV
+fold over the four rows of `g_logits4` and over the drafter's slot-0 logits, printed
+per round under `MEGA_SPECLOG=1`, 400 rounds at 10K, backup on against backup off.
+
+| 400 rounds, 10K | verify-logit hash differs | drafter-logit hash differs | token dump |
+|---|---|---|---|
+| backup on, before the fix, run 1 | 63/400, first at round 229 | 0/400 | `ec0b9e52...`, 843 tokens |
+| backup on, before the fix, run 2 | -- | -- | `490e5fc0...`, 836 tokens |
+| backup off | -- | -- | `490e5fc0...`, 836 tokens |
+| backup on, after the fix (2 runs) | **0/400** | **0/400** | **`490e5fc0...`**, 436/1200 |
+
+The drafter's logits never moved, so the proposal side was clean. The target side
+moved, and at round 336 it moved enough to fork the emitted stream. Round 229 is the
+useful one: same position, same drafts, same accepted count, same next token, and a
+different hash over 4 x VOCAB logits. A tolerance would have hidden it.
+
+**Cause.** `pfa_sm_i8` looped `for (gg = 0; gg < g_i8g; ++gg)` over the shared
+`g_i8g`. `pfa_run` sets it to 1 for the four-row round and puts it back to `I8_G`
+(16) the moment `run(task_attn4_a)` returns; the X100 pool is not a participant in
+that barrier, by design. The window is therefore: the A thread takes the backup
+plane, the layer finishes, the stage flips the count to 16, and the owning worker is
+still inside the call. The remaining fifteen iterations write fifteen more group
+blocks starting at `g_w4 + h*WBLK`: heads h+1..h+15, each fed from that head's own
+score plane but with `L` shifted by 4..60 positions and the causal-tail zeroing
+computed from the shifted length. A plane read inside the window hands a correct
+head a wrong tail, and the PV sum carries it into every later layer.
+
+Without the backup the window cannot open: the A thread cannot leave a head before
+its owner has published, so no owner is ever inside the call when the count flips.
+That is why the arm that had been running for weeks was clean and the new one was
+not -- not a missing barrier, but a new path around one.
+
+**Fix.** The count is an argument now, `pfa_sm_i8(..., int ng)`. The four decode call
+sites (owner, backup, the A-side fallback, and the `MEGA_A4S=2` in-place softmax)
+pass 1; the two prefill sites pass `g_i8g` at the call. Nothing in the decode path
+reads a global that the next stage owns. Cost: nothing measurable -- the four arms
+of the 400-round A/B above emit the same 836 tokens with the same 436/1200
+acceptance.
+
+**The general shape**, because this is what a working overlap hides. A generation
+tag protects a *flag*: a stale publish is ignored because it carries an older
+number. A loop bound has no generation to carry. Anything a late thread reads to
+decide *how much* to do has to arrive as an argument or be snapshotted while the
+caller still owns the stage.
+
+## The neighbour backup charged the cluster's publish skew to the owner
+
+With the fix in, the 400-round means at 10K are 121.5 and 121.7 ms with the backup
+off and 115.5 and 114.9 with it on. The stage timers (`MEGA_M4TIME=1`) say where the
+backup's own cost sits: in a quiet 60-round window the attention layer wall is
+26.4 ms with the backup off and 32.6 ms with it at 80 us, and the takeover counter
+fires 78 times a round -- while the A side's own wait is 0.011 ms. The backup was
+scoring heads nobody was waiting for.
+
+The deadline was measured from the pass's entry, and that timestamp is taken
+*before* the wait for the neighbour's qk flag. A worker that arrives at the loop
+before the A thread has published spends the whole 80 us on the flag wait and then
+takes the head over with no lateness to point at. Starting the deadline at the
+first sight of the flag -- the moment the owning worker could also have started --
+cuts takeovers from 78 to 1.5 a round and the steady-state attention wall from 32.6
+to 29.4 ms.
+
+The right semantics is not the right schedule. Rescue latency is worth more than
+duplicate work, and the deadline curve is flat only below 80 us:
+
+| 400 rounds, 10K, backup deadline | mean ms/round | tok/s |
+|---|---|---|
+| off | 121.49 / 121.71 | 17.20 / 17.17 |
+| 20 us | 113.81 | 18.36 |
+| 40 us | 113.48 | 18.42 |
+| **80 us (default)** | **114.29 / 113.64** | **18.29 / 18.39** |
+| 150 us | 116.75 / 115.95 | 17.90 / 18.03 |
+| 300 us | 119.43 / 120.36 | 17.50 / 17.37 |
+
+20, 40 and 80 us are inside one round's noise of each other; 150 and up lose more to
+rescue latency than they save on duplicate work. The default stays 80 us, now
+measured from the flag. The deadline change alone is worth about 1.2 ms at the same
+nominal value (115.5/114.9 before against 114.3/113.6 after).
+
+Where the round stands at 10K, four rows, 1.09 accepted per round: draft 18.5,
+verify GEMM 52.4, verify attention 29-33 of which 23.1 is QK+PV at the `vmadot`
+ceiling, lm_head 7.4, elementwise 4.2, round 113.6-114.3 at 18.3-18.4 tok/s. The
+6-9 ms between the attention's compute and its wall is now the largest identified
+slack, and the GEMM's 24.2 against 27.5 GB/s is 6 ms behind it.

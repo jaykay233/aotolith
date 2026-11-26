@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <atomic>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include "spine_tcm.h"
 #include <sys/stat.h>
 #include <riscv_vector.h>
@@ -100,6 +101,19 @@ static __attribute__((noinline)) double now_s(void) {
 #define TICK_DECL double _t0
 #define TICK() _t0 = now_s()
 #define TOCK(st) g_stage[st] += now_s() - _t0
+
+// Spin without offering the core back. Zihintpause on RISC-V is a hint that costs
+// nothing when the machine ignores it, and on this core it keeps the poll out of
+// the scheduler's way.
+static inline void cpu_pause(void) {
+#if defined(__riscv) && defined(__riscv_zihintpause)
+    __builtin_riscv_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
 
 static void use_huge(void * p, size_t n) { if (p) madvise(p, n, MADV_HUGEPAGE); }
 
@@ -501,16 +515,33 @@ static void repack_b(uint8_t * dst, const uint8_t * src, int64_t rows, int64_t k
 static std::atomic<int> g_bar_gen{0};
 static std::atomic<int> g_bar_cnt{0};
 static std::atomic<int> g_quit{0};
+static int g_cpu0 = 8;
+static thread_local int g_cpu_id = -1;
 static int g_participants = N_GPU;
+// Who reaches the barrier late? A stage whose wall time triples while its
+// threads consume the same CPU is a stage where seven threads spin waiting for
+// the eighth. Recording each thread's arrival offset says which one it is
+// without guessing from counters that only cover the body.
+static bool g_bar_watch;
+static double g_bar_bt0;
+static double g_bar_arr[N_GPU];
+static int g_bar_nlay;
+static long g_bar_late[N_GPU];
 
 static inline void barrier(void) {
     const int g = g_bar_gen.load(std::memory_order_acquire);
+    if (g_bar_watch) {
+        const int me = g_cpu0 > 0 ? g_cpu_id : -1;
+        if (me >= 0 && me < N_GPU && g_bar_arr[me] == 0.0) g_bar_arr[me] = now_s() - g_bar_bt0;
+    }
     if (g_bar_cnt.fetch_add(1, std::memory_order_acq_rel) == g_participants - 1) {
         g_bar_cnt.store(0, std::memory_order_relaxed);
         g_bar_gen.fetch_add(1, std::memory_order_release);
     } else {
         // Back off between polls: seven cores hammering one cache line starve
-        // whatever thread is still doing the work.
+        // whatever thread is still doing the work. A pause instead of the yield
+        // measured neutral (119.49 against 120.52 over two paired 150-round runs at
+        // 10K, and the two swapped order between runs), so the yield stays.
         while (g_bar_gen.load(std::memory_order_acquire) == g) sched_yield();
     }
 }
@@ -518,7 +549,6 @@ static inline void barrier(void) {
 typedef void (*task_fn)(int tid);
 static task_fn g_task;
 
-static int g_cpu0 = 8;
 static uint8_t * g_tcm[16];
 static int64_t   g_tcm_size;
 static void tcm_attach(int id) {
@@ -537,6 +567,7 @@ static inline long vlenb_self(void) { long v = 0; asm volatile("csrr %0, vlenb" 
 // a 2x swing in the benchmark. Serialise the vendor handshake, retry it, and treat
 // a thread that misses its cluster as fatal.
 static int bind_cpu(int cpu) {
+    g_cpu_id = cpu - g_cpu0;
     static std::atomic_flag gate = ATOMIC_FLAG_INIT;
     while (gate.test_and_set(std::memory_order_acquire)) sched_yield();
     int rc = -1;
@@ -3083,6 +3114,39 @@ static int16_t * g_psa16;
 static const int PFA_TSTRIDE = 8;
 static double g_pfa_qk[N_GPU * PFA_TSTRIDE], g_pfa_sm[N_GPU * PFA_TSTRIDE],
               g_pfa_pv[N_GPU * PFA_TSTRIDE];
+// Time the A side spends waiting for a head's softmax. The round's attention
+// sometimes takes three times its usual wall time with identical core-seconds in
+// qk and pv, which means threads are not running; this says whether the wait is
+// on the other cluster's handshake or somewhere the counters do not reach.
+static double g_pfa_wt[N_GPU * PFA_TSTRIDE];
+// The two barriers around the attention body. A round whose qk and pv
+// core-seconds are unchanged but whose stage wall time triples has its missing
+// time here, and which of the two says whether a thread was late to start or late
+// to finish.
+static double g_pfa_ent[N_GPU * PFA_TSTRIDE], g_pfa_exi[N_GPU * PFA_TSTRIDE];
+static double g_a4_tstart;
+static double g_pfa_body[N_GPU * PFA_TSTRIDE];
+// Does an A thread lose the CPU, or does it run the whole time and merely run
+// slower? Wall time cannot tell those apart and both look like "the layer got
+// slower". Per-thread CPU time can: a thread descheduled for a millisecond inside
+// the attention body finishes the round with a millisecond less CPU than wall.
+// The context-switch counters then say who took it: an involuntary switch is
+// something else being scheduled on the core, a voluntary one is this thread
+// blocking on something it asked for.
+static double g_a4_cpu[N_GPU];
+static long g_a4_csw_v[N_GPU], g_a4_csw_i[N_GPU];
+// Worst single-head handoff on the X100 side this round: total, the part spent
+// waiting for the flag, and the context switches the worker took while doing it.
+static double g_a4_smw, g_a4_smww, g_a4_smwo;
+static long g_a4_smwv, g_a4_smwi;
+static double now_cpu() {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
+}
+static double g_a4_lsum, g_a4_lmax;   // per round: total and worst layer
+static int g_a4_lslow;                // layers over 1.5 ms, i.e. in the tail
+static char g_a4_lstr[N_LAYER + 1];   // one digit per layer, tenths of a ms
 static double g_pfa_mx[N_GPU * PFA_TSTRIDE], g_pfa_ex[N_GPU * PFA_TSTRIDE];
 static double g_pfa_smb[8 * PFA_TSTRIDE];
 static double g_pfa_mxb[8 * PFA_TSTRIDE], g_pfa_exb[8 * PFA_TSTRIDE];
@@ -3859,7 +3923,7 @@ static void pfa_pack_q(int64_t rows) {
 // then PV. QK and softmax are shared with the pipelined path so both use the same
 // score layout and there is only one copy of that arithmetic to keep correct.
 static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc);
-static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc);
+static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc, int ng);
 
 static void pfa_head_i8(int layer, int h, int64_t qbase) {
     const int kv = h / NH_PER_KV;
@@ -3875,7 +3939,7 @@ static void pfa_head_i8(int layer, int h, int64_t qbase) {
     g_pfa_qk[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _q;
 
     const double _s = now_s();
-    pfa_sm_i8(h, qbase, sc, w8, wsc);
+    pfa_sm_i8(h, qbase, sc, w8, wsc, g_i8g);
     g_pfa_sm[(g_pfa_tid) * PFA_TSTRIDE] += now_s() - _s;
 
     // PV: two passes of 64 dims, contracting 16 positions per step. The four row
@@ -4139,7 +4203,7 @@ static void pfa_qk_i8(int h, int64_t qbase, int16_t * sc) {
 // never sees memory QK has not written. The exp pass runs 32 lanes (four rows x
 // eight positions) per step; each row's eight weights go to its own slot of the
 // pv4 A layout, which is what the four slidedowns at the end are for.
-static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc) {
+static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, float * wsc, int ng) {
     const int kv = h / NH_PER_KV;
     const int L = (int) (g_pfa_ctx + qbase);
     alignas(64) static __thread float kkl[I8_G][32], mml[I8_G][32];
@@ -4148,7 +4212,7 @@ static void pfa_sm_i8(int h, int64_t qbase, const int16_t * sc, int8_t * w8, flo
     const size_t vlz = __riscv_vsetvl_e16m2(32);
     const size_t vl4 = __riscv_vsetvl_e32m4(32);
 
-    for (int gg = 0; gg < g_i8g; ++gg) {
+    for (int gg = 0; gg < ng; ++gg) {
         const int16_t * base = sc + (size_t) gg * SC_GSTRIDE;
         int8_t * wb = w8 + (size_t) gg * WBLK;
         const int nbv = (L + gg * 4 + 1) / 8;    // blocks all four rows of the group own
@@ -4439,7 +4503,7 @@ static void task_pfa_pipe_B(int tid) {
         // A cluster's QK runs with no consumer reading what it wrote. Every other
         // isolation so far (-D, -0) left the consumer's reads in place, which is
         // the only structural difference left against probe_qk_real.
-        if (!g_nosm) pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc);
+        if (!g_nosm) pfa_sm_i8(tile_h(t), qb, sl.scores, sl.w8 + g_w8off, sl.wsc, g_i8g);
         g_pfa_sm[(tid) * PFA_TSTRIDE] += now_s() - _sm;
         r.st.store(2, std::memory_order_release);
     }
@@ -4488,10 +4552,39 @@ static void pfa_pipe_alloc(void) {
 // default rather than an environment variable.
 static int g_a4p = 1;                       // MEGA_ATTN4P=0 turns it off
 static int16_t * g_sc4;                     // N_HEAD * SC_GSTRIDE int16
+
 static int8_t  * g_w4;                      // N_HEAD * WBLK bytes
 static float   * g_wsc4;                    // N_HEAD * I8_ROWS floats
 static std::atomic<int> g_a4_gen{0};
-static std::atomic<int> g_a4_qk[N_HEAD], g_a4_sm[N_HEAD];
+// One cacheline per flag. Every A thread stores its two heads' qk flags and reads
+// its two sm flags on every layer, and all eight X100 threads poll the same
+// variables; packed into one line each, sixteen threads bounce two lines through
+// the coherence fabric and the store's own latency lands outside every timer.
+struct alignas(64) A4Flag { std::atomic<int> v; A4Flag() : v(0) {} };
+
+static A4Flag g_a4_qk[N_HEAD], g_a4_sm[N_HEAD];
+static int g_a4_slast[N_HEAD];   // newest generation the pool has scored, per head
+// Backup pass. The pool shares cores 0-7 with this board's desktop and monitor
+// daemons, and a preempted worker takes 1-5 ms to notice a head whose score is
+// already published; the A thread waiting for it stalls the whole layer, because
+// the other seven are behind the same barrier. So after a worker publishes its own
+// two heads it looks at the next worker's two: if those flags have been published
+// and are still unscored after MEGA_A4BK us, it scores them into a second weight
+// plane and publishes g_a4_smb. The A side takes whichever of the two is ready.
+// The pass costs two loads when nothing is late, and a late worker's head is then
+// ready 0.1-0.2 ms after the miss instead of whenever the scheduler gives the core
+// back. Each head has exactly one backup owner, so each plane has one writer.
+static A4Flag g_a4_smb[N_HEAD];
+static int8_t * g_w4b;           // N_HEAD * WBLK bytes, written only by the backup
+static float  * g_wscb;          // N_HEAD * I8_ROWS floats
+static double g_a4_bk_us = 80;   // how long a published head may stay unscored
+static double g_a4_bkn;          // backup scores this round
+static double g_a4_bkmax;        // longest time from publish to backup publish
+// A thread's own copy of the softmax weights, so a head it scores itself cannot be
+// overwritten by the pool worker that turns up late for the same head.
+static double g_fb_n;
+static int8_t * g_fb_w;          // 8 x WBLK
+static float  * g_fb_sc;         // 8 x I8_ROWS
 static std::atomic<int> g_a4_done{0};
 
 static void attn4p_alloc(void) {
@@ -4504,7 +4597,17 @@ static void attn4p_alloc(void) {
     if (!g_sc4 || !g_w4 || !g_wsc4) { fprintf(stderr, "oom attn4p\n"); g_a4p = 0; return; }
     use_huge(g_sc4, sn);
     use_huge(g_w4, wn);
-    for (int h = 0; h < N_HEAD; ++h) { g_a4_qk[h].store(0); g_a4_sm[h].store(0); }
+    g_fb_w  = (int8_t *) hugemem((size_t) 8 * WBLK + (1 << 20));
+    g_fb_sc = (float *) aligned_alloc(64, (size_t) 8 * I8_ROWS * 4 + 64);
+    if (!g_fb_w || !g_fb_sc) { fprintf(stderr, "oom attn4p fb\n"); g_a4p = 0; return; }
+    use_huge(g_fb_w, (size_t) 8 * WBLK + (1 << 20));
+    g_w4b  = (int8_t *) hugemem(wn);
+    g_wscb = (float *) aligned_alloc(64, (size_t) N_HEAD * I8_ROWS * 4 + 64);
+    // MEGA_A4BK=0 turns the backup pass off; any other value is its deadline in us.
+    if (const char * e = getenv("MEGA_A4BK")) g_a4_bk_us = atof(e);
+    if (!g_w4b || !g_wscb) { fprintf(stderr, "oom attn4p bk\n"); g_a4_bk_us = 0; }
+    else use_huge(g_w4b, wn);
+    for (int h = 0; h < N_HEAD; ++h) { g_a4_qk[h].v.store(0); g_a4_sm[h].v.store(0); g_a4_smb[h].v.store(0); g_a4_slast[h] = 0; }
     printf("  attn4p: %.1f MB scratch, %d heads, softmax on the X100 cluster\n",
            (sn + wn) / 1e6, N_HEAD);
 }
@@ -4515,39 +4618,162 @@ static void attn4p_alloc(void) {
 // layer costs QK+PV instead of QK+softmax+PV.
 static void task_attn4_a(int tid) {
     g_pfa_tid = tid;
+    const double _c0 = now_cpu();
+    struct rusage _ru0; getrusage(RUSAGE_THREAD, &_ru0);
+    g_pfa_ent[(tid) * PFA_TSTRIDE] += now_s() - g_a4_tstart;
+    const double _tb = now_s();
     const int gen = g_a4_gen.load(std::memory_order_acquire);
     int hs[N_HEAD]; int n = 0;
     for (int h = tid; h < N_HEAD; h += g_participants) {
         const double _q = now_s();
         pfa_qk_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE);
         g_pfa_qk[(tid) * PFA_TSTRIDE] += now_s() - _q;
-        g_a4_qk[h].store(gen, std::memory_order_release);
+        g_a4_qk[h].v.store(gen, std::memory_order_release);
         hs[n++] = h;
     }
+    // The wait is normally over before it starts: this thread's second QK takes
+    // longer than the X100's softmax of the first head, and both counters are
+    // published per head. A deadline that only a stall can cross keeps the
+    // schedule unchanged on every ordinary round.
+    // Handing the head to this cluster on a deadline does not work, and the
+    // numbers say why. The wait here is 0.1 ms on an ordinary round and 33 ms on
+    // the straggler of a slow one, because the X100 pool shares cores 0-7 with this
+    // board's desktop and monitor daemons. But the moment this thread gives up and
+    // starts the next layer, the flag the late worker is still waiting for has been
+    // overwritten, so it can only finish a layer that has already moved on: the
+    // pool stays one generation behind and every later layer falls back too, which
+    // costs the overlap the pool exists to provide. Measured at 10K over 150
+    // rounds: 122.68 ms/round with the fallback against 117.87 without.
+    // 0.3 ms is eight times an ordinary head's wait (0.012 ms), so only a worker
+    // that has lost its core crosses it. Scores written and flag published in that
+    // order mean a pool pass can never label this layer with a newer generation,
+    // so ">= gen" always means "these weights are for the scores now in g_sc4".
+    // Measured, 600 rounds at 10K, paired arms: 120.29 and 120.35 ms/round with
+    // the wait alone against 125.17 and 124.88 with a 0.3 ms deadline. The
+    // deadline is off by default and MEGA_A4STMO sets it to a time in seconds.
+    static const double sm_dl = getenv("MEGA_A4STMO") ? atof(getenv("MEGA_A4STMO")) : 1e9;
     for (int i = 0; i < n; ++i) {
         const int h = hs[i];
-        while (g_a4_sm[h].load(std::memory_order_acquire) != gen) sched_yield();
+        const double _w = now_s();
+        int rd = 0;   // 0 = neither copy ready, 1 = pool copy, 2 = backup copy
+        for (;;) {
+            if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gen) { rd = 1; break; }
+            if (g_a4_bk_us > 0 && g_a4_smb[h].v.load(std::memory_order_acquire) >= gen) { rd = 2; break; }
+            if (now_s() - _w > sm_dl) break;
+            cpu_pause();
+        }
+        g_pfa_wt[(tid) * PFA_TSTRIDE] += now_s() - _w;
+        int8_t * w8;
+        float * wsc;
+        if (rd == 1) {
+            w8  = g_w4 + (size_t) h * WBLK;
+            wsc = g_wsc4 + (size_t) h * I8_ROWS;
+        } else if (rd == 2) {
+            w8  = g_w4b + (size_t) h * WBLK;
+            wsc = g_wscb + (size_t) h * I8_ROWS;
+        } else {
+            w8  = g_fb_w + (size_t) (tid & 7) * WBLK;
+            wsc = g_fb_sc + (size_t) (tid & 7) * I8_ROWS;
+            g_pfa_smid = tid & 7;
+            const double _s = now_s();
+            pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE, w8, wsc, 1);
+            g_pfa_sm[(g_pfa_smid) * PFA_TSTRIDE] += now_s() - _s;
+            g_fb_n += 1;
+        }
         const double _v = now_s();
-        pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
-                  g_wsc4 + (size_t) h * I8_ROWS);
+        pfa_pv_i8(g_pfa_layer, h, 0, w8, wsc);
         g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
     }
+    // Body time the three counters above do not explain. The exit barrier is not
+    // in here; it is in the stage's wall time, so stage - (ent + exi) is the
+    // barrier wait itself.
+    g_pfa_exi[(tid) * PFA_TSTRIDE] += now_s() - _tb;
+    g_pfa_body[(tid) * PFA_TSTRIDE] += now_s() - _tb;
+    g_a4_cpu[tid] += now_cpu() - _c0;
+    struct rusage _ru1; getrusage(RUSAGE_THREAD, &_ru1);
+    g_a4_csw_v[tid] += _ru1.ru_nvcsw - _ru0.ru_nvcsw;
+    g_a4_csw_i[tid] += _ru1.ru_nivcsw - _ru0.ru_nivcsw;
 }
 
 // X100 side. Head t and t+8, matching the A side's stride so every head has one
 // owner on each cluster.
+// The head's own qk flag carries the generation its scores belong to, and the pool
+// always scores the newest one: scores and flag are published in that order, so a
+// flag value names the scores that a reader of that flag will see. Waiting on the
+// layer counter instead loses the wakeup the moment the A side gives up on a late
+// head -- the counter has moved and the flag the worker wants never comes back,
+// which parks the worker one generation behind for the rest of the run.
 static void task_attn4_sm(int id) {
-    const int gen = g_a4_gen.load(std::memory_order_acquire);
+    // Poll policy for the per-head handoff. The pool's idle loop yields because a
+    // spin there is a full-rate reader of the A cluster's generation line, but this
+    // loop is different: it is waiting for work that is already committed and
+    // arrives within a layer, so giving the core away here costs the A thread a
+    // scheduling slice (measured: run-queue wait of 1.1 ms per slice on cores 0-7,
+    // against 5 us on cores 8-15). MEGA_SMPOL=0 restores the yield.
+    static const bool poll_pause = !getenv("MEGA_SMPOL") || atoi(getenv("MEGA_SMPOL"));
     g_pfa_smid = id;
     for (int h = id; h < N_HEAD; h += 8) {
-        while (g_a4_qk[h].load(std::memory_order_acquire) != gen) sched_yield();
+        const double _h0 = now_s();
+        struct rusage _r0; getrusage(RUSAGE_THREAD, &_r0);
+        int gq;
+        for (;;) {
+            gq = g_a4_qk[h].v.load(std::memory_order_acquire);
+            if (gq != g_a4_slast[h]) break;
+            if (poll_pause) cpu_pause(); else sched_yield();
+        }
+        const double _h1 = now_s();
         int16_t * sc  = g_sc4 + (size_t) h * SC_GSTRIDE;
         int8_t  * w8  = g_w4 + (size_t) h * WBLK;
         float   * wsc = g_wsc4 + (size_t) h * I8_ROWS;
         const double _s = now_s();
-        pfa_sm_i8(h, 0, sc, w8, wsc);
+        pfa_sm_i8(h, 0, sc, w8, wsc, 1);
         g_pfa_sm[(id) * PFA_TSTRIDE] += now_s() - _s;
-        g_a4_sm[h].store(gen, std::memory_order_release);
+        g_a4_slast[h] = gq;
+        g_a4_sm[h].v.store(gq, std::memory_order_release);
+        // Hand-to-hand for one head: wait for the flag, score, publish. The worst
+        // one in the round, with its context switches, says whether a late head is
+        // this worker being taken off its core or the work itself being slow.
+        const double _h2 = now_s();
+        struct rusage _r1; getrusage(RUSAGE_THREAD, &_r1);
+        const double d = _h2 - _h0;
+        if (d > g_a4_smw) {
+            g_a4_smw = d; g_a4_smww = _h1 - _h0; g_a4_smwv = _r1.ru_nvcsw - _r0.ru_nvcsw;
+            g_a4_smwi = _r1.ru_nivcsw - _r0.ru_nivcsw; g_a4_smwo = (double) id;
+        }
+    }
+    if (g_a4_bk_us <= 0) return;
+    // Backup pass: the neighbouring worker's two heads. A head is taken over only
+    // when its qk flag is published, this round's scores are the ones named by that
+    // flag (so the plane cannot mix two generations), and nobody has scored it after
+    // g_a4_bk_us. Two loads when the pool is on time.
+    const int b0 = (id + 1) & 7;
+    for (int k = 0; k < 2; ++k) {
+        const int h = b0 + k * 8;
+        const double _b0 = now_s();
+        int gq;
+        for (;;) {
+            gq = g_a4_qk[h].v.load(std::memory_order_acquire);
+            if (gq != 0 && g_a4_gen.load(std::memory_order_acquire) == gq) break;
+            if (now_s() - _b0 > 0.0003) return;
+            cpu_pause();
+        }
+        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) continue;
+        // The deadline starts when the flag is first visible, which is when the
+        // owning worker starts its own call. Measuring it from this loop's entry
+        // instead charges the two clusters' publish skew to the owner and takes
+        // over a head that is not late: at 10K that fired 85 times a round and
+        // cost 6.4 ms of stage wall for duplicate work nobody needed.
+        const double _t0 = now_s();
+        while (now_s() - _t0 < g_a4_bk_us * 1e-6) cpu_pause();
+        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) continue;
+        if (g_a4_smb[h].v.load(std::memory_order_acquire) >= gq) continue;
+        // Still unscored: the owning worker has lost its core. Score it here.
+        pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE,
+                  g_w4b + (size_t) h * WBLK, g_wscb + (size_t) h * I8_ROWS, 1);
+        g_a4_smb[h].v.store(gq, std::memory_order_release);
+        const double t = now_s() - _b0;
+        if (t > g_a4_bkmax) g_a4_bkmax = t;
+        g_a4_bkn += 1;
     }
 }
 
@@ -4659,17 +4885,21 @@ static void task_attn4s(int tid) {
             const int h = h0 + i;
             const double _s = now_s();
             pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE,
-                      g_w4 + (size_t) h * WBLK, g_wsc4 + (size_t) h * I8_ROWS);
+                      g_w4 + (size_t) h * WBLK, g_wsc4 + (size_t) h * I8_ROWS, 1);
             g_pfa_sm[(tid) * PFA_TSTRIDE] += now_s() - _s;
         }
     } else {
-        g_a4_qk[h0].store(gen, std::memory_order_release);
-        g_a4_qk[h0 + 1].store(gen, std::memory_order_release);
+        g_a4_qk[h0].v.store(gen, std::memory_order_release);
+        g_a4_qk[h0 + 1].v.store(gen, std::memory_order_release);
     }
 
     for (int i = 0; i < 2; ++i) {
         const int h = h0 + i;
-        if (!sm_here) while (g_a4_sm[h].load(std::memory_order_acquire) != gen) sched_yield();
+        if (!sm_here) {
+            const double _w = now_s();
+            while (g_a4_sm[h].v.load(std::memory_order_acquire) != gen) sched_yield();
+            g_pfa_wt[(tid) * PFA_TSTRIDE] += now_s() - _w;
+        }
         const double _v = now_s();
         pfa_pv_i8(g_pfa_layer, h, 0, g_w4 + (size_t) h * WBLK,
                   g_wsc4 + (size_t) h * I8_ROWS);
@@ -4708,9 +4938,48 @@ static void a4s_run(int L) {
 static void attn4p_run(int L) {
     g_pfa_layer = L;
     g_i8g = 1;
+    // Per-layer snapshots: the round-level counters are cleared once per round, so
+    // a single slow layer cannot be located inside them.
+    static const bool dump = getenv("MEGA_A4DUMP") != nullptr;
+    double q0[N_GPU], w0[N_GPU], p0v[N_GPU], b0[N_GPU];
+    if (dump) for (int t = 0; t < N_GPU; ++t) {
+        q0[t] = g_pfa_qk[t * PFA_TSTRIDE]; w0[t] = g_pfa_wt[t * PFA_TSTRIDE];
+        p0v[t] = g_pfa_pv[t * PFA_TSTRIDE]; b0[t] = g_pfa_body[t * PFA_TSTRIDE];
+    }
+    // Arrival watch: arms the barrier's recorder for this layer only.
+    for (int t = 0; t < N_GPU; ++t) g_bar_arr[t] = 0;
+    g_bar_bt0 = now_s();
+    g_bar_watch = true;
     g_a4_gen.fetch_add(1, std::memory_order_acq_rel);
+    g_a4_tstart = g_bar_bt0;
     run(task_attn4_a);
+    g_bar_watch = false;
     g_i8g = I8_G;
+    {
+        // Per-layer wall spread, kept for every layer rather than only the slow
+        // ones: whether a slow round is one stalled layer or forty-two merely slow
+        // layers is the difference between a scheduler artifact and a bandwidth
+        // one.
+        const double wall = now_s() - g_a4_tstart;
+        g_a4_lsum += wall;
+        if (wall > g_a4_lmax) g_a4_lmax = wall;
+        if (wall > 0.0015) g_a4_lslow += 1;
+        if (L < N_LAYER) g_a4_lstr[L] = wall > 0.0095 ? '9' : (char) ('0' + (int) (wall * 1e3));
+    }
+    if (dump) {
+        const double wall = now_s() - g_a4_tstart;
+        if (wall > 0.002) {
+            fprintf(stderr, "  [a4] L%d wall %.2f ms", L, wall * 1e3);
+            for (int t = 0; t < N_GPU; ++t)
+                fprintf(stderr, " | t%d qk %.2f wt %.2f pv %.2f body %.2f ent %.2f", t,
+                        (g_pfa_qk[t * PFA_TSTRIDE] - q0[t]) * 1e3,
+                        (g_pfa_wt[t * PFA_TSTRIDE] - w0[t]) * 1e3,
+                        (g_pfa_pv[t * PFA_TSTRIDE] - p0v[t]) * 1e3,
+                        (g_pfa_body[t * PFA_TSTRIDE] - b0[t]) * 1e3,
+                        g_bar_arr[t] * 1e3);
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 // X100 worker: no /proc/set_ai_thread (that would pin it to the A cluster), so
@@ -4719,6 +4988,14 @@ static int bind_cpu_x100(int cpu) {
     cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s);
     return sched_setaffinity(0, sizeof(s), &s);
 }
+
+// Park-and-poll backoff for the X100 workers. Every one of them sits in the wait
+// loop for the whole verify round, and a bare sched_yield there is a scheduler
+// entry per iteration: eight cores trapping continuously is both the load the
+// tick lands on and the coherence traffic that makes the A side's store of a
+// head's flag slow. Pausing between loads keeps the thread warm and drops the
+// poll rate to one per MEGA_XBS cycles; the response latency stays far below the
+// 600 us a layer takes.
 
 static void * sm_worker(void * arg) {
     const int id = (int) (intptr_t) arg;
@@ -6022,6 +6299,25 @@ static bool m4spec_run(int64_t p0, int anchor, int rounds, int K) {
         acc += n; total += K;
         const int next = g_m4out[n];
 
+        // Round log for the determinism audit: the drafts, the accepted count, and
+        // an FNV hash of the verify logits and of the drafter's own logits, so a
+        // differing round says whether the target moved or only the proposal did.
+        static const bool speclog = getenv("MEGA_SPECLOG") != nullptr;
+        if (speclog) {
+            uint32_t hv = 2166136261u, hd = 2166136261u;
+            const int nv = (K + 1) * VOCAB;
+            for (int i = 0; i < nv; ++i) {
+                uint32_t u; memcpy(&u, g_logits4 + i, 4);
+                hv = (hv ^ u) * 16777619u;
+            }
+            for (int i = 0; i < VOCAB; ++i) {
+                uint32_t u; memcpy(&u, g_dslog + i, 4);
+                hd = (hd ^ u) * 16777619u;
+            }
+            fprintf(stderr, "SL %d p=%lld an=%d n=%d dr=%d,%d,%d nx=%d v=%08x d=%08x\n",
+                    it, (long long) p0, anchor, n, dr[0], dr[1], dr[2], next, hv, hd);
+        }
+
         // The round's capture has the target's residual stream for every row it ran,
         // so the committed positions go into the draft's cache before the next round.
         ds_inject4(p0, 0, n + 1);
@@ -6324,15 +6620,39 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         // qk/pv are A-cluster core-s, sm is X100 core-s: the split says whether the
         // round's attention is dot-bound or bound by the KV stream.
         // qk/pv are per A thread, sm per X100 thread; both index 0..7.
-        double qk = 0, sm = 0, pv = 0, mx = 0, ex = 0;
+        double qk = 0, sm = 0, pv = 0, mx = 0, ex = 0, wt = 0, wtmax = 0, entmax = 0, eximax = 0;
+        double cpu = 0; long csv = 0, csi = 0;
         for (int t = 0; t < N_GPU; ++t) {
             qk += g_pfa_qk[(t) * PFA_TSTRIDE]; sm += g_pfa_sm[(t) * PFA_TSTRIDE]; pv += g_pfa_pv[(t) * PFA_TSTRIDE];
             mx += g_pfa_mxb[(t) * PFA_TSTRIDE]; ex += g_pfa_exb[(t) * PFA_TSTRIDE];
+            wt += g_pfa_wt[(t) * PFA_TSTRIDE];
+            cpu += g_a4_cpu[t];
+            csv += g_a4_csw_v[t]; csi += g_a4_csw_i[t];
+            if (g_pfa_wt[(t) * PFA_TSTRIDE] > wtmax) wtmax = g_pfa_wt[(t) * PFA_TSTRIDE];
+            if (g_pfa_ent[(t) * PFA_TSTRIDE] > entmax) entmax = g_pfa_ent[(t) * PFA_TSTRIDE];
+            if (g_pfa_exi[(t) * PFA_TSTRIDE] > eximax) eximax = g_pfa_exi[(t) * PFA_TSTRIDE];
         }
-        printf("m4dec: attn core-s qk %.3f + pv %.3f on 8, sm %.3f (max %.3f exp %.3f) on %d\n",
-               qk, pv, sm, mx, ex, g_n_sm);
+        printf("m4dec: attn core-s qk %.3f + pv %.3f on 8, sm %.3f (max %.3f exp %.3f) on %d, "
+               "a-wait %.3f (max %.3f) fb %.0f bk %.0f (max %.3f) | cpu %.3f/%.3f csw %ld/%ld | sm-w %.3f (wait %.3f t%.0f csw %ld/%ld) | layers %.2f max %.2f slow %d\n",
+               qk, pv, sm, mx, ex, g_n_sm, wt, wtmax, g_fb_n,
+               g_a4_bkn, g_a4_bkmax * 1e3,
+               cpu, 8.0 * g_a4_lsum, csv, csi,
+               g_a4_smw * 1e3, g_a4_smww * 1e3, g_a4_smwo, g_a4_smwv, g_a4_smwi,
+               g_a4_lsum * 1e3, g_a4_lmax * 1e3, g_a4_lslow);
+        if (getenv("MEGA_A4LS")) {
+            g_a4_lstr[N_LAYER] = 0;
+            printf("m4dec: layers %s (ms per layer, one digit each)\n", g_a4_lstr);
+        }
         for (int t = 0; t < N_GPU; ++t) {
             g_pfa_qk[(t) * PFA_TSTRIDE] = 0; g_pfa_pv[(t) * PFA_TSTRIDE] = 0; g_pfa_sm[(t) * PFA_TSTRIDE] = 0;
+            g_pfa_wt[(t) * PFA_TSTRIDE] = 0; g_pfa_ent[(t) * PFA_TSTRIDE] = 0; g_fb_n = 0;
+            g_a4_bkn = g_a4_bkmax = 0;
+            g_a4_lsum = g_a4_lmax = 0; g_a4_lslow = 0;
+            memset(g_a4_lstr, '.', N_LAYER);
+            g_pfa_exi[(t) * PFA_TSTRIDE] = 0;
+            g_a4_cpu[t] = 0;
+            g_a4_csw_v[t] = g_a4_csw_i[t] = 0;
+            if (t == 0) { g_a4_smw = g_a4_smww = g_a4_smwo = 0; g_a4_smwv = g_a4_smwi = 0; }
             g_pfa_smb[(t) * PFA_TSTRIDE] = 0; g_pfa_mxb[(t) * PFA_TSTRIDE] = 0; g_pfa_exb[(t) * PFA_TSTRIDE] = 0;
         }
         m4_report();
