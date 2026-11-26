@@ -5173,15 +5173,23 @@ static bool ds_alloc(void) {
             const DRef * w[7] = { &g_ds_wq[L], &g_ds_wk[L], &g_ds_wv[L], &g_ds_wo[L],
                                   &g_ds_wg[L], &g_ds_wu[L], &g_ds_wd[L] };
             for (int j = 0; j < 7; ++j)
-                by += (int64_t) (w[j]->k / 32) * g_blk_bytes;
+                by += (int64_t) (w[j]->k / 32) * (w[j]->n / 32) * g_blk_bytes;
         }
         // per round: this many bytes of the drafter, plus the target's own lm_head
+        // A Q4_0 matrix of k x n is (k/32) * (n/32) * 576 bytes; leaving out the
+        // n/32 term made this report 1.7 MB for what is really 153 MB, which read
+        // as "the drafter is latency bound" for half an hour.
+        const int64_t lm_bytes = (int64_t) (g_wo.k / 32) * (g_wo.n / 32) * g_blk_bytes;
         printf("  drafter: %d layers, %.1f MB of weights per round (lm_head shared: %.1f MB)\n",
-               DS_LAYER, (double) by / 1e6,
-               (double) ((int64_t) (g_wo.k / 32) * g_blk_bytes) / 1e6);
-        printf("  drafter: markov table %.1f MB, %d layers, FFN %lld\n",
-               (double) ((int64_t) (g_ds_w2.k / 32) * g_blk_bytes) / 1e6, DS_LAYER,
-               (long long) g_ds_wg[0].n);
+               DS_LAYER, (double) by / 1e6, (double) lm_bytes / 1e6);
+        printf("  drafter shapes: wq[%lldx%lld] wg[%lldx%lld] wd[%lldx%lld]"
+               " | target lm_head[%lldx%lld] blk=%zu\n",
+               (long long) g_ds_wq[0].k, (long long) g_ds_wq[0].n,
+               (long long) g_ds_wg[0].k, (long long) g_ds_wg[0].n,
+               (long long) g_ds_wd[0].k, (long long) g_ds_wd[0].n,
+               (long long) g_wo.k, (long long) g_wo.n, g_blk_bytes);
+        printf("  drafter: markov table %.1f MB\n",
+               (double) ((int64_t) (g_ds_w2.k / 32) * (g_ds_w2.n / 32) * g_blk_bytes) / 1e6);
     }
     if (!g_dskc || !g_dsvc || !g_dshid || !g_dsx || !g_dsxa || !g_dsq || !g_dsatt ||
         !g_dsk || !g_dsv || !g_dsgate || !g_dsup || !g_dsfeat || !g_dsenc ||

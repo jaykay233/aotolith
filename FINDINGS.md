@@ -2355,3 +2355,48 @@ The round is now verify 101.3 + draft 21.3 + 1.2. Inside the draft, the shared
 lm_head is 6.55 ms for 150 MB (23 GB/s, at the bus) and the five layers' 20 GEMM
 calls are 5.56 ms for 1.7 MB (0.3 GB/s), so the layers are still latency, not
 bytes, which is where the next 3 ms is.
+
+### The drafter is at the bus, and my "1.7 MB, latency bound" reading was wrong
+
+The byte counter that printed the drafter's traffic left out the `n/32` factor of a
+Q4_0 matrix, so it reported 1.7 MB for what is really 153.4 MB and I spent a stretch
+treating the drafter as latency bound. Its real shapes are
+`wq[2048x2048] wg[2048x6144] wd[6144x2048] wo[2048x2048]`, 576 B per block, i.e.
+30.7 MB a layer and 153.4 MB for five.
+
+With the arithmetic right, the picture inverts:
+
+| pass | bytes | ms | effective |
+|---|---|---|---|
+| target layers, 42 | 1421 MB | 52.0 | 27.3 GB/s |
+| drafter layers, 5 | 153.4 MB | 5.66 | **27.1 GB/s** |
+| shared lm_head, verify | 150.4 MB | 6.55 | 23.0 GB/s |
+| verify attention, int8 K+V | 220 MB | 25.2 | **8.7 GB/s** |
+
+Three of those four are at the bus and the one that is not is attention, by a
+factor of three.
+
+**kstep does not matter, which is the experiment that settled it.** The draft's
+matrices are small (n of 2048 or 6144, so 8 to 24 n-blocks a thread), so 4-row
+by 128-column calls looked suspiciously small and a per-call cost seemed likely:
+
+| 10K, 120 rounds | drafter gemm | draft layers | round |
+|---|---|---|---|
+| `-k 4` (default) | 5.66 | 11.92 | 123.89 |
+| `-k 8` | 5.65 | 10.80 | 125.41 |
+| `-k 16` | 5.70 | 11.98 | 123.63 |
+
+The GEMM time is flat to 1% across a 4x change in call size, so there is no per-call
+cost to recover: the pass is streaming 153 MB at the bus already. The layer total
+moves by more than the GEMM does, which is the prep work's variance, not a trend.
+
+So the draft's 21.8 ms is gemm 5.66 (at the bus), shared head 6.54 (23 GB/s), prep
+6.26 (of which attention 2.14) and bias 3.28. Nothing in it is three times off.
+
+**Where the round's headroom actually is.** A round moves 1421 + 153 + 150 + 150 =
+1874 MB, which at 27.5 GB/s is 68 ms; the round takes 123.8. The 55 ms above the
+floor is dominated by verify attention at 8.7 GB/s: at the bus it would be 8 ms
+instead of 25.2, taking the round to ~107 ms and the rate to ~15.3 tok/s. That is
+the same dim-major tiling conclusion this file reached for the single-row path,
+now with a 17 ms price on it. 15.3 tok/s is also roughly the accuracy-preserving
+ceiling the Q4_0 analysis derived, reached from a different direction.
