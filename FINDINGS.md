@@ -2497,3 +2497,57 @@ GB/s) and 6 ms in the verify GEMM (24.3 against 27.5), both of them the vendor
 IME2 kernel. Everything else in the round is either at the bus, at the dot
 instruction, or is the four-row attention's arithmetic. Acceptance is the larger
 lever: this file's 0.637 text gives 13.8 tok/s at the same round cost.
+
+## Decode V in int8, K left in f16
+
+`-K8` quantises both caches to one scale per (layer, kv head) and was off by
+default because it costs accuracy: cosine **0.9109**, top-1 58/64, against
+0.978266. Splitting the two halves of that measurement shows the loss is all in K
+and the speed is all in V:
+
+| arm, 64 forced steps | qk | pv | decode | cosine | top-1 |
+|---|---|---|---|---|---|
+| f16 K, f16 V (shipped before) | 12.39 | 13.41 | 11.65 | 0.978266 | 60/64 |
+| int8 K, int8 V (`-K8`) | 13.12 | 9.82 | 12.22 | 0.9109 | 58/64 |
+| **f16 K, int8 V** (now default) | 12.37 | **9.73** | **12.28** | 0.978304 | 60/64 |
+
+Two things had to be true for the mixed arm to exist, and the measurements say
+both are:
+
+- **A K error is amplified, a V error averages out.** K enters through the dot
+  before the exponent, so one wrong element moves the whole score row's softmax.
+  V enters after the weights, so its error is a weighted sum of per-position
+  errors: 0.4% per element over ten thousand positions lands at the fourth
+  decimal of the output, which is what the cosine column shows.
+- **The two stages gain from int8 in opposite directions.** PV is stream limited
+  at 16 GB/s for the f16 plane, so halving its bytes takes 13.41 to 9.73 ms. QK
+  is issue limited, and int8 K adds two conversions per load, so int8 K is
+  *slower* (12.39 to 13.12) even though it halves the bytes. Splitting the flag is
+  what lets each stage keep its better format.
+
+`g_v8dec` (`MEGA_V8=0` turns it off, `-V8` forces it on) now owns the int8 V plane
+alone: the plane, its per-(layer, kv) scales from prefill's max-abs, the append in
+`rope_all`, and a matching append in `m4_rope_item` so a run that emits through
+four-row rounds and then falls back to single-row decode does not read V for those
+positions out of a plane nobody wrote. The PV-order f16 copy is not built when V
+is int8, which is 264 MB back.
+
+**One bug worth recording.** `rope_all` wrote the PV-order f16 copy under
+`if (vpo_on())`, and `vpo_on()` returned `g_vpo`. With the copy no longer built,
+that store landed on a null base and took the process down on the first decode
+token. `vpo_on()` now asks the buffer, and `build_vpv_order` asks the flag, so a
+"read PV order" answer cannot outlive the buffer it describes.
+
+The cost of the change on the 10K prompt is 4 ms: `/tmp/p10k.txt`, 64 forced
+steps, md5 of the new logits `0.978304` mean cosine and 60/64 top-1, same as the
+f16 arm's top-1 and 4e-4 below its cosine. Speculative rounds are untouched: the
+same 30 rounds at 10K give the same drafts and the same 10/90 acceptance with V
+in int8 and with `MEGA_V8=0`.
+
+**A trap for the next measurement.** Two rounds of this A/B were run with the
+command duplicated, so two processes shared the eight A cores and the eight X100
+workers. Both came back with 0/300 drafts accepted instead of 49/300, at a
+*lower* verify time. A contended board does not just slow the numbers down, it
+changes what the speculative path computes, because the four-row verify's softmax
+runs on that pool. `/tmp/p10k.txt` takes 150 s of prefill, so it is tempting to
+run two arms at once; don't.

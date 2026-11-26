@@ -722,6 +722,12 @@ static inline int64_t v8_off(int kv, int half, int64_t pos) {
 }
 static float g_k8dsc[N_LAYER][N_KV], g_v8dsc[N_LAYER][N_KV];
 static int g_k8dec = 0;
+// V alone, K left in f16. A K error enters through the exponent and moves every
+// score in the row; a V error is weighted and summed, so over ten thousand
+// positions it averages toward zero. Measured: int8 K+V gives cosine 0.9109, and
+// PV is the stage that actually gains (13.41 -> 9.82 ms) while int8 K makes QK
+// slower (12.39 -> 13.12), so the pair is worth splitting.
+static int g_v8dec = 1;      // MEGA_V8=0 restores the f16 V read
 
 static const int64_t KV_LAYER_STRIDE = (int64_t) N_KV * HEAD_DIM * MAXCTX;   // V: pos-major
 // A second f16 V copy, laid out in PV order: [kv][half][pos][64]. The pos-major
@@ -745,7 +751,10 @@ static int g_pvu = 4;
 // zicbop prefetch distance in positions, 0 = off. A position is one 64-byte
 // line, so this puts PF more lines on the bus without holding any register.
 static int g_pvpf = 0;
-static inline int vpo_on(void) { return g_vpo; }
+// The PV-order f16 copy is optional: it is not built when V is int8, and a flag
+// that says "read PV order" must not outlive the buffer. A null-base store here
+// segfaults the first decode token, which is how this was found.
+static inline int vpo_on(void) { return g_vpo && g_vpv != nullptr; }
 static inline int64_t vf16o(int kv, int half, int64_t pos) {
     return (((int64_t) kv * 2 + half) * MAXCTX + pos) * 64;
 }
@@ -2544,7 +2553,7 @@ static void attn_exp_sum(int tid) {
     do {                                                                       \
         const _Float16 * vp_ = vpo ? (basev + (int64_t) (Q) * 64)              \
                                    : (base + (int64_t) (p0 + (Q)) * N_KV * HEAD_DIM); \
-        if (g_k8dec) {                                                         \
+        if (g_v8dec) {                                                         \
             V0 = ld_i8_f32(base8 + (int64_t) (p0 + (Q)) * 64, 32);             \
             V1 = ld_i8_f32(base8 + (int64_t) (p0 + (Q)) * 64 + 32, 32);        \
         } else {                                                              \
@@ -2605,8 +2614,8 @@ static void attn_pv(int tid) {
             const _Float16 * base = vb + (int64_t) kv * HEAD_DIM + half * 64;
             // PV order: this (kv, half)'s positions are contiguous, so one position
             // is 64 contiguous f16 instead of 128 bytes of a 512-byte block.
-            const _Float16 * basev = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
-                                     vf16o((int) kv, (int) half, p0);
+            const _Float16 * basev = g_vpv ? g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
+                                     vf16o((int) kv, (int) half, p0) : vb;
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
@@ -2692,7 +2701,7 @@ static int g_pvm2 = 1;
     do {{                                                                       \
         const int64_t _pf = (Q) + g_pvpf;                                      \
         if (g_pvpf && _pf < (LEN))                                             \
-            __builtin_prefetch(g_k8dec                                          \
+            __builtin_prefetch(g_v8dec                                          \
                 ? (const void *) (base8 + (int64_t) (p0 + _pf) * 64)           \
                 : (const void *) (vpo ? (basev + _pf * 64)                     \
                                       : (base + (int64_t) (p0 + _pf) * N_KV * HEAD_DIM))); \
@@ -2700,7 +2709,7 @@ static int g_pvm2 = 1;
 
 #define PV2_LD(V, Q)                                                           \
     do {                                                                       \
-        V = g_k8dec                                                            \
+        V = g_v8dec                                                            \
                 ? ld_i8_f32_m2(base8 + (int64_t) (p0 + (Q)) * 64, vl)          \
                 : __riscv_vfwcvt_f_f_v_f32m2(                                  \
                       __riscv_vle16_v_f16m1(vpo ? basev + (int64_t) (Q) * 64   \
@@ -2748,8 +2757,8 @@ static void attn_pv_m2(int tid) {
             const _Float16 * base = vb + (int64_t) kv * HEAD_DIM + half * 64;
             // PV order: this (kv, half)'s positions are contiguous, so one position
             // is 64 contiguous f16 instead of 128 bytes of a 512-byte block.
-            const _Float16 * basev = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
-                                     vf16o((int) kv, (int) half, p0);
+            const _Float16 * basev = g_vpv ? g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE +
+                                     vf16o((int) kv, (int) half, p0) : vb;
             const int8_t * base8 = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
                                    (int64_t) kv * 2 * MAXCTX * 64 + (int64_t) half * MAXCTX * 64;
             const float * wk = sa + (int64_t) kv * NH_PER_KV * SMAX;
@@ -2887,23 +2896,28 @@ static void rope_all(void) {
     const double _tb = now_s();
     const int pblk = g_pos / KT, pi = g_pos % KT;
     _Float16 * vb = g_vpos + (int64_t) g_layer * KV_LAYER_STRIDE + (int64_t) g_pos * N_KV * HEAD_DIM;
-    int8_t * k8base = g_k8d + (int64_t) g_layer * K_LAYER_STRIDE;
+    int8_t * const k8base = g_k8dec ? g_k8d + (int64_t) g_layer * K_LAYER_STRIDE : nullptr;
     for (int kv = 0; kv < N_KV; ++kv) {
         _Float16 * kb = ktile(g_layer, kv, pblk);
-        int8_t * kb8 = k8base + (((int64_t) kv * NKT + pblk) * HEAD_DIM) * KT;
+        int8_t * kb8 = k8base ? k8base + (((int64_t) kv * NKT + pblk) * HEAD_DIM) * KT : nullptr;
         if (g_k8dec) {
             // Same scale as every already-cached position, so the new token is just
             // another sample of one fixed grid. A value past the grid clips at 127
             // rather than triggering a rescale, which would have to rewrite the
             // whole history and would move every earlier token's score.
             const float ik = g_k8dsc[g_layer][kv] > 0 ? 1.0f / g_k8dsc[g_layer][kv] : 1.0f;
-            const float iv = g_v8dsc[g_layer][kv] > 0 ? 1.0f / g_v8dsc[g_layer][kv] : 1.0f;
             for (int d = 0; d < HEAD_DIM; ++d) {
                 int q = (int) lrintf(g_k[kv * HEAD_DIM + d] * ik);
                 if (q > 127) q = 127;
                 if (q < -127) q = -127;
                 kb8[(int64_t) d * KT + pi] = (int8_t) q;
             }
+        }
+        if (g_v8dec) {
+            // One fixed grid for the whole history, so a new token is just another
+            // sample of it; clipping at 127 beats rescaling, which would rewrite
+            // every earlier term of the sum PV is accumulating.
+            const float iv = g_v8dsc[g_layer][kv] > 0 ? 1.0f / g_v8dsc[g_layer][kv] : 1.0f;
             for (int d = 0; d < HEAD_DIM; d += 32) {
                 const size_t vl = __riscv_vsetvl_e32m1(32);
                 const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
@@ -2930,12 +2944,12 @@ static void rope_all(void) {
         // Two stores of the same values: pos-major for every other reader, PV order
         // for the PV stream. 128 bytes each, so the extra store is a rounding error
         // next to the layer's GEMM.
-        _Float16 * vpv = g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE;
+        _Float16 * vpv = g_vpv ? g_vpv + (int64_t) g_layer * KV_LAYER_STRIDE : vb;
         for (int d = 0; d < HEAD_DIM; d += 32) {
             const vfloat16mf2_t h = __riscv_vfncvt_f_f_w_f16mf2(
                 __riscv_vle32_v_f32m1(g_v + kv * HEAD_DIM + d, 32), 32);
             __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d, h, 32);
-            if (vpo_on())
+            if (g_vpv)
                 __riscv_vse16_v_f16mf2(vpv + vf16o((int) kv, d / 64, g_pos) + d % 64, h, 32);
         }
     }
@@ -2953,7 +2967,7 @@ static void attn_combine(int tid) {
         // along with the softmax denominator here: one multiply per output vector
         // instead of sixteen per position block inside PV.
         const float inv = (1.0f / gsum[hh]) *
-                          (g_k8dec ? g_v8dsc[g_layer][hh / NH_PER_KV] : 1.0f);
+                          (g_v8dec ? g_v8dsc[g_layer][hh / NH_PER_KV] : 1.0f);
         for (int d = 0; d < HEAD_DIM; d += 32) {
             vfloat32m1_t acc = __riscv_vfmv_v_f_f32m1(0.0f, 32);
             for (int t = 0; t < g_participants; ++t)
@@ -6016,6 +6030,21 @@ static void m4_rope_item(int r, int kv) {
     for (int d = 0; d < HEAD_DIM; d += 32)
         __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d,
                                __riscv_vfncvt_f_f_w_f16mf2(__riscv_vle32_v_f32m1(v + kv * HEAD_DIM + d, 32), 32), 32);
+    if (g_v8dec) {
+        const float iv = g_v8dsc[g_layer][kv] > 0 ? 1.0f / g_v8dsc[g_layer][kv] : 1.0f;
+        for (int d = 0; d < HEAD_DIM; d += 32) {
+            const size_t vl = __riscv_vsetvl_e32m1(32);
+            const vfloat32m1_t f = __riscv_vfmul_vf_f32m1(
+                __riscv_vle32_v_f32m1(v + kv * HEAD_DIM + d, 32), iv, vl);
+            vint32m1_t q = __riscv_vfcvt_x_f_v_i32m1(f, vl);
+            q = __riscv_vmax_vx_i32m1(q, -127, vl);
+            q = __riscv_vmin_vx_i32m1(q, 127, vl);
+            int8_t * vq = g_v8d + (int64_t) g_layer * KV_LAYER_STRIDE +
+                          v8_off(kv, d / 64, pos) + d % 64;
+            __riscv_vse8_v_i8mf4(vq,
+                                 __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+        }
+    }
 }
 
 static void m4_rope_band(int64_t lo, int64_t hi) {
@@ -7417,7 +7446,7 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
             // same pass instead of a second sweep over 440 MB at the end. Only the last
             // chunk counts: its scale is the max over the whole prefix, so any earlier
             // chunk would write a cache the next chunk immediately overwrites.
-            if (g_k8dec && base + cm >= npref) {
+            if ((g_k8dec || g_v8dec) && base + cm >= npref) {
                 for (int kv = 0; kv < N_KV; ++kv) {
                     g_k8dsc[L][kv] = g_k8isc[kv];
                     g_v8dsc[L][kv] = g_v8isc[kv];
@@ -7430,7 +7459,8 @@ static bool real_prefill(const int32_t * toks, int64_t npref, int64_t R) {
                 g_cv8_ik = g_cv8_ik_arr[0];
                 g_cv8_iv = g_cv8_iv_arr[0];
                 parallel_for((int64_t) (base + cm) * N_KV * HEAD_DIM, conv_kv8_v_band);
-                parallel_for((int64_t) N_KV * NKT * HEAD_DIM * KT, conv_kv8_band);
+                if (g_k8dec)
+                    parallel_for((int64_t) N_KV * NKT * HEAD_DIM * KT, conv_kv8_band);
             }
             t_conv+=now_s()-_a; _a=now_s();
             g_pfa_ctx = base;
@@ -8005,6 +8035,7 @@ int main(int argc, char ** argv) {
     exp3_init();
     if (getenv("MEGA_BT")) signal(SIGABRT, abort_bt);
     { const char * e = getenv("MEGA_VPO"); g_vpo = (e && *e == '0') ? 0 : 1; }
+    if (getenv("MEGA_V8")) g_v8dec = atoi(getenv("MEGA_V8"));
     { const char * e = getenv("MEGA_PVU"); g_pvu = e ? atoi(e) : 4; if (g_pvu != 1 && g_pvu != 2 && g_pvu != 4) g_pvu = 4; }
     { const char * e = getenv("MEGA_PVPF"); g_pvpf = e ? atoi(e) : 0; if (g_pvpf < 0 || g_pvpf > 64) g_pvpf = 0; }
     if (getenv("MEGA_QKSAME")) g_qksame = 1;
@@ -8024,6 +8055,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-q2")) g_bit2 = 1;
         else if (!strcmp(argv[i], "-H")) g_hpdec = 1;
         else if (!strcmp(argv[i], "-K8")) g_k8dec = 1;
+        else if (!strcmp(argv[i], "-V8")) g_v8dec = 1;
         else if (!strcmp(argv[i], "-SQ0")) silu_q_on = 0;
         else if (!strcmp(argv[i], "-FSUM")) g_atr_fsum = 1;
         else if (!strcmp(argv[i], "-P4")) g_pvm4 = 1;
@@ -8343,13 +8375,16 @@ int main(int argc, char ** argv) {
     if (!g_kdim || !g_vpos) { fprintf(stderr, "oom kv\n"); return 1; }
     use_huge(g_kdim, kbytes);
     use_huge(g_vpos, vbytes);
-    if (g_k8dec) {
+    if (g_k8dec || g_v8dec) {
         const size_t k8b = (size_t) N_LAYER * K_LAYER_STRIDE;
         const size_t v8b = (size_t) N_LAYER * KV_LAYER_STRIDE;
-        g_k8d = (int8_t *) hugemem(k8b);
+        if (g_k8dec) {
+            g_k8d = (int8_t *) hugemem(k8b);
+            if (!g_k8d) { fprintf(stderr, "oom int8 k\n"); return 1; }
+            use_huge(g_k8d, k8b);
+        }
         g_v8d = (int8_t *) hugemem(v8b);
-        if (!g_k8d || !g_v8d) { fprintf(stderr, "oom int8 kv\n"); return 1; }
-        use_huge(g_k8d, k8b);
+        if (!g_v8d) { fprintf(stderr, "oom int8 v\n"); return 1; }
         use_huge(g_v8d, v8b);
         for (int L = 0; L < N_LAYER; ++L)
             for (int kv = 0; kv < N_KV; ++kv) { g_k8dsc[L][kv] = 0; g_v8dsc[L][kv] = 0; }
@@ -8498,7 +8533,13 @@ int main(int argc, char ** argv) {
                    (long long) pos0, now_s() - _k);
         }
     }
-    if (vpo_on() && !g_vpv) {
+    // A plane whose scale never got set must not be read: prefill fills it only on
+    // its last chunk, so a run with no prefix leaves every scale at zero.
+    if (g_v8dec && g_v8dsc[0][0] <= 0) {
+        fprintf(stderr, "int8 V: no scale written by prefill, falling back to f16\n");
+        g_v8dec = 0;
+    }
+    if (g_vpo && !g_v8dec && !g_vpv) {
         const double _vp = now_s();
         g_vpv = (_Float16 *) hugemem(vbytes);
         if (!g_vpv) { g_vpo = 0; }
@@ -8516,8 +8557,8 @@ int main(int argc, char ** argv) {
     // Say which optional paths are live. A flag that silently fails to parse
     // (one `-X` used to swallow the argument after it) turns a whole A/B into
     // two runs of the same code, and the identical timings look like a result.
-    printf("decode path: int8kv %d  bit3 %d  bit2 %d  hpdec %d  vendor %d  win %d  pv %s\n",
-           g_k8dec, g_bit3, g_bit2, g_hpdec, g_pf_vendor, g_win,
+    printf("decode path: int8kv %d int8v %d  bit3 %d  bit2 %d  hpdec %d  vendor %d  win %d  pv %s\n",
+           g_k8dec, g_v8dec, g_bit3, g_bit2, g_hpdec, g_pf_vendor, g_win,
            g_pvm4 ? "m4" : g_pvm2 ? "m2" : "m1");
     if (g_win) printf("attention window: last %d positions\n", g_win);
     printf("decode: %d tokens from %d\n", ngen, prompt);

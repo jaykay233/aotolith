@@ -306,6 +306,18 @@ breakdown above is the one to use.) **Twenty tok/s is not reachable at one
 row per weight pass by any amount of kernel work**, which is why the speculator
 is not optional.
 
+**Correction: `-K8` is not the default any more, and the 220 MB floor above does
+not exist.** Int8 K costs accuracy where int8 V does not: one scale per
+(layer, kv head) leaves the K cache at cosine 0.9109 against 0.978266, while the
+V cache at the same precision lands at 0.978304 because its error is a weighted
+sum over ten thousand positions instead of an exponent. The default is now f16 K
+with an int8 V plane, which is 430 MB of f16 K plus 220 MB of int8 V, and it
+measures 12.28 tok/s with pv 13.41 -> 9.73 ms. The ceiling that matters for the
+single-row path is the f16 K stream, not the int8 one. `FINDINGS.md`,
+"Decode V in int8, K left in f16", has the three-arm table and the reason QK
+prefers f16 K even ignoring accuracy (int8 adds two conversions per load to an
+issue-bound loop).
+
 Attention is 30.78 ms for 220 MB, i.e. 7.1 GB/s, so it is nowhere near its own
 byte floor. Section 3 of `FINDINGS.md` has the measurement: the four-row int8
 `vmadot` tile (`MEGA_ATTN4_ROWS=4`) costs 41.54 ms at 10K with the three-
