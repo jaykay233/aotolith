@@ -2930,3 +2930,25 @@ The same lesson as the QK stride entry: a measured "ceiling" is a ceiling for th
 access pattern that measured it. `bwprobe` streams one contiguous run per thread,
 and that is what 27.5 describes; eight threads splitting one matrix into distant
 bands is a different pattern and it lands at 24.4.
+
+## Falsified: wider tiles for the wide matrices
+
+The tile order left three shapes reading below the rest: the lm_head and the two
+130560-wide heads at 21.8-23.1 GB/s, against 28.0 for the 42-layer GEMM. The
+obvious explanation was per-tile setup -- 4080 32-n tiles, each paying an
+a-record pointer, the scale loads and eight `vxor` before its first multiply --
+so wider tiles should amortise it.
+
+They do not. Sweeping the tile width for matrices at n>=8192 only, 80 rounds:
+
+| wide-matrix tile | drafter head | markov bias | round |
+|---|---|---|---|
+| **32 n (1 tile)** | **5.44 ms** | **2.64 ms** | **99.75 ms** |
+| 64 n | 6.05 | 2.42 | 100.85 |
+| 128 n | 6.36 | 2.53 | 101.52 |
+| 256 n | 6.42 | 2.55 | 101.23 |
+
+A wider tile is a *narrower interleave*: with one tile per step the eight threads
+cover a 4.6 KB window of the matrix and advance together, and every extra tile of
+width spreads them 576 bytes further apart. The 23 GB/s is what this shape streams
+at, not what the setup costs. Reverted; the chunk is one tile for every matrix.
