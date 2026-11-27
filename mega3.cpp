@@ -1148,10 +1148,10 @@ static inline uint8_t * m4_aq2(int64_t k) {
 // A wide matrix hands each thread a long contiguous band, and at n=130560 that is
 // eight bands of 18.8 MB read in parallel: eight streams the prefetcher cannot
 // merge. Walking the chunks round-robin instead advances one window of the matrix
-// at a time, so the eight threads read neighbouring 576-byte tiles. Measured on
-// the 150 MB lm_head and the 16.7 MB markov head: 20.3 -> 21.2 and 20.7 -> 27.6
-// GB/s, 2.45 ms off the round. One 32-n tile per step is the flat optimum
-// (109.65 ms against 109.82 at two, 110.36 at four).
+// at a time, so the eight threads read neighbouring 576-byte tiles. Measured, one
+// tile per step: the 150 MB lm_head goes 20.3 -> 23.1 GB/s and the four 18.8 MB
+// markov passes 23 -> 29 GB/s, 2.45 ms off the round. One tile is the flat
+// optimum (109.65 ms against 109.82 at two, 110.36 at four over 80 rounds).
 static int m4_ilv(void) {
     static int v = -1;
     if (v < 0) { const char * e = getenv("MEGA_M4ILV"); v = e ? atoi(e) : 1; }

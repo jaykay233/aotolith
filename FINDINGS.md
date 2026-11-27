@@ -16,17 +16,17 @@ file is the index of conclusions; it does not repeat their derivations.
 
 ## 导读（中文）
 
-- **10K decode 目前 12.36 tok/s**（真实 Q3_K 权重 + int8 KV），Q4_0 是 11.18。
-  投机解码（Q4_0 + dspark，逐 slot markov 权重 0.8/0.25/0.25/0.25）在同一块板上
-  是 **17.89 tok/s**：每轮 119.8 ms、接受 1.143 个草案。剩下的差距在 drafter
-  结构上——四个 slot 都只看前缀 + slot 0，slot 1-3 无法条件于 slot 0 的结果。
-  20 tok/s 不是内核问题，是**每 token 要搬的字节数**问题：Q4_0 权重 1265 MB
-  + int8 KV 215 MB = 1480 MB，在 16.5 GB/s 上就是 89.5 ms。要 20 tok/s 必须
-  让一次权重读取产出多个 token（dspark 投机解码），或者把权重压到 2-3 bit。
-- **prefill 200 tok/s 的差距不是调参**：对齐的 4-bit 厂商内核（K256 hp m4）
-  10K 是 139 tok/s（73.4 s），A 核 MAC 地板约 61 s。要 200 必须把 30-40% 的
-  MAC 分给 X100，而 X100 现在算的是不同精度（每行一个 scale），接进去 token
-  就漂。正确的做法是给 X100 喂 hp 的 A 记录 + 每 K32 fp32 折叠。
+- **10K decode 目前 20.93 tok/s**（Q4_0 + dspark 投机解码，逐 slot markov 权重
+  0.8/0.25/0.25/0.25，release 构建 `-O3`）：每轮 99.9 ms、接受 1.090 个草案。
+  单 token 贪心 decode 在物理上到不了 20——Q4_0 权重 1265 MB + int8 KV 215 MB
+  在 24-27.5 GB/s 的实测带宽上是 55-61 ms 的纯字节时间，而一次前向只产出一个
+  token。要 20 必须让一次权重读取产出多个 token（dspark），或者把权重压到
+  2-3 bit。剩下的差距在 drafter 结构上——四个 slot 都只看前缀 + slot 0，
+  slot 1-3 无法条件于 slot 0 的结果。
+- **prefill 10K 目前 203.5 tok/s**（`-x100`，把 GEMM 的 48/48/45/28% 列分给
+  X100 cluster）：49.13 s，其中 GEMM 26.51 s。不加 `-x100` 是 164.5 tok/s
+  （60.78 s，GEMM 39.2 s）。X100 那条路能走通，靠的是给它喂 hp 的 A 记录
+  加每 K32 fp32 折叠，而不是每行一个 scale 的近似精度。
 - **今天修掉了 3-bit 路径上的三个 bug**（prefill 拿 4-bit 内核吃 3-bit 权重、
   反量化用错类型、embedding 行跨距写死 Q4_0）。修完 3-bit 不再出垃圾，短上下文
   20.94 tok/s，但和 llama.cpp 同一份 Q3_K 文件仍然第 0 个 token 就分叉，
