@@ -2753,3 +2753,93 @@ verify GEMM 52.4, verify attention 29-33 of which 23.1 is QK+PV at the `vmadot`
 ceiling, lm_head 7.4, elementwise 4.2, round 113.6-114.3 at 18.3-18.4 tok/s. The
 6-9 ms between the attention's compute and its wall is now the largest identified
 slack, and the GEMM's 24.2 against 27.5 GB/s is 6 ms behind it.
+
+## Where the attention stage's 6 ms went: the pool was polling the wrong line
+
+The stage decomposition added to `attn4p_run` measures four things per layer and
+prints their sums per round: `ent` (release of the entry barrier, the latest stamp
+at the top of the body), `acc` (qk + wait + pv inside the body), `body` (the largest
+thread's whole body) and `skew` (stage wall minus body). At 10K with the backup
+pass on, `ent 0.32 body 26.1 acc 26.1 skew 0.62`: the barriers are 0.9 ms of a
+29 ms stage and the rest is inside the threads. The sum of qk and pv over all eight
+threads is 22.5 ms, so the gap is not compute and not a barrier.
+
+A per-layer hand-to-hand trace (`MEGA_A4TRACE=L`) prints, for one layer, the time
+each head's QK was published, when its A thread started waiting, when its owner
+published the weights, and when the PV ran. Layer 20 at 10K, 726 us wall:
+
+| head group | QK published | weights published | A-side wait began |
+|---|---|---|---|
+| h0-3 | 113.7 us | 211.3 | 257.7 |
+| h4-7 | 192.7 | 297.5 | 326.7 |
+| h8-11 | 257.2 | 356.1 | 432.9 |
+| h12-15 | 326.5 | 430.2 | 494.1 |
+| **h5** | 192.7 | **530.6** | 326.7 |
+
+Head 5's weights arrive 233 us after its own QK against 98 us of softmax work, and
+its A thread waits 204 us of a 726 us layer. Its owner's own flag wait was under
+1 us, so the delay is entirely *before* the worker notices: the pool's idle loop
+polled `g_a4_gen`, which is written once per layer, while the two head flags that
+worker is responsible for are written by its own A thread. A worker woken through
+the scheduler had already lost a third of the layer.
+
+Each worker now polls its own two head flags in the idle loop (bounded pause spin,
+then one `sched_yield`, so the core still comes back to the board's daemons), and
+dispatches on "my heads have unscored work" rather than on "a layer started". A
+worker can no longer be a generation behind for a head that is waiting on it.
+
+400 rounds at 10K, paired against the backup-on build before it:
+
+| 400 rounds, 10K | mean ms/round | tok/s | tokens |
+|---|---|---|---|
+| before | 113.6 / 114.3 | 18.3 / 18.4 | 836 |
+| **after** | **111.3 / 111.5** | **18.76** | 836, same md5 |
+
+The bounded spin is not where the gain is: with `MEGA_A4WSPIN=0` (plain yield, the
+old idle loop) the round is unchanged. What pays is the dispatch key. The spin is
+kept because it costs nothing measurable and removes the scheduler from the wake.
+
+## Two rescuers per head is not a plane the code can publish into
+
+The residual 90 us a layer of A-side wait after the wake fix is a layer where the
+owner and its one rescuer both lost their core. Giving each head two rescuers
+(four backup slots instead of two, `MEGA_A4BKNB=2`) brought the stage to its
+arithmetic floor -- `body 24.1` against a `qk + pv` sum of 24.4 -- and it is
+**wrong**:
+
+| 400 rounds, 10K | accepted | tokens | md5 |
+|---|---|---|---|
+| one rescuer | 436/1200 | 836 | `490e5fc0...` |
+| two rescuers | **197/1200** | 597 | **`5ee8e190...`** |
+
+The streams fork at token 41. `pfa_sm_i8` is not a pure writer: it clears a
+sixteen-position tail block with `memset` before filling it, and both rescuers
+write the same `g_w4b`. One rescuer's clear can land in a block the other has
+already published, so a reader inside that window gets zeros. The window is also
+widened by the pass itself: four backup slots at up to 300 us of flag wait plus
+80 us of deadline can still be running when the next layer's QK starts overwriting
+`g_sc4 + h*SC_GSTRIDE`.
+
+The speed was not worth fixing: the two-rescuer round is 109.6 ms against the one
+rescuer's 110.2 ms in the same A/B, i.e. **0.6 ms**, and the walk back to a correct
+version needs a plane and a flag per rescuer rank. Reverted to one rescuer, which
+is the invariant the original comment states: each head has exactly one rescuer, so
+each plane has exactly one writer.
+
+## 200 tok/s needs `-x100`, and the board hides it twice
+
+A prefill run without `-x100` is 60.8 s (164.5 tok/s) and with it 49.8 s (200.65),
+in the same build, back to back. Nothing regressed; the flag was simply missing, and
+the X100 cluster is what takes GEMM from 39.2 s to 26.6 s:
+
+| prefill at 10K | qkv | o | gate+up | down | GEMM | total |
+|---|---|---|---|---|---|---|
+| no `-x100` | 4.36 | 3.75 | 20.74 | 10.36 | 39.2 s | 60.78 s |
+| `-x100` | 2.90 | 3.11 | 12.24 | 8.32 | 26.6 s | **49.83 s** |
+
+The first `-x100` run of this build read 101 tok/s, which is a contended board and
+not the code: a previous invocation's decode loop was still alive, so two processes
+shared the sixteen cores. `pgrep -x m3c.dv` is the check, and it has to be empty
+before any number is recorded. Every benchmark note in this file that quotes a
+regression should be read as "unless a stray run was alive", because that failure
+mode has now produced a false regression twice.
