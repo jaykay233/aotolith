@@ -2843,3 +2843,34 @@ shared the sixteen cores. `pgrep -x m3c.dv` is the check, and it has to be empty
 before any number is recorded. Every benchmark note in this file that quotes a
 regression should be read as "unless a stray run was alive", because that failure
 mode has now produced a false regression twice.
+
+## The 200 tok/s prefill is unchanged by two weeks of decode work, and the
+
+## 3e-4 cosine it lost is the decode V plane
+
+The decode line went from 10.87 to 19.0 tok/s after the 200 tok/s prefill was
+recorded, and the two share one X100 idle loop, so the prefill number needs a check
+across that boundary rather than an assumption. Reference-locked logits make the
+check exact: `-force refs/golden_10k_tokens.txt` walks the reference chain so every
+step scores the prefix the reference scored, and `MEGA_STEPLOG` writes one 130560-wide
+row per step.
+
+| 10K, 64 forced steps, `-x100` | prefill | cosine | top-1 | rows md5 |
+|---|---|---|---|---|
+| recorded 2026-11-25, before the decode work | 49.907-50.148 s | 0.977316 | 60/64 | `46ee3c9b...` |
+| today, default (int8 V on) | 49.839 s / 200.63 | 0.977015 | 60/64 | `4e0f7d81...` |
+| today, `MEGA_V8=0` | 49.299 s / 202.83 | **0.977316** | 60/64 | `29724e42...` |
+
+Prefill is inside the old spread and slightly faster at its best run, and turning
+the decode V plane off restores the recorded cosine to its last digit. So the
+3.0e-4 gap is the int8 V quantisation from the decode commit, matching the 4e-4
+that entry measured, and nothing in the decode work moved the prefill.
+
+Two things that look like findings and are not:
+
+- The two rows md5s do not match because the dump is 64 separate rows and the
+  historical `46ee3c9b` was recorded over the whole 64-step comparison, not one row.
+  Cosine and top-1 are the comparable quantities.
+- `MEGA_V8=0` reads 202.83 tok/s against 200.63, which is not the V plane making
+  prefill faster: prefill does not read the decode V plane at all. It is the same
+  board noise as the 49.91-50.15 s spread, and the run order.
