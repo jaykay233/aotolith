@@ -2885,32 +2885,46 @@ Walking the 32-n tiles round-robin instead (thread `tid` takes tiles
 `tid, tid+8, tid+16, ...`) makes the eight threads read *neighbouring* 576-byte
 tiles, so the cluster advances one 288 KB window of the matrix at a time.
 
-| 10K, 400 rounds | per-thread bands | round-robin tiles |
+| 10K, 400 rounds, release build | per-thread bands | round-robin tiles |
 |---|---|---|
-| verify GEMM | 51.05 ms | **46.77 ms (27.0 GB/s)** |
-| verify lm_head | 7.40 | **6.43** |
-| drafter head | 6.40 | **5.34** |
-| markov bias | 3.27 | **2.58** |
-| round | 110.14 ms | **101.77 ms** |
-| tok/s at 1.090 accepted | 18.98 | **20.54** |
+| verify GEMM | 51.05 ms | **46.06 ms (27.5 GB/s)** |
+| verify lm_head | 7.40 | **6.50** |
+| drafter head | 6.40 | **5.33** |
+| markov bias | 3.27 | **2.59** |
+| draft | 18.39 | **15.98** |
+| verify | 90.82 | **83.23** |
+| round | 110.14 ms | **100.10 ms** |
+| tok/s at 1.090 accepted | 18.98 | **20.88** |
 
 The GEMM was reading at 24.4 GB/s, which this file previously took as "88 percent
 of the 27.5 GB/s ceiling" and blamed on the vendor kernel. It was not the kernel
 and it was not the bus: it was the access pattern. The same kernel moving the
-same bytes in tile order reads 27.0 GB/s.
+same bytes in tile order reads 27.5 GB/s.
 
 Correctness is unchanged because a 32-n tile owns its own output columns: the
 tile order cannot move a value. Two 400-round runs emit the same 836 tokens with
-the same 436/1200 acceptance and the same md5 `490e5fc0...` as before the change.
+the same 436/1200 acceptance and the same md5 `490e5fc0...` as before the change,
+and the second run read 99.88 ms / 20.93 tok/s.
 
 One tile per step is the flat optimum (109.65 ms against 109.82 at two tiles and
 110.36 at four, 80 rounds). `MEGA_M4ILV=0` restores the band split, `MEGA_M4ILVC`
 sets the chunk.
 
-Prefill is untouched: it runs its own m-inner loop and never enters
-`task_mgemm_m4`. Three back-to-back 10K prefill runs read 198.65, 198.80 and
-200.22 tok/s with GEMM 26.51 s against the recorded 26.57, the same 49.91-50.15 s
-spread this file already records.
+### The build line is part of the measurement
+
+The first build of this change used `-O2`, because that is the line section 9
+gives for the probes. The release binary is `-O3`:
+
+    g++ -O3 -fno-stack-protector -march=rv64gcv_zvfh_xsmtvdotii \
+        -o m3c.dv xa.cpp ime2.o rvv.o -lm -pthread
+
+`-O2` costs 1.7 ms a round (101.62 against 99.88) and 1.4 tok/s of prefill
+(198.7 against 203.5), which reads exactly like a regression and is not one. The
+two binaries are 375 KB and 474 KB and both emit the same token md5.
+
+Prefill is untouched by the tile order: it runs its own m-inner loop and never
+enters `task_mgemm_m4`. Two runs of the release build read 203.53 and 202.33
+tok/s with GEMM 26.51 s against the recorded 26.57.
 
 The same lesson as the QK stride entry: a measured "ceiling" is a ceiling for the
 access pattern that measured it. `bwprobe` streams one contiguous run per thread,
