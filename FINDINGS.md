@@ -2844,9 +2844,7 @@ before any number is recorded. Every benchmark note in this file that quotes a
 regression should be read as "unless a stray run was alive", because that failure
 mode has now produced a false regression twice.
 
-## The 200 tok/s prefill is unchanged by two weeks of decode work, and the
-
-## 3e-4 cosine it lost is the decode V plane
+## The 200 tok/s prefill is unchanged by the decode work, and its 3e-4 is int8 V
 
 The decode line went from 10.87 to 19.0 tok/s after the 200 tok/s prefill was
 recorded, and the two share one X100 idle loop, so the prefill number needs a check
