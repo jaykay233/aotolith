@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SpacemiT K3 上的 2B 模型：优化思路与实测</title>
+<style>
+  @page {
+    size: A4;
+    margin: 20mm 18mm 18mm 18mm;
+    @bottom-center {
+      content: counter(page);
+      font: 9pt "PingFang SC", sans-serif;
+      color: #98a2b3;
+    }
+  }
+  @page :first { margin: 0; }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Arial Unicode MS", sans-serif;
+    font-size: 10.2pt;
+    line-height: 1.72;
+    color: #1e2430;
+    margin: 0;
+    font-feature-settings: "tnum";
+  }
+
+  /* ---------------- cover ---------------- */
+  .cover {
+    height: 297mm;
+    padding: 34mm 22mm 20mm 22mm;
+    background: linear-gradient(160deg, #f4f7fb 0%, #eaf1f9 46%, #e3edf7 100%);
+    page-break-after: always;
+    position: relative;
+  }
+  .cover .rule {
+    width: 46mm; height: 3.2pt;
+    background: #1f6feb;
+    border-radius: 2pt;
+    margin-bottom: 10mm;
+  }
+  .cover .kicker {
+    font-size: 10pt; letter-spacing: 0.14em; color: #4a6fa5;
+    font-weight: 600; text-transform: uppercase; margin-bottom: 8mm;
+  }
+  .cover h1 {
+    font-size: 30pt; line-height: 1.28; margin: 0 0 7mm 0;
+    font-weight: 700; letter-spacing: -0.01em; color: #10151f;
+  }
+  .cover h1 .thin { font-weight: 300; color: #35507a; }
+  .cover .sub {
+    font-size: 12.4pt; color: #40506b; line-height: 1.75;
+    max-width: 132mm; margin-bottom: 16mm;
+  }
+
+  .scorecard {
+    display: flex; gap: 4mm; margin-bottom: 9mm;
+  }
+  .score {
+    flex: 1; background: #fff; border-radius: 3mm;
+    padding: 5.5mm 5mm; border: 0.6pt solid #d7e2f0;
+    box-shadow: 0 1pt 3pt rgba(31,111,235,0.06);
+  }
+  .score .n {
+    font-size: 21pt; font-weight: 700; color: #1f6feb;
+    letter-spacing: -0.02em; line-height: 1.1;
+  }
+  .score .n small { font-size: 9.5pt; font-weight: 500; color: #5b7ca6; }
+  .score .l { font-size: 8.6pt; color: #6b7a90; margin-top: 1.6mm; line-height: 1.5; }
+  .score.alt .n { color: #2f8f6b; }
+
+  .cover .meta {
+    position: absolute; bottom: 20mm; left: 22mm; right: 22mm;
+    font-size: 8.8pt; color: #6b7a90;
+    border-top: 0.6pt solid #c9d6e6; padding-top: 4mm;
+    display: flex; justify-content: space-between;
+  }
+
+  /* ---------------- body ---------------- */
+  .page { }
+
+  h2 {
+    font-size: 15.5pt; font-weight: 700; color: #10151f;
+    margin: 9mm 0 5mm 0; padding-bottom: 2.4mm;
+    border-bottom: 1.6pt solid #1f6feb;
+    letter-spacing: -0.005em;
+    break-after: avoid; break-inside: avoid;
+  }
+  h2 .num {
+    color: #1f6feb; font-weight: 700; margin-right: 3mm;
+    font-variant-numeric: tabular-nums;
+  }
+  h3 {
+    font-size: 11.6pt; font-weight: 650; color: #17253a;
+    margin: 7mm 0 2.4mm 0;
+    break-after: avoid; break-inside: avoid;
+  }
+  h3 .sn { color: #7b8ca3; font-weight: 500; margin-right: 2mm; }
+
+  p { margin: 0 0 3.2mm 0; text-align: justify; orphans: 3; widows: 3; }
+  p.lead {
+    font-size: 10.8pt; color: #33415a; line-height: 1.78;
+    margin-bottom: 5mm;
+  }
+
+  strong { color: #10151f; font-weight: 650; }
+
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 8.9pt; background: #eef2f7; color: #234;
+    padding: 0.5pt 1.4pt; border-radius: 1.2pt;
+  }
+
+  ul, ol { margin: 0 0 3.4mm 0; padding-left: 5.4mm; }
+  li { margin-bottom: 1.6mm; }
+
+  /* tables */
+  table {
+    width: 100%; border-collapse: collapse; margin: 3mm 0 5mm 0;
+    font-size: 9.2pt; page-break-inside: avoid;
+  }
+  caption {
+    caption-side: top; text-align: left; font-size: 8.6pt;
+    color: #6b7a90; padding-bottom: 1.6mm;
+  }
+  th {
+    text-align: left; font-weight: 600; color: #33415a;
+    border-bottom: 1pt solid #b8c8dc; padding: 1.8mm 2.4mm;
+    font-size: 8.6pt; letter-spacing: 0.02em;
+  }
+  td {
+    padding: 1.8mm 2.4mm; border-bottom: 0.5pt solid #e2e9f2;
+    vertical-align: baseline;
+  }
+  tbody tr:nth-child(even) td { background: #f8fafd; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  td.hl { font-weight: 650; color: #1f6feb; }
+  td.win { font-weight: 650; color: #2f8f6b; }
+  td.dim { color: #8b98ab; }
+
+  /* callouts */
+  .callout {
+    border-radius: 2.2mm; padding: 3.6mm 4.4mm; margin: 4mm 0 5mm 0;
+    page-break-inside: avoid; font-size: 9.4pt; line-height: 1.68;
+  }
+  .callout .tag {
+    display: inline-block; font-size: 7.8pt; font-weight: 700;
+    letter-spacing: 0.08em; padding: 0.8mm 2mm; border-radius: 1.2mm;
+    margin-bottom: 2mm;
+  }
+  .wrong { background: #fdf3f2; border-left: 2.6pt solid #d1544a; }
+  .wrong .tag { background: #f5d9d6; color: #a3352c; }
+  .right { background: #f1f8f4; border-left: 2.6pt solid #2f8f6b; }
+  .right .tag { background: #d5ecdf; color: #1f6b4e; }
+  .note { background: #f4f7fc; border-left: 2.6pt solid #1f6feb; }
+  .note .tag { background: #dce8fa; color: #1a56b8; }
+
+  /* bar rows */
+  .bars { margin: 3mm 0 5mm 0; page-break-inside: avoid; }
+  .bar {
+    display: flex; align-items: center; gap: 3mm;
+    margin-bottom: 1.8mm; font-size: 9pt;
+  }
+  .bar .lbl { width: 40mm; color: #40506b; flex-shrink: 0; }
+  .bar .track { flex: 1; background: #eef2f7; border-radius: 1mm; height: 4.6mm; position: relative; }
+  .bar .fill { height: 100%; border-radius: 1mm; background: #9db6d4; }
+  .bar .fill.good { background: #1f6feb; }
+  .bar .val { width: 26mm; text-align: right; font-variant-numeric: tabular-nums; color: #33415a; flex-shrink: 0; }
+
+  .kv { font-size: 9.4pt; color: #40506b; margin: 0 0 4mm 0; }
+  .kv b { color: #10151f; }
+
+  .toc { font-size: 10pt; }
+  .toc div {
+    display: flex; justify-content: space-between;
+    padding: 1.9mm 0; border-bottom: 0.5pt dotted #cdd8e6;
+  }
+  .toc .t { color: #22303f; }
+  .toc .t span.n { color: #1f6feb; font-weight: 650; margin-right: 3mm; }
+  .toc .pg { color: #8b98ab; font-variant-numeric: tabular-nums; }
+
+  .footnote {
+    font-size: 8.4pt; color: #7b8ca3; line-height: 1.6;
+    border-top: 0.5pt solid #e2e9f2; padding-top: 2.6mm; margin-top: 6mm;
+  }
+  .avoid { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<!-- ======================= COVER ======================= -->
+<div class="cover">
+  <div class="rule"></div>
+  <div class="kicker">SpacemiT K3 · RISC-V · 双 cluster</div>
+  <h1>把 2B 模型塞进<br><span class="thin">一块 16 核 RISC-V 板</span></h1>
+  <div class="sub">
+    MiniCPM5-2B megakernel 的 decode 与 prefill 优化思路。
+    不按时间线写改了什么，按<b>每一次误判长什么样</b>来写：
+    先以为是算力，后来发现是访问模式；先以为是带宽，后来发现是唤醒。
+  </div>
+
+  <div class="scorecard">
+    <div class="score">
+      <div class="n">20.93 <small>tok/s</small></div>
+      <div class="l">10K decode<br>99.88 ms / 轮 · 1.090 accepted</div>
+    </div>
+    <div class="score alt">
+      <div class="n">203.5 <small>tok/s</small></div>
+      <div class="l">10K prefill<br>49.13 s · <code>-x100</code></div>
+    </div>
+    <div class="score">
+      <div class="n">0</div>
+      <div class="l">1600 轮 token 分歧<br>md5 逐字节一致</div>
+    </div>
+  </div>
+
+  <div class="meta">
+    <span>aotolith / FINDINGS.md 的提炼</span>
+    <span>2026-11-27</span>
+  </div>
+</div>
+
+<!-- ======================= TOC ======================= -->
+<h2><span class="num">0</span>这份文档讲什么</h2>
+<p class="lead">
+  优化一台机器的性能，真正难的不是写更快的代码，而是<b>判断这一层的时间到底花在哪</b>。
+  同一个「慢了 6 ms」，可能是算术不够、可能是字节太多、可能是内存访问模式不对、
+  可能是线程没被唤醒、也可能是计时器打在了错误的时刻。判断错一次，就会去优化一个
+  不存在的问题，并且拿到一个「看起来有提升」的假结果。
+</p>
+<p>
+  下面每一条都是这个判断的一次纠错。格式统一：<b>当时的误判 → 正确的提问方式 →
+  用来分辨的测量 → 结果</b>。数字全部来自这块板上的实测，一条进程、安静系统。
+</p>
+
+<div class="toc" style="margin-top:6mm">
+  <div><span class="t"><span class="n">1</span>先把「下限」测出来</span><span class="pg">三种下限</span></div>
+  <div><span class="t"><span class="n">2</span>案例一：慢的不是内核，是跨距</span><span class="pg">PV 布局</span></div>
+  <div><span class="t"><span class="n">3</span>案例二：6 ms 不是算力，是唤醒</span><span class="pg">per-head 轮询</span></div>
+  <div><span class="t"><span class="n">4</span>案例三：超时不是等待，是计时点</span><span class="pg">备份 deadline</span></div>
+  <div><span class="t"><span class="n">5</span>案例四：边界不能从共享全局继承</span><span class="pg">pfa_sm_i8</span></div>
+  <div><span class="t"><span class="n">6</span>案例五：并行度不是免费的</span><span class="pg">两个 rescuer</span></div>
+  <div><span class="t"><span class="n">7</span>案例六：8 条带 vs 一个窗口</span><span class="pg">列分块顺序</span></div>
+  <div><span class="t"><span class="n">8</span>测量本身会骗人</span><span class="pg">四个陷阱</span></div>
+  <div><span class="t"><span class="n">9</span>正确性先于速度</span><span class="pg">哈希审计</span></div>
+  <div><span class="t"><span class="n">10</span>现状与剩余空间</span><span class="pg">还能往哪走</span></div>
+</div>
+
+<div style="break-after: page"></div>
+
+<!-- ======================= 1 ======================= -->
+<div class="page">
+<h2><span class="num">1</span>先把「下限」测出来</h2>
+
+<p class="lead">
+  所有优化的本质都是同一个问题：<b>这个阶段离它的正确下限还有多远？</b>
+  所以第一件事不是改代码，是把下限测出来。问题在于，「下限」有三个完全不同的来源，
+  而它们的优化手法互相冲突。
+</p>
+
+<table>
+  <caption>三种下限，以及它们各自的优化手法</caption>
+  <thead>
+    <tr><th>下限类型</th><th>判定方法</th><th>如果它是瓶颈</th><th>典型症状</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>字节</b></td>
+      <td>字节数 ÷ 实测流带宽</td>
+      <td>减少要搬的字节：量化、改布局、一次读取产出多个 token</td>
+      <td>加算力没用，换内核没用，时间随数据量线性走</td>
+    </tr>
+    <tr>
+      <td><b>算术</b></td>
+      <td>MAC 数 ÷ 实测指令吞吐</td>
+      <td>换指令（IME2 ↔ vmadot）、降低精度、减少冗余计算</td>
+      <td>所有线程都跑满，时间不随缓存变热而下降</td>
+    </tr>
+    <tr>
+      <td><b>延迟</b></td>
+      <td>把工作拿掉，看墙钟是否还是不降</td>
+      <td>改调度与握手，不改算术</td>
+      <td>时间在「等」，线程计时加起来远小于墙钟</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  这次的目标是 10K 上下文下 <b>decode ≥ 20 tok/s、prefill ≥ 200 tok/s</b>，贪心解码，
+  允许有损数值。板子的实测包络决定了可行范围：
+</p>
+
+<table>
+  <caption>硬件包络（bwprobe + 各内核微基准，全部单进程实测）</caption>
+  <thead>
+    <tr><th>项目</th><th class="n">实测值</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>连续流带宽（合成 buffer，8–16 线程）</td><td class="n">25.1 GB/s</td><td>这是「一个线程一条连续流」的上限</td></tr>
+    <tr><td>连续流带宽（真实权重文件，8 线程）</td><td class="n">23.6 GB/s</td><td>换到真实数据略低</td></tr>
+    <tr><td>内核形状访问（8 线程）</td><td class="n">17.5 GB/s</td><td>同一条探测程序，只换访问模式</td></tr>
+    <tr><td>1-of-4 跨距</td><td class="n">−48%</td><td>任何「按 position 循环、固定一维切片」的内核都要付这个税</td></tr>
+    <tr><td><code>gemm_kernel_i8i4_hp_m4</code>（单核）</td><td class="n">47.7 GMAC/s</td><td>IME2 路径</td></tr>
+    <tr><td>vmadot int8（16 核聚合）</td><td class="n">809.8 GMAC/s</td><td>RVV 路径，比 IME2 高一个数量级</td></tr>
+  </tbody>
+</table>
+
+<div class="callout note">
+  <span class="tag">这条决定了架构</span>
+  IME2 和 vmadot 的差距不是一个数量级的调优，而是两种分工：
+  <b>decode 用 IME2</b>（一次读 1265 MB 权重，算术被流掩盖，慢一点无所谓）；
+  <b>prefill 用 vmadot</b>（算术是约束，必须走 RVV 点积）。
+  先测出这个不对称，后面所有关于「哪个内核放在哪个阶段」的决定才有依据。
+</div>
+
+<p>
+  一个直接后果：decode 一次前向要搬 <b>1265 MB 权重 + 215 MB int8 KV</b>，在 24 GB/s
+  上是 61 ms 的纯字节时间。<b>单 token 贪心 decode 在物理上到不了 20 tok/s</b>，
+  所以投机解码不是优化选项，是必要条件——让一次权重读取产出多个 token。
+</p>
+</div>
+
+<!-- ======================= 2 ======================= -->
+<div class="page">
+<h2><span class="num">2</span>案例一：慢的不是内核，是跨距</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  attention 的 PV 阶段跑 11 GB/s，总线 27.5 GB/s。第一反应是内核写得不好、
+  或者 KV 用 f16 太浪费——那就上 int8，把字节砍一半。
+</div>
+
+<p>
+  这个判断错在分母。<b>11 GB/s</b> 是把 attention 全部 43.8 ms 除以 KV 字节数算出来的，
+  但 attention 同时在跑 exp，QK 也在读 K。分阶段拆开才对得上账：
+</p>
+
+<table>
+  <caption>10K，拆分到每个阶段</caption>
+  <thead>
+    <tr><th>阶段</th><th class="n">ms/token</th><th class="n">字节</th><th class="n">有效带宽</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>QK</td><td class="n">18.0</td><td class="n">K 264 MB</td><td class="n">14.7 GB/s</td></tr>
+    <tr><td>exp</td><td class="n">1.3</td><td class="n">—</td><td class="n">—</td></tr>
+    <tr><td><b>PV</b></td><td class="n"><b>24.0</b></td><td class="n">V 264 MB</td><td class="n"><b>11.0 GB/s</b></td></tr>
+    <tr><td>收尾</td><td class="n">0.6</td><td class="n">—</td><td class="n">—</td></tr>
+  </tbody>
+</table>
+
+<div class="callout right">
+  <span class="tag">正确的提问</span>
+  PV 搬 264 MB 用了 24 ms。问题不是「为什么只有 11 而不是 27」，
+  而是「<b>这个内核的访问形状在 bwprobe 里对应哪个数字</b>」。
+</div>
+
+<p>
+  V 是 position-major 存储：<code>[pos][kv][dim]</code>，一个 position 512 字节，
+  PV 每次只取其中 128 字节（一个 kv、一个 64 维半）。<code>bwprobe MEGA_STRIDE</code>
+  精确复现这个形状：
+</p>
+
+<table>
+  <caption>bwprobe：每 n*128 字节里只用 32 字节</caption>
+  <thead>
+    <tr><th>跨距模式</th><th>每块有效字节</th><th class="n">有效带宽</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>连续</td><td>128 / 128</td><td class="n win">27.2 GB/s</td></tr>
+    <tr><td>1-of-2</td><td>64 / 128</td><td class="n">13.5</td></tr>
+    <tr><td>1-of-4</td><td>32 / 128</td><td class="n">5.7</td></tr>
+  </tbody>
+</table>
+
+<p>
+  硬件预取器会把整个 128 字节块拉进来，然后丢弃四分之三。<b>PV 付的是跨距的钱，
+  不是字节的钱。</b>所以 int8 化 KV 只能减少字节，跨距带来的浪费一分享受不了：
+  1-of-4 的浪费率不变，砍半的字节里还是在浪费四分之三。
+</p>
+
+<h3><span class="sn">2.1</span>为什么不能就地改循环顺序</h3>
+<p>
+  直接的做法是把循环改成「一个 position 的四个 (kv, half) 一次处理完」，读就连续了。
+  但那样要同时保持 16 个 head × 128 维的累加器活着——V 值还没加载就先占掉 32 个寄存器。
+  按 half 拆开正是让 16 个累加器塞得下的原因，而按 half 拆开正好制造了跨距。
+  <b>两个约束互为因果，所以就地改顺序不可能，只能多存一份。</b>
+</p>
+
+<p>
+  于是建第二份 f16 V 副本，布局改成 <code>[kv][half][pos][64]</code>。这样
+  一个 position 的 64 维是 128 连续字节，相邻 position 在内存里相邻，
+  单个 (kv, half) 读就是一条连续流。
+</p>
+
+<table>
+  <caption>代价与结果（同热态、交替运行）</caption>
+  <thead>
+    <tr><th></th><th class="n">PV ms</th><th class="n">10K decode</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>position-major</td><td class="n">23.9 / 24.1</td><td class="n">9.98 / 9.98 tok/s</td></tr>
+    <tr><td><b>PV order</b></td><td class="n win"><b>13.4 / 13.6</b></td><td class="n win"><b>10.98 / 10.93</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  副本只建一次：264 MB 读 + 264 MB 写，实测 0.107 s。并且在
+  <code>prefill_release()</code> 之后才分配，所以 264 MB 不会和 prefill 的工作集重叠。
+  只有 decode 的 PV 读这份副本，prefill attention、int8 转换、所有调试路径
+  继续读原来的 position-major 缓存。
+</p>
+
+<div class="callout note">
+  <span class="tag">一般化</span>
+  一个内核的有效带宽要跟<b>同形状</b>的微基准比，不能跟「最佳情况」比。
+  「11 GB/s vs 27.5 GB/s」听起来像内核差 2.5 倍，实际上它已经跑在自己形状的
+  上限上了；真正的问题是形状，而形状由寄存器预算决定。
+</div>
+</div>
+
+<!-- ======================= 3 ======================= -->
+<div class="page">
+<h2><span class="num">3</span>案例二：6 ms 不是算力，是唤醒</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  四行 verify 的 attention 阶段墙钟比「八个线程各自 qk + pv 之和」多出 6 ms。
+  A 侧自己的等待只有 0.011 ms，屏障 skew 只有 0.6 ms。既然不是等待，
+  那大概是算力没打满——去看内核。
+</div>
+
+<h3><span class="sn">3.1</span>先把台阶拆开</h3>
+<p>
+  阶段分解按每层四项计时并汇总：<code>ent</code>（入口屏障释放）、
+  <code>acc</code>（body 内 qk + 等待 + pv）、<code>body</code>（最慢线程的整个 body）、
+  <code>skew</code>（阶段墙钟减 body）。
+</p>
+
+<table>
+  <caption>10K，备份开着，每轮汇总（42 层）</caption>
+  <thead>
+    <tr><th>ent</th><th class="n">body</th><th class="n">acc</th><th class="n">skew</th><th class="n">八线程 qk+pv 之和</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0.32 ms</td><td class="n">26.1</td><td class="n">26.1</td><td class="n">0.62</td><td class="n">22.5</td></tr>
+  </tbody>
+</table>
+
+<p>
+  屏障只占 0.9 ms，剩下的全在线程里面。<code>body</code> 比 <code>acc</code> 只多
+  0.0 ms，说明时间花在 body 内部而不是线程之间。而 22.5 ms 的算术和对应 26.1 ms 的
+  body——差 3.6 ms 在「线程内部的等待」里，这个数在 A 侧计时上是 0.011 ms，
+  所以等待发生在别的地方。
+</p>
+
+<h3><span class="sn">3.2</span>逐层逐 head 的时间线</h3>
+<p>
+  <code>MEGA_A4TRACE</code> 打印某一层里每个 head 的 QK 发布时刻、权重发布时刻、
+  以及对应 A 线程开始等待的时刻。这是唯一能把「谁在等谁」看清楚的工具。
+</p>
+
+<table>
+  <caption>第 20 层，10K，整层 726 µs</caption>
+  <thead>
+    <tr><th>head 组</th><th class="n">QK 发布</th><th class="n">权重发布</th><th class="n">A 侧开始等待</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>h0–3</td><td class="n">113.7 µs</td><td class="n">211.3</td><td class="n">257.7</td></tr>
+    <tr><td>h4–7</td><td class="n">192.7</td><td class="n">297.5</td><td class="n">326.7</td></tr>
+    <tr><td>h8–11</td><td class="n">257.2</td><td class="n">356.1</td><td class="n">432.9</td></tr>
+    <tr><td>h12–15</td><td class="n">326.5</td><td class="n">430.2</td><td class="n">494.1</td></tr>
+    <tr><td><b>h5</b></td><td class="n">192.7</td><td class="n"><b>530.6</b></td><td class="n">326.7</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Head 5 的权重晚了 <b>233 µs</b> 才到，而它的 softmax 本身只要 98 µs。
+  它的 A 线程在 726 µs 的一层里等了 <b>204 µs</b>。而它 owner 自己的 flag 等待
+  不到 1 µs——也就是说延迟完全发生在 worker <b>注意到</b>这件事之前。
+</p>
+
+<div class="callout right">
+  <span class="tag">根因</span>
+  X100 的空闲循环在轮询 <code>g_a4_gen</code>，这个计数器<b>每层只写一次</b>；
+  而这个 worker 负责的那两个 head 的 flag，是它自己的 A 线程写的。
+  通过调度器被唤醒的 worker，入场时已经损失了三分之一层的时间。
+</div>
+
+<p>
+  修法两层，但只有一层真正付钱：
+</p>
+<ul>
+  <li><b>每个 worker 在空闲循环里轮询自己那两个 head 的 flag</b>，派发条件是
+      「我的 head 有未算的工作」，而不是「有一层开始了」。这样 worker 不可能
+      对一个正在等它的 head 落后一代。</li>
+  <li>轮询用有界的 <code>cpu_pause</code> 自旋，然后一次 <code>sched_yield</code>，
+      保证核心还会还给板子上的桌面和监控守护进程。</li>
+</ul>
+
+<table>
+  <caption>400 轮，10K，与修前对跑</caption>
+  <thead>
+    <tr><th>400 轮 · 10K</th><th class="n">mean ms/round</th><th class="n">tok/s</th><th class="n">tokens</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>修前</td><td class="n">113.6 / 114.3</td><td class="n">18.3 / 18.4</td><td class="n">836</td></tr>
+    <tr><td><b>修后</b></td><td class="n win"><b>111.3 / 111.5</b></td><td class="n win"><b>18.76</b></td><td class="n">836，同 md5</td></tr>
+  </tbody>
+</table>
+
+<p>
+  有界自旋不是收益来源：<code>MEGA_A4WSPIN=0</code>（退回裸 yield）时轮次时间不变。
+  <b>付钱的是派发键。</b>自旋留下来是因为它测不出成本，同时把调度器从唤醒路径里拿掉了。
+</p>
+
+<div class="callout note">
+  <span class="tag">一般化</span>
+  「线程计时加起来小于墙钟」有两种可能：在等锁，或者<b>根本没被唤醒</b>。
+  第一种去看等待点，第二种去看<b>空闲循环轮询的是哪条 cache line</b>。
+  一个每层翻一次的计数器，无法表达「我这个 head 有活」这件事。
+</div>
+</div>
+
+<!-- ======================= 4 ======================= -->
+<div class="page">
+<h2><span class="num">4</span>案例三：超时不是等待，是计时点</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  邻居备份（backup）机制开了之后，attention 阶段墙钟从 26.4 ms 涨到 32.6 ms，
+  备份每轮触发 <b>78 次</b>，而 A 侧自己的等待只有 0.011 ms。
+  结论看起来很清楚：备份在抢本来没人等的工作，把不必要的工作重复做了。
+</div>
+
+<p>
+  这个判断对了一半：备份确实在抢没人等的工作。但「为什么抢」不是它太激进，
+  而是它的<b>计时器打在了错误的时刻</b>。
+</p>
+
+<p>
+  deadline 是从这一趟的<b>入口</b>开始算的。而入口时间戳是在
+  <b>等待邻居的 QK flag 之前</b>取的。于是：一个在 A 线程发布之前就到达循环的
+  worker，会把整个 80 µs 预算花在 flag 等待上，然后 flag 一到就立刻接管——
+  它没有任何「迟到」可以指认，因为它的 80 µs 早就用完了。
+</p>
+
+<div class="callout right">
+  <span class="tag">修法</span>
+  把 deadline 的起点移到<b>第一次看到 QK flag 的时刻</b>——也就是 owner 也可能
+  才开始的那个瞬间。这样「超时」才表达「owner 在这段时间里本可以做但没做」。
+</div>
+
+<table>
+  <caption>修法前后（400 轮，10K）</caption>
+  <thead>
+    <tr><th></th><th class="n">每轮接管次数</th><th class="n">稳态 attention 墙钟</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>计时点在入口</td><td class="n">78</td><td class="n">32.6 ms</td></tr>
+    <tr><td><b>计时点在 flag 之后</b></td><td class="n win"><b>1.5</b></td><td class="n win"><b>29.4 ms</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  但这里有个反直觉的地方：<b>正确的语义不等于正确的调度</b>。
+  修完之后 deadline 的曲线是单调的，而且 80 µs 不是最优：
+</p>
+
+<table>
+  <caption>400 轮，10K，备份 deadline 扫描</caption>
+  <thead>
+    <tr><th>deadline</th><th class="n">mean ms/round</th><th class="n">tok/s</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>关闭</td><td class="n">121.49 / 121.71</td><td class="n">17.20 / 17.17</td></tr>
+    <tr><td>20 µs</td><td class="n">113.81</td><td class="n">18.36</td></tr>
+    <tr><td>40 µs</td><td class="n">113.48</td><td class="n">18.42</td></tr>
+    <tr><td><b>80 µs（默认）</b></td><td class="n"><b>114.29 / 113.64</b></td><td class="n"><b>18.29 / 18.39</b></td></tr>
+    <tr><td>150 µs</td><td class="n">116.75 / 115.95</td><td class="n">17.90 / 18.03</td></tr>
+    <tr><td>300 µs</td><td class="n">119.43 / 120.36</td><td class="n">17.50 / 17.37</td></tr>
+  </tbody>
+</table>
+
+<p>
+  关掉备份的代价是 <b>7 ms</b>，说明整个备份机制是净正收益，必须留着。
+  曲线在 80 µs 以下很平，往上变差——所以「救火延迟」比「重复工作」值钱。
+  这是这台机器的实际约束：X100 池和板子的桌面进程共享 0–7 核，
+  某个 worker 会偶尔丢掉核心，这时候 1.5 次/轮的接管就是那 7 ms 的来源。
+</p>
+</div>
+
+<!-- ======================= 5 ======================= -->
+<div class="page">
+<h2><span class="num">5</span>案例四：边界不能从共享全局继承</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  备份机制加进来之后，跑了 100 轮 2K 和 150 轮 10K 的 token md5 对比，
+  全部通过。结论：正确性没问题，可以收工。
+</div>
+
+<p>
+  这个结论之所以错，是因为<b>测得太短</b>。这个 bug 大约每 400 轮出现一次。
+  真正抓住它的不是 token 对比，而是<b>把每一轮自己的数字哈希掉</b>：
+  对 <code>g_logits4</code> 的四行和 drafter 的 slot-0 logits 做 FNV 折叠，
+  每轮打印一次。
+</p>
+
+<table>
+  <caption>400 轮，10K，备份开 vs 备份关</caption>
+  <thead>
+    <tr><th>400 轮 · 10K</th><th class="n">verify logits 哈希不一致</th><th class="n">drafter logits</th><th class="n">token dump</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>修前，第 1 次</td><td class="n">63/400，首次在第 229 轮</td><td class="n">0/400</td><td class="n"><code>ec0b9e52…</code>，843</td></tr>
+    <tr><td>修前，第 2 次</td><td class="n">—</td><td class="n">0/400</td><td class="n"><code>490e5fc0…</code>，836</td></tr>
+    <tr><td>备份关</td><td class="n">—</td><td class="n">—</td><td class="n"><code>490e5fc0…</code>，836</td></tr>
+    <tr><td><b>修后（2 次）</b></td><td class="n win"><b>0/400</b></td><td class="n win"><b>0/400</b></td><td class="n win"><b><code>490e5fc0…</code>，436/1200</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  drafter 的 logits 一次都没动，所以提案侧是干净的。动的是 target 侧。
+  第 229 轮是最有用的一条：<b>同一位置、同样 drafts、同样接受数、同样的下一个 token，
+  但 4 × VOCAB 个 logits 的哈希不同。</b>用容差去比会直接放过它。
+</p>
+
+<h3><span class="sn">5.1</span>根因：一个循环边界读到了别人拥有的全局</h3>
+<p>
+  <code>pfa_sm_i8</code> 的循环写成 <code>for (gg = 0; gg &lt; g_i8g; ++gg)</code>，
+  读共享的 <code>g_i8g</code>。<code>pfa_run</code> 为四行 decode 把它设成 1，
+  然后在 <code>run(task_attn4_a)</code> 返回的<b>那一刻</b>就恢复成 16——而
+  X100 池按设计不是这个屏障的参与者。
+</p>
+<p>
+  窗口是这样的：A 线程接手备份平面 → 这一层结束 → 阶段把计数翻成 16 →
+  而 owner worker 还在这个调用里面。剩下十五次迭代从 <code>g_w4 + h*WBLK</code>
+  开始写十五个 group 块：head h+1..h+15，每个都喂自己 head 的 score 平面，
+  但 <code>L</code> 偏移了 4..60 个位置，causal 尾部清零按偏移后的长度算。
+  窗口内被读到的平面会拿到正确的 head 加错误的尾巴，PV 求和把它带进后面每一层。
+</p>
+
+<div class="callout right">
+  <span class="tag">修法</span>
+  计数变成参数：<code>pfa_sm_i8(…, int ng)</code>。
+  四个 decode 调用点（owner、backup、A 侧 fallback、<code>MEGA_A4S=2</code> 的
+  原地 softmax）传 1，两个 prefill 调用点传 <code>g_i8g</code>。
+  decode 路径不再读任何「下一阶段拥有」的全局。成本：测不出来，
+  四组 400 轮 A/B 都发出同样的 836 个 token、同样的 436/1200。
+</div>
+
+<div class="callout note">
+  <span class="tag">一般化：一个能工作的重叠会隐藏什么</span>
+  代际标签（generation tag）保护的是 <b>flag</b>：过期的发布带着旧编号所以被忽略。
+  但<b>循环边界没有编号可带</b>。任何晚到的线程用来决定「做多少」的东西，
+  都必须以参数形式到达，或者在调用者仍然拥有这个阶段时快照下来。
+  没有备份的时候这个窗口开不了——A 线程在 owner 发布之前离不开一个 head，
+  所以计数翻转时不可能有 owner 还在调用里。这不是缺一个屏障，
+  而是多了一条绕过屏障的新路径。
+</div>
+</div>
+
+<!-- ======================= 6 ======================= -->
+<div class="page">
+<h2><span class="num">6</span>案例五：并行度不是免费的</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  唤醒修好之后，每层还残留 90 µs 的 A 侧等待，来自「owner 和它唯一的 rescuer
+  同时丢了核心」的层。那么给每个 head 配<b>两个</b> rescuer，等待就会消失。
+</div>
+
+<p>
+  这个推理在性能上完全成立：stage 直接贴到算术地板。
+  <code>body 24.1</code>，而 <code>qk + pv</code> 的算术和是 <code>24.4</code>。
+  它也是<b>错的</b>：
+</p>
+
+<table>
+  <caption>400 轮，10K</caption>
+  <thead>
+    <tr><th></th><th class="n">accepted</th><th class="n">tokens</th><th class="n">md5</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>一个 rescuer</td><td class="n">436/1200</td><td class="n">836</td><td class="n"><code>490e5fc0…</code></td></tr>
+    <tr><td>两个 rescuer</td><td class="n">197/1200</td><td class="n">597</td><td class="n"><b><code>5ee8e190…</code></b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  流在第 <b>41</b> 个 token 处分叉，接受率从 1.09 掉到 0.49。
+</p>
+
+<h3><span class="sn">6.1</span>根因：pfa_sm_i8 不是纯写入</h3>
+<p>
+  它在填之前会先 <code>memset</code> 一个十六位置的尾部块。两个 rescuer 写同一个
+  <code>g_w4b</code>：一个的清零可以落进另一个<b>已经发布</b>的块里，
+  于是 Reader 在窗口内读到零。窗口还被这个 pass 自己拉宽了：四个 backup slot
+  在最多 300 µs 的 flag 等待加 80 µs deadline 之后仍在运行，
+  而下一层的 QK 已经开始覆盖 <code>g_sc4 + h*SC_GSTRIDE</code>。
+</p>
+
+<div class="callout right">
+  <span class="tag">决定：回退</span>
+  同一个 A/B 里，两个 rescuer 是 109.6 ms，一个 rescuer 是 110.2 ms——<b>0.6 ms</b>。
+  修对这条路需要「每个 rescuer rank 一个平面 + 一个 flag」，收益 0.6 ms 不值得。
+  回退到单 rescuer，也就是原始注释里那条不变量：<b>每个 head 恰好一个 rescuer，
+  所以每个平面恰好一个写者。</b>
+</div>
+
+<div class="callout note">
+  <span class="tag">一般化</span>
+  加并行之前先问一句：<b>这个函数是纯写入吗？</b>
+  如果它内部有「先清空再填充」，那么两个写者对同一块内存的写序就不是可交换的，
+  即使它们算的东西一模一样。<code>memset</code> 是这里唯一的问题，
+  而它在性能测量里完全不可见——它只是一次清零，不属于任何计时器。
+</div>
+</div>
+
+<!-- ======================= 7 ======================= -->
+<div class="page">
+<h2><span class="num">7</span>案例六：8 条带 vs 一个窗口</h2>
+
+<div class="callout wrong">
+  <span class="tag">当时的判断</span>
+  GEMM 跑 24.4 GB/s，实测连续流上限 27.5 GB/s，也就是「88% 的上限」。
+  剩下的 12% 归给厂商 IME2 内核，没法动。于是所有优化都转向接受率。
+</div>
+
+<p>
+  「88% 的上限」这个说法本身没问题，问题在于<b>那个上限是在什么访问模式下测的</b>。
+  27.5 GB/s 是「一个线程一条连续流」测出来的。而 GEMM 的任务分派是
+  把矩阵的 n 维按线程切成一条<b>连续带</b>。
+</p>
+
+<p>
+  n=2048 时是 8 条 1 MB 的带，无所谓。但 n=130560 的三个矩阵——
+  verify 的 lm_head、drafter 的 head、四次 markov bias 调用——就是
+  <b>8 条 18.8 MB 的带并行读</b>。DRAM 行缓冲一直在换行。
+</p>
+
+<div class="callout right">
+  <span class="tag">正确的提问</span>
+  不是「内核能不能更快」，而是「<b>8 个线程读的是不是同一片</b>」。
+  改成按 32-n tile 交错（线程 <code>tid</code> 取 tile <code>tid, tid+8, tid+16, …</code>），
+  8 个线程读的就是<b>相邻</b>的 576 字节 tile，整个集群一次推进一个 288 KB 的窗口。
+</div>
+
+<table>
+  <caption>10K，400 轮，release 构建（<code>-O3</code>）</caption>
+  <thead>
+    <tr><th></th><th class="n">每线程一条带</th><th class="n">tile 交错</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>verify GEMM</td><td class="n">51.05 ms</td><td class="n win"><b>46.06 ms（27.5 GB/s）</b></td></tr>
+    <tr><td>verify lm_head</td><td class="n">7.40</td><td class="n win"><b>6.50</b></td></tr>
+    <tr><td>drafter head</td><td class="n">6.40</td><td class="n win"><b>5.33</b></td></tr>
+    <tr><td>markov bias</td><td class="n">3.27</td><td class="n win"><b>2.59</b></td></tr>
+    <tr><td>draft 合计</td><td class="n">18.39</td><td class="n win"><b>15.98</b></td></tr>
+    <tr><td>verify 合计</td><td class="n">90.82</td><td class="n win"><b>83.23</b></td></tr>
+    <tr><td><b>round</b></td><td class="n">110.14 ms</td><td class="n win"><b>100.10 ms</b></td></tr>
+    <tr><td><b>tok/s（1.090 accepted）</b></td><td class="n">18.98</td><td class="n win"><b>20.88</b></td></tr>
+  </tbody>
+</table>
+
+<div class="bars">
+  <div class="bar"><span class="lbl">每线程一条带</span><span class="track"><span class="fill" style="width:60%"></span></span><span class="val">24.4 GB/s</span></div>
+  <div class="bar"><span class="lbl">32-n tile 交错</span><span class="track"><span class="fill good" style="width:67.5%"></span></span><span class="val">27.5 GB/s</span></div>
+  <div class="bar"><span class="lbl">连续流上限</span><span class="track"><span class="fill" style="width:67.5%; background:#c3d3e6"></span></span><span class="val">27.5 GB/s</span></div>
+</div>
+
+<p>
+  同一个内核、同样的字节，换读取顺序就到位了。<b>不是内核的问题，也不是总线的问题，
+  是访问模式的问题。</b>
+</p>
+
+<h3><span class="sn">7.1</span>为什么这不动任何数值</h3>
+<p>
+  一个 32-n tile 拥有自己的输出列。tile 的顺序不可能移动任何数值——
+  这不是「误差可接受」，是<b>严格恒等</b>。两次 400 轮都发出同样的 836 个 token、
+  同样的 436/1200 接受、同样的 md5 <code>490e5fc0…</code>。
+</p>
+
+<p>
+  步长取一个 tile 是最佳点（109.65 ms），两个是 109.82，四个是 110.36。
+  <code>MEGA_M4ILV=0</code> 恢复分带，<code>MEGA_M4ILVC</code> 设步长。
+  prefill 不受影响：它走自己的 m-inner 循环，从不进入 <code>task_mgemm_m4</code>。
+</p>
+
+<div class="callout note">
+  <span class="tag">一般化</span>
+  实测出来的「上限」是<b>某个访问模式的上限</b>。
+  <code>bwprobe</code> 每线程一条连续流，27.5 描述的就是那个形状；
+  八个线程把一个大矩阵切成遥远的带，是另一种形状，落在 24.4。
+  用「88% 上限」去解释它，会让人误以为只有内核问题可查，
+  从而彻底放弃这一层——而它正好是这几个案例里收益最大的一个。
+</div>
+</div>
+
+<!-- ======================= 8 ======================= -->
+<div class="page">
+<h2><span class="num">8</span>测量本身会骗人</h2>
+
+<p class="lead">
+  上面六个案例都是「判断错了」。这一节是「测量错了」——它更危险，
+  因为数字看起来很硬，而错误的数字会让人得出完全相反的结论。
+</p>
+
+<h3><span class="sn">8.1</span>编译选项：一次 1.7 ms 的假回归</h3>
+<div class="callout wrong">
+  <span class="tag">发生了什么</span>
+  新改动测出来 round 101.62 ms、prefill 198.7 tok/s，之前是 100.1 和 203.5。
+  看起来像改了 10 ms 的收益里被吃回去 1.7 ms。查了一轮代码，没有问题。
+</div>
+<p>
+  原因是编译用了 <code>-O2</code>：我照抄了 FINDINGS 第 9 节给 <b>probe</b> 的编译行。
+  发布二进制是 <code>-O3</code>。两个二进制 375 KB 和 474 KB，发出完全相同的 token md5。
+</p>
+<table>
+  <caption>同一份源码，同一个 md5</caption>
+  <thead><tr><th></th><th class="n">round</th><th class="n">prefill</th></tr></thead>
+  <tbody>
+    <tr><td><code>-O2</code></td><td class="n">101.62 ms</td><td class="n">198.7 tok/s</td></tr>
+    <tr><td><b><code>-O3</code></b></td><td class="n win"><b>99.88 ms</b></td><td class="n win"><b>203.5 tok/s</b></td></tr>
+  </tbody>
+</table>
+<div class="callout right">
+  <span class="tag">教训</span>
+  发布编译行要写进文档，并且和 probe 的编译行分开写。
+  一个「回归」如果伴随二进制体积突变，先查编译器参数，再查代码。
+</div>
+
+<h3><span class="sn">8.2</span>残留进程会改变计算结果</h3>
+<div class="callout wrong">
+  <span class="tag">发生了什么</span>
+  prefill 读到 101 tok/s，远低于 200。原因是上一次的 decode 循环还活着，
+  两个进程共享十六个核。
+</div>
+<p>
+  更糟的是它在投机解码上<b>不只是变慢</b>：并发的两次 A/B 都返回 0/300 接受，
+  而不是 49/300，同时 verify 时间还<b>更低</b>。四行 verify 的 softmax 就跑在这个池上，
+  所以一个被争用的板子会改变计算，不只是改变速度。
+</p>
+<div class="callout right">
+  <span class="tag">规则</span>
+  任何数字记录之前，<code>pgrep -x m3c.dv</code> 必须为空。
+  10K 的 prefill 要 150 s，所以很想并行跑两组——不要。
+</div>
+
+<h3><span class="sn">8.3</span>四十轮太短，接受率读低五倍</h3>
+<p>
+  这个提示词上的接受率在不同文本段之间相差 2 倍以上。四十轮很容易整段落在
+  「草案失手」的区间里。所有接受率数字都是 300–600 轮，并且成对测量：
+  同一轮里用两个权重各跑一次 draft，对同一组 target logits 打分。
+</p>
+<p>
+  一个具体的反例：早期 0.35 / 0.40 / 0.55 三个权重读出来的接受率顺序是乱的，
+  因为两个权重采样了同一段文本的不同片段。改成成对测量之后，
+  slot-0 的曲线是干净的平台（0.5–1.0）加 1.6 之后的悬崖。
+</p>
+
+<h3><span class="sn">8.4</span>两个流对比，要说清是哪个位置</h3>
+<p>
+  投机路径和单行路径发出的 token 只有前 300 个里的 21 个相同，第 12 个就分叉。
+  但这不是「两个模型」：在 position 10000 上比同一位置的 logits，
+  cosine 0.9883，top-1 都是 220，max|d| 1.909（26 个 logit 的跨度上）。
+  这比这个构建相对冻结的 llama.cpp 参考的偏差（0.978 cosine）还小。
+  分叉是 int8-K 分辨率下的近似平局被翻掉。
+</p>
+<div class="callout note">
+  <span class="tag">规则</span>
+  引用输出一致性时必须说明比的是哪个位置。
+  「step 0 一致、step 12 不一致」和「输出相同」是两个不同的声明。
+</div>
+</div>
+
+<!-- ======================= 9 ======================= -->
+<div class="page">
+<h2><span class="num">9</span>正确性先于速度</h2>
+
+<p class="lead">
+  这套优化全程允许有损数值，但<b>不允许不确定</b>。区别是：
+  有损意味着结果可以偏离参考，偏差大小已测；不确定意味着同样的输入可能给出
+  不同的结果。后者会让所有性能测量失去意义，因为优化目标本身在漂。
+</p>
+
+<h3><span class="sn">9.1</span>三层验证，从松到紧</h3>
+<table>
+  <thead><tr><th>层级</th><th>方法</th><th>抓什么</th></tr></thead>
+  <tbody>
+    <tr><td>1. 参考锁定</td><td><code>-force refs/golden_10k_tokens.txt</code> 走参考链，每步打分同样的前缀</td><td>整体偏差：cosine、top-1</td></tr>
+    <tr><td>2. token 流</td><td><code>MEGA_TOKD</code> 逐 token 落盘，跑完比 md5</td><td>累积分歧、分叉点</td></tr>
+    <tr><td><b>3. 逐轮哈希</b></td><td>对每轮 <code>g_logits4</code> 四行 + drafter slot-0 做 FNV 折叠</td><td><b>还没改变 token 的内部漂移</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  第三层是唯一能抓住「案例四」那种 bug 的。前 228 轮完全一致，
+  token 流直到第 336 轮才分叉。用 token 比、用容差比，都会放过它。
+</p>
+
+<h3><span class="sn">9.2</span>为什么容差会掩盖问题</h3>
+<p>
+  第 229 轮：同一位置、同样 drafts、同样接受数、同样的下一个 token，
+  但 4 × VOCAB 个 logits 的哈希不同。这个差异<b>没有到达输出</b>，
+  所以任何以输出为对象的比较都看不见它。而它之所以危险，是因为
+  它证明了一个写者正在被另一个写者污染——下一次可能就翻掉一个近似的 argmax。
+</p>
+
+<div class="callout right">
+  <span class="tag">判据</span>
+  「同一输入两次运行必须给出同一个哈希」。这比「余弦足够高」强得多，
+  而且是可自动化的：把哈希打进日志，跑 400 轮，数不一致的条数。
+</div>
+
+<h3><span class="sn">9.3</span>最终的记录</h3>
+<table>
+  <caption>10K，400 轮 × 4 组（修复后）</caption>
+  <thead><tr><th>指标</th><th class="n">值</th></tr></thead>
+  <tbody>
+    <tr><td>verify logits 哈希不一致</td><td class="n win">0 / 400</td></tr>
+    <tr><td>drafter logits 哈希不一致</td><td class="n win">0 / 400</td></tr>
+    <tr><td>发出 token</td><td class="n">836，md5 <code>490e5fc0e3b93ef70ea4ca9b9bcff5cb</code></td></tr>
+    <tr><td>接受</td><td class="n">436 / 1200（1.090 / 轮）</td></tr>
+    <tr><td>列分块改动后</td><td class="n win">同上，逐字节一致</td></tr>
+  </tbody>
+</table>
+
+<p>
+  最后一行是这次列分块优化的核心证据：它动了 GEMM 的读取顺序，
+  按通常的直觉应该「可能」改变数值。它没有——因为一个 tile 拥有自己的输出列。
+  <b>把「为什么不应该变」讲清楚，比测出来没变更有价值</b>，
+  因为前者可以预测下一次改动。
+</p>
+</div>
+
+<!-- ======================= 10 ======================= -->
+<div class="page">
+<h2><span class="num">10</span>现状与剩余空间</h2>
+
+<table>
+  <caption>10K，每轮预算（release 构建，400 轮均值）</caption>
+  <thead>
+    <tr><th>阶段</th><th class="n">ms</th><th>状态</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>verify GEMM（42 层，1265 MB）</td><td class="n">46.06</td><td class="win">27.5 GB/s，贴住实测连续流上限</td></tr>
+    <tr><td>verify attention（4 行）</td><td class="n">~25.9</td><td class="win">body 对 qk+pv 算术和 24.4，贴在 vmadot 地板</td></tr>
+    <tr><td>verify lm_head（150 MB）</td><td class="n">6.50</td><td>tile 交错后 21.2 GB/s</td></tr>
+    <tr><td>draft（5 层）</td><td class="n">15.98</td><td>layers 8.06 + head 5.33 + bias 2.59</td></tr>
+    <tr><td>norm / silu / rope+kv / quant / argmax</td><td class="n">3.2</td><td>各有小幅优化，均已成对验证</td></tr>
+    <tr><td><b>round</b></td><td class="n win"><b>100.10</b></td><td><b>20.88 tok/s @ 1.090 accepted</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  <code>tokens/round = 1 + E[accepted]</code>。20 tok/s 在 100 ms 的轮上需要
+  1.00 accepted——已经超过。所以目标已达成，但余量很薄：
+  这块板对温度敏感，轮次时间在 99.9–101.8 ms 之间浮动。
+</p>
+
+<h3><span class="sn">10.1</span>哪些路已经关闭</h3>
+<table>
+  <tbody>
+    <tr><td><b>GEMM 带宽</b></td><td>27.5 GB/s 是实测连续流上限，没有下一档</td></tr>
+    <tr><td><b>attention 算力</b></td><td>vmadot 点积指令的算术地板，只能靠减少「四行读全上下文」来动</td></tr>
+    <tr><td><b>备份 rescuer 加倍</b></td><td>+0.6 ms，且破坏单写者不变量，已证伪</td></tr>
+    <tr><td><b>X100 elementwise 池</b></td><td>四行 decode 只有 8192 个 float，跨 cluster 握手 200 µs 比工作本身贵</td></tr>
+    <tr><td><b>裸自旋替代 sched_yield</b></td><td>会全速轮询 <code>g_a4_gen</code>，把 A 核 QK 的 cache line 打掉</td></tr>
+  </tbody>
+</table>
+
+<h3><span class="sn">10.2</span>还剩什么</h3>
+<ul>
+  <li><b>接受率</b>：slot 0 单独贡献 221/297 个被接受的草案，slots 1–3 之间合计
+      0.25/轮。瓶颈在 drafter 结构——四个 slot 都是对同一个 anchor 的并行 mask
+      查询，slot 1 无法条件于 slot 0 的结果。要让四行覆盖 4 个位置而不是各占一个位置，
+      需要一个树状的 mask。</li>
+  <li><b>权重精度</b>：Q4_0 是 1265 MB。压到 2–3 bit 会把字节时间从 46 ms 再砍一半，
+      那是唯一能让「不靠接受率」也过 20 的路，代价是精度。</li>
+  <li><b>四行 verify 的上下文</b>：让四行不各读一遍全上下文（例如共享 K 的 score
+      计算），是 attention 那 25.9 ms 唯一的减法方向。</li>
+</ul>
+
+<h3><span class="sn">10.3</span>这套方法可以复述成四句话</h3>
+<div class="callout note">
+  <span class="tag">方法论</span>
+  <ol style="margin-bottom:0">
+    <li><b>先测下限，再改代码。</b>并且要分清是字节、算术还是延迟——三者的手法互相冲突。</li>
+    <li><b>「上限」要问是在哪种访问模式下测的。</b>同形状比较，不要跟最佳情况比较。</li>
+    <li><b>线程计时加起来小于墙钟，先查有没有被唤醒。</b>空闲循环轮询哪条 cache line，决定它多久能看见工作。</li>
+    <li><b>正确性用哈希，不用容差。</b>并且要说清「为什么这个改动不应该改变数值」，比测出来没变更有预测力。</li>
+  </ol>
+</div>
+
+<div class="footnote">
+  数据来源：<code>FINDINGS.md</code>（结论索引）、<code>DECODE.md</code>（decode 分解）、
+  <code>DSPARK.md</code>（drafter）。所有数字均为 SpacemiT K3 上单进程、安静系统的实测；
+  每条被证伪的路径在 <code>FINDINGS.md</code> 第 5 节附有杀死它的那个数字。
+</div>
+</div>
+
+</body>
+</html>
