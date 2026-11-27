@@ -3124,6 +3124,11 @@ static double g_pfa_wt[N_GPU * PFA_TSTRIDE];
 // time here, and which of the two says whether a thread was late to start or late
 // to finish.
 static double g_pfa_ent[N_GPU * PFA_TSTRIDE], g_pfa_exi[N_GPU * PFA_TSTRIDE];
+// Round-level decomposition of the attention stage's wall: the latest entry into
+// the body, the longest body, the longest qk+wait+pv inside it, and what is left
+// for the entry and exit barriers. QK and PV are at their issue ceiling, so any
+// gap between their sum and the stage is in one of these four and nowhere else.
+static double g_a4_asum, g_a4_bsum, g_a4_esum, g_a4_xsum;
 static double g_a4_tstart;
 static double g_pfa_body[N_GPU * PFA_TSTRIDE];
 // Does an A thread lose the CPU, or does it run the whole time and merely run
@@ -4579,6 +4584,27 @@ static int8_t * g_w4b;           // N_HEAD * WBLK bytes, written only by the bac
 static float  * g_wscb;          // N_HEAD * I8_ROWS floats
 static double g_a4_bk_us = 80;   // how long a published head may stay unscored
 static double g_a4_bkn;          // backup scores this round
+static double g_a4_bkto;         // neighbour's flag never arrived within 300 us
+static double g_a4_bkrd;         // neighbour had already scored it
+static double g_a4_bkwon;        // neighbour scored it during the deadline wait
+static double g_a4_aown, g_a4_abk;   // A-side reads: owner plane / backup plane
+// Wake source for the four-row softmax. g_a4_gen is written once per layer and
+// read by all eight workers, so a worker that polls only it notices the layer
+// through the scheduler. On layer 20 at 10K one worker published its head 338 us
+// after that head's QK against 98 us of work, and the A thread that owns it spent
+// 204 us of a 726 us layer waiting. The two head flags a worker scores are lines
+// its own A thread writes anyway, so polling them adds no traffic, and a bounded
+// pause-spin there turns the wake into the store's own latency.
+static int g_a4_wspin = 20000;   // pause iterations per yield (MEGA_A4WSPIN)
+static double g_a4_wfast;        // wakes that came from the spin
+static double g_a4_wskip;        // a head this worker was no longer needed for
+// One layer's hand-to-hand timeline, in seconds from the stage entry. Every
+// timestamp below is stamped by the thread that owns that event, so the print
+// shows which side of the handshake spent the layer's slack.
+static int g_a4_trace = -1;
+static bool g_a4_ltr = false;        // this layer is the traced one
+static double g_a4_tr_qk[N_HEAD], g_a4_tr_ws[N_HEAD], g_a4_tr_sm[N_HEAD];
+static double g_a4_tr_smb[N_HEAD], g_a4_tr_pv0[N_HEAD], g_a4_tr_pv1[N_HEAD];
 static double g_a4_bkmax;        // longest time from publish to backup publish
 // A thread's own copy of the softmax weights, so a head it scores itself cannot be
 // overwritten by the pool worker that turns up late for the same head.
@@ -4605,6 +4631,8 @@ static void attn4p_alloc(void) {
     g_wscb = (float *) aligned_alloc(64, (size_t) N_HEAD * I8_ROWS * 4 + 64);
     // MEGA_A4BK=0 turns the backup pass off; any other value is its deadline in us.
     if (const char * e = getenv("MEGA_A4BK")) g_a4_bk_us = atof(e);
+    // 0 restores the plain yield, which is how the wake change is A/B'd.
+    if (const char * e = getenv("MEGA_A4WSPIN")) g_a4_wspin = atoi(e);
     if (!g_w4b || !g_wscb) { fprintf(stderr, "oom attn4p bk\n"); g_a4_bk_us = 0; }
     else use_huge(g_w4b, wn);
     for (int h = 0; h < N_HEAD; ++h) { g_a4_qk[h].v.store(0); g_a4_sm[h].v.store(0); g_a4_smb[h].v.store(0); g_a4_slast[h] = 0; }
@@ -4629,6 +4657,7 @@ static void task_attn4_a(int tid) {
         pfa_qk_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE);
         g_pfa_qk[(tid) * PFA_TSTRIDE] += now_s() - _q;
         g_a4_qk[h].v.store(gen, std::memory_order_release);
+        if (g_a4_ltr) g_a4_tr_qk[h] = now_s() - g_a4_tstart;
         hs[n++] = h;
     }
     // The wait is normally over before it starts: this thread's second QK takes
@@ -4655,6 +4684,7 @@ static void task_attn4_a(int tid) {
     for (int i = 0; i < n; ++i) {
         const int h = hs[i];
         const double _w = now_s();
+        if (g_a4_ltr) g_a4_tr_ws[h] = _w - g_a4_tstart;
         int rd = 0;   // 0 = neither copy ready, 1 = pool copy, 2 = backup copy
         for (;;) {
             if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gen) { rd = 1; break; }
@@ -4666,9 +4696,11 @@ static void task_attn4_a(int tid) {
         int8_t * w8;
         float * wsc;
         if (rd == 1) {
+            g_a4_aown += 1;
             w8  = g_w4 + (size_t) h * WBLK;
             wsc = g_wsc4 + (size_t) h * I8_ROWS;
         } else if (rd == 2) {
+            g_a4_abk += 1;
             w8  = g_w4b + (size_t) h * WBLK;
             wsc = g_wscb + (size_t) h * I8_ROWS;
         } else {
@@ -4681,7 +4713,9 @@ static void task_attn4_a(int tid) {
             g_fb_n += 1;
         }
         const double _v = now_s();
+        if (g_a4_ltr) g_a4_tr_pv0[h] = _v - g_a4_tstart;
         pfa_pv_i8(g_pfa_layer, h, 0, w8, wsc);
+        if (g_a4_ltr) g_a4_tr_pv1[h] = now_s() - g_a4_tstart;
         g_pfa_pv[(tid) * PFA_TSTRIDE] += now_s() - _v;
     }
     // Body time the three counters above do not explain. The exit barrier is not
@@ -4715,12 +4749,20 @@ static void task_attn4_sm(int id) {
     for (int h = id; h < N_HEAD; h += 8) {
         const double _h0 = now_s();
         struct rusage _r0; getrusage(RUSAGE_THREAD, &_r0);
-        int gq;
+        int gq = 0;
+        const double _hw = now_s();
         for (;;) {
-            gq = g_a4_qk[h].v.load(std::memory_order_acquire);
-            if (gq != g_a4_slast[h]) break;
+            const int q = g_a4_qk[h].v.load(std::memory_order_acquire);
+            if (q != g_a4_slast[h]) { gq = q; break; }
+            // Equal flags mean either "scored already" or "this layer is not
+            // published yet"; the generation says which. The deadline only covers
+            // the second, so a worker woken for one head does not park on the
+            // other when this generation has nothing left for it.
+            if (q == g_a4_gen.load(std::memory_order_acquire)) break;
+            if (now_s() - _hw > 0.0004) break;
             if (poll_pause) cpu_pause(); else sched_yield();
         }
+        if (gq == 0) { g_a4_wskip += 1; continue; }
         const double _h1 = now_s();
         int16_t * sc  = g_sc4 + (size_t) h * SC_GSTRIDE;
         int8_t  * w8  = g_w4 + (size_t) h * WBLK;
@@ -4729,6 +4771,7 @@ static void task_attn4_sm(int id) {
         pfa_sm_i8(h, 0, sc, w8, wsc, 1);
         g_pfa_sm[(id) * PFA_TSTRIDE] += now_s() - _s;
         g_a4_slast[h] = gq;
+        if (g_a4_ltr) g_a4_tr_sm[h] = now_s() - g_a4_tstart;
         g_a4_sm[h].v.store(gq, std::memory_order_release);
         // Hand-to-hand for one head: wait for the flag, score, publish. The worst
         // one in the round, with its context switches, says whether a late head is
@@ -4754,10 +4797,10 @@ static void task_attn4_sm(int id) {
         for (;;) {
             gq = g_a4_qk[h].v.load(std::memory_order_acquire);
             if (gq != 0 && g_a4_gen.load(std::memory_order_acquire) == gq) break;
-            if (now_s() - _b0 > 0.0003) return;
+            if (now_s() - _b0 > 0.0003) { g_a4_bkto += 1; return; }
             cpu_pause();
         }
-        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) continue;
+        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) { g_a4_bkrd += 1; continue; }
         // The deadline starts when the flag is first visible, which is when the
         // owning worker starts its own call. Measuring it from this loop's entry
         // instead charges the two clusters' publish skew to the owner and takes
@@ -4765,11 +4808,12 @@ static void task_attn4_sm(int id) {
         // cost 6.4 ms of stage wall for duplicate work nobody needed.
         const double _t0 = now_s();
         while (now_s() - _t0 < g_a4_bk_us * 1e-6) cpu_pause();
-        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) continue;
-        if (g_a4_smb[h].v.load(std::memory_order_acquire) >= gq) continue;
+        if (g_a4_sm[h].v.load(std::memory_order_acquire) >= gq) { g_a4_bkwon += 1; continue; }
+        if (g_a4_smb[h].v.load(std::memory_order_acquire) >= gq) { g_a4_bkrd += 1; continue; }
         // Still unscored: the owning worker has lost its core. Score it here.
         pfa_sm_i8(h, 0, g_sc4 + (size_t) h * SC_GSTRIDE,
                   g_w4b + (size_t) h * WBLK, g_wscb + (size_t) h * I8_ROWS, 1);
+        if (g_a4_ltr) g_a4_tr_smb[h] = now_s() - g_a4_tstart;
         g_a4_smb[h].v.store(gq, std::memory_order_release);
         const double t = now_s() - _b0;
         if (t > g_a4_bkmax) g_a4_bkmax = t;
@@ -4938,13 +4982,23 @@ static void a4s_run(int L) {
 static void attn4p_run(int L) {
     g_pfa_layer = L;
     g_i8g = 1;
+    if (g_a4_trace < 0 && getenv("MEGA_A4TRACE")) g_a4_trace = atoi(getenv("MEGA_A4TRACE"));
+    const bool L_IS_TRACE = (L == g_a4_trace);
+    g_a4_ltr = L_IS_TRACE;
+    if (L_IS_TRACE) {
+        for (int h = 0; h < N_HEAD; ++h) {
+            g_a4_tr_qk[h] = g_a4_tr_ws[h] = g_a4_tr_sm[h] = -1;
+            g_a4_tr_smb[h] = g_a4_tr_pv0[h] = g_a4_tr_pv1[h] = -1;
+        }
+    }
     // Per-layer snapshots: the round-level counters are cleared once per round, so
     // a single slow layer cannot be located inside them.
     static const bool dump = getenv("MEGA_A4DUMP") != nullptr;
-    double q0[N_GPU], w0[N_GPU], p0v[N_GPU], b0[N_GPU];
-    if (dump) for (int t = 0; t < N_GPU; ++t) {
+    double q0[N_GPU], w0[N_GPU], p0v[N_GPU], b0[N_GPU], e0[N_GPU];
+    for (int t = 0; t < N_GPU; ++t) {
         q0[t] = g_pfa_qk[t * PFA_TSTRIDE]; w0[t] = g_pfa_wt[t * PFA_TSTRIDE];
         p0v[t] = g_pfa_pv[t * PFA_TSTRIDE]; b0[t] = g_pfa_body[t * PFA_TSTRIDE];
+        e0[t] = g_pfa_ent[t * PFA_TSTRIDE];
     }
     // Arrival watch: arms the barrier's recorder for this layer only.
     for (int t = 0; t < N_GPU; ++t) g_bar_arr[t] = 0;
@@ -4965,6 +5019,31 @@ static void attn4p_run(int L) {
         if (wall > g_a4_lmax) g_a4_lmax = wall;
         if (wall > 0.0015) g_a4_lslow += 1;
         if (L < N_LAYER) g_a4_lstr[L] = wall > 0.0095 ? '9' : (char) ('0' + (int) (wall * 1e3));
+        // Where in the stage the wall went. ent is stamped at the top of the body,
+        // so esum is the entry barrier's release; body is the whole body, and the
+        // acc is qk+wait+pv inside it; whatever body has beyond that is work the
+        // three timers do not name. xsum is what the exit barrier costs the round.
+        double bmax = 0, emax = 0, amax = 0;
+        for (int t = 0; t < N_GPU; ++t) {
+            const double b = g_pfa_body[t * PFA_TSTRIDE] - b0[t];
+            const double a = g_pfa_qk[t * PFA_TSTRIDE] - q0[t]
+                           + g_pfa_wt[t * PFA_TSTRIDE] - w0[t]
+                           + g_pfa_pv[t * PFA_TSTRIDE] - p0v[t];
+            if (b > bmax) bmax = b;
+            if (a > amax) amax = a;
+            if (g_pfa_ent[t * PFA_TSTRIDE] - e0[t] > emax) emax = g_pfa_ent[t * PFA_TSTRIDE] - e0[t];
+        }
+        g_a4_bsum += bmax; g_a4_esum += emax; g_a4_asum += amax;
+        g_a4_xsum += wall - bmax;
+    }
+    if (L == g_a4_trace) {
+        fprintf(stderr, "  [tr] L%d wall %.3f ms (times in us from stage entry)\n",
+                L, (now_s() - g_a4_tstart) * 1e6 / 1e3);
+        for (int h = 0; h < N_HEAD; ++h)
+            fprintf(stderr, "  [tr] h%2d qk %7.1f ws %7.1f sm %7.1f smb %7.1f"
+                            " pv %7.1f..%7.1f\n", h,
+                    g_a4_tr_qk[h] * 1e6, g_a4_tr_ws[h] * 1e6, g_a4_tr_sm[h] * 1e6,
+                    g_a4_tr_smb[h] * 1e6, g_a4_tr_pv0[h] * 1e6, g_a4_tr_pv1[h] * 1e6);
     }
     if (dump) {
         const double wall = now_s() - g_a4_tstart;
@@ -4997,6 +5076,12 @@ static int bind_cpu_x100(int cpu) {
 // poll rate to one per MEGA_XBS cycles; the response latency stays far below the
 // 600 us a layer takes.
 
+// Does this worker have unscored work on either of its two heads?
+static inline bool a4_own_work(int id) {
+    return g_a4_qk[id].v.load(std::memory_order_acquire) != g_a4_slast[id] ||
+           g_a4_qk[id + 8].v.load(std::memory_order_acquire) != g_a4_slast[id + 8];
+}
+
 static void * sm_worker(void * arg) {
     const int id = (int) (intptr_t) arg;
     bind_cpu_x100(id);
@@ -5018,6 +5103,13 @@ static void * sm_worker(void * arg) {
         // Four-row softmax is addressed by generation counters, not the tile
         // machinery: a decode layer has exactly sixteen head-tiles and the caller
         // waits on them directly, so there is nothing to claim.
+        if (a4_own_work(id)) {
+            g_a4_wfast += 1;
+            agen = g_a4_gen.load(std::memory_order_acquire);
+            task_attn4_sm(id);
+            g_a4_done.fetch_add(1, std::memory_order_release);
+            continue;
+        }
         const int a = g_a4_gen.load(std::memory_order_acquire);
         if (a != agen) {
             agen = a;
@@ -5030,15 +5122,23 @@ static void * sm_worker(void * arg) {
                g_a4_gen.load(std::memory_order_acquire) == agen) {
             if (g_quit.load(std::memory_order_acquire)) return nullptr;
             if (g_el_gen.load(std::memory_order_acquire) != egen) break;
-            // The yield is a rate limiter, not politeness. Pausing instead
-            // (or sleeping) makes this worse: a bare spin polls g_a4_gen at full
-            // rate from eight cores and invalidates the line under the A cluster's
-            // QK, and a sleeping thread is late to the 600 us handshake -- mean
-            // attn 37.0 / max 86.0 for the spin and 36.3 / 143 for the sleep,
-            // against 28.3 / 40.3 for the yield.
+            // The yield is a rate limiter, not politeness. A bare spin on the
+            // shared generation line is worse than yielding (mean 37.0 / max 86.0
+            // against 28.3 / 40.3) and a sleeping thread is late to the 600 us
+            // handshake. A bounded spin on this worker's own two head flags, then
+            // one yield, keeps both properties: the wake no longer waits for a
+            // scheduler round trip, and the core still comes back to the board's
+            // daemons between layers.
+            bool w = false;
+            for (int sp = 0; sp < g_a4_wspin; ++sp) {
+                if (a4_own_work(id)) { w = true; break; }
+                cpu_pause();
+            }
+            if (w) break;
             sched_yield();
         }
         if (g_el_gen.load(std::memory_order_acquire) != egen) continue;
+        if (a4_own_work(id)) continue;
         if (g_a4_gen.load(std::memory_order_acquire) != agen) continue;
         const int x = g_xg_gen.load(std::memory_order_acquire);
         if (x != xgen) {
@@ -5134,31 +5234,6 @@ static void m4dec_alloc(void) {
 // K: one position's 16 dims fill one lane of a 64-position block, so a 16-lane
 // conversion is exactly one position. V: a 16-position block interleaves
 // positions, so a single new position is a byte store per dim.
-static void conv_kv8_inc(int layer, int64_t p0, int nrows) {
-    for (int kv = 0; kv < N_KV; ++kv) {
-        const float sk = g_k8i_sc[layer * N_KV + kv];
-        const float sv = g_v8i_sc[layer * N_KV + kv];
-        const float ik = sk > 0 ? 1.0f / sk : 1.0f;
-        const float iv = sv > 0 ? 1.0f / sv : 1.0f;
-        int8_t * vbase = v8i_base(layer) + (int64_t) kv * g_v8i_npb16 * 2048;
-        for (int64_t p = p0; p < p0 + nrows; ++p) {
-            const _Float16 * kb = ktile(layer, kv, (int) (p / KT));
-            int8_t * kdst = k8i_base(layer) + ((int64_t) (kv * g_k8i_npb + p / 64) * 8) * 1024
-                          + (p % 64) * 16;
-            for (int dg = 0; dg < HEAD_DIM / 16; ++dg)
-                conv16(kb + dg * 16 * KT + (int) (p % KT), KT, ik, kdst + dg * 1024);
-            const _Float16 * vb = g_vpos + (int64_t) layer * KV_LAYER_STRIDE
-                                + p * N_KV * HEAD_DIM + kv * HEAD_DIM;
-            int8_t * vdst = vbase + (p / 16) * 1024 + (p % 16);
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                int b = (int) lrintf((float) vb[d] * iv);
-                if (b > 127) b = 127;
-                if (b < -127) b = -127;
-                vdst[((d / 64) * g_v8i_npb16) * 1024 + (d % 64) * 16] = (int8_t) b;
-            }
-        }
-    }
-}
 
 static void silu4_fn(int64_t lo, int64_t hi) {
     for (int64_t i = lo; i < hi; i += 32) {
@@ -6424,7 +6499,14 @@ static void m4_rope_item(int r, int kv) {
             kb8[(int64_t) d * KT + pi] = (int8_t) b;
         }
     }
-    for (int d = 0; d < HEAD_DIM; ++d) kb16[(int64_t) d * KT + pi] = (_Float16) k[kv * HEAD_DIM + d];
+    // Strided store, sixteen lanes at a time: 128 scalar stores per unit was the
+    // largest single item in the round's rope+kv bucket (8 threads x 32 units).
+    for (int d = 0; d < HEAD_DIM; d += 16) {
+        const size_t vlk = __riscv_vsetvl_e32m4(16);
+        const vfloat32m4_t fk = __riscv_vle32_v_f32m4(k + kv * HEAD_DIM + d, vlk);
+        __riscv_vsse16_v_f16m2(kb16 + (int64_t) d * KT + pi, (int64_t) KT * 2,
+                               __riscv_vfncvt_f_f_w_f16m2(fk, vlk), vlk);
+    }
     for (int d = 0; d < HEAD_DIM; d += 32)
         __riscv_vse16_v_f16mf2(vb + kv * HEAD_DIM + d,
                                __riscv_vfncvt_f_f_w_f16mf2(__riscv_vle32_v_f32m1(v + kv * HEAD_DIM + d, 32), 32), 32);
@@ -6441,6 +6523,36 @@ static void m4_rope_item(int r, int kv) {
                           v8_off(kv, d / 64, pos) + d % 64;
             __riscv_vse8_v_i8mf4(vq,
                                  __riscv_vncvt_x_x_w_i8mf4(__riscv_vncvt_x_x_w_i16mf2(q, vl), vl), vl);
+        }
+    }
+
+    // The four-row verify's int8 K and V planes, written here instead of by a
+    // second pass over the same 32 (row, kv) units. conv_kv8_inc was serial over
+    // 64 units of 128 elements, 1.7 ms a round at 10K; fusing it into this
+    // dispatch also removes a barrier. The arithmetic is unchanged -- the source
+    // is the f16 just stored above, so the requantisation sees the same value it
+    // saw when it read the tile back from memory.
+    {
+        if (g_k8i) {
+            const float sk0 = g_k8i_sc[g_layer * N_KV + kv];
+            const float ik = sk0 > 0 ? 1.0f / sk0 : 1.0f;
+            int8_t * kdst = k8i_base(g_layer)
+                          + ((int64_t) (kv * g_k8i_npb + pos / 64) * 8) * 1024
+                          + (pos % 64) * 16;
+            for (int dg = 0; dg < HEAD_DIM / 16; ++dg)
+                conv16(kb16 + dg * 16 * KT + (pos % KT), KT, ik, kdst + dg * 1024);
+        }
+        if (g_v8i) {
+            const float sv0 = g_v8i_sc[g_layer * N_KV + kv];
+            const float iv = sv0 > 0 ? 1.0f / sv0 : 1.0f;
+            int8_t * vbase = v8i_base(g_layer) + (int64_t) kv * g_v8i_npb16 * 2048;
+            int8_t * vdst = vbase + (pos / 16) * 1024 + (pos % 16);
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                int b = (int) lrintf((float) vb[kv * HEAD_DIM + d] * iv);
+                if (b > 127) b = 127;
+                if (b < -127) b = -127;
+                vdst[((d / 64) * g_v8i_npb16) * 1024 + (d % 64) * 16] = (int8_t) b;
+            }
         }
     }
 }
@@ -6490,7 +6602,6 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
             dump_n("m4", L, 'k', g_k4, N_KV * HEAD_DIM);
             dump_n("m4", L, 'v', g_v4, N_KV * HEAD_DIM);
         }
-        conv_kv8_inc(L, p0, 4);
         if (M4TIME) { g_m4t[4] += now_s() - _t; _t = now_s(); }
 
         g_pq = g_q4;
@@ -6639,6 +6750,19 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
                cpu, 8.0 * g_a4_lsum, csv, csi,
                g_a4_smw * 1e3, g_a4_smww * 1e3, g_a4_smwo, g_a4_smwv, g_a4_smwi,
                g_a4_lsum * 1e3, g_a4_lmax * 1e3, g_a4_lslow);
+        printf("m4dec: wake from head spin %.0f, skipped %.0f (per round)\n",
+               g_a4_wfast, g_a4_wskip);
+        printf("m4dec: backup fires %.0f (max %.3f ms) | to %.0f ready %.0f late-ready %.0f | A reads own %.0f bk %.0f\n",
+               g_a4_bkn, g_a4_bkmax * 1e3, g_a4_bkto, g_a4_bkrd, g_a4_bkwon, g_a4_aown, g_a4_abk);
+        printf("m4dec: attn split ent %.2f body %.2f acc %.2f skew %.2f (ms/round, 42 layers)\n",
+               g_a4_esum * 1e3, g_a4_bsum * 1e3, g_a4_asum * 1e3, g_a4_xsum * 1e3);
+        if (getenv("MEGA_A4T")) {
+            printf("m4dec: per-thread qk/wt/pv:");
+            for (int t = 0; t < N_GPU; ++t)
+                printf("  %.1f/%.1f/%.1f", g_pfa_qk[t * PFA_TSTRIDE] * 1e3,
+                       g_pfa_wt[t * PFA_TSTRIDE] * 1e3, g_pfa_pv[t * PFA_TSTRIDE] * 1e3);
+            printf("\n");
+        }
         if (getenv("MEGA_A4LS")) {
             g_a4_lstr[N_LAYER] = 0;
             printf("m4dec: layers %s (ms per layer, one digit each)\n", g_a4_lstr);
@@ -6646,8 +6770,12 @@ static bool m4_round(int64_t p0, const int * toks, int * out) {
         for (int t = 0; t < N_GPU; ++t) {
             g_pfa_qk[(t) * PFA_TSTRIDE] = 0; g_pfa_pv[(t) * PFA_TSTRIDE] = 0; g_pfa_sm[(t) * PFA_TSTRIDE] = 0;
             g_pfa_wt[(t) * PFA_TSTRIDE] = 0; g_pfa_ent[(t) * PFA_TSTRIDE] = 0; g_fb_n = 0;
+            g_pfa_body[(t) * PFA_TSTRIDE] = 0;
             g_a4_bkn = g_a4_bkmax = 0;
+            g_a4_bkto = g_a4_bkrd = g_a4_bkwon = g_a4_aown = g_a4_abk = 0;
+            g_a4_wfast = g_a4_wskip = 0;
             g_a4_lsum = g_a4_lmax = 0; g_a4_lslow = 0;
+            g_a4_asum = g_a4_bsum = g_a4_esum = g_a4_xsum = 0;
             memset(g_a4_lstr, '.', N_LAYER);
             g_pfa_exi[(t) * PFA_TSTRIDE] = 0;
             g_a4_cpu[t] = 0;
