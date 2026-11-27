@@ -43,8 +43,8 @@
     margin-bottom: 10mm;
   }
   .cover .kicker {
-    font-size: 10pt; letter-spacing: 0.14em; color: #4a6fa5;
-    font-weight: 600; text-transform: uppercase; margin-bottom: 8mm;
+    font-size: 9.4pt; letter-spacing: 0.06em; color: #4a6fa5;
+    font-weight: 600; margin-bottom: 8mm;
   }
   .cover h1 {
     font-size: 30pt; line-height: 1.28; margin: 0 0 7mm 0;
@@ -77,6 +77,25 @@
     font-size: 8.8pt; color: #6b7a90;
     border-top: 0.6pt solid #c9d6e6; padding-top: 4mm;
     display: flex; justify-content: space-between;
+  }
+
+  .abstract {
+    margin-top: 4mm; border-top: 0.6pt solid #c9d6e6; padding-top: 6mm;
+  }
+  .abstract .a-h {
+    font-size: 9pt; font-weight: 700; color: #35507a;
+    letter-spacing: 0.04em; margin-bottom: 3.6mm;
+  }
+  .abstract .a-grid { display: flex; flex-wrap: wrap; gap: 3mm 4mm; }
+  .abstract .a-item {
+    flex: 1 1 56mm; min-width: 56mm;
+    display: flex; gap: 2.4mm; align-items: baseline;
+    font-size: 9.1pt; line-height: 1.6; color: #3d4b62;
+  }
+  .abstract .a-item b { color: #10151f; font-weight: 650; }
+  .abstract .a-n {
+    font-size: 8.2pt; font-weight: 700; color: #1f6feb;
+    font-variant-numeric: tabular-nums; flex-shrink: 0;
   }
 
   /* ---------------- body ---------------- */
@@ -120,11 +139,13 @@
   /* tables */
   table {
     width: 100%; border-collapse: collapse; margin: 3mm 0 5mm 0;
-    font-size: 9.2pt; page-break-inside: avoid;
+    font-size: 9.2pt; break-inside: auto;
   }
+  tr { break-inside: avoid; }
+  thead { display: table-header-group; break-after: avoid; }
   caption {
     caption-side: top; text-align: left; font-size: 8.6pt;
-    color: #6b7a90; padding-bottom: 1.6mm;
+    color: #6b7a90; padding-bottom: 1.6mm; break-after: avoid;
   }
   th {
     text-align: left; font-weight: 600; color: #33415a;
@@ -159,7 +180,7 @@
   .note .tag { background: #dce8fa; color: #1a56b8; }
 
   /* bar rows */
-  .bars { margin: 3mm 0 5mm 0; page-break-inside: avoid; }
+  .bars { margin: 3mm 0 5mm 0; page-break-inside: avoid; break-before: avoid; }
   .bar {
     display: flex; align-items: center; gap: 3mm;
     margin-bottom: 1.8mm; font-size: 9pt;
@@ -217,6 +238,16 @@
     </div>
   </div>
 
+  <div class="abstract">
+    <div class="a-h">四个贯穿全文的结论</div>
+    <div class="a-grid">
+      <div class="a-item"><span class="a-n">01</span><span><b>下限有三类</b>——字节、算术、延迟。它们的优化手法互相冲突，先分清再动手。</span></div>
+      <div class="a-item"><span class="a-n">02</span><span><b>「上限」属于测它的那个访问模式</b>。8 条 18.8 MB 的带并行读，落不到单线程连续流的数字上。</span></div>
+      <div class="a-item"><span class="a-n">03</span><span><b>线程计时加起来小于墙钟，先查有没有被唤醒</b>。空闲循环轮询哪条 cache line 决定它多久看见工作。</span></div>
+      <div class="a-item"><span class="a-n">04</span><span><b>正确性用哈希，不用容差</b>。能讲清「为什么不该变」比测出来没变更有预测力。</span></div>
+    </div>
+  </div>
+
   <div class="meta">
     <span>aotolith / FINDINGS.md 的提炼</span>
     <span>2026-11-27</span>
@@ -235,19 +266,64 @@
   下面每一条都是这个判断的一次纠错。格式统一：<b>当时的误判 → 正确的提问方式 →
   用来分辨的测量 → 结果</b>。数字全部来自这块板上的实测，一条进程、安静系统。
 </p>
+<p style="font-size:9.4pt;color:#5a6a80">
+  只想看结论，跳到第 10 节的预算表和「还剩什么」。想学方法，第 2–7 节按顺序读，
+  每节都是同一个套路，六遍下来它会变成条件反射。想避免踩坑，第 8 节——
+  那一节里每条都真的浪费过一次测量。
+</p>
 
 <div class="toc" style="margin-top:6mm">
   <div><span class="t"><span class="n">1</span>先把「下限」测出来</span><span class="pg">三种下限</span></div>
-  <div><span class="t"><span class="n">2</span>案例一：慢的不是内核，是跨距</span><span class="pg">PV 布局</span></div>
-  <div><span class="t"><span class="n">3</span>案例二：6 ms 不是算力，是唤醒</span><span class="pg">per-head 轮询</span></div>
-  <div><span class="t"><span class="n">4</span>案例三：超时不是等待，是计时点</span><span class="pg">备份 deadline</span></div>
-  <div><span class="t"><span class="n">5</span>案例四：边界不能从共享全局继承</span><span class="pg">pfa_sm_i8</span></div>
-  <div><span class="t"><span class="n">6</span>案例五：并行度不是免费的</span><span class="pg">两个 rescuer</span></div>
-  <div><span class="t"><span class="n">7</span>案例六：8 条带 vs 一个窗口</span><span class="pg">列分块顺序</span></div>
+  <div><span class="t"><span class="n">2–7</span>六个案例，见下表</span><span class="pg">误判 → 根因</span></div>
   <div><span class="t"><span class="n">8</span>测量本身会骗人</span><span class="pg">四个陷阱</span></div>
   <div><span class="t"><span class="n">9</span>正确性先于速度</span><span class="pg">哈希审计</span></div>
   <div><span class="t"><span class="n">10</span>现状与剩余空间</span><span class="pg">还能往哪走</span></div>
 </div>
+
+<h3 style="margin-top:7mm"><span class="sn">索引</span>六个案例：误判是什么，根因是什么</h3>
+<table>
+  <thead>
+    <tr><th>案例</th><th>最初的误判</th><th>真正的根因</th><th class="n">收益</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>PV 布局</b></td>
+      <td>内核太慢，或者 f16 太费字节</td>
+      <td>1-of-4 跨距让预取器拉进 4 倍数据</td>
+      <td class="n win">PV −43%</td>
+    </tr>
+    <tr>
+      <td><b>attention 唤醒</b></td>
+      <td>算力没打满，去查内核</td>
+      <td>worker 轮询每层翻一次的计数器，而非自己的 head flag</td>
+      <td class="n win">−2.3 ms</td>
+    </tr>
+    <tr>
+      <td><b>备份 deadline</b></td>
+      <td>备份在抢没人等的工作</td>
+      <td>计时器打在等 flag 之前，早到者把预算花在等待上</td>
+      <td class="n win">接管 78→1.5</td>
+    </tr>
+    <tr>
+      <td><b>循环边界</b></td>
+      <td>150 轮 token 一致，正确性没问题</td>
+      <td>循环上界读共享全局，晚到线程看到别人的值</td>
+      <td class="n">0（修 bug）</td>
+    </tr>
+    <tr>
+      <td><b>双 rescuer</b></td>
+      <td>并行度不够，等待就加人</td>
+      <td>函数不是纯写入，<code>memset</code> 覆盖已发布块</td>
+      <td class="n">回退，只值 0.6 ms</td>
+    </tr>
+    <tr>
+      <td><b>列分块顺序</b></td>
+      <td>24.4 是 27.5 上限的 88%，归给内核</td>
+      <td>8 个线程读 8 条遥远的带，而非同一窗口</td>
+      <td class="n win">round −10 ms</td>
+    </tr>
+  </tbody>
+</table>
 
 <div style="break-after: page"></div>
 
@@ -398,7 +474,7 @@
 <table>
   <caption>代价与结果（同热态、交替运行）</caption>
   <thead>
-    <tr><th></th><th class="n">PV ms</th><th class="n">10K decode</th></tr>
+    <tr><th>V 存储顺序</th><th class="n">PV ms</th><th class="n">10K decode</th></tr>
   </thead>
   <tbody>
     <tr><td>position-major</td><td class="n">23.9 / 24.1</td><td class="n">9.98 / 9.98 tok/s</td></tr>
@@ -556,7 +632,7 @@
 <table>
   <caption>修法前后（400 轮，10K）</caption>
   <thead>
-    <tr><th></th><th class="n">每轮接管次数</th><th class="n">稳态 attention 墙钟</th></tr>
+    <tr><th>deadline 起点</th><th class="n">每轮接管次数</th><th class="n">稳态 attention 墙钟</th></tr>
   </thead>
   <tbody>
     <tr><td>计时点在入口</td><td class="n">78</td><td class="n">32.6 ms</td></tr>
@@ -682,7 +758,7 @@
 <table>
   <caption>400 轮，10K</caption>
   <thead>
-    <tr><th></th><th class="n">accepted</th><th class="n">tokens</th><th class="n">md5</th></tr>
+    <tr><th>rescuer 数</th><th class="n">accepted</th><th class="n">tokens</th><th class="n">md5</th></tr>
   </thead>
   <tbody>
     <tr><td>一个 rescuer</td><td class="n">436/1200</td><td class="n">836</td><td class="n"><code>490e5fc0…</code></td></tr>
@@ -752,7 +828,7 @@
 <table>
   <caption>10K，400 轮，release 构建（<code>-O3</code>）</caption>
   <thead>
-    <tr><th></th><th class="n">每线程一条带</th><th class="n">tile 交错</th></tr>
+    <tr><th>阶段</th><th class="n">每线程一条带</th><th class="n">tile 交错</th></tr>
   </thead>
   <tbody>
     <tr><td>verify GEMM</td><td class="n">51.05 ms</td><td class="n win"><b>46.06 ms（27.5 GB/s）</b></td></tr>
@@ -821,7 +897,7 @@
 </p>
 <table>
   <caption>同一份源码，同一个 md5</caption>
-  <thead><tr><th></th><th class="n">round</th><th class="n">prefill</th></tr></thead>
+  <thead><tr><th>编译选项</th><th class="n">round</th><th class="n">prefill</th></tr></thead>
   <tbody>
     <tr><td><code>-O2</code></td><td class="n">101.62 ms</td><td class="n">198.7 tok/s</td></tr>
     <tr><td><b><code>-O3</code></b></td><td class="n win"><b>99.88 ms</b></td><td class="n win"><b>203.5 tok/s</b></td></tr>
@@ -948,8 +1024,8 @@
   </thead>
   <tbody>
     <tr><td>verify GEMM（42 层，1265 MB）</td><td class="n">46.06</td><td class="win">27.5 GB/s，贴住实测连续流上限</td></tr>
-    <tr><td>verify attention（4 行）</td><td class="n">~25.9</td><td class="win">body 对 qk+pv 算术和 24.4，贴在 vmadot 地板</td></tr>
-    <tr><td>verify lm_head（150 MB）</td><td class="n">6.50</td><td>tile 交错后 21.2 GB/s</td></tr>
+    <tr><td>verify attention（4 行）</td><td class="n">25.9</td><td class="win">QK/PV 已在 vmadot 点积地板，余量是 flag 等待</td></tr>
+    <tr><td>verify lm_head（150 MB）</td><td class="n">6.50</td><td>tile 交错后 23.1 GB/s</td></tr>
     <tr><td>draft（5 层）</td><td class="n">15.98</td><td>layers 8.06 + head 5.33 + bias 2.59</td></tr>
     <tr><td>norm / silu / rope+kv / quant / argmax</td><td class="n">3.2</td><td>各有小幅优化，均已成对验证</td></tr>
     <tr><td><b>round</b></td><td class="n win"><b>100.10</b></td><td><b>20.88 tok/s @ 1.090 accepted</b></td></tr>
