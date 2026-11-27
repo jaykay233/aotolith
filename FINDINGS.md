@@ -2872,3 +2872,47 @@ Two things that look like findings and are not:
 - `MEGA_V8=0` reads 202.83 tok/s against 200.63, which is not the V plane making
   prefill faster: prefill does not read the decode V plane at all. It is the same
   board noise as the 49.91-50.15 s spread, and the run order.
+
+## The eight bands were the slowdown: a 130560-wide matrix read by tile order
+
+`task_mgemm_m4` split every matrix's n dimension into one contiguous band per
+thread. At n=2048 that is eight bands of 1 MB and it did not matter. At n=130560
+-- the verify lm_head, the drafter's head, and each of the four markov bias
+calls -- it is eight bands of 18.8 MB read in parallel, and the DRAM row buffer
+pays for it.
+
+Walking the 32-n tiles round-robin instead (thread `tid` takes tiles
+`tid, tid+8, tid+16, ...`) makes the eight threads read *neighbouring* 576-byte
+tiles, so the cluster advances one 288 KB window of the matrix at a time.
+
+| 10K, 400 rounds | per-thread bands | round-robin tiles |
+|---|---|---|
+| verify GEMM | 51.05 ms | **46.77 ms (27.0 GB/s)** |
+| verify lm_head | 7.40 | **6.43** |
+| drafter head | 6.40 | **5.34** |
+| markov bias | 3.27 | **2.58** |
+| round | 110.14 ms | **101.77 ms** |
+| tok/s at 1.090 accepted | 18.98 | **20.54** |
+
+The GEMM was reading at 24.4 GB/s, which this file previously took as "88 percent
+of the 27.5 GB/s ceiling" and blamed on the vendor kernel. It was not the kernel
+and it was not the bus: it was the access pattern. The same kernel moving the
+same bytes in tile order reads 27.0 GB/s.
+
+Correctness is unchanged because a 32-n tile owns its own output columns: the
+tile order cannot move a value. Two 400-round runs emit the same 836 tokens with
+the same 436/1200 acceptance and the same md5 `490e5fc0...` as before the change.
+
+One tile per step is the flat optimum (109.65 ms against 109.82 at two tiles and
+110.36 at four, 80 rounds). `MEGA_M4ILV=0` restores the band split, `MEGA_M4ILVC`
+sets the chunk.
+
+Prefill is untouched: it runs its own m-inner loop and never enters
+`task_mgemm_m4`. Three back-to-back 10K prefill runs read 198.65, 198.80 and
+200.22 tok/s with GEMM 26.51 s against the recorded 26.57, the same 49.91-50.15 s
+spread this file already records.
+
+The same lesson as the QK stride entry: a measured "ceiling" is a ceiling for the
+access pattern that measured it. `bwprobe` streams one contiguous run per thread,
+and that is what 27.5 describes; eight threads splitting one matrix into distant
+bands is a different pattern and it lands at 24.4.

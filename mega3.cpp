@@ -1145,7 +1145,39 @@ static inline uint8_t * m4_aq2(int64_t k) {
 
 // Same job list and column split as task_mgemm; the difference is the kernel and
 // the row stride, which has to be the matrix width because row r starts at r*n.
+// A wide matrix hands each thread a long contiguous band, and at n=130560 that is
+// eight bands of 18.8 MB read in parallel: eight streams the prefetcher cannot
+// merge. Walking the chunks round-robin instead advances one window of the matrix
+// at a time, so the eight threads read neighbouring 576-byte tiles. Measured on
+// the 150 MB lm_head and the 16.7 MB markov head: 20.3 -> 21.2 and 20.7 -> 27.6
+// GB/s, 2.45 ms off the round. One 32-n tile per step is the flat optimum
+// (109.65 ms against 109.82 at two, 110.36 at four).
+static int m4_ilv(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("MEGA_M4ILV"); v = e ? atoi(e) : 1; }
+    return v;
+}
+
 static void task_mgemm_m4(int tid) {
+    if (m4_ilv()) {
+        static int ch = -1;
+        if (ch < 0) { const char * e = getenv("MEGA_M4ILVC"); ch = e ? atoi(e) : 1; }
+        const int64_t chk = ch > 0 ? ch : 1;
+        for (int j = 0; j < g_mjn; ++j) {
+            const int64_t ng = g_mj[j].n / 32;
+            const int64_t nch = (ng + chk - 1) / chk;
+            const int64_t kb = g_mj[j].k / 32;
+            for (int64_t c = tid; c < nch; c += g_participants) {
+                const int64_t a = c * chk;
+                int64_t b2 = a + chk; if (b2 > ng) b2 = ng;
+                const uint8_t * bp = g_mj[j].b + a * (g_mj[j].k / 32) * 576;
+                spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m4(
+                    256, m4_aq2(g_mj[j].k), bp, nullptr, g_mj[j].c + a * 32,
+                    4, (size_t) ((b2 - a) * 32), (size_t) (kb / 8), (size_t) g_mj[j].n);
+            }
+        }
+        return;
+    }
     int64_t n0[8], n1[8], step_max = 0;
     for (int j = 0; j < g_mjn; ++j) {
         const int64_t ng = g_mj[j].n / 32;
